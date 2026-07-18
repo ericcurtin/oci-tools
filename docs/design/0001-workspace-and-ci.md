@@ -116,16 +116,26 @@ Artifacts: the six release binaries per matrix cell.
 
 ## Decisions and risks
 
-* **Firmware, corrected by inspection**: the CentOS Stream 10 GenericCloud
-  x86_64 image is **BIOS-boot-only** (GPT with a 1M BIOS-boot partition, no
-  ESP — under OVMF it PXE-loops into the EFI shell), while Ubuntu amd64
-  images are hybrid. So x86_64 defaults to SeaBIOS (`VM_FIRMWARE=uefi`
-  switches to OVMF for UEFI-only disks, e.g. the milestone-5 ociboot boot
-  test); aarch64 has no BIOS and always uses `QEMU_EFI.fd`. NIC PXE option
-  ROMs are disabled (`romfile=`): we always boot from disk, and the ROM
-  package (`ipxe-qemu`) is only a Recommends of `qemu-system-arm` — its
-  absence otherwise aborts QEMU startup on the arm runners (found the hard
-  way).
+* **Firmware, learned the hard way**: UEFI (OVMF / `QEMU_EFI.fd`)
+  everywhere, `smm=off` on q35.
+  - SeaBIOS guests do not boot on GitHub's hosted x86_64 runners: the vCPU
+    sits idle forever with an empty console (nested-virt real-mode
+    limitation — with `unrestricted_guest=N`, 16-bit/big-real-mode BIOS
+    code cannot run; OVMF leaves real mode almost immediately and works).
+    SeaBIOS remains available via `VM_FIRMWARE=bios` for KVM-capable
+    hosts and TCG.
+  - The CentOS Stream 10 **osbuild** GenericCloud x86_64 image
+    (`GenericCloud-10-*`) is BIOS-boot-only (1M BIOS-boot partition, no
+    ESP; OVMF PXE-loops into the EFI shell). The **kiwi**-built variant
+    (`GenericCloud-x86_64-10-*`) is hybrid with a 200M ESP — CI uses that
+    one. Ubuntu amd64 images are hybrid already; aarch64 images are UEFI by
+    construction.
+  - NIC PXE option ROMs are disabled (`romfile=`): we always boot from
+    disk, and the ROM package (`ipxe-qemu`) is only a Recommends of
+    `qemu-system-arm`, whose absence aborts QEMU startup on arm runners.
+  - SeaBIOS text output is mirrored to serial via the `etc/sercon-port`
+    fw_cfg knob in BIOS mode, so firmware-phase failures are visible in
+    `console.log`.
 * **CentOS Stream 10 requires x86-64-v3**: fine under KVM (`-cpu host`,
   runners have AVX2) and under TCG with `-cpu max` (QEMU >= 7.2 implements
   AVX2; ubuntu-24.04 ships 8.2).

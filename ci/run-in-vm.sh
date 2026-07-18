@@ -26,7 +26,11 @@ fi
 
 case "$base/$arch" in
     centos-stream10/x86_64)
-        default_url="https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2"
+        # The kiwi-built "GenericCloud-x86_64" variant is UEFI-capable
+        # (hybrid ESP + BIOS-boot partition); the osbuild "GenericCloud"
+        # variant is BIOS-only, and SeaBIOS guests do not run under the
+        # nested virtualization of GitHub's hosted x86_64 runners.
+        default_url="https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-x86_64-10-latest.x86_64.qcow2"
         ;;
     centos-stream10/aarch64)
         default_url="https://cloud.centos.org/centos/10-stream/aarch64/images/CentOS-Stream-GenericCloud-10-latest.aarch64.qcow2"

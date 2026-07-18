@@ -31,6 +31,13 @@ if [ -e /dev/kvm ]; then
     else
         echo "setup-host: /dev/kvm present but not accessible; harness will fall back to TCG"
     fi
+    # Nested-virt quality varies; unrestricted_guest=N means real-mode
+    # guest code (SeaBIOS) cannot run, which is why the harness boots
+    # x86_64 guests with OVMF by default.
+    for p in /sys/module/kvm_intel/parameters/unrestricted_guest \
+        /sys/module/kvm_amd/parameters/nested; do
+        [ -f "$p" ] && echo "setup-host: $p = $(cat "$p" 2>/dev/null || echo '?')"
+    done
 else
     echo "setup-host: no /dev/kvm; harness will fall back to TCG"
 fi

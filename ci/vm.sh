@@ -26,11 +26,11 @@
 #                     Default: 1200 (KVM) / 2400 (TCG fallback)
 #   VM_FORCE_TCG      Set to 1 to use TCG even when /dev/kvm is usable
 #                     (mirrors GitHub's aarch64 runners, which lack KVM).
-#   VM_FIRMWARE       x86_64 only: bios (default) | uefi. The CentOS Stream 10
-#                     GenericCloud x86_64 image is BIOS-boot-only and the
-#                     Ubuntu amd64 images are hybrid, so SeaBIOS boots both;
-#                     uefi (OVMF) is for UEFI-only guest disks. aarch64 is
-#                     always UEFI.
+#   VM_FIRMWARE       x86_64 only: uefi (default, OVMF) | bios (SeaBIOS).
+#                     UEFI is the default because SeaBIOS guests hang (idle
+#                     vCPU, no output) under the nested virtualization of
+#                     GitHub's hosted x86_64 runners, where OVMF is fine.
+#                     aarch64 is always UEFI.
 #   VM_PUSH_EXCLUDE   Space-separated tar --exclude patterns for `push`.
 set -euo pipefail
 
@@ -156,20 +156,21 @@ EOF
     case "$arch" in
         x86_64)
             qemu="qemu-system-x86_64"
-            # smm=off: SeaBIOS's SMM/SMBASE relocation stalls badly on
-            # QEMU 8.2+ (gitlab qemu#2365), and catastrophically so under the
-            # nested virtualization of GitHub's hosted runners. Our guests
-            # never need SMM (no secure boot).
+            # smm=off: SMM emulation is a liability under nested
+            # virtualization (and SeaBIOS's SMM relocation stalls on
+            # QEMU 8.2+, gitlab qemu#2365); our guests never need it.
             machine="q35,smm=off"
-            case "${VM_FIRMWARE:-bios}" in
-                bios) ;; # SeaBIOS is the QEMU default; no -bios argument
+            case "${VM_FIRMWARE:-uefi}" in
                 uefi)
                     for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd; do
                         [ -f "$f" ] && firmware=$f && break
                     done
                     [ -n "$firmware" ] || die "OVMF firmware not found (install the 'ovmf' package)"
                     ;;
-                *) die "invalid VM_FIRMWARE '${VM_FIRMWARE}' (bios | uefi)" ;;
+                bios) ;; # SeaBIOS is the QEMU default; no -bios argument.
+                         # Known not to work on GitHub-hosted runners (nested
+                         # virt: the vCPU never leaves the BIOS, idle).
+                *) die "invalid VM_FIRMWARE '${VM_FIRMWARE}' (uefi | bios)" ;;
             esac
             ;;
         aarch64)
