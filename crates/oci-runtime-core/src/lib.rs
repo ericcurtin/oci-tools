@@ -25,6 +25,7 @@
 //! - [`identity`] — dropping from "root in the new namespaces" to the
 //!   spec's declared `process.user`, capability sets, and
 //!   `no_new_privileges`, in the exact kernel-required order.
+//! - [`rlimits`] — `process.rlimits` -> `setrlimit(2)`.
 //! - [`launch`] — assembling all of the above (plus `oci_mount`) into an
 //!   actual `create`-and-`start`-in-one-step container run, the shape
 //!   `ocirun run` uses.
@@ -41,8 +42,8 @@
 //! - namespaces (user, mount, pid, net, uts, ipc, cgroup, time), rootless
 //!   user-namespace setup with uid/gid mappings
 //! - cgroups v2 with both systemd and cgroupfs drivers
-//! - seccomp profiles, POSIX rlimits (capability sets and
-//!   `no_new_privileges` are done — see [`identity`])
+//! - seccomp profiles (uid/gid, capability sets, `no_new_privileges`,
+//!   and POSIX rlimits are done — see [`identity`] and [`rlimits`])
 //! - pivot_root into the prepared rootfs (via `oci-mount`)
 //! - terminal handling: PTY allocation, console socket protocol
 //!
@@ -57,6 +58,7 @@ pub mod identity;
 pub mod launch;
 pub mod namespaces;
 pub mod process;
+pub mod rlimits;
 pub mod rootfs;
 pub mod state;
 mod time;

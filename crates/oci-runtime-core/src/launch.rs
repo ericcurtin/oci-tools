@@ -17,12 +17,15 @@ use std::io;
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 
-use oci_spec_types::runtime::{LinuxCapabilities, LinuxIdMapping, NamespaceType, User};
+use oci_spec_types::runtime::{
+    LinuxCapabilities, LinuxIdMapping, NamespaceType, PosixRlimit, User,
+};
 
 use crate::bundle::Bundle;
 use crate::identity;
 use crate::namespaces;
 use crate::process;
+use crate::rlimits;
 use crate::rootfs::{self, MaskedPathKind, RootfsAction};
 
 /// Exit code used when oci-tools itself (not the container's process)
@@ -99,6 +102,7 @@ pub unsafe fn run(bundle: &Bundle, rootfs: &Path) -> io::Result<i32> {
         user: process_spec.user.clone(),
         capabilities: process_spec.capabilities.clone(),
         no_new_privileges: process_spec.no_new_privileges,
+        rlimits: process_spec.rlimits.clone(),
         args: process_spec.args.clone(),
         env: process_spec.env.clone(),
         cwd: process_spec.cwd.clone(),
@@ -122,6 +126,7 @@ struct ChildSetup {
     user: User,
     capabilities: Option<LinuxCapabilities>,
     no_new_privileges: bool,
+    rlimits: Vec<PosixRlimit>,
     args: Vec<String>,
     env: Vec<String>,
     cwd: String,
@@ -150,6 +155,15 @@ impl ChildSetup {
     /// so whoever is waiting on it (the outer [`run`]) sees that status
     /// either way.
     fn run(&self) -> ! {
+        // Applied before `unshare`, matching real crun: rlimits are a
+        // plain process attribute with no interaction with namespaces
+        // or the rootless ID-mapping dance, and raising one above its
+        // current hard limit (if ever needed) is only guaranteed to
+        // work with whatever privilege this process has *before*
+        // becoming a fake-root-in-a-userns.
+        if let Err(e) = rlimits::apply(&self.rlimits) {
+            fail(SETUP_FAILURE_EXIT_CODE, &format!("setting rlimits: {e}"));
+        }
         if let Err(e) = namespaces::unshare(self.flags) {
             fail(SETUP_FAILURE_EXIT_CODE, &format!("unshare: {e}"));
         }

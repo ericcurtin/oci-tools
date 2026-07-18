@@ -219,6 +219,51 @@ fn run_drops_capabilities_the_spec_does_not_grant() {
 }
 
 #[test]
+fn run_applies_rlimits() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(
+        dir.path(),
+        &busybox,
+        &[
+            "/bin/sh",
+            "-c",
+            r#"grep -E "^Max open files" /proc/self/limits"#,
+        ],
+    );
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    // Deliberately not RLIMIT_NPROC: it counts against the *real* host
+    // uid's total process count (applied before the container even has
+    // its own user namespace — see docs/design/0014), so a low value
+    // would make this test's pass/fail depend on how many other
+    // processes the CI/dev machine's user happens to have running.
+    config["process"]["rlimits"] = serde_json::json!([
+        {"type": "RLIMIT_NOFILE", "soft": 256, "hard": 512},
+    ]);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let out = ocirun_run(dir.path(), "rlimits-test");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let line = stdout.trim();
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(
+        &fields[..5],
+        ["Max", "open", "files", "256", "512"],
+        "got: {line:?}"
+    );
+}
+
+#[test]
 fn run_isolates_hostname_from_the_host() {
     let Some(busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");
