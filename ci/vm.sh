@@ -156,7 +156,11 @@ EOF
     case "$arch" in
         x86_64)
             qemu="qemu-system-x86_64"
-            machine="q35"
+            # smm=off: SeaBIOS's SMM/SMBASE relocation stalls badly on
+            # QEMU 8.2+ (gitlab qemu#2365), and catastrophically so under the
+            # nested virtualization of GitHub's hosted runners. Our guests
+            # never need SMM (no secure boot).
+            machine="q35,smm=off"
             case "${VM_FIRMWARE:-bios}" in
                 bios) ;; # SeaBIOS is the QEMU default; no -bios argument
                 uefi)
@@ -202,6 +206,11 @@ EOF
         -daemonize
     )
     [ -n "$firmware" ] && args+=(-bios "$firmware")
+    # Mirror SeaBIOS/bootloader output onto the serial port so BIOS-phase
+    # problems show up in console.log (SeaBIOS is otherwise serial-silent).
+    if [ "$arch" = x86_64 ] && [ -z "$firmware" ]; then
+        args+=(-fw_cfg "name=etc/sercon-port,string=0x3f8")
+    fi
 
     if [ -n "$VM_CACHE_DISK" ]; then
         if [ ! -f "$VM_CACHE_DISK" ]; then
@@ -227,6 +236,8 @@ EOF
         fi
         if [ "$SECONDS" -ge "$deadline" ]; then
             console_tail 120
+            log "qemu process state at timeout:"
+            ps -o pid,etime,time,%cpu,stat -p "$(qemu_pid)" >&2 || true
             die "ssh not reachable after ${VM_BOOT_TIMEOUT}s"
         fi
         sleep 5
