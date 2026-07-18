@@ -1,10 +1,18 @@
 //! OCI runtime-spec execution engine — the heart of `ocirun`.
 //!
-//! **Scope shipped so far**: [`state`] — the on-disk container state
-//! model (`<root>/<id>/state.json`) and the `StateStore` directory
-//! abstraction `create`/`start`/`kill`/`delete`/`state`/`list` all build
-//! on. This is deliberately built and tested *before* actual container
-//! creation: it has no idea how to start a container process yet.
+//! **Scope shipped so far**:
+//! - [`state`] — the on-disk container state model
+//!   (`<root>/<id>/state.json`) and the `StateStore` directory
+//!   abstraction `create`/`start`/`kill`/`delete`/`state`/`list` all build
+//!   on.
+//! - [`bundle`] — reading and parsing `config.json` out of a bundle
+//!   directory.
+//! - [`validate`] — config sanity checks (rootfs exists, namespace/ID-
+//!   mapping consistency, ...) that must pass before a bundle can be
+//!   created.
+//!
+//! All of this is deliberately built and tested *before* actual container
+//! creation: none of it needs privilege, namespaces, or a running process.
 //!
 //! Planned (rest of milestone 3):
 //! - container lifecycle per the OCI runtime spec: create, start, kill,
@@ -21,7 +29,11 @@
 //! containers through it as a library (never by exec'ing `ocirun`).
 //! Prior art: youki, crun — concepts borrowed, code original.
 
+pub mod bundle;
 pub mod state;
 mod time;
+pub mod validate;
 
+pub use bundle::{Bundle, BundleError};
 pub use state::{PersistedState, StateError, StateStore, StateView, Status};
+pub use validate::ValidateError;
