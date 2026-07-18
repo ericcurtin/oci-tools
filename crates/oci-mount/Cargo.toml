@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 oci-spec-types.workspace = true
+rustix = { workspace = true, features = ["fs", "mount"] }
 
 [lints]
 workspace = true
