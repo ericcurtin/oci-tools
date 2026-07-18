@@ -13,11 +13,12 @@ publish = false
 libc.workspace = true
 oci-mount.workspace = true
 oci-spec-types.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["fs", "mount"] }
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

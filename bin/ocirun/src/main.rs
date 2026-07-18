@@ -1,10 +1,12 @@
 //! `ocirun` — standalone OCI runtime (crun equivalent).
 //!
 //! Thin, runc-CLI-compatible wrapper over `oci-runtime-core`, so it can be
-//! dropped into other engines. Shipped so far: `spec`, `state`, `list`
-//! (container creation itself, the rest of milestone 3, has nothing to
-//! list yet). Planned: `create`, `start`, `kill`, `delete`, `exec`, `run`,
-//! `features`.
+//! dropped into other engines. Shipped so far: `spec`, `state`, `list`,
+//! `run` (create-and-start in one step; the separate `create`/`start`/
+//! `kill`/`delete`/`exec` two-phase lifecycle — which needs a persistent
+//! background process surviving after the CLI invocation returns, and
+//! state-store integration with a live pid to track — is not implemented
+//! yet).
 
 use std::path::{Path, PathBuf};
 
@@ -33,7 +35,7 @@ struct Cli {
 }
 
 /// Subcommands shipped so far. `create`/`start`/`kill`/`delete`/`exec`/
-/// `run`/`features` arrive with the rest of milestone 3.
+/// `features` arrive with the rest of milestone 3.
 #[derive(Debug, clap::Subcommand)]
 enum Command {
     /// Create a new specification file (`config.json`) for a bundle.
@@ -60,6 +62,19 @@ enum Command {
         #[arg(short, long)]
         quiet: bool,
     },
+    /// Create and immediately start a container (combines OCI "create"
+    /// and "start" into one step, foreground, like `runc run`/`crun
+    /// run`). The container's own exit code becomes `ocirun`'s exit code.
+    Run {
+        /// The container's ID (accepted for CLI-compatibility; not yet
+        /// tracked in the state store — that lands with `create`/
+        /// `start`/`delete`).
+        id: String,
+        /// Path to the root of the bundle directory (defaults to the
+        /// current directory).
+        #[arg(short, long, value_name = "DIR")]
+        bundle: Option<PathBuf>,
+    },
 }
 
 /// Filename of the OCI runtime-spec bundle configuration, per the spec.
@@ -79,13 +94,14 @@ fn main() -> std::process::ExitCode {
 
         match cli.command {
             None => anyhow::bail!(
-                "no command given; try `ocirun --help` (`spec`/`state`/`list` are \
-                 implemented; `create`/`start`/`run`/`kill`/`delete`/`exec`/`features` \
-                 arrive with the rest of milestone 3)"
+                "no command given; try `ocirun --help` (`spec`/`state`/`list`/`run` are \
+                 implemented; `create`/`start`/`kill`/`delete`/`exec`/`features` arrive \
+                 with the rest of milestone 3)"
             ),
             Some(Command::Spec { bundle, rootless }) => cmd_spec(bundle.as_deref(), rootless),
             Some(Command::State { id }) => cmd_state(&root, &id),
             Some(Command::List { format, quiet }) => cmd_list(&root, &format, quiet),
+            Some(Command::Run { id, bundle }) => cmd_run(&id, bundle.as_deref()),
         }
     })
 }
@@ -161,4 +177,28 @@ fn cmd_list(root: &Path, format: &str, quiet: bool) -> anyhow::Result<()> {
         other => anyhow::bail!("invalid format option: {other:?} (expected \"table\" or \"json\")"),
     }
     Ok(())
+}
+
+fn cmd_run(id: &str, bundle: Option<&Path>) -> anyhow::Result<()> {
+    let dir = bundle.unwrap_or_else(|| Path::new("."));
+    tracing::debug!(container_id = id, bundle = %dir.display(), "run starting");
+
+    let bundle = oci_runtime_core::Bundle::load(dir)
+        .with_context(|| format!("loading bundle from {}", dir.display()))?;
+    let rootfs =
+        oci_runtime_core::validate::validate(&bundle).context("config.json failed validation")?;
+
+    // SAFETY: `ocirun`'s own process has not spawned any additional
+    // threads by this point (argument parsing and log initialization
+    // don't spawn any), so the fork `launch::run` performs is sound —
+    // see its own safety note for the requirement this satisfies.
+    #[allow(unsafe_code)]
+    let exit_code =
+        unsafe { oci_runtime_core::launch::run(&bundle, &rootfs) }.context("running container")?;
+
+    // The container's own exit code becomes ours, matching runc/crun's
+    // `run`: exit code 0 must mean "the container's process exited 0",
+    // not merely "ocirun didn't error", so this bypasses
+    // oci_cli_common::run_main's usual Ok(())-means-success mapping.
+    std::process::exit(exit_code);
 }

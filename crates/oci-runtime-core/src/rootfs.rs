@@ -138,10 +138,22 @@ pub fn plan_rootfs_setup(bundle: &Bundle, rootfs: &Path) -> Vec<RootfsAction> {
     for mount in &bundle.spec.mounts {
         let target = join_under_root(rootfs, &mount.destination);
         let parsed = oci_mount::parse_mount_options(&mount.options);
+        // The runtime-spec's mount type vocabulary predates cgroup v2 and
+        // still says "cgroup" (a cgroup-v1-style single-hierarchy mount);
+        // oci-tools targets cgroup v2 exclusively (no v1 host support to
+        // fall back to), so the substitution is unconditional, not an
+        // auto-detected-at-runtime choice. Confirmed against a real
+        // `strace` of `runc run` on a cgroup-v2-unified host: it issues
+        // `mount("cgroup", ..., "cgroup2", ...)` -- the source string is
+        // untouched, only the filesystem type changes (see 0007/0010).
+        let file_system_type = match mount.kind.as_deref() {
+            Some("cgroup") => Some("cgroup2".to_string()),
+            _ => mount.kind.clone(),
+        };
         plan_one_mount(
             target,
             mount.source.clone(),
-            mount.kind.clone(),
+            file_system_type,
             parsed,
             &mut actions,
         );
@@ -337,6 +349,35 @@ mod tests {
         assert_eq!(mount_targets[4], rootfs.join("dev/mqueue"));
         assert_eq!(mount_targets[5], rootfs.join("sys"));
         assert_eq!(mount_targets[6], rootfs.join("sys/fs/cgroup"));
+    }
+
+    #[test]
+    fn cgroup_mount_type_is_substituted_with_cgroup2() {
+        // oci-tools targets cgroup v2 exclusively (no v1 host to fall
+        // back to), so this is unconditional -- confirmed against a real
+        // `strace` of `runc run` on a cgroup-v2-unified host (0007/0010).
+        let (_dir, bundle) = bundle_with(Spec::example());
+        let rootfs = bundle.rootfs_path().unwrap();
+        let actions = plan_rootfs_setup(&bundle, &rootfs);
+
+        let cgroup_mount = actions
+            .iter()
+            .find(|a| matches!(a, RootfsAction::Mount { target, .. } if *target == rootfs.join("sys/fs/cgroup")))
+            .unwrap();
+        let RootfsAction::Mount {
+            source,
+            file_system_type,
+            ..
+        } = cgroup_mount
+        else {
+            panic!("expected a Mount action");
+        };
+        assert_eq!(
+            source.as_deref(),
+            Some("cgroup"),
+            "source string is untouched"
+        );
+        assert_eq!(file_system_type.as_deref(), Some("cgroup2"));
     }
 
     #[test]

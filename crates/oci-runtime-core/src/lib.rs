@@ -22,6 +22,9 @@
 //!   crate).
 //! - [`process`] — `fork(2)`/`waitpid(2)`, the one syscall `rustix`
 //!   deliberately never wraps.
+//! - [`launch`] — assembling all of the above (plus `oci_mount`) into an
+//!   actual `create`-and-`start`-in-one-step container run, the shape
+//!   `ocirun run` uses.
 //!
 //! All of this is deliberately built and tested *before* actual container
 //! creation: nothing here does the one truly risky thing yet — actually
@@ -46,6 +49,7 @@
 
 pub mod bundle;
 pub mod cgroups;
+pub mod launch;
 pub mod namespaces;
 pub mod process;
 pub mod rootfs;
