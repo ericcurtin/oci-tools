@@ -15,18 +15,25 @@
 
 use std::io;
 use std::os::unix::process::CommandExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use oci_spec_types::runtime::{
     LinuxCapabilities, LinuxIdMapping, NamespaceType, PosixRlimit, User,
 };
 
 use crate::bundle::Bundle;
+use crate::cgroups::{self, CgroupWrite};
 use crate::identity;
 use crate::namespaces;
 use crate::process;
 use crate::rlimits;
 use crate::rootfs::{self, MaskedPathKind, RootfsAction};
+
+/// The cgroup v2 unified hierarchy's mount point in production. Tests
+/// substitute a plain temp directory (see [`crate::cgroups`]'s own
+/// doc comment on why plain file writes don't need a real cgroupfs to
+/// exercise this logic).
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// Exit code used when oci-tools itself (not the container's process)
 /// fails to set the container up — matches the Docker/podman convention
@@ -92,12 +99,24 @@ pub unsafe fn run(bundle: &Bundle, rootfs: &Path) -> io::Result<i32> {
         .map_or(&[][..], |l| &l.gid_mappings)
         .to_vec();
 
+    let linux = bundle.spec.linux.as_ref();
+    let cgroup_dir = cgroups::directory_for(
+        Path::new(CGROUP_ROOT),
+        linux.and_then(|l| l.cgroups_path.as_deref()),
+    )?;
+    let cgroup_writes = linux
+        .and_then(|l| l.resources.as_ref())
+        .map(cgroups::plan_resources)
+        .unwrap_or_default();
+
     let plan = rootfs::plan_rootfs_setup(bundle, rootfs);
     let child_setup = ChildSetup {
         flags,
         needs_self_mapping,
         uid_mappings,
         gid_mappings,
+        cgroup_dir,
+        cgroup_writes,
         plan,
         user: process_spec.user.clone(),
         capabilities: process_spec.capabilities.clone(),
@@ -122,6 +141,8 @@ struct ChildSetup {
     needs_self_mapping: bool,
     uid_mappings: Vec<LinuxIdMapping>,
     gid_mappings: Vec<LinuxIdMapping>,
+    cgroup_dir: Option<PathBuf>,
+    cgroup_writes: Vec<CgroupWrite>,
     plan: Vec<RootfsAction>,
     user: User,
     capabilities: Option<LinuxCapabilities>,
@@ -163,6 +184,28 @@ impl ChildSetup {
         // becoming a fake-root-in-a-userns.
         if let Err(e) = rlimits::apply(&self.rlimits) {
             fail(SETUP_FAILURE_EXIT_CODE, &format!("setting rlimits: {e}"));
+        }
+        // Also strictly before `unshare`: entering the target cgroup
+        // *before* a `CLONE_NEWCGROUP` unshare is what makes that
+        // namespace root at the container's own cgroup rather than
+        // whatever the host process was in — see `cgroups::enter`'s own
+        // doc comment.
+        if let Some(dir) = &self.cgroup_dir {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                fail(
+                    SETUP_FAILURE_EXIT_CODE,
+                    &format!("creating cgroup directory {}: {e}", dir.display()),
+                );
+            }
+            if let Err(e) = cgroups::apply(dir, &self.cgroup_writes) {
+                fail(
+                    SETUP_FAILURE_EXIT_CODE,
+                    &format!("applying cgroup resources: {e}"),
+                );
+            }
+            if let Err(e) = cgroups::enter(dir) {
+                fail(SETUP_FAILURE_EXIT_CODE, &format!("entering cgroup: {e}"));
+            }
         }
         if let Err(e) = namespaces::unshare(self.flags) {
             fail(SETUP_FAILURE_EXIT_CODE, &format!("unshare: {e}"));

@@ -15,7 +15,9 @@
 //!   user-namespace ID-mapping dance (`/proc/<pid>/{uid,gid}_map`,
 //!   `setgroups`).
 //! - [`cgroups`] — `LinuxResources` (memory/cpu/pids) -> cgroup v2
-//!   interface file writes.
+//!   interface file writes, resolving `linux.cgroupsPath` to a real
+//!   cgroup v2 directory (`cgroupfs` driver only), and migrating the
+//!   container process into it.
 //! - [`rootfs`] — planning the ordered sequence of mount/pivot_root/
 //!   hostname operations a bundle's `config.json` calls for (the
 //!   "sequencing" piece `oci_mount::syscalls` explicitly left for this
@@ -41,7 +43,9 @@
 //!   delete, exec; hooks (prestart/createRuntime/...)
 //! - namespaces (user, mount, pid, net, uts, ipc, cgroup, time), rootless
 //!   user-namespace setup with uid/gid mappings
-//! - cgroups v2 with both systemd and cgroupfs drivers
+//! - the systemd cgroup driver and automatic rootless delegated-subtree
+//!   discovery (the `cgroupfs` driver and manual directory creation +
+//!   process migration are done — see [`cgroups`])
 //! - seccomp profiles (uid/gid, capability sets, `no_new_privileges`,
 //!   and POSIX rlimits are done — see [`identity`] and [`rlimits`])
 //! - pivot_root into the prepared rootfs (via `oci-mount`)

@@ -173,6 +173,14 @@ pub struct Linux {
     /// cgroup resource limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<LinuxResources>,
+    /// Path to the cgroup the container process is placed in — a plain
+    /// path relative to the cgroup v2 mount root (the `cgroupfs`
+    /// driver's interpretation; the `slice:prefix:name` systemd-driver
+    /// form isn't accepted yet). `None`/absent means "the caller didn't
+    /// ask for cgroup management"; unlike `runc`, this crate does not
+    /// yet synthesize a default path when it's unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroups_path: Option<String>,
     /// Paths made unreadable (bind-mounted from `/dev/null` or similar)
     /// inside the container.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -454,6 +462,7 @@ impl Spec {
                     cpu: None,
                     pids: None,
                 }),
+                cgroups_path: None,
                 masked_paths: default_masked_paths(),
                 readonly_paths: default_readonly_paths(),
             }),

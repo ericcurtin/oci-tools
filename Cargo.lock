@@ -529,6 +529,7 @@ name = "oci-tools-tests"
 version = "0.1.0"
 dependencies = [
  "oci-runtime-core",
+ "rustix",
  "serde_json",
  "tempfile",
 ]

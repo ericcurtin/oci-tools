@@ -28,6 +28,29 @@ fn busybox_path() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Whether a real, working `systemd --user` session is reachable —
+/// needed to test cgroup directory creation/process migration for real
+/// (see `docs/design/0015`): a raw `cgroup.procs` write only succeeds
+/// across cgroup branches when the calling process already has write
+/// access to their common ancestor, which a plain SSH/login session's
+/// cgroup never has. `systemd-run --user --scope` asks systemd itself
+/// (which owns and delegates the whole `app.slice` subtree) to place
+/// the calling test process into a fresh, properly delegated scope
+/// first, sidestepping that.
+///
+/// Does a real, self-cleaning probe (`systemd-run --user --scope --
+/// true`) rather than just checking the binary is on `$PATH`: a
+/// minimal CI image can have `systemd-run` installed with no user
+/// D-Bus/systemd instance actually reachable (no login session, no
+/// lingering enabled), which fails the exact same way whether or not
+/// the binary exists.
+fn systemd_user_scope_available() -> bool {
+    Command::new("systemd-run")
+        .args(["--user", "--scope", "--", "true"])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
 /// Build a minimal bundle at `dir`: a busybox-based rootfs with `sh` and
 /// the given symlinked applets, and a rootless `config.json` running
 /// `args` (a `/bin/sh -c "..."` style command is the expected shape).
@@ -260,6 +283,79 @@ fn run_applies_rlimits() {
         &fields[..5],
         ["Max", "open", "files", "256", "512"],
         "got: {line:?}"
+    );
+}
+
+#[test]
+fn run_creates_and_enters_the_requested_cgroup() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_scope_available() {
+        eprintln!(
+            "skipping: no reachable `systemd --user` session (systemd-run --user --scope failed)"
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(
+        dir.path(),
+        &busybox,
+        &["/bin/sh", "-c", "cat /proc/self/cgroup"],
+    );
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    let uid = rustix::process::getuid().as_raw();
+    // A sibling of the carrier scope `systemd-run` below places this
+    // test process into: both are direct children of the delegated
+    // `app.slice`, so `app.slice` (writable, since the whole subtree is
+    // delegated to this uid) is their common ancestor — the specific
+    // permission `cgroup.procs` migration checks. See docs/design/0015
+    // for why this can't just be an arbitrary/absolute path picked
+    // without regard for what cgroup the calling process is in.
+    let target = format!(
+        "/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/ocirun-cgroup-test-{}",
+        std::process::id()
+    );
+    config["linux"]["cgroupsPath"] = serde_json::json!(target);
+    config["linux"]["resources"] = serde_json::json!({"pids": {"limit": 20}});
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let carrier_unit = format!("ocirun-test-carrier-{}.scope", std::process::id());
+    let out = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--slice=app.slice",
+            &format!("--unit={carrier_unit}"),
+            "--",
+        ])
+        .arg(bin_path("ocirun"))
+        .args(["run", "cgroup-test"])
+        .current_dir(dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .output()
+        .expect("failed to spawn systemd-run");
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The container's own view of `/proc/self/cgroup`: `0::/` (its own
+    // cgroup as the *root*) proves both that it was actually migrated
+    // into the cgroup this test asked for, and that the migration ran
+    // strictly before the `CLONE_NEWCGROUP` unshare (see
+    // `cgroups::enter`'s doc comment) — the wrong order would show the
+    // full absolute path instead of `/`.
+    assert_eq!(
+        stdout.lines().next_back().unwrap_or_default(),
+        "0::/",
+        "got stdout: {stdout:?}"
     );
 }
 

@@ -13,6 +13,7 @@ publish = false
 
 [dev-dependencies]
 oci-runtime-core.workspace = true
+rustix.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 

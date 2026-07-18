@@ -31,7 +31,7 @@
 //! this one *is* tested against real file I/O, just not a real cgroupfs).
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use oci_spec_types::runtime::LinuxResources;
 
@@ -186,6 +186,55 @@ pub fn apply(cgroup_dir: &Path, writes: &[CgroupWrite]) -> io::Result<()> {
         std::fs::write(cgroup_dir.join(filename), content)?;
     }
     Ok(())
+}
+
+/// Resolve `linux.cgroupsPath` to an actual directory under
+/// `cgroup_root` (`/sys/fs/cgroup` in production) — the plain
+/// `cgroupfs`-driver interpretation runc's own `fs2` uses when *not*
+/// using the systemd driver: `cgroupsPath` is a path relative to the
+/// cgroup v2 mount root, not a literal filesystem path and not the
+/// systemd-driver's `slice:prefix:name` form (that form isn't accepted
+/// yet — see `docs/design/0015`).
+///
+/// Returns `None` when `cgroups_path` is unset: unlike `runc`, this
+/// crate does not yet synthesize a default cgroup path (that needs
+/// either a `--cgroup-parent`-equivalent CLI convention or systemd
+/// delegated-subtree discovery, neither of which exist yet), so an
+/// omitted `cgroupsPath` honestly means "no cgroup management for this
+/// container" rather than guessing.
+///
+/// A `..` path component is rejected outright (matching crun's own
+/// `path_has_dot_dot_component` check) — cgroupfs has no concept of
+/// `..`-relative escapes, so a config asking for one is either a bug or
+/// hostile input, not something to silently clean away.
+pub fn directory_for(
+    cgroup_root: &Path,
+    cgroups_path: Option<&str>,
+) -> io::Result<Option<PathBuf>> {
+    let Some(path) = cgroups_path else {
+        return Ok(None);
+    };
+    if path.split('/').any(|component| component == "..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid `..` component in cgroupsPath `{path}`"),
+        ));
+    }
+    Ok(Some(cgroup_root.join(path.trim_start_matches('/'))))
+}
+
+/// Move the calling process into `cgroup_dir` by writing its own pid to
+/// `cgroup.procs`. Must run *before* a `CLONE_NEWCGROUP` `unshare(2)` if
+/// one is coming (see [`crate::launch`]): the kernel roots a new cgroup
+/// namespace at whatever cgroup the calling process is in *at unshare
+/// time*, so entering the target cgroup first is what makes the
+/// container's own later view of `/sys/fs/cgroup`/`/proc/self/cgroup`
+/// show its own cgroup as `/` instead of the host's real path.
+pub fn enter(cgroup_dir: &Path) -> io::Result<()> {
+    std::fs::write(
+        cgroup_dir.join("cgroup.procs"),
+        rustix::process::getpid().as_raw_nonzero().to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -433,6 +482,50 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("pids.max")).unwrap(),
             "max"
+        );
+    }
+
+    #[test]
+    fn directory_for_none_when_cgroups_path_is_unset() {
+        assert_eq!(
+            directory_for(Path::new("/sys/fs/cgroup"), None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn directory_for_joins_cgroup_root_and_path() {
+        assert_eq!(
+            directory_for(Path::new("/sys/fs/cgroup"), Some("/foo/bar")).unwrap(),
+            Some(PathBuf::from("/sys/fs/cgroup/foo/bar"))
+        );
+    }
+
+    #[test]
+    fn directory_for_accepts_a_path_without_a_leading_slash() {
+        assert_eq!(
+            directory_for(Path::new("/sys/fs/cgroup"), Some("foo/bar")).unwrap(),
+            Some(PathBuf::from("/sys/fs/cgroup/foo/bar"))
+        );
+    }
+
+    #[test]
+    fn directory_for_rejects_dot_dot_components() {
+        let err = directory_for(Path::new("/sys/fs/cgroup"), Some("../escape")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = directory_for(Path::new("/sys/fs/cgroup"), Some("foo/../../escape")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn enter_writes_own_pid_to_cgroup_procs() {
+        let dir = tempfile::tempdir().unwrap();
+        enter(dir.path()).unwrap();
+        let written = std::fs::read_to_string(dir.path().join("cgroup.procs")).unwrap();
+        assert_eq!(
+            written,
+            rustix::process::getpid().as_raw_nonzero().to_string()
         );
     }
 }
