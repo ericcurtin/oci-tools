@@ -22,6 +22,7 @@ pub mod identity;
 pub mod logging;
 pub mod output;
 pub mod progress;
+pub mod runtime_root;
 pub mod storage;
 pub mod version;
 

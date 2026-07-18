@@ -1,14 +1,16 @@
 //! `ocirun` — standalone OCI runtime (crun equivalent).
 //!
 //! Thin, runc-CLI-compatible wrapper over `oci-runtime-core`, so it can be
-//! dropped into other engines. Shipped so far: `spec`. Planned (rest of
-//! milestone 3): `create`, `start`, `state`, `kill`, `delete`, `exec`,
-//! `run`, `features`.
+//! dropped into other engines. Shipped so far: `spec`, `state`, `list`
+//! (container creation itself, the rest of milestone 3, has nothing to
+//! list yet). Planned: `create`, `start`, `kill`, `delete`, `exec`, `run`,
+//! `features`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use clap::Parser;
+use oci_runtime_core::StateStore;
 
 /// Command-line interface.
 #[derive(Debug, Parser)]
@@ -21,12 +23,17 @@ struct Cli {
     #[command(flatten)]
     global: oci_cli_common::GlobalArgs,
 
+    /// Root directory for storage of container state (should be tmpfs).
+    /// Defaults to `/run/ocirun`, or `$XDG_RUNTIME_DIR/ocirun` rootless.
+    #[arg(long, global = true, value_name = "DIR")]
+    root: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
 
-/// Subcommands shipped so far. `create`/`start`/`state`/`kill`/`delete`/
-/// `exec`/`run`/`features` arrive with the rest of milestone 3.
+/// Subcommands shipped so far. `create`/`start`/`kill`/`delete`/`exec`/
+/// `run`/`features` arrive with the rest of milestone 3.
 #[derive(Debug, clap::Subcommand)]
 enum Command {
     /// Create a new specification file (`config.json`) for a bundle.
@@ -38,6 +45,20 @@ enum Command {
         /// Generate a configuration for a rootless container.
         #[arg(long)]
         rootless: bool,
+    },
+    /// Output the state of a container.
+    State {
+        /// The container's ID.
+        id: String,
+    },
+    /// List containers started by `ocirun` with the given root.
+    List {
+        /// Output format: "table" or "json".
+        #[arg(short, long, default_value = "table")]
+        format: String,
+        /// Display only container IDs.
+        #[arg(short, long)]
+        quiet: bool,
     },
 }
 
@@ -52,20 +73,25 @@ fn main() -> std::process::ExitCode {
             git_hash = oci_cli_common::version::GIT_HASH,
             "ocirun starting"
         );
+        let root = cli
+            .root
+            .unwrap_or_else(|| oci_cli_common::runtime_root::default_root("ocirun"));
 
         match cli.command {
             None => anyhow::bail!(
-                "no command given; try `ocirun --help` (`spec` is implemented; \
-                 `create`/`start`/`run`/`kill`/`delete`/`exec`/`state`/`features` \
+                "no command given; try `ocirun --help` (`spec`/`state`/`list` are \
+                 implemented; `create`/`start`/`run`/`kill`/`delete`/`exec`/`features` \
                  arrive with the rest of milestone 3)"
             ),
             Some(Command::Spec { bundle, rootless }) => cmd_spec(bundle.as_deref(), rootless),
+            Some(Command::State { id }) => cmd_state(&root, &id),
+            Some(Command::List { format, quiet }) => cmd_list(&root, &format, quiet),
         }
     })
 }
 
-fn cmd_spec(bundle: Option<&std::path::Path>, rootless: bool) -> anyhow::Result<()> {
-    let dir = bundle.unwrap_or_else(|| std::path::Path::new("."));
+fn cmd_spec(bundle: Option<&Path>, rootless: bool) -> anyhow::Result<()> {
+    let dir = bundle.unwrap_or_else(|| Path::new("."));
     let path = dir.join(SPEC_CONFIG);
 
     if path.exists() {
@@ -95,5 +121,44 @@ fn cmd_spec(bundle: Option<&std::path::Path>, rootless: bool) -> anyhow::Result<
             .with_context(|| format!("setting permissions on {}", path.display()))?;
     }
 
+    Ok(())
+}
+
+fn cmd_state(root: &Path, id: &str) -> anyhow::Result<()> {
+    let store = StateStore::open(root)
+        .with_context(|| format!("opening container state root {}", root.display()))?;
+    let state = store.load(id)?;
+    oci_cli_common::output::print_json(&state.to_view())?;
+    Ok(())
+}
+
+fn cmd_list(root: &Path, format: &str, quiet: bool) -> anyhow::Result<()> {
+    let store = StateStore::open(root)
+        .with_context(|| format!("opening container state root {}", root.display()))?;
+    let views: Vec<_> = store.list()?.iter().map(|s| s.to_view()).collect();
+
+    if quiet {
+        for view in &views {
+            println!("{}", view.id);
+        }
+        return Ok(());
+    }
+
+    match format {
+        "table" => {
+            println!(
+                "{:<12}{:<8}{:<10}{:<40}CREATED",
+                "ID", "PID", "STATUS", "BUNDLE"
+            );
+            for view in &views {
+                println!(
+                    "{:<12}{:<8}{:<10}{:<40}{}",
+                    view.id, view.pid, view.status, view.bundle, view.created
+                );
+            }
+        }
+        "json" => oci_cli_common::output::print_json(&views)?,
+        other => anyhow::bail!("invalid format option: {other:?} (expected \"table\" or \"json\")"),
+    }
     Ok(())
 }

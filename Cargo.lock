@@ -487,6 +487,13 @@ dependencies = [
 [[package]]
 name = "oci-runtime-core"
 version = "0.1.0"
+dependencies = [
+ "oci-spec-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "oci-spec-types"
@@ -513,6 +520,7 @@ dependencies = [
 name = "oci-tools-tests"
 version = "0.1.0"
 dependencies = [
+ "oci-runtime-core",
  "serde_json",
  "tempfile",
 ]
@@ -575,6 +583,7 @@ dependencies = [
  "anyhow",
  "clap",
  "oci-cli-common",
+ "oci-runtime-core",
  "oci-spec-types",
  "serde",
  "serde_json",

@@ -13,9 +13,10 @@ use std::path::PathBuf;
 /// * Rootless: `$XDG_DATA_HOME/oci-tools/storage`, defaulting
 ///   `XDG_DATA_HOME` to `~/.local/share` per the XDG base directory spec.
 pub fn default_root() -> PathBuf {
+    let (euid, _) = crate::identity::effective_uid_gid();
     resolve_root(
         std::env::var_os("OCI_TOOLS_STORAGE_ROOT"),
-        is_root(),
+        euid == 0,
         std::env::var_os("XDG_DATA_HOME"),
         std::env::var_os("HOME"),
     )
@@ -41,20 +42,6 @@ fn resolve_root(
         .or_else(|| home.map(|home| PathBuf::from(home).join(".local/share")))
         .unwrap_or_else(|| PathBuf::from(".local/share"));
     data_home.join("oci-tools").join("storage")
-}
-
-/// Whether the current process is running as uid 0. Reads `/proc/self/status`
-/// directly rather than pulling in a syscall-wrapper crate for one integer.
-fn is_root() -> bool {
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return false;
-    };
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))
-        .and_then(|rest| rest.split_whitespace().next())
-        .map(|real_uid| real_uid == "0")
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -99,17 +86,16 @@ mod tests {
     }
 
     #[test]
-    fn is_root_reflects_proc_self_status() {
-        // We can't control our own uid in a unit test, but we can assert
-        // the parse matches the real geteuid() via the one dependency-free
-        // signal available: root's Uid line always starts with "0\t".
-        let status = std::fs::read_to_string("/proc/self/status").unwrap();
-        let expected = status
-            .lines()
-            .find_map(|l| l.strip_prefix("Uid:"))
-            .and_then(|r| r.split_whitespace().next())
-            .map(|u| u == "0")
-            .unwrap_or(false);
-        assert_eq!(is_root(), expected);
+    fn default_root_agrees_with_real_euid() {
+        // End-to-end sanity check that default_root() actually consults
+        // the real process identity (identity::tests covers the
+        // /proc/self/status parsing itself in detail).
+        let (euid, _) = crate::identity::effective_uid_gid();
+        let root = default_root();
+        if euid == 0 {
+            assert_eq!(root, PathBuf::from("/var/lib/oci-tools/storage"));
+        } else {
+            assert_ne!(root, PathBuf::from("/var/lib/oci-tools/storage"));
+        }
     }
 }

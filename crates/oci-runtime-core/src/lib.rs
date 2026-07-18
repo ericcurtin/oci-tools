@@ -1,10 +1,14 @@
 //! OCI runtime-spec execution engine — the heart of `ocirun`.
 //!
-//! **Status: stub** — implemented in milestone 3 (see `docs/design/`).
+//! **Scope shipped so far**: [`state`] — the on-disk container state
+//! model (`<root>/<id>/state.json`) and the `StateStore` directory
+//! abstraction `create`/`start`/`kill`/`delete`/`state`/`list` all build
+//! on. This is deliberately built and tested *before* actual container
+//! creation: it has no idea how to start a container process yet.
 //!
-//! Planned scope:
+//! Planned (rest of milestone 3):
 //! - container lifecycle per the OCI runtime spec: create, start, kill,
-//!   delete, exec; state tracking and hooks (prestart/createRuntime/...)
+//!   delete, exec; hooks (prestart/createRuntime/...)
 //! - namespaces (user, mount, pid, net, uts, ipc, cgroup, time), rootless
 //!   user-namespace setup with uid/gid mappings
 //! - cgroups v2 with both systemd and cgroupfs drivers
@@ -16,3 +20,8 @@
 //! thin runc-compatible CLI over this crate, and `ociman`/`ocicri` execute
 //! containers through it as a library (never by exec'ing `ocirun`).
 //! Prior art: youki, crun — concepts borrowed, code original.
+
+pub mod state;
+mod time;
+
+pub use state::{PersistedState, StateError, StateStore, StateView, Status};

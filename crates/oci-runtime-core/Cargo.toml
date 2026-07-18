@@ -10,6 +10,11 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+oci-spec-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true
