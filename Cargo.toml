@@ -17,6 +17,11 @@ authors = ["The oci-tools contributors"]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive", "env", "string", "wrap_help"] }
 indicatif = "0.18"
+# Not in the "low-level unix syscalls" capability group below: it isn't an
+# alternative to rustix, it's the necessary escape hatch for the one
+# syscall rustix deliberately never wraps (raw `fork(2)`, due to its
+# contentious signal-safety semantics) -- see oci-runtime-core::process.
+libc = "0.2"
 rustix = { version = "1.1", features = ["thread", "system", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

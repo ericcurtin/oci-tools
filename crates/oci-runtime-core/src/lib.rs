@@ -20,6 +20,8 @@
 //!   hostname operations a bundle's `config.json` calls for (the
 //!   "sequencing" piece `oci_mount::syscalls` explicitly left for this
 //!   crate).
+//! - [`process`] — `fork(2)`/`waitpid(2)`, the one syscall `rustix`
+//!   deliberately never wraps.
 //!
 //! All of this is deliberately built and tested *before* actual container
 //! creation: nothing here does the one truly risky thing yet — actually
@@ -45,12 +47,14 @@
 pub mod bundle;
 pub mod cgroups;
 pub mod namespaces;
+pub mod process;
 pub mod rootfs;
 pub mod state;
 mod time;
 pub mod validate;
 
 pub use bundle::{Bundle, BundleError};
+pub use process::{exit_code_from_wait_status, fork_and_wait};
 pub use rootfs::{RootfsAction, plan_rootfs_setup};
 pub use state::{PersistedState, StateError, StateStore, StateView, Status};
 pub use validate::ValidateError;
