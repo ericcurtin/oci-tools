@@ -17,9 +17,10 @@ use std::io;
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 
-use oci_spec_types::runtime::{LinuxIdMapping, NamespaceType};
+use oci_spec_types::runtime::{LinuxCapabilities, LinuxIdMapping, NamespaceType, User};
 
 use crate::bundle::Bundle;
+use crate::identity;
 use crate::namespaces;
 use crate::process;
 use crate::rootfs::{self, MaskedPathKind, RootfsAction};
@@ -95,6 +96,9 @@ pub unsafe fn run(bundle: &Bundle, rootfs: &Path) -> io::Result<i32> {
         uid_mappings,
         gid_mappings,
         plan,
+        user: process_spec.user.clone(),
+        capabilities: process_spec.capabilities.clone(),
+        no_new_privileges: process_spec.no_new_privileges,
         args: process_spec.args.clone(),
         env: process_spec.env.clone(),
         cwd: process_spec.cwd.clone(),
@@ -115,6 +119,9 @@ struct ChildSetup {
     uid_mappings: Vec<LinuxIdMapping>,
     gid_mappings: Vec<LinuxIdMapping>,
     plan: Vec<RootfsAction>,
+    user: User,
+    capabilities: Option<LinuxCapabilities>,
+    no_new_privileges: bool,
     args: Vec<String>,
     env: Vec<String>,
     cwd: String,
@@ -186,6 +193,15 @@ impl ChildSetup {
             if let Err(e) = execute_rootfs_action(action) {
                 fail(SETUP_FAILURE_EXIT_CODE, &format!("{action:?}: {e}"));
             }
+        }
+
+        if let Err(e) = identity::apply(
+            Path::new("/proc"),
+            &self.user,
+            self.capabilities.as_ref(),
+            self.no_new_privileges,
+        ) {
+            fail(SETUP_FAILURE_EXIT_CODE, &format!("applying identity: {e}"));
         }
 
         let mut command = std::process::Command::new(&self.args[0]);

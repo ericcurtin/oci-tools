@@ -22,6 +22,9 @@
 //!   crate).
 //! - [`process`] — `fork(2)`/`waitpid(2)`, the one syscall `rustix`
 //!   deliberately never wraps.
+//! - [`identity`] — dropping from "root in the new namespaces" to the
+//!   spec's declared `process.user`, capability sets, and
+//!   `no_new_privileges`, in the exact kernel-required order.
 //! - [`launch`] — assembling all of the above (plus `oci_mount`) into an
 //!   actual `create`-and-`start`-in-one-step container run, the shape
 //!   `ocirun run` uses.
@@ -38,7 +41,8 @@
 //! - namespaces (user, mount, pid, net, uts, ipc, cgroup, time), rootless
 //!   user-namespace setup with uid/gid mappings
 //! - cgroups v2 with both systemd and cgroupfs drivers
-//! - seccomp profiles, capability sets, rlimits, no_new_privs
+//! - seccomp profiles, POSIX rlimits (capability sets and
+//!   `no_new_privileges` are done — see [`identity`])
 //! - pivot_root into the prepared rootfs (via `oci-mount`)
 //! - terminal handling: PTY allocation, console socket protocol
 //!
@@ -49,6 +53,7 @@
 
 pub mod bundle;
 pub mod cgroups;
+pub mod identity;
 pub mod launch;
 pub mod namespaces;
 pub mod process;

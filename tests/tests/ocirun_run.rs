@@ -144,6 +144,81 @@ fn run_reports_command_not_found_as_exit_127() {
 }
 
 #[test]
+fn run_applies_the_default_capability_set_and_no_new_privileges() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(
+        dir.path(),
+        &busybox,
+        &[
+            "/bin/sh",
+            "-c",
+            r#"grep -E "^(CapInh|CapPrm|CapEff|CapBnd|CapAmb|NoNewPrivs):" /proc/self/status"#,
+        ],
+    );
+
+    let out = ocirun_run(dir.path(), "capabilities-default-test");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // `ocirun spec`'s default capability set is exactly CAP_AUDIT_WRITE
+    // (bit 29) | CAP_KILL (bit 5) | CAP_NET_BIND_SERVICE (bit 10) = the
+    // bitmask below — applied to every set `identity::apply` touches
+    // (bounding/effective/permitted; inheritable/ambient stay empty,
+    // matching the spec), and `no_new_privileges` defaults to `true`.
+    assert_eq!(
+        stdout.trim(),
+        "CapInh:\t0000000000000000\nCapPrm:\t0000000020000420\nCapEff:\t0000000020000420\nCapBnd:\t0000000020000420\nCapAmb:\t0000000000000000\nNoNewPrivs:\t1"
+    );
+}
+
+#[test]
+fn run_drops_capabilities_the_spec_does_not_grant() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(
+        dir.path(),
+        &busybox,
+        &[
+            "/bin/sh",
+            "-c",
+            r#"grep -E "^(CapEff|CapBnd|NoNewPrivs):" /proc/self/status"#,
+        ],
+    );
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["process"]["capabilities"] = serde_json::json!({
+        "bounding": [],
+        "effective": [],
+        "permitted": [],
+    });
+    config["process"]["noNewPrivileges"] = serde_json::json!(false);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let out = ocirun_run(dir.path(), "capabilities-empty-test");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.trim(),
+        "CapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nNoNewPrivs:\t0"
+    );
+}
+
+#[test]
 fn run_isolates_hostname_from_the_host() {
     let Some(busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");
