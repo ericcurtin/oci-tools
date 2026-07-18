@@ -2,8 +2,9 @@
 //! `--version` (with embedded git hash), prints usable `--help`, and fails
 //! loudly (never silently succeeds) when invoked without a command.
 
-use std::path::PathBuf;
 use std::process::{Command, Output};
+
+use oci_tools_tests::bin_path;
 
 /// clap-based binaries sharing `oci-cli-common`.
 const CLAP_BINS: &[&str] = &["ocirun", "ociman", "ocicri", "ocibox", "ociboot"];
@@ -17,22 +18,6 @@ const ALL_BINS: &[&str] = &[
     "ociboot",
     "ociboot-init",
 ];
-
-/// Locate a workspace binary next to this test executable's target dir.
-fn bin_path(name: &str) -> PathBuf {
-    let mut path = std::env::current_exe().expect("current_exe");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        path.exists(),
-        "binary {name} not found at {}; run `cargo build --workspace` first",
-        path.display()
-    );
-    path
-}
 
 fn run(name: &str, args: &[&str]) -> Output {
     Command::new(bin_path(name))

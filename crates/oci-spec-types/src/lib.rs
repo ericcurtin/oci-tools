@@ -1,14 +1,17 @@
 //! Serde types for the OCI image, runtime, and distribution specifications.
 //!
-//! Scope shipped so far (milestone 2):
+//! Scope shipped so far:
 //! - [`digest`]: content digests (`sha256:...`), streaming hashing
 //! - [`image`]: descriptors, manifests, image indexes, image config,
-//!   media types
+//!   media types (milestone 2)
 //! - [`reference`]: Docker/OCI image reference parsing and normalization
+//!   (milestone 2)
+//! - [`runtime`]: runtime-spec `config.json` — currently just what
+//!   `ocirun spec` needs (process/root/mounts/namespaces/ID-mappings/
+//!   device-cgroup allow-list); full resource limits, seccomp, and hooks
+//!   land with actual container creation (milestone 3, in progress)
 //!
-//! Planned (milestone 3+):
-//! - runtime-spec: `config.json` (process, mounts, namespaces, cgroups,
-//!   seccomp, hooks) shared by `oci-runtime-core` and `ocirun`
+//! Planned:
 //! - distribution-spec: tag lists, error payloads, auth challenge parsing
 //!   beyond what `oci-registry` already needs internally
 //!
@@ -20,6 +23,7 @@
 pub mod digest;
 pub mod image;
 pub mod reference;
+pub mod runtime;
 
 pub use digest::{Algorithm, Digest};
 pub use reference::Reference;

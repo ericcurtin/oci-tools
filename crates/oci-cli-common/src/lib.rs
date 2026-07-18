@@ -18,6 +18,7 @@
 
 pub mod args;
 pub mod error;
+pub mod identity;
 pub mod logging;
 pub mod output;
 pub mod progress;

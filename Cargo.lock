@@ -512,6 +512,10 @@ dependencies = [
 [[package]]
 name = "oci-tools-tests"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "ociboot"
@@ -571,6 +575,9 @@ dependencies = [
  "anyhow",
  "clap",
  "oci-cli-common",
+ "oci-spec-types",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 
