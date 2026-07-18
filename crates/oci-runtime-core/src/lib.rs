@@ -16,6 +16,10 @@
 //!   `setgroups`).
 //! - [`cgroups`] — `LinuxResources` (memory/cpu/pids) -> cgroup v2
 //!   interface file writes.
+//! - [`rootfs`] — planning the ordered sequence of mount/pivot_root/
+//!   hostname operations a bundle's `config.json` calls for (the
+//!   "sequencing" piece `oci_mount::syscalls` explicitly left for this
+//!   crate).
 //!
 //! All of this is deliberately built and tested *before* actual container
 //! creation: nothing here does the one truly risky thing yet — actually
@@ -41,10 +45,12 @@
 pub mod bundle;
 pub mod cgroups;
 pub mod namespaces;
+pub mod rootfs;
 pub mod state;
 mod time;
 pub mod validate;
 
 pub use bundle::{Bundle, BundleError};
+pub use rootfs::{RootfsAction, plan_rootfs_setup};
 pub use state::{PersistedState, StateError, StateStore, StateView, Status};
 pub use validate::ValidateError;

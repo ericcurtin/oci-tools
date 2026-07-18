@@ -10,6 +10,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+oci-mount.workspace = true
 oci-spec-types.workspace = true
 rustix.workspace = true
 serde.workspace = true
