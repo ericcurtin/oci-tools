@@ -10,6 +10,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+oci-spec-types.workspace = true
 
 [lints]
 workspace = true

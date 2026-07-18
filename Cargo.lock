@@ -466,6 +466,9 @@ version = "0.1.0"
 [[package]]
 name = "oci-mount"
 version = "0.1.0"
+dependencies = [
+ "oci-spec-types",
+]
 
 [[package]]
 name = "oci-net"
