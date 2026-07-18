@@ -22,7 +22,15 @@
 #   VM_CACHE_DISK     Optional path to a persistent qcow2 attached as
 #                     /dev/disk/by-id/virtio-ocicache (created if missing).
 #   VM_CACHE_DISK_GB  Size when creating VM_CACHE_DISK. Default: 60
-#   VM_BOOT_TIMEOUT   Seconds to wait for ssh after boot. Default: 1200
+#   VM_BOOT_TIMEOUT   Seconds to wait for ssh after boot.
+#                     Default: 1200 (KVM) / 2400 (TCG fallback)
+#   VM_FORCE_TCG      Set to 1 to use TCG even when /dev/kvm is usable
+#                     (mirrors GitHub's aarch64 runners, which lack KVM).
+#   VM_FIRMWARE       x86_64 only: bios (default) | uefi. The CentOS Stream 10
+#                     GenericCloud x86_64 image is BIOS-boot-only and the
+#                     Ubuntu amd64 images are hybrid, so SeaBIOS boots both;
+#                     uefi (OVMF) is for UEFI-only guest disks. aarch64 is
+#                     always UEFI.
 #   VM_PUSH_EXCLUDE   Space-separated tar --exclude patterns for `push`.
 set -euo pipefail
 
@@ -35,7 +43,8 @@ VM_SSH_PORT=${VM_SSH_PORT:-2222}
 VM_SSH_USER=${VM_SSH_USER:-ci}
 VM_CACHE_DISK=${VM_CACHE_DISK:-}
 VM_CACHE_DISK_GB=${VM_CACHE_DISK_GB:-60}
-VM_BOOT_TIMEOUT=${VM_BOOT_TIMEOUT:-1200}
+# Default boot timeout is resolved after acceleration is known (TCG is slow).
+VM_BOOT_TIMEOUT=${VM_BOOT_TIMEOUT:-}
 
 IMAGES_DIR=$(dirname "$VM_DIR")/images
 
@@ -45,7 +54,11 @@ die() {
     exit 1
 }
 
+# -F /dev/null keeps the harness hermetic: no user/system ssh config, so no
+# ControlMaster/ProxyCommand surprises and no SendEnv locale forwarding
+# (guests lack the host's locales and would warn on every command).
 ssh_opts=(
+    -F /dev/null
     -o StrictHostKeyChecking=no
     -o UserKnownHostsFile=/dev/null
     -o LogLevel=ERROR
@@ -53,6 +66,7 @@ ssh_opts=(
     -o ConnectTimeout=10
     -o ServerAliveInterval=15
     -o ServerAliveCountMax=8
+    -o IdentitiesOnly=yes
     -i "$VM_DIR/ssh/id_ed25519"
     -p "$VM_SSH_PORT"
 )
@@ -67,7 +81,9 @@ qemu_pid() {
     printf '%s' "$pid"
 }
 
-kvm_ok() { [ -r /dev/kvm ] && [ -w /dev/kvm ]; }
+kvm_ok() {
+    [ "${VM_FORCE_TCG:-0}" != 1 ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]
+}
 
 console_tail() {
     log "last serial console lines:"
@@ -123,47 +139,69 @@ local-hostname: $VM_NAME
 EOF
     cloud-localds "$VM_DIR/seed.iso" "$VM_DIR/user-data" "$VM_DIR/meta-data"
 
-    # Architecture / acceleration / firmware.
-    local arch qemu machine cpu accel firmware=""
+    # Architecture / acceleration / firmware. GitHub's hosted aarch64 runners
+    # have no /dev/kvm, so TCG must work: multi-threaded TCG, a large
+    # translation buffer, and (aarch64) cheap IMPDEF pointer-auth.
+    local arch qemu machine cpu accel_args firmware=""
     arch=$(uname -m)
-    if kvm_ok; then accel=kvm cpu=host; else accel=tcg cpu=max; fi
+    if kvm_ok; then
+        accel_args="kvm"
+        cpu=host
+        VM_BOOT_TIMEOUT=${VM_BOOT_TIMEOUT:-1200}
+    else
+        accel_args="tcg,thread=multi,tb-size=1024"
+        cpu=max
+        VM_BOOT_TIMEOUT=${VM_BOOT_TIMEOUT:-2400}
+    fi
     case "$arch" in
         x86_64)
             qemu="qemu-system-x86_64"
-            machine="q35,accel=$accel"
-            for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd; do
-                [ -f "$f" ] && firmware=$f && break
-            done
-            [ -n "$firmware" ] || die "OVMF firmware not found (install the 'ovmf' package)"
+            machine="q35"
+            case "${VM_FIRMWARE:-bios}" in
+                bios) ;; # SeaBIOS is the QEMU default; no -bios argument
+                uefi)
+                    for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd; do
+                        [ -f "$f" ] && firmware=$f && break
+                    done
+                    [ -n "$firmware" ] || die "OVMF firmware not found (install the 'ovmf' package)"
+                    ;;
+                *) die "invalid VM_FIRMWARE '${VM_FIRMWARE}' (bios | uefi)" ;;
+            esac
             ;;
         aarch64)
             qemu="qemu-system-aarch64"
-            machine="virt,accel=$accel,gic-version=max"
-            # Emulating pointer auth is very slow; use cheap IMPDEF algorithm.
-            [ "$accel" = tcg ] && cpu="max,pauth-impdef=on"
+            machine="virt,gic-version=max"
+            # TCG note: '-cpu max' trips a QEMU 8.2 assertion
+            # (target/arm regime_is_user) with modern guest kernels, and its
+            # pointer-auth emulation is slow anyway; a fixed v8.2 core avoids
+            # both.
+            [ "$cpu" = max ] && cpu="neoverse-n1"
             firmware=/usr/share/qemu-efi-aarch64/QEMU_EFI.fd
             [ -f "$firmware" ] || die "QEMU_EFI.fd not found (install 'qemu-efi-aarch64')"
             ;;
         *) die "unsupported host architecture: $arch" ;;
     esac
 
+    # romfile= disables the NIC's PXE option ROM: we always boot from disk,
+    # and the ROM file (ipxe-qemu) is not installed everywhere.
     local args=(
         -name "$VM_NAME"
         -machine "$machine"
+        -accel "$accel_args"
         -cpu "$cpu"
         -smp "$VM_CPUS"
         -m "$VM_MEM_MB"
-        -bios "$firmware"
         -drive "file=$VM_DIR/disk.qcow2,if=virtio,format=qcow2,discard=unmap"
         -drive "file=$VM_DIR/seed.iso,if=virtio,format=raw,readonly=on"
         -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$VM_SSH_PORT-:22"
-        -device "virtio-net-pci,netdev=net0"
+        -device "virtio-net-pci,netdev=net0,romfile="
         -device virtio-rng-pci
         -display none
         -serial "file:$VM_DIR/console.log"
         -pidfile "$VM_DIR/qemu.pid"
         -daemonize
     )
+    [ -n "$firmware" ] && args+=(-bios "$firmware")
 
     if [ -n "$VM_CACHE_DISK" ]; then
         if [ ! -f "$VM_CACHE_DISK" ]; then
@@ -177,7 +215,7 @@ EOF
         )
     fi
 
-    log "starting $qemu (accel=$accel cpu=$cpu smp=$VM_CPUS mem=${VM_MEM_MB}M ssh=127.0.0.1:$VM_SSH_PORT)"
+    log "starting $qemu (accel=$accel_args cpu=$cpu firmware=${firmware:-seabios} smp=$VM_CPUS mem=${VM_MEM_MB}M ssh=127.0.0.1:$VM_SSH_PORT)"
     "$qemu" "${args[@]}"
 
     log "waiting for ssh (timeout ${VM_BOOT_TIMEOUT}s)"

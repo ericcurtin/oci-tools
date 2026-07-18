@@ -116,14 +116,28 @@ Artifacts: the six release binaries per matrix cell.
 
 ## Decisions and risks
 
-* **UEFI everywhere** in the VM harness: CentOS Stream 10 cloud images no
-  longer support BIOS boot; Ubuntu images boot UEFI fine. x86_64 uses OVMF
-  (`-bios OVMF.fd`), aarch64 uses `QEMU_EFI.fd`.
+* **Firmware, corrected by inspection**: the CentOS Stream 10 GenericCloud
+  x86_64 image is **BIOS-boot-only** (GPT with a 1M BIOS-boot partition, no
+  ESP — under OVMF it PXE-loops into the EFI shell), while Ubuntu amd64
+  images are hybrid. So x86_64 defaults to SeaBIOS (`VM_FIRMWARE=uefi`
+  switches to OVMF for UEFI-only disks, e.g. the milestone-5 ociboot boot
+  test); aarch64 has no BIOS and always uses `QEMU_EFI.fd`. NIC PXE option
+  ROMs are disabled (`romfile=`): we always boot from disk, and the ROM
+  package (`ipxe-qemu`) is only a Recommends of `qemu-system-arm` — its
+  absence otherwise aborts QEMU startup on the arm runners (found the hard
+  way).
 * **CentOS Stream 10 requires x86-64-v3**: fine under KVM (`-cpu host`,
   runners have AVX2) and under TCG with `-cpu max` (QEMU >= 7.2 implements
   AVX2; ubuntu-24.04 ships 8.2).
-* **KVM on GitHub arm64 runners** is not contractual; the harness
-  auto-falls-back to TCG, and job timeouts are sized for the slow path.
+* **GitHub arm64 hosted runners have no /dev/kvm** (confirmed on
+  ubuntu-24.04-arm): the aarch64 cells run under multi-threaded TCG with
+  `tb-size=1024` and `pauth-impdef=on`, get a 2400 s boot timeout and a
+  300-minute job timeout, and lean hard on the cache disk. If GitHub ever
+  enables KVM there, the harness picks it up automatically.
+  `VM_FORCE_TCG=1` reproduces the runner behavior locally.
+* **Cache keys end in `run_id`**: `actions/cache` never overwrites an
+  existing key, so an exact-hash key would freeze the first (cold or failed)
+  cache forever; unique keys + prefix restore-keys keep the newest warm disk.
 * **Image URLs are pinned to "latest"** symlinks (CentOS) / release paths
   (Ubuntu 26.04) and validated at time of writing; `OCI_CI_IMAGE_URL`
   overrides without a workflow change.

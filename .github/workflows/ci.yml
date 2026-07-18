@@ -22,13 +22,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install pinned toolchain
         run: rustup toolchain install
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -55,6 +55,8 @@ jobs:
 
   # Exactly 4 parallel VM jobs; each boots the target distro as a VM on a
   # same-arch runner and builds/tests the workspace natively inside it.
+  # x86_64 runners provide KVM; GitHub's aarch64 runners have no /dev/kvm,
+  # so those cells run under TCG and get a much larger timeout.
   vm-test:
     name: vm (${{ matrix.base }}, ${{ matrix.arch }})
     strategy:
@@ -64,26 +66,33 @@ jobs:
           - base: centos-stream10
             arch: x86_64
             runs-on: ubuntu-24.04
+            timeout: 90
           - base: centos-stream10
             arch: aarch64
             runs-on: ubuntu-24.04-arm
+            timeout: 300
           - base: ubuntu-26.04
             arch: x86_64
             runs-on: ubuntu-24.04
+            timeout: 90
           - base: ubuntu-26.04
             arch: aarch64
             runs-on: ubuntu-24.04-arm
+            timeout: 300
     runs-on: ${{ matrix.runs-on }}
-    timeout-minutes: 120
+    timeout-minutes: ${{ matrix.timeout }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
+      # The key ends in run_id so a fresh (warmer) cache is saved after every
+      # run; restore falls back to the newest matching prefix.
       - name: Restore build cache disk
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/oci-tools-ci/cache-disk.qcow2
-          key: vmcache-v1-${{ matrix.base }}-${{ matrix.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          key: vmcache-v1-${{ matrix.base }}-${{ matrix.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.run_id }}
           restore-keys: |
+            vmcache-v1-${{ matrix.base }}-${{ matrix.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
             vmcache-v1-${{ matrix.base }}-${{ matrix.arch }}-
 
       - name: Set up host (qemu, firmware, kvm)
@@ -96,7 +105,7 @@ jobs:
         run: ci/run-in-vm.sh
 
       - name: Upload binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.base }}-${{ matrix.arch }}
           path: artifacts/
