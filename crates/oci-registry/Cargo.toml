@@ -10,6 +10,15 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+oci-spec-types.workspace = true
+oci-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -21,6 +21,7 @@ pub mod error;
 pub mod logging;
 pub mod output;
 pub mod progress;
+pub mod storage;
 pub mod version;
 
 pub use args::GlobalArgs;
