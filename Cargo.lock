@@ -489,6 +489,7 @@ name = "oci-runtime-core"
 version = "0.1.0"
 dependencies = [
  "oci-spec-types",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

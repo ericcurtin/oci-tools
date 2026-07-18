@@ -10,9 +10,16 @@
 //! - [`validate`] — config sanity checks (rootfs exists, namespace/ID-
 //!   mapping consistency, ...) that must pass before a bundle can be
 //!   created.
+//! - [`namespaces`] — runtime-spec namespace list -> `unshare(2)` flag
+//!   computation, the `unshare` wrapper itself, and the rootless
+//!   user-namespace ID-mapping dance (`/proc/<pid>/{uid,gid}_map`,
+//!   `setgroups`).
 //!
 //! All of this is deliberately built and tested *before* actual container
-//! creation: none of it needs privilege, namespaces, or a running process.
+//! creation: nothing here does the one truly risky thing yet — actually
+//! forking/cloning the container's init process and calling `unshare`
+//! against a real running process ([`namespaces`]'s doc comment explains
+//! why that specific step isn't covered by an automated test yet).
 //!
 //! Planned (rest of milestone 3):
 //! - container lifecycle per the OCI runtime spec: create, start, kill,
@@ -30,6 +37,7 @@
 //! Prior art: youki, crun — concepts borrowed, code original.
 
 pub mod bundle;
+pub mod namespaces;
 pub mod state;
 mod time;
 pub mod validate;
