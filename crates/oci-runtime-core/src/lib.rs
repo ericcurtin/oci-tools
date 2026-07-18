@@ -14,6 +14,8 @@
 //!   computation, the `unshare` wrapper itself, and the rootless
 //!   user-namespace ID-mapping dance (`/proc/<pid>/{uid,gid}_map`,
 //!   `setgroups`).
+//! - [`cgroups`] — `LinuxResources` (memory/cpu/pids) -> cgroup v2
+//!   interface file writes.
 //!
 //! All of this is deliberately built and tested *before* actual container
 //! creation: nothing here does the one truly risky thing yet — actually
@@ -37,6 +39,7 @@
 //! Prior art: youki, crun — concepts borrowed, code original.
 
 pub mod bundle;
+pub mod cgroups;
 pub mod namespaces;
 pub mod state;
 mod time;

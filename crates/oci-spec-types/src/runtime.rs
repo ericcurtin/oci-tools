@@ -241,15 +241,133 @@ pub struct LinuxIdMapping {
 
 /// cgroup resource limits.
 ///
-/// **Scope shipped so far**: `devices`, the only field `ocirun spec`'s
-/// default output sets. Memory/CPU/pids/block-IO/huge-page/network limits
-/// land with actual container creation.
+/// **Scope shipped so far**: `devices` (the only field `ocirun spec`'s
+/// default output sets), `memory`, `cpu`, `pids`. Block-IO/huge-page/
+/// network/RDMA limits are not modeled yet — no oci-tools feature
+/// exercises them.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LinuxResources {
     /// Device cgroup allow/deny rules, evaluated in order (a later rule
     /// overrides an earlier match).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<LinuxDeviceCgroup>,
+    /// Memory limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<LinuxMemory>,
+    /// CPU limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<LinuxCpu>,
+    /// Process-count (pids) limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids: Option<LinuxPids>,
+}
+
+/// `memory` cgroup resource limits. All fields are in bytes unless noted
+/// otherwise; `-1` is the container-ecosystem convention (inherited from
+/// cgroup v1's `memory.limit_in_bytes`) for "unlimited", not part of the
+/// formal runtime-spec text but honored the same way runc/crun do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LinuxMemory {
+    /// Memory usage limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
+    /// Memory reservation/soft limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation: Option<i64>,
+    /// Total memory + swap limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap: Option<i64>,
+    /// Kernel memory limit. Deprecated upstream (unsupported since
+    /// cgroup v2 / kernel 5.4); accepted on parse, never acted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<i64>,
+    /// Kernel TCP buffer memory limit. Same deprecation status as
+    /// `kernel`.
+    #[serde(rename = "kernelTCP", default, skip_serializing_if = "Option::is_none")]
+    pub kernel_tcp: Option<i64>,
+    /// Swappiness (`0`-`100`); cgroup v2 has no per-cgroup equivalent, so
+    /// this is accepted on parse but never acted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swappiness: Option<u64>,
+    /// Disable the OOM killer; cgroup v2 has no equivalent knob (use
+    /// `memory.oom.group` for group-kill semantics instead), so this is
+    /// accepted on parse but never acted on.
+    #[serde(
+        rename = "disableOOMKiller",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub disable_oom_killer: Option<bool>,
+    /// Enable hierarchical accounting; always true under cgroup v2, so
+    /// this is accepted on parse but never acted on.
+    #[serde(
+        rename = "useHierarchy",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub use_hierarchy: Option<bool>,
+    /// Reject a lower limit update if it's below current usage.
+    #[serde(
+        rename = "checkBeforeUpdate",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub check_before_update: Option<bool>,
+}
+
+/// `cpu` cgroup resource limits (field names follow the runtime-spec,
+/// which reuses cgroup v1 vocabulary — `shares`/`quota`/`period` — even
+/// though this crate only targets cgroup v2, which has different
+/// interface files (`cpu.weight`, `cpu.max`); translating between the two
+/// is `oci_runtime_core::cgroups`' job).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LinuxCpu {
+    /// CPU shares (relative weight vs. other cgroups), cgroup-v1-style
+    /// (range roughly 2-262144, default 1024).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shares: Option<u64>,
+    /// CPU hardcap limit in microseconds per `period`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<i64>,
+    /// CPU hardcap burst limit, in microseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u64>,
+    /// CPU period for hardcapping, in microseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period: Option<u64>,
+    /// Realtime scheduling runtime, in microseconds. cgroup v2 has no
+    /// realtime-scheduling controller; accepted on parse, never acted on.
+    #[serde(
+        rename = "realtimeRuntime",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub realtime_runtime: Option<i64>,
+    /// Realtime scheduling period, in microseconds. Same status as
+    /// `realtime_runtime`.
+    #[serde(
+        rename = "realtimePeriod",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub realtime_period: Option<u64>,
+    /// `cpuset.cpus`-style CPU list (e.g. `"0-3"`). Not yet translated to
+    /// a cgroup write.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cpus: String,
+    /// `cpuset.mems`-style memory-node list. Not yet translated to a
+    /// cgroup write.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mems: String,
+}
+
+/// `pids` cgroup resource limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LinuxPids {
+    /// Maximum number of PIDs.  `-1` (the container-ecosystem convention,
+    /// same as [`LinuxMemory`]) means "no limit".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
 }
 
 /// One device-cgroup allow/deny rule.
@@ -332,6 +450,9 @@ impl Spec {
                         minor: None,
                         access: Some("rwm".to_string()),
                     }],
+                    memory: None,
+                    cpu: None,
+                    pids: None,
                 }),
                 masked_paths: default_masked_paths(),
                 readonly_paths: default_readonly_paths(),
@@ -632,5 +753,63 @@ mod tests {
         let spec: Spec = serde_json::from_str(raw).expect("parses real crun spec output");
         assert_eq!(spec.hostname.as_deref(), Some("crun"));
         assert_eq!(spec.process.unwrap().args, vec!["sh"]);
+    }
+
+    #[test]
+    fn parses_real_runc_config_with_memory_cpu_pids_resources() {
+        // A `runc spec` bundle with memory/cpu/pids resources added
+        // (real runc accepted and would apply this exact JSON via
+        // `runc create`; captured, not hand-written).
+        let raw = include_str!("../tests/fixtures/runc-spec-with-resources.json");
+        let spec: Spec = serde_json::from_str(raw).expect("parses real runc resources config");
+        let resources = spec.linux.unwrap().resources.unwrap();
+
+        let memory = resources.memory.unwrap();
+        assert_eq!(memory.limit, Some(104_857_600));
+        assert_eq!(memory.reservation, Some(52_428_800));
+        assert_eq!(memory.swap, Some(209_715_200));
+
+        let cpu = resources.cpu.unwrap();
+        assert_eq!(cpu.shares, Some(512));
+        assert_eq!(cpu.quota, Some(50_000));
+        assert_eq!(cpu.period, Some(100_000));
+        assert_eq!(cpu.cpus, "0-1");
+
+        assert_eq!(resources.pids.unwrap().limit, Some(100));
+    }
+
+    #[test]
+    fn resource_fields_use_camel_case_on_the_wire() {
+        let resources = LinuxResources {
+            memory: Some(LinuxMemory {
+                kernel_tcp: Some(1),
+                disable_oom_killer: Some(true),
+                use_hierarchy: Some(true),
+                check_before_update: Some(true),
+                ..Default::default()
+            }),
+            cpu: Some(LinuxCpu {
+                realtime_runtime: Some(1),
+                realtime_period: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&resources).unwrap();
+        assert_eq!(json["memory"]["kernelTCP"], 1);
+        assert_eq!(json["memory"]["disableOOMKiller"], true);
+        assert_eq!(json["memory"]["useHierarchy"], true);
+        assert_eq!(json["memory"]["checkBeforeUpdate"], true);
+        assert_eq!(json["cpu"]["realtimeRuntime"], 1);
+        assert_eq!(json["cpu"]["realtimePeriod"], 2);
+    }
+
+    #[test]
+    fn empty_resources_omit_memory_cpu_pids() {
+        let json = serde_json::to_value(LinuxResources::default()).unwrap();
+        assert!(json.get("memory").is_none());
+        assert!(json.get("cpu").is_none());
+        assert!(json.get("pids").is_none());
+        assert!(json.get("cpus").is_none());
     }
 }
