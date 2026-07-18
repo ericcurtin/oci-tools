@@ -1,0 +1,24 @@
+[package]
+name = "oci-cli-common"
+description = "Shared CLI plumbing (global args, logging, error rendering, JSON output, progress bars) for oci-tools binaries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+indicatif.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+oci-build-info.workspace = true
+
+[lints]
+workspace = true

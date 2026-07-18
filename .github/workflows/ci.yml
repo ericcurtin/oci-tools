@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lint-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: lint-${{ runner.os }}-
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+      - name: Project guards (forbidden fs, bin deps, capability dups)
+        run: python3 ci/guards.py
+
+  # Exactly 4 parallel VM jobs; each boots the target distro as a VM on a
+  # same-arch runner and builds/tests the workspace natively inside it.
+  vm-test:
+    name: vm (${{ matrix.base }}, ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - base: centos-stream10
+            arch: x86_64
+            runs-on: ubuntu-24.04
+          - base: centos-stream10
+            arch: aarch64
+            runs-on: ubuntu-24.04-arm
+          - base: ubuntu-26.04
+            arch: x86_64
+            runs-on: ubuntu-24.04
+          - base: ubuntu-26.04
+            arch: aarch64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore build cache disk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/oci-tools-ci/cache-disk.qcow2
+          key: vmcache-v1-${{ matrix.base }}-${{ matrix.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: |
+            vmcache-v1-${{ matrix.base }}-${{ matrix.arch }}-
+
+      - name: Set up host (qemu, firmware, kvm)
+        run: ci/setup-host.sh
+
+      - name: Build and test in VM
+        env:
+          OCI_CI_BASE: ${{ matrix.base }}
+          OCI_CI_ARCH: ${{ matrix.arch }}
+        run: ci/run-in-vm.sh
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.base }}-${{ matrix.arch }}
+          path: artifacts/
+          if-no-files-found: error

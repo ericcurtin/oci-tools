@@ -1,0 +1,15 @@
+[package]
+name = "oci-runtime-core"
+description = "OCI runtime-spec execution engine: namespaces, cgroups v2, seccomp, capabilities, pivot_root, PTY"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,7 @@
+# Pinned stable toolchain. MSRV policy: latest stable; bump this file (and
+# workspace.package.rust-version) freely. CI and the in-VM builds all use
+# exactly this toolchain.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,57 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "bin/*", "tests"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/ericcurtin/oci-tools"
+homepage = "https://github.com/ericcurtin/oci-tools"
+rust-version = "1.97"
+authors = ["The oci-tools contributors"]
+
+[workspace.dependencies]
+# External crates. One crate per capability; ci/guards.py enforces that the
+# alternatives (structopt, snafu, ureq, ...) never sneak in alongside these.
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive", "env", "string", "wrap_help"] }
+indicatif = "0.18"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Workspace crates. bin/* may depend on crates/* only (enforced by ci/guards.py).
+oci-bls = { path = "crates/oci-bls" }
+oci-build-info = { path = "crates/oci-build-info" }
+oci-cli-common = { path = "crates/oci-cli-common" }
+oci-dockerfile = { path = "crates/oci-dockerfile" }
+oci-erofs = { path = "crates/oci-erofs" }
+oci-mount = { path = "crates/oci-mount" }
+oci-net = { path = "crates/oci-net" }
+oci-registry = { path = "crates/oci-registry" }
+oci-runtime-core = { path = "crates/oci-runtime-core" }
+oci-spec-types = { path = "crates/oci-spec-types" }
+oci-store = { path = "crates/oci-store" }
+
+[workspace.lints.rust]
+unsafe_code = "warn"                  # overridden where genuinely needed (mount/runtime crates)
+missing_docs = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+print_stdout = "allow"                # CLIs print to stdout by design
+uninlined_format_args = "warn"
+
+# The release profile favors reproducibility and small-ish binaries; per-bin
+# size tuning (ociboot-init) comes with the initramfs milestone.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

@@ -1,0 +1,47 @@
+# cargo-deny configuration (checked in CI by the lint job).
+# ci/guards.py adds the project-specific rules cargo-deny cannot express
+# (bin->bin dependency ban, one-crate-per-capability, btrfs/zfs grep guard).
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Semver duplicates bloat builds and hint at drift; keep this at deny and add
+# targeted skips when the ecosystem forces a transient duplicate.
+multiple-versions = "deny"
+wildcards = "deny"
+# Internal path dependencies (crates/*) carry no version; that is fine for
+# private workspace members.
+allow-wildcard-paths = true
+skip = []
+skip-tree = []
+deny = [
+    # Forbidden filesystems: never even link support crates for these.
+    { crate = "btrfs", reason = "btrfs is forbidden in oci-tools (ext4/xfs/erofs only)" },
+    { crate = "libbtrfs", reason = "btrfs is forbidden in oci-tools (ext4/xfs/erofs only)" },
+    { crate = "zfs", reason = "zfs is forbidden in oci-tools (ext4/xfs/erofs only)" },
+    { crate = "libzetta", reason = "zfs is forbidden in oci-tools (ext4/xfs/erofs only)" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

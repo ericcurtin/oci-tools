@@ -1,0 +1,15 @@
+[package]
+name = "oci-mount"
+description = "Mount plumbing: loop devices, overlayfs, bind mounts, mount namespaces, idmapped mounts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

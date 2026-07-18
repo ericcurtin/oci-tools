@@ -1,0 +1,21 @@
+[package]
+name = "ociboot-init"
+description = "Tiny initramfs binary that mounts ociboot deployments (dracut 90ociboot module)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+# Runtime-dependency-free by design: this binary must build as a tiny static
+# executable for the initramfs. Do not add clap/tracing/oci-cli-common here;
+# only the build-time git-hash helper is shared.
+[dependencies]
+
+[build-dependencies]
+oci-build-info.workspace = true
+
+[lints]
+workspace = true

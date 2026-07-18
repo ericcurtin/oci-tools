@@ -1,0 +1,15 @@
+[package]
+name = "oci-net"
+description = "Container networking: netns setup, veth/bridge, port forwarding, pasta/slirp4netns integration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

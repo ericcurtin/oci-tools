@@ -1,0 +1,15 @@
+[package]
+name = "oci-erofs"
+description = "Build and seal erofs images: mkfs.erofs driver (pure-Rust writer later), fsverity/dm-verity sealing and verification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true
