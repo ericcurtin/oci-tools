@@ -37,9 +37,14 @@
 //!   nonzero exit aborts the whole build, matching real `docker
 //!   build`/`podman build`.
 //! * **`COPY` (from the build context, or `--from=<earlier-stage>`) is
-//!   supported, narrowly.** One or more explicit sources (no glob
-//!   patterns yet), each landing under the destination by its own
-//!   basename when there's more than one — real Docker's own rule,
+//!   supported, narrowly.** One or more explicit sources, glob
+//!   patterns included (`oci_dockerfile::{contains_wildcards,
+//!   match_pattern}` — a direct, exhaustively-verified-against-the-
+//!   real-Go-toolchain translation of Go's own `path/filepath.Match`,
+//!   the exact matcher real BuildKit's own `copyWithWildcards` uses),
+//!   each landing under the destination by its own basename when
+//!   there's more than one (after glob expansion, not the number of
+//!   source arguments as literally written) — real Docker's own rule,
 //!   checked directly (`copy.go`'s own `createCopyInstruction`):
 //!   with more than one source the destination must be a directory
 //!   and end with a `/`. No `--from=<external-image>` (only an
@@ -52,9 +57,9 @@
 //!   same diff/`commit_layer`/`record_layer` path), just from a plain
 //!   recursive file copy instead of running a command.
 //! * **`ADD` is supported for local sources.** Same scope limits as
-//!   `COPY` above (one or more explicit sources, no globs, no
-//!   `--chown`/`--chmod`), plus real docker's own documented
-//!   archive-auto-extraction: a
+//!   `COPY` above (one or more explicit sources, glob patterns
+//!   included, no `--chown`/`--chmod`), plus real docker's own
+//!   documented archive-auto-extraction: a
 //!   non-directory local source that's a real tar archive (plain,
 //!   gzip, or zstd-compressed — `oci_layer::detect_archive`'s own doc
 //!   comment has the exact scope, checked directly against the
@@ -732,8 +737,9 @@ fn run_step_spec(
 /// into `rootfs`, commit the result as a real new layer exactly like
 /// [`run_instruction`] does (same diff/`commit_layer`/`record_layer`
 /// path), and record it into `config`/`layers`. See this module's own
-/// doc comment for exactly what's rejected (`--from`/`--chown`/
-/// `--chmod`, multiple sources, glob patterns) and why.
+/// doc comment for exactly what's supported (`--from=<earlier-stage>`,
+/// multiple explicit sources, glob patterns) and what's still rejected
+/// (`--chown`/`--chmod`, `--from=<external-image>`) and why.
 #[allow(clippy::too_many_arguments)]
 fn copy_instruction(
     flags: &CopyFlags,
@@ -758,24 +764,6 @@ fn copy_instruction(
         !sources.is_empty(),
         "ociman build: COPY requires at least one source"
     );
-    for source in sources {
-        anyhow::ensure!(
-            !source.contains(['*', '?', '[']),
-            "ociman build: COPY wildcard patterns are not yet supported ({source:?})"
-        );
-    }
-    // Real Docker/BuildKit rule, checked directly (`copy.go`'s own
-    // `createCopyInstruction`: `"When using COPY with more than one
-    // source file, the destination must be a directory and end with a
-    // /"`) -- with more than one source, `dest` must be written with
-    // a trailing `/` (an *already-existing* directory without one is
-    // not enough on its own, matching the real error message's own
-    // literal wording).
-    anyhow::ensure!(
-        sources.len() == 1 || dest.ends_with('/'),
-        "ociman build: when using COPY with more than one source file, the destination must be \
-         a directory and end with a / ({dest:?})"
-    );
     let command_text = match &flags.from {
         Some(from) => format!("COPY --from={from} {} {dest}", sources.join(" ")),
         None => format!("COPY {} {dest}", sources.join(" ")),
@@ -795,6 +783,21 @@ fn copy_instruction(
             )
         })?,
     };
+    let sources = resolve_sources(source_root, sources, "COPY")?;
+    // Real Docker/BuildKit rule, checked directly (`copy.go`'s own
+    // `createCopyInstruction`: `"When using COPY with more than one
+    // source file, the destination must be a directory and end with a
+    // /"`) -- checked against the *expanded* source count (after glob
+    // matching), not the number of source arguments as literally
+    // written: a single glob pattern that itself expands to more than
+    // one real file needs the same trailing `/`, confirmed directly
+    // against the real source (`len(infos) > 1`, `infos` being the
+    // already-glob-expanded list).
+    anyhow::ensure!(
+        sources.len() == 1 || dest.ends_with('/'),
+        "ociman build: when using COPY with more than one source file, the destination must be \
+         a directory and end with a / ({dest:?})"
+    );
 
     // A relative destination is resolved against the working
     // directory currently in effect, same as a `RUN` step's own `cwd`
@@ -808,7 +811,7 @@ fn copy_instruction(
 
     let before = oci_layer::Snapshot::capture(rootfs)
         .with_context(|| format!("capturing rootfs state before {command_text}"))?;
-    for source in sources {
+    for source in &sources {
         let source_path = safe_join(source_root, source.trim_start_matches('/'))
             .with_context(|| format!("resolving COPY source {source:?}"))?;
         anyhow::ensure!(
@@ -890,22 +893,22 @@ fn add_instruction(
     );
     for source in sources {
         anyhow::ensure!(
-            !source.contains(['*', '?', '[']),
-            "ociman build: ADD wildcard patterns are not yet supported ({source:?})"
-        );
-        anyhow::ensure!(
             !source.starts_with("http://") && !source.starts_with("https://"),
             "ociman build: ADD from a remote URL is not yet supported ({source:?})"
         );
     }
+    let command_text = format!("ADD {} {dest}", sources.join(" "));
+
+    let sources = resolve_sources(context, sources, "ADD")?;
     // Same real Docker/BuildKit rule as `copy_instruction` -- see its
-    // own doc comment for the exact source checked directly.
+    // own doc comment for the exact source checked directly (against
+    // the *expanded* source count, not the number of source arguments
+    // as literally written).
     anyhow::ensure!(
         sources.len() == 1 || dest.ends_with('/'),
         "ociman build: when using ADD with more than one source file, the destination must be \
          a directory and end with a / ({dest:?})"
     );
-    let command_text = format!("ADD {} {dest}", sources.join(" "));
 
     let container_config = config.config.clone().unwrap_or_default();
     let resolved_dest = resolve_workdir(container_config.working_dir.as_deref(), dest);
@@ -914,7 +917,7 @@ fn add_instruction(
 
     let before = oci_layer::Snapshot::capture(rootfs)
         .with_context(|| format!("capturing rootfs state before {command_text}"))?;
-    for source in sources {
+    for source in &sources {
         // `ADD` has no `--from` at all (see `AddFlags`'s own doc
         // comment) -- always relative to the build context, unlike
         // `COPY`, which can also reach into an earlier stage's own
@@ -991,6 +994,93 @@ fn add_instruction(
     let committed = commit_layer(store, rootfs, &diff)
         .with_context(|| format!("committing layer for {command_text}"))?;
     record_layer(config, layers, &committed, command_text);
+    Ok(())
+}
+
+/// Join `relative` onto `base`, rejecting any `..` component that
+/// Resolve `sources` (each either a literal path, or — per real
+/// BuildKit's own `containsWildcards` check, [`oci_dockerfile::
+/// contains_wildcards`] — a glob pattern) against `source_root` into a
+/// flat list of every real relative path to actually copy.
+///
+/// A literal source passes through unchanged (its own existence is
+/// still checked later, by the caller, exactly as before this
+/// function existed). A glob pattern is matched against *every* entry
+/// anywhere in `source_root`'s own tree (each entry's own path
+/// relative to `source_root`, not just top-level ones), walked and
+/// matched in lexical order — matching real BuildKit's own
+/// `copyWithWildcards` exactly (`~/git/moby/daemon/builder/dockerfile/
+/// copy.go`, which calls `filepath.WalkDir` — itself documented to
+/// walk in lexical order — then tests `filepath.Match` against each
+/// visited entry). A pattern matching zero real paths is a real,
+/// surfaced error (`instruction_name` names which instruction for the
+/// message), matching real BuildKit's own `"no source files were
+/// specified"` for this same case.
+fn resolve_sources(
+    source_root: &Path,
+    sources: &[String],
+    instruction_name: &str,
+) -> anyhow::Result<Vec<String>> {
+    let mut resolved = Vec::new();
+    for source in sources {
+        if oci_dockerfile::contains_wildcards(source) {
+            let matches = expand_wildcard_source(source_root, source)
+                .with_context(|| format!("expanding {instruction_name} source {source:?}"))?;
+            anyhow::ensure!(
+                !matches.is_empty(),
+                "ociman build: {instruction_name} source pattern {source:?} matched no files in \
+                 {}",
+                source_root.display()
+            );
+            resolved.extend(matches);
+        } else {
+            resolved.push(source.clone());
+        }
+    }
+    Ok(resolved)
+}
+
+/// Every real path (file or directory alike, at any depth) under
+/// `source_root` whose own path relative to `source_root` matches
+/// `pattern`, in lexical order.
+fn expand_wildcard_source(source_root: &Path, pattern: &str) -> anyhow::Result<Vec<String>> {
+    let mut all_relative_paths = Vec::new();
+    walk_relative_paths(source_root, source_root, &mut all_relative_paths)?;
+    all_relative_paths.sort();
+    let mut matches = Vec::new();
+    for rel in all_relative_paths {
+        let is_match = oci_dockerfile::match_pattern(pattern, &rel)
+            .map_err(|_| anyhow::anyhow!("invalid glob pattern {pattern:?}"))?;
+        if is_match {
+            matches.push(rel);
+        }
+    }
+    Ok(matches)
+}
+
+/// Recursively collect every entry under `dir` (starting at `root`),
+/// as each one's own path relative to `root`, using `/` as the
+/// separator regardless of host platform (matching the Dockerfile
+/// instruction syntax's own always-`/`-separated paths).
+fn walk_relative_paths(root: &Path, dir: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("reading file type for {}", path.display()))?;
+        if file_type.is_dir() {
+            walk_relative_paths(root, &path, out)?;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .expect("every walked path is under its own root")
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        out.push(rel);
+    }
     Ok(())
 }
 

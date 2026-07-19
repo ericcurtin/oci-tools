@@ -860,6 +860,154 @@ fn copy_with_multiple_sources_places_each_under_its_own_basename() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), "aaa\nbbb\nnested\n");
 }
 
+/// `COPY *.txt /dest/` matches real BuildKit's own documented glob
+/// semantics exactly (`oci_dockerfile::{contains_wildcards,
+/// match_pattern}`, exhaustively verified against the real Go
+/// toolchain's own official test suite): `*` never crosses a `/`, so
+/// a top-level pattern like `*.txt` matches only top-level files, not
+/// `subdir/nested.txt` -- confirmed here by checking the *absence* of
+/// the nested file just as carefully as the presence of the matched
+/// ones, and that a differently-suffixed file (`c.md`) is correctly
+/// excluded too.
+#[test]
+fn copy_expands_a_glob_pattern_against_the_build_context() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copy-glob-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("a.txt"), "aaa\n").unwrap();
+    std::fs::write(context_dir.path().join("b.txt"), "bbb\n").unwrap();
+    std::fs::write(context_dir.path().join("c.md"), "ccc\n").unwrap();
+    std::fs::create_dir(context_dir.path().join("subdir")).unwrap();
+    std::fs::write(
+        context_dir.path().join("subdir").join("nested.txt"),
+        "nested\n",
+    )
+    .unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copy-glob-base:latest\n\
+         COPY *.txt /app/\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/copy-glob-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/copy-glob-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "find /app -type f | sort",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "/app/a.txt\n/app/b.txt\n"
+    );
+}
+
+/// A glob pattern containing a real `/` (e.g. `subdir/*.txt`) matches
+/// entries at that exact nested depth -- BuildKit's own
+/// `copyWithWildcards` walks the *entire* source tree, not just the
+/// top level, testing each visited entry's own path relative to the
+/// source root.
+#[test]
+fn copy_expands_a_glob_pattern_that_reaches_into_a_subdirectory() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copy-glob-nested-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(context_dir.path().join("subdir")).unwrap();
+    std::fs::write(
+        context_dir.path().join("subdir").join("nested.txt"),
+        "nested content\n",
+    )
+    .unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copy-glob-nested-base:latest\n\
+         COPY subdir/*.txt /app.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/copy-glob-nested-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/copy-glob-nested-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /app.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "nested content\n");
+}
+
 #[test]
 fn copy_rejects_a_source_that_escapes_the_build_context() {
     let Some(busybox) = busybox_path() else {
@@ -897,7 +1045,7 @@ fn copy_rejects_a_source_that_escapes_the_build_context() {
 }
 
 #[test]
-fn copy_rejects_unsupported_flags_multiple_sources_and_globs() {
+fn copy_rejects_unsupported_flags_and_bad_glob_patterns() {
     let Some(busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");
         return;
@@ -920,7 +1068,15 @@ fn copy_rejects_unsupported_flags_multiple_sources_and_globs() {
             "COPY a.txt b.txt /a.txt\n",
             "must be a directory and end with a /",
         ),
-        ("COPY *.txt /dest/\n", "wildcard"),
+        // A malformed glob pattern (an unterminated `[...]` character
+        // class) is still a real, surfaced error -- unlike a
+        // well-formed glob pattern, which is genuinely supported now
+        // (see `copy_expands_a_glob_pattern_against_the_build_context`).
+        ("COPY a[ /dest/\n", "invalid glob pattern"),
+        // A well-formed glob pattern matching zero real files is a
+        // real, surfaced error too, matching real BuildKit's own "no
+        // source files were specified".
+        ("COPY *.nonexistent /dest/\n", "matched no files"),
     ];
     for (instruction, expected_error_fragment) in cases {
         let context_dir = tempfile::tempdir().unwrap();

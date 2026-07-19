@@ -68,6 +68,7 @@
 mod commit;
 mod dependencies;
 mod expand_stage;
+mod glob;
 mod instruction;
 mod lexer;
 mod shell_expand;
@@ -78,6 +79,7 @@ pub use commit::{
 };
 pub use dependencies::{resolve_copy_from_dependencies, resolve_dependencies, stages_needed_for};
 pub use expand_stage::{expand_meta_args, expand_stage};
+pub use glob::{BadPattern, contains_wildcards, match_pattern};
 pub use instruction::{AddFlags, CopyFlags, Instruction, ShellOrExec};
 pub use shell_expand::expand;
 pub use stage::{Stage, declared_arg_names, find_stage, group_stages};
