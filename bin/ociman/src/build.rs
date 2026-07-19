@@ -583,6 +583,18 @@ fn run_step_spec(
     if !container_config.env.is_empty() {
         process.env = container_config.env;
     }
+    // Same real `podman`-default capability set every other real
+    // container this project runs gets (see `synthesize_spec`'s own
+    // identical fix and comment in `main.rs`) — a `RUN` step is a real
+    // container process too, not a special trusted case that should
+    // stay stuck with `Spec::example()`'s own bare 3-capability
+    // runc-scaffold default.
+    if let Some(capabilities) = process.capabilities.as_mut() {
+        let podman_caps = oci_spec_types::runtime::podman_default_capabilities();
+        capabilities.bounding = podman_caps.clone();
+        capabilities.effective = podman_caps.clone();
+        capabilities.permitted = podman_caps;
+    }
 
     let linux = spec
         .linux

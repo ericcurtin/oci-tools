@@ -688,12 +688,55 @@ impl Spec {
     }
 }
 
+/// [`Spec::example()`]'s own bare-scaffold capability set — checked
+/// directly against real, installed `runc spec`'s own output (see this
+/// module's own doc comment), **not** any container engine's own
+/// richer default. `ocirun spec` deliberately keeps this exact 3-
+/// capability list so its own output stays structurally interchangeable
+/// with real `runc spec`'s. A real container *engine* (`ociman run`)
+/// wants a much richer default instead — see
+/// [`podman_default_capabilities`], used only by `ociman`'s own spec-
+/// synthesis path, never by `Spec::example()` itself.
 fn default_capabilities() -> Vec<String> {
     vec![
         "CAP_AUDIT_WRITE".to_string(),
         "CAP_KILL".to_string(),
         "CAP_NET_BIND_SERVICE".to_string(),
     ]
+}
+
+/// Real `podman run`'s own default capability set (11 capabilities) —
+/// checked directly against `~/git/container-libs/common/pkg/config/
+/// default.go`'s own `DefaultCapabilities`, and cross-checked live
+/// against a real `podman run --rm alpine cat /proc/self/status`'s own
+/// `CapEff` bitmask (podman 4.9.3), not re-derived from documentation.
+/// Deliberately **not** real `docker`'s own default (`~/git/moby/
+/// daemon/pkg/oci/caps/defaults.go`, 14 capabilities: the same 11 plus
+/// `CAP_MKNOD`/`CAP_NET_RAW`/... beyond what podman itself grants) —
+/// `ociman` is a `podman` clone, so its own default should match
+/// `podman`'s exactly, not `docker`'s slightly larger one.
+///
+/// For use by `ociman`'s own spec-synthesis path only, *never* by
+/// [`Spec::example()`] itself — see `default_capabilities`'s own doc
+/// comment for why `ocirun`'s own bare-scaffold default must stay the
+/// real-`runc`-scaffold 3-capability list instead.
+pub fn podman_default_capabilities() -> Vec<String> {
+    [
+        "CAP_CHOWN",
+        "CAP_DAC_OVERRIDE",
+        "CAP_FOWNER",
+        "CAP_FSETID",
+        "CAP_KILL",
+        "CAP_NET_BIND_SERVICE",
+        "CAP_SETFCAP",
+        "CAP_SETGID",
+        "CAP_SETPCAP",
+        "CAP_SETUID",
+        "CAP_SYS_CHROOT",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 fn default_mounts() -> Vec<Mount> {
@@ -837,6 +880,46 @@ mod tests {
         assert!(json["process"]["capabilities"].get("inheritable").is_none());
         assert!(json["process"].get("user").is_some());
         assert_eq!(json["process"]["user"]["uid"], 0);
+    }
+
+    #[test]
+    fn podman_default_capabilities_matches_the_real_11_capability_podman_default() {
+        // Checked directly against `~/git/container-libs/common/pkg/
+        // config/default.go`'s own `DefaultCapabilities`, and
+        // cross-checked live against a real `podman run --rm alpine
+        // cat /proc/self/status`'s own `CapEff` bitmask (podman
+        // 4.9.3) -- deliberately different from, and smaller than,
+        // `Spec::example()`'s own real-runc-scaffold 3-capability
+        // default (`default_capabilities`) and real docker's own
+        // 14-capability default, neither of which this function is.
+        let caps = podman_default_capabilities();
+        assert_eq!(caps.len(), 11, "real podman's own default has exactly 11");
+        for expected in [
+            "CAP_CHOWN",
+            "CAP_DAC_OVERRIDE",
+            "CAP_FOWNER",
+            "CAP_FSETID",
+            "CAP_KILL",
+            "CAP_NET_BIND_SERVICE",
+            "CAP_SETFCAP",
+            "CAP_SETGID",
+            "CAP_SETPCAP",
+            "CAP_SETUID",
+            "CAP_SYS_CHROOT",
+        ] {
+            assert!(
+                caps.iter().any(|c| c == expected),
+                "missing {expected} in {caps:?}"
+            );
+        }
+        // Real docker's own default additionally has these three;
+        // `ociman` is a `podman` clone, so its own default must not.
+        for docker_only in ["CAP_MKNOD", "CAP_NET_RAW", "CAP_AUDIT_WRITE"] {
+            assert!(
+                !caps.iter().any(|c| c == docker_only),
+                "real podman's own default does not include {docker_only}, unlike docker's"
+            );
+        }
     }
 
     #[test]

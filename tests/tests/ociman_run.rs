@@ -49,6 +49,55 @@ fn ociman_run(storage_root: &Path, image: &str, args: &[&str]) -> std::process::
         .expect("failed to spawn ociman run")
 }
 
+/// `ociman run` grants real `podman run`'s own default 11-capability
+/// set (`oci_spec_types::runtime::podman_default_capabilities`) —
+/// deliberately *not* `Spec::example()`'s own bare 3-capability
+/// real-runc-scaffold default `ocirun spec`/`ocirun run` still use
+/// (see `tests/tests/ocirun_run.rs`'s own identically-shaped
+/// `run_applies_the_default_capability_set_and_no_new_privileges`,
+/// which keeps asserting the *smaller* runc-scaffold bitmask — the two
+/// binaries deliberately no longer share one capability default,
+/// `ocirun` being a `runc` clone and `ociman` a `podman` one). The
+/// exact bitmask below was read directly from a real running
+/// container's own `/proc/self/status` while building this increment,
+/// and matches a real `podman run --rm alpine cat /proc/self/status`'s
+/// own `CapEff` (podman 4.9.3) exactly.
+#[test]
+fn run_grants_the_real_podman_default_capability_set() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/default-caps:latest",
+        &busybox,
+        &["sh", "grep"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/default-caps:latest",
+        &[
+            "/bin/sh",
+            "-c",
+            r#"grep -E "^(CapInh|CapPrm|CapEff|CapBnd|CapAmb):" /proc/self/status"#,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "CapInh:\t0000000000000000\nCapPrm:\t00000000800405fb\nCapEff:\t00000000800405fb\nCapBnd:\t00000000800405fb\nCapAmb:\t0000000000000000"
+    );
+}
+
 #[test]
 fn run_uses_the_images_default_cmd_and_env() {
     let Some(busybox) = busybox_path() else {

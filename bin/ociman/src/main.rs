@@ -1069,6 +1069,23 @@ fn synthesize_spec(
     if !container_config.env.is_empty() {
         process.env = container_config.env;
     }
+    // `Spec::example()`'s own capability set is real `runc spec`'s own
+    // bare-scaffold default (3 capabilities) -- correct for `ocirun`
+    // (a runc clone, see `oci_spec_types::runtime::
+    // default_capabilities`'s own doc comment for why that must stay
+    // byte-identical to real `runc`), but `ociman` is a real
+    // container *engine* (a `podman` clone), which grants a much
+    // richer default (11 capabilities) to every container it starts.
+    // No `--cap-add`/`--cap-drop` override exists yet, matching this
+    // project's own already-established "ship the default first, an
+    // override flag can come later" pattern for `--security-opt
+    // seccomp=`/`--memory` before it.
+    if let Some(capabilities) = process.capabilities.as_mut() {
+        let podman_caps = oci_spec_types::runtime::podman_default_capabilities();
+        capabilities.bounding = podman_caps.clone();
+        capabilities.effective = podman_caps.clone();
+        capabilities.permitted = podman_caps;
+    }
 
     spec.hostname = Some(id.to_string());
 
