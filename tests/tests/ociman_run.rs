@@ -584,6 +584,85 @@ fn run_without_hostname_flag_defaults_to_the_containers_own_id() {
     );
 }
 
+/// `-w`/`--workdir` overrides the image's own default `WORKDIR`,
+/// matching real `docker run -w`/`podman run -w` exactly -- checked
+/// the most direct way available: printing the real, current working
+/// directory from inside the running container.
+#[test]
+fn run_workdir_flag_overrides_the_images_default_workdir() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/workdir-flag:latest",
+        &busybox,
+        &["sh", "pwd"],
+        ContainerConfig {
+            working_dir: Some("/".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "-w", "/bin"])
+        .args(["ociman-test/workdir-flag:latest"])
+        .args(["/bin/pwd"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "/bin\n");
+}
+
+/// With no `-w`/`--workdir` given, the image's own `WORKDIR` config
+/// still applies -- a real regression guard: `-w` must only ever
+/// override, never silently replace, the existing image-config
+/// default path this project's own `synthesize_spec` already applied
+/// correctly before this increment.
+#[test]
+fn run_without_workdir_flag_uses_the_images_own_workdir() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/workdir-default:latest",
+        &busybox,
+        &["sh", "pwd"],
+        ContainerConfig {
+            working_dir: Some("/bin".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm"])
+        .args(["ociman-test/workdir-default:latest"])
+        .args(["/bin/pwd"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "/bin\n");
+}
+
 #[test]
 fn run_uses_the_images_default_cmd_and_env() {
     let Some(busybox) = busybox_path() else {

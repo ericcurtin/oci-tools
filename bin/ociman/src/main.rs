@@ -340,6 +340,13 @@ enum Command {
         /// `--cpuset-mems`).
         #[arg(long)]
         hostname: Option<String>,
+        /// Override the working directory the container's own process
+        /// starts in, matching real `docker run -w`/`podman run -w`
+        /// exactly. Defaults to the image's own `WORKDIR` config (or
+        /// `/` if the image sets none), same as `ociman exec --cwd`'s
+        /// own analogous override for an already-running container.
+        #[arg(short = 'w', long = "workdir")]
+        workdir: Option<String>,
     },
     /// List containers.
     Ps {
@@ -464,6 +471,7 @@ fn main() -> std::process::ExitCode {
                 read_only,
                 env,
                 hostname,
+                workdir,
             }) => cmd_run(
                 &image,
                 &args,
@@ -482,6 +490,7 @@ fn main() -> std::process::ExitCode {
                 read_only,
                 &env,
                 hostname.as_deref(),
+                workdir.as_deref(),
             ),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
@@ -640,6 +649,7 @@ fn cmd_run(
     read_only: bool,
     env: &[String],
     hostname: Option<&str>,
+    workdir: Option<&str>,
 ) -> anyhow::Result<()> {
     let seccomp = resolve_seccomp(security_opts, privileged)?;
     let base_capabilities = if privileged {
@@ -732,6 +742,7 @@ fn cmd_run(
             read_only,
             env,
             hostname,
+            workdir,
         )?;
         if let Some(process) = &spec.process {
             state
@@ -1189,6 +1200,7 @@ fn synthesize_spec(
     read_only: bool,
     env: &[String],
     hostname: Option<&str>,
+    workdir: Option<&str>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -1224,10 +1236,12 @@ fn synthesize_spec(
         .expect("Spec::example always sets process");
     process.args = full_args;
     process.terminal = false;
-    process.cwd = container_config
-        .working_dir
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/".to_string());
+    process.cwd = workdir.map(str::to_string).unwrap_or_else(|| {
+        container_config
+            .working_dir
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/".to_string())
+    });
     process.user.uid = uid;
     process.user.gid = gid;
     if !container_config.env.is_empty() {
