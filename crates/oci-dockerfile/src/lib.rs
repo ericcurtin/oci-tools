@@ -1,12 +1,16 @@
 //! Dockerfile/Containerfile parser, build graph, and build cache.
 //!
-//! **Status: parser only, first increment** — see this crate's own
-//! `docs/design/` note for the exact scope. `parse` turns raw
-//! Dockerfile/Containerfile text into an ordered list of
-//! [`Instruction`]s; nothing here executes them yet (that's
-//! `ociman build`'s own job, layered on top of this crate, `oci-
-//! runtime-core` for `RUN` steps, and `oci-store` for layer commits —
-//! none of which exist yet either).
+//! **Status: parsing/build-graph plus one piece of layer-commit
+//! plumbing** — see this crate's own `docs/design/` notes for the
+//! exact scope. `parse` turns raw Dockerfile/Containerfile text into
+//! an ordered list of [`Instruction`]s; nothing here executes a build
+//! yet (that's `ociman build`'s own job, layered on top of this
+//! crate and `oci-runtime-core` for `RUN` steps — not implemented
+//! yet). [`commit_layer`] is the one exception: given a rootfs diff a
+//! future build executor has already computed (via
+//! [`oci_layer::changes`]), it turns that diff into a real, stored
+//! layer — the actual execution loop that would call it doesn't exist
+//! yet either.
 //!
 //! Every lexical/grammar rule this crate implements was checked
 //! directly against the real, current BuildKit Dockerfile frontend
@@ -44,16 +48,21 @@
 //!   `--exclude=`, `ADD --link`/`--keep-git-dir`/`--checksum=`/
 //!   `--unpack`) — a Containerfile using any of these fails to parse
 //!   with a clear error, rather than being silently misparsed.
-//! - Actual build execution (`RUN` steps via `oci-runtime-core`, layer
-//!   commits via `oci-store`) and the build cache this crate's own
-//!   module doc has always planned — the dependency graph above tells
-//!   a future build-execution increment *what order* to build stages
-//!   in and *which* stages it can skip for a given target, but nothing
-//!   actually builds anything yet.
+//! - Actual build execution (`RUN` steps via `oci-runtime-core`) and
+//!   the build cache this crate's own module doc has always planned —
+//!   the dependency graph above tells a future build-execution
+//!   increment *what order* to build stages in and *which* stages it
+//!   can skip for a given target, but nothing actually builds
+//!   anything yet. [`commit_layer`] can turn an already-computed diff
+//!   into a real stored layer, but nothing yet decides *when* to diff
+//!   a rootfs, drives a `RUN` step, or updates an image config's own
+//!   `rootfs`/`history` or a manifest's own `layers` list with
+//!   [`commit_layer`]'s own output.
 //! - `--build-arg` (an external override for a meta-`ARG`'s own
 //!   value) has no representation at all yet — [`expand_meta_args`]
 //!   only ever sees each `ARG`'s own inline default.
 
+mod commit;
 mod dependencies;
 mod expand_stage;
 mod instruction;
@@ -61,6 +70,7 @@ mod lexer;
 mod shell_expand;
 mod stage;
 
+pub use commit::{CommitLayerError, CommittedLayer, commit_layer};
 pub use dependencies::{resolve_dependencies, stages_needed_for};
 pub use expand_stage::{expand_meta_args, expand_stage};
 pub use instruction::{AddFlags, CopyFlags, Instruction, ShellOrExec};

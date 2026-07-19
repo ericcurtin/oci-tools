@@ -750,7 +750,12 @@ dependencies = [
 name = "oci-dockerfile"
 version = "0.1.0"
 dependencies = [
+ "oci-layer",
+ "oci-spec-types",
+ "oci-store",
  "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
