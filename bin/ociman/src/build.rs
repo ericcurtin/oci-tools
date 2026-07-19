@@ -563,7 +563,7 @@ fn apply_instruction(
         // Already fully resolved by `expand_stage`; no config effect
         // of its own. `SHELL` only affects a future shell-form `RUN`,
         // which isn't supported yet either.
-        Instruction::Arg { .. } | Instruction::Shell(_) => {}
+        Instruction::Arg(_) | Instruction::Shell(_) => {}
         Instruction::Env(pairs) => {
             let cc = config.config.get_or_insert_with(ContainerConfig::default);
             for (key, value) in pairs {

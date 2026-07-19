@@ -59,7 +59,7 @@ pub fn group_stages(
 
     for instruction in instructions {
         if stages.is_empty()
-            && let Instruction::Arg { .. } = &instruction
+            && let Instruction::Arg(_) = &instruction
         {
             meta_args.push(instruction);
             continue;
@@ -118,9 +118,9 @@ pub fn declared_arg_names(
     meta_args
         .iter()
         .chain(stages.iter().flat_map(|stage| &stage.instructions))
-        .filter_map(|instruction| match instruction {
-            Instruction::Arg { name, .. } => Some(name.clone()),
-            _ => None,
+        .flat_map(|instruction| match instruction {
+            Instruction::Arg(pairs) => pairs.iter().map(|(name, _)| name.clone()).collect(),
+            _ => Vec::new(),
         })
         .collect()
 }

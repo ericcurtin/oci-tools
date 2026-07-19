@@ -52,16 +52,30 @@ pub fn expand_meta_args(
 ) -> Result<HashMap<String, String>, String> {
     let mut env = HashMap::new();
     for instruction in meta_args {
-        if let Instruction::Arg { name, default } = instruction {
-            let value = match overrides.get(name) {
-                Some(overridden) => Some(overridden.clone()),
-                None => match default {
-                    Some(default) => Some(expand(default, &env)?),
-                    None => None,
-                },
-            };
-            if let Some(value) = value {
-                env.insert(name.clone(), value);
+        if let Instruction::Arg(pairs) = instruction {
+            // Threaded progressively, one pair at a time -- *not* a
+            // snapshot the way `Instruction::Env`'s own multiple pairs
+            // are (see `expand_instruction`'s own `Env` arm doc
+            // comment for that contrasting case). Checked directly
+            // against real BuildKit's own `dispatchArg`
+            // (`dockerfile2llb/convert.go`): `d.state =
+            // d.state.AddEnv(arg.Key, *arg.Value)` runs *inside* the
+            // per-`arg` loop, so `ARG a=1 b=$a` really does see `a`'s
+            // own just-resolved value while resolving `b`, on the same
+            // line -- confirmed by reading that loop directly rather
+            // than assuming it matched `ENV`'s own documented
+            // snapshot behavior.
+            for (name, default) in pairs {
+                let value = match overrides.get(name) {
+                    Some(overridden) => Some(overridden.clone()),
+                    None => match default {
+                        Some(default) => Some(expand(default, &env)?),
+                        None => None,
+                    },
+                };
+                if let Some(value) = value {
+                    env.insert(name.clone(), value);
+                }
             }
         }
     }
@@ -142,7 +156,7 @@ fn expand_instruction(
     overrides: &HashMap<String, String>,
 ) -> Result<Instruction, String> {
     match instruction {
-        Instruction::Arg { name, default } => {
+        Instruction::Arg(pairs) => {
             // `overrides` wins outright, used verbatim (not
             // re-expanded) — same real, checked-directly rule as
             // `expand_meta_args`'s own doc comment, applied here to a
@@ -157,21 +171,24 @@ fn expand_instruction(
             // name if one exists — real, checked-directly rule: a
             // meta-arg is *not* automatically inherited by a stage; it
             // must be re-declared (bare) to become usable there at
-            // all.
-            let value = match overrides.get(name) {
-                Some(overridden) => Some(overridden.clone()),
-                None => match default {
-                    Some(d) => Some(expand(d, env)?),
-                    None => global_args.get(name).cloned(),
-                },
-            };
-            if let Some(v) = &value {
-                env.insert(name.clone(), v.clone());
+            // all. Threaded progressively across multiple pairs on the
+            // same line, same real, checked-directly reason as
+            // `expand_meta_args`'s own doc comment.
+            let mut resolved = Vec::with_capacity(pairs.len());
+            for (name, default) in pairs {
+                let value = match overrides.get(name) {
+                    Some(overridden) => Some(overridden.clone()),
+                    None => match default {
+                        Some(d) => Some(expand(d, env)?),
+                        None => global_args.get(name).cloned(),
+                    },
+                };
+                if let Some(v) = &value {
+                    env.insert(name.clone(), v.clone());
+                }
+                resolved.push((name.clone(), value));
             }
-            Ok(Instruction::Arg {
-                name: name.clone(),
-                default: value,
-            })
+            Ok(Instruction::Arg(resolved))
         }
         Instruction::Env(pairs) => {
             // Real, checked-directly rule: every substitution within
@@ -347,10 +364,7 @@ mod tests {
         let stage = expand_stage(&global_args, &no_overrides(), &stages[0]).unwrap();
         assert_eq!(
             stage.instructions[0],
-            Instruction::Arg {
-                name: "VERSION".to_string(),
-                default: Some("1.0".to_string()),
-            }
+            Instruction::Arg(vec![("VERSION".to_string(), Some("1.0".to_string()))])
         );
         assert_eq!(
             stage.instructions[1],
@@ -397,6 +411,32 @@ mod tests {
                 sources: vec!["".to_string()],
                 dest: "/app".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn multiple_args_on_one_line_thread_progressively_unlike_env() {
+        // Real, checked-directly rule (real BuildKit's own
+        // `dispatchArg`, see `expand_meta_args`'s own doc comment):
+        // unlike `ENV a=hello b=$a` (a snapshot -- `b` never sees
+        // `a`'s new value), `ARG a=1 b=$a` really does thread each
+        // pair's own resolved value into the next, on the very same
+        // line.
+        let (global_args, stages) = stages_for(
+            "FROM scratch\nARG A=1 B=${A}2\nWORKDIR /${A}/${B}\n",
+            &no_overrides(),
+        );
+        let stage = expand_stage(&global_args, &no_overrides(), &stages[0]).unwrap();
+        assert_eq!(
+            stage.instructions[0],
+            Instruction::Arg(vec![
+                ("A".to_string(), Some("1".to_string())),
+                ("B".to_string(), Some("12".to_string())),
+            ])
+        );
+        assert_eq!(
+            stage.instructions[1],
+            Instruction::Workdir("/1/12".to_string())
         );
     }
 
@@ -452,10 +492,7 @@ mod tests {
         let stage = expand_stage(&global_args, &overrides, &stages[0]).unwrap();
         assert_eq!(
             stage.instructions[0],
-            Instruction::Arg {
-                name: "OWNER".to_string(),
-                default: Some("2000".to_string()),
-            }
+            Instruction::Arg(vec![("OWNER".to_string(), Some("2000".to_string()))])
         );
         assert_eq!(
             stage.instructions[1],

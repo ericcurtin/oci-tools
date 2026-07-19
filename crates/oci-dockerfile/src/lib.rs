@@ -133,7 +133,7 @@ CMD [\"--verbose\"]
             matches!(&instructions[0], Instruction::From { stage_name: Some(s), .. } if s == "base")
         );
         assert!(
-            matches!(&instructions[1], Instruction::Arg { name, default: Some(d) } if name == "VERSION" && d == "1.0")
+            matches!(&instructions[1], Instruction::Arg(pairs) if pairs == &[("VERSION".to_string(), Some("1.0".to_string()))])
         );
         // Not yet interpolated -- `${VERSION}` stays literal, per this
         // crate's own documented scope limit.

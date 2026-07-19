@@ -94,13 +94,15 @@ pub enum Instruction {
     /// forms (`ENV k v` and `ENV k1=v1 k2=v2 ...`), which are
     /// indistinguishable once parsed.
     Env(Vec<(String, String)>),
-    /// Declares a build-time variable.
-    Arg {
-        /// The variable's name.
-        name: String,
-        /// Its default value, if given.
-        default: Option<String>,
-    },
+    /// `name`/optional-default pairs, in the order written — real
+    /// `ARG a=1 b=2` declares two independent variables on one line
+    /// (checked directly against real BuildKit's own `ArgCommand`,
+    /// `~/git/moby/vendor/github.com/moby/buildkit/frontend/dockerfile/
+    /// instructions/commands.go`: `Args []KeyValuePairOptional`, a
+    /// list from the start, one entry per whitespace-separated word
+    /// on the line) — see [`parse_arg`]'s own doc comment for why this
+    /// crate didn't support more than one at first.
+    Arg(Vec<(String, Option<String>)>),
     /// `key=value` pairs, same grammar as [`Instruction::Env`].
     Label(Vec<(String, String)>),
     /// Sets the working directory for later instructions.
@@ -159,7 +161,7 @@ pub fn parse_instruction(line: &LogicalLine) -> Result<Instruction, String> {
         "LABEL" => parse_name_val_list(&rest, "LABEL")
             .map(Instruction::Label)
             .or_else(|e| err(&e)),
-        "ARG" => parse_arg(&rest).or_else(|e| err(&e)),
+        "ARG" => parse_arg(&rest).map(Instruction::Arg).or_else(|e| err(&e)),
         "WORKDIR" => {
             if rest.trim().is_empty() {
                 err("WORKDIR requires exactly one argument")
@@ -369,36 +371,32 @@ fn parse_sources_and_dest(rest: &str) -> Result<(Vec<String>, String), String> {
     Ok((words, dest))
 }
 
-fn parse_arg(rest: &str) -> Result<Instruction, String> {
+/// `ARG name[=default] [name[=default] ...]` — real `ARG a=1 b=2`
+/// declares two independent variables on one line, checked directly
+/// against real BuildKit's own `parseArg`
+/// (`~/git/moby/vendor/github.com/moby/buildkit/frontend/dockerfile/
+/// instructions/parse.go`): each whitespace-separated word (via this
+/// crate's own quote-aware [`shell_words`], the same tokenizer
+/// [`parse_name_val_list`] already uses for `ENV`/`LABEL` — real
+/// BuildKit's own word-splitting is quote-aware too, via `shlex`, so a
+/// naive `split_whitespace` would also mis-split a single `ARG
+/// FOO="a b"` declaration) is parsed independently: `name=value` sets
+/// a default, a bare `name` (no `=` at all) declares one with none.
+fn parse_arg(rest: &str) -> Result<Vec<(String, Option<String>)>, String> {
     let trimmed = rest.trim();
     if trimmed.is_empty() {
         return Err("ARG requires a name".to_string());
     }
-    // Only the *first* declared name/default is returned as one
-    // `Instruction::Arg` — matches real behavior where `ARG a=1 b=2`
-    // is really two independent declarations; callers that need
-    // multiple should call this once per whitespace-delimited word.
-    // Kept intentionally simple (one `Instruction::Arg` per line) for
-    // this crate's own first increment — a Containerfile declaring
-    // several `ARG`s on one line should just write them on separate
-    // lines instead, which every real one this project targets does.
-    if trimmed.split_whitespace().count() > 1 {
-        return Err(
-            "ARG: declaring more than one name per line is not supported yet; use one ARG per line"
-                .to_string(),
-        );
-    }
-    match trimmed.split_once('=') {
-        Some((name, value)) if !name.is_empty() => Ok(Instruction::Arg {
-            name: name.to_string(),
-            default: Some(value.to_string()),
-        }),
-        Some((_, _)) => Err("ARG: blank name before '='".to_string()),
-        None => Ok(Instruction::Arg {
-            name: trimmed.to_string(),
-            default: None,
-        }),
-    }
+    shell_words(trimmed)?
+        .into_iter()
+        .map(|word| match word.split_once('=') {
+            Some((name, value)) if !name.is_empty() => {
+                Ok((name.to_string(), Some(value.to_string())))
+            }
+            Some((_, _)) => Err("ARG: blank name before '='".to_string()),
+            None => Ok((word, None)),
+        })
+        .collect()
 }
 
 /// Real form: `KEY value` (legacy, exactly two words) or `KEY1=val1
@@ -689,10 +687,7 @@ mod tests {
     fn arg_with_default() {
         assert_eq!(
             parse("ARG VERSION=1.0"),
-            Instruction::Arg {
-                name: "VERSION".to_string(),
-                default: Some("1.0".to_string()),
-            }
+            Instruction::Arg(vec![("VERSION".to_string(), Some("1.0".to_string()))])
         );
     }
 
@@ -700,11 +695,49 @@ mod tests {
     fn arg_without_default() {
         assert_eq!(
             parse("ARG VERSION"),
-            Instruction::Arg {
-                name: "VERSION".to_string(),
-                default: None,
-            }
+            Instruction::Arg(vec![("VERSION".to_string(), None)])
         );
+    }
+
+    #[test]
+    fn arg_declares_multiple_independent_names_on_one_line() {
+        // Real, checked-directly behavior (real BuildKit's own
+        // `ArgCommand.Args` is a list from the start): `ARG a=1 b=2`
+        // is two independent declarations, not an error.
+        assert_eq!(
+            parse("ARG FIRST=1 SECOND SECOND=2"),
+            Instruction::Arg(vec![
+                ("FIRST".to_string(), Some("1".to_string())),
+                ("SECOND".to_string(), None),
+                ("SECOND".to_string(), Some("2".to_string())),
+            ])
+        );
+    }
+
+    #[test]
+    fn arg_default_value_may_be_quoted_and_contain_whitespace() {
+        // A quoted value with embedded whitespace is one word, not
+        // several -- proves `parse_arg` really uses the same
+        // quote-aware `shell_words` tokenizer `ENV`/`LABEL` do, not a
+        // naive `split_whitespace` that would misread this as two
+        // more (bare, invalid) names.
+        assert_eq!(
+            parse(r#"ARG GREETING="hello world""#),
+            Instruction::Arg(vec![(
+                "GREETING".to_string(),
+                Some("hello world".to_string())
+            )])
+        );
+    }
+
+    #[test]
+    fn arg_rejects_a_blank_name_before_equals_even_among_other_valid_names() {
+        let line = LogicalLine {
+            line_number: 1,
+            text: "ARG OK=1 =bad".to_string(),
+        };
+        let err = parse_instruction(&line).unwrap_err();
+        assert!(err.contains("blank name"), "{err}");
     }
 
     #[test]
