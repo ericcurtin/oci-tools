@@ -471,6 +471,18 @@ fn cmd_start(root: &Path, id: &str) -> anyhow::Result<()> {
     // running, only clutters its state directory.
     let _ = std::fs::remove_file(&fifo_path);
 
+    // Matches real runc's own `Container.exec()` exactly (signal the
+    // fifo, then run `poststart` — see `docs/design/0089`): reload the
+    // bundle fresh from `state.bundle` rather than keeping one around
+    // from `create` time (this is a wholly separate CLI invocation).
+    // Best-effort: a bundle that's moved or been removed since
+    // `create` shouldn't stop `start` itself from succeeding, matching
+    // `remove_cgroup_directory_if_any`'s own established tolerance for
+    // exactly this same failure mode.
+    if let Ok(bundle) = oci_runtime_core::Bundle::load(&state.bundle) {
+        oci_runtime_core::launch::run_poststart_hooks(&bundle, id, state.pid.unwrap_or(0));
+    }
+
     state.status = Status::Running;
     store.write(&state)?;
     Ok(())
@@ -527,6 +539,14 @@ fn cmd_delete(root: &Path, id: &str, force: bool) -> anyhow::Result<()> {
     }
 
     remove_cgroup_directory_if_any(&state.bundle);
+    // Matches real runc's own `destroy()`, which always runs
+    // `poststop` hooks as part of tearing a container down (see
+    // `docs/design/0089`) — best-effort for the same reason
+    // `remove_cgroup_directory_if_any` already is: a moved/removed
+    // bundle shouldn't stop `delete` itself from succeeding.
+    if let Ok(bundle) = oci_runtime_core::Bundle::load(&state.bundle) {
+        oci_runtime_core::launch::run_poststop_hooks(&bundle, id);
+    }
     store.remove(id)?;
     Ok(())
 }

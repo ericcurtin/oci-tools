@@ -374,6 +374,38 @@ fn run_lifecycle_hooks(bundle: &Bundle, id: &str, pid: i32, status: &str, which:
     }
 }
 
+/// Run `bundle.spec.hooks`'s `poststart` list with `pid`/status
+/// `"running"` — the same logic [`run_reporting_pid`] already uses
+/// internally for plain `run`, exposed here for `ocirun start`'s own
+/// separate two-phase-lifecycle call site (see `docs/design/0089`):
+/// real runc's own `Container.exec()` (called by both `Run` and the
+/// separate `Exec`/`start`) signals the exec fifo and *then* runs
+/// `postStart()` — checked directly against
+/// `~/git/runc/libcontainer/container_linux.go`, not assumed — so
+/// `ocirun start` doing the same right after
+/// [`crate::exec_fifo::signal_start`] matches exactly. A failure is
+/// logged and tolerated, never fails the `start` command itself —
+/// same "a broken notify/cleanup script isn't a reason to report an
+/// otherwise-successful operation as failed" reasoning
+/// [`run_reporting_pid`] already applies to its own `run`-lifecycle
+/// `poststart` (a deliberate simplification from real runc, which
+/// actually kills the container on a failing `postStart()` — not
+/// followed here, for consistency with the `run` lifecycle's own
+/// already-established, more tolerant behavior).
+pub fn run_poststart_hooks(bundle: &Bundle, id: &str, pid: i32) {
+    run_lifecycle_hooks(bundle, id, pid, "running", &HookPoint::Poststart);
+}
+
+/// Run `bundle.spec.hooks`'s `poststop` list with `pid: 0`/status
+/// `"stopped"` — see [`run_poststart_hooks`]'s own doc comment for why
+/// this is exposed publicly (`ocirun delete`'s own two-phase-lifecycle
+/// call site), matching real runc's own `destroy()`, which always
+/// calls `runPoststopHooks` as part of tearing a container down
+/// (checked directly against `~/git/runc/libcontainer/state_linux.go`).
+pub fn run_poststop_hooks(bundle: &Bundle, id: &str) {
+    run_lifecycle_hooks(bundle, id, 0, "stopped", &HookPoint::Poststop);
+}
+
 /// Run `bundle.spec.hooks`'s `prestart` list, then its `createRuntime`
 /// list (in that order, matching real `crun`'s own `do_hooks` call
 /// sites — checked directly against
@@ -500,6 +532,18 @@ fn spawn_log_tee_thread(
 /// other backgrounded Unix process — no extra double-fork/
 /// daemonization step needed.
 ///
+/// Also runs `bundle.spec.hooks`'s `prestart`/`createRuntime` hooks
+/// (if any), synchronously, before returning — matching real runc's
+/// own `create`, which does the same (see `docs/design/0089`). Unlike
+/// those two, `createContainer`/`startContainer` need no extra
+/// handling here at all: they run unconditionally from inside
+/// [`ChildSetup::mount_pivot_and_exec`] regardless of which of `run`/
+/// `create` forked it (see `docs/design/0088`). `poststart`/`poststop`
+/// are *not* run here — they belong to `start`/`delete` respectively
+/// (see `docs/design/0089`, `crate::launch::run_poststart_hooks`/
+/// `run_poststop_hooks`), matching real runc's own `Container.exec()`/
+/// `destroy()` call sites exactly.
+///
 /// # Safety
 ///
 /// Same contract as [`run`].
@@ -516,13 +560,54 @@ pub unsafe fn create(
     child_setup.exec_fifo = Some(exec_fifo_path.to_path_buf());
     child_setup.pid_pipe_write = Some(write_fd);
 
+    // Same shape as [`run_reporting_pid`]'s own `hooks_ready_write` —
+    // see its own doc comment for exactly why this pipe exists at all.
+    // Real runc's own `create`/`run` both run `prestart`/`createRuntime`
+    // synchronously as part of container *creation* itself, before
+    // ever returning to their own caller (checked directly against
+    // `~/git/runc/libcontainer/process_linux.go`'s `procHooks` case,
+    // run from inside `c.start()`, which both `Container.Start`
+    // (`ocirun start`'s real-runc equivalent's own underlying call) and
+    // `Container.Run` call and wait on) — so `ocirun create` blocking
+    // on them here, before ever returning to its own caller, matches
+    // real runc exactly, not a deviation from the `run`-only 0035
+    // increment's own original scope.
+    let needs_pre_pivot_hooks = bundle
+        .spec
+        .hooks
+        .as_ref()
+        .is_some_and(|h| !h.prestart.is_empty() || !h.create_runtime.is_empty());
+    let hooks_ready_write = if needs_pre_pivot_hooks {
+        let (ready_read, ready_write) =
+            rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)?;
+        child_setup.hooks_ready_read = Some(ready_read);
+        Some(ready_write)
+    } else {
+        None
+    };
+
     // SAFETY: forwarded from this function's own contract. The direct
     // child's own pid is deliberately not what this function returns —
     // see the doc comment above.
     #[allow(unsafe_code)]
-    let _direct_child_pid = unsafe { process::fork(move || child_setup.run()) }?;
+    let direct_child_pid = unsafe { process::fork(move || child_setup.run()) }?;
 
-    read_container_pid(read_fd)
+    let container_pid = read_container_pid(read_fd)?;
+
+    // Same fatal-on-failure handling as `run_reporting_pid`'s own
+    // identical block — see its doc comment for why a failure here
+    // must kill the still-blocked child rather than leave it hanging
+    // forever on the very pipe this write end belongs to.
+    if let Some(write_fd) = &hooks_ready_write {
+        if let Err(e) = run_pre_pivot_hooks(bundle, id, container_pid) {
+            let _ = process::kill(container_pid, libc::SIGKILL);
+            let _ = process::wait(direct_child_pid);
+            return Err(e);
+        }
+        let _ = rustix::io::write(write_fd, b"\0");
+    }
+
+    Ok(container_pid)
 }
 
 /// Block until the container process (or its relay, if the pid

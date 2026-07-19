@@ -33,6 +33,25 @@ fn systemd_user_scope_available() -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
+/// Add a `hooks.<point>` entry to an already-`write_bundle`-built
+/// `config.json` that runs `/bin/sh -c "cat > <out>"` — dumping the
+/// hook's own stdin (the state JSON) verbatim into `out`. Same helper
+/// `ocirun_hooks.rs`'s own tests already use (kept as a small,
+/// deliberate per-file duplicate rather than a shared, cross-file
+/// export: neither file otherwise depends on the other).
+fn add_dump_state_hook(bundle_dir: &Path, point: &str, out: &Path) {
+    let config_path = bundle_dir.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["hooks"] = serde_json::json!({
+        point: [{
+            "path": "/bin/sh",
+            "args": ["sh", "-c", format!("cat > {}", out.display())],
+        }]
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+}
+
 #[test]
 fn create_start_kill_delete_lifecycle() {
     let Some(busybox) = busybox_path() else {
@@ -103,6 +122,177 @@ fn create_start_kill_delete_lifecycle() {
         !after.status.success(),
         "state should fail once deleted: {after:?}"
     );
+}
+
+/// `create` runs `prestart` then `createRuntime` synchronously, before
+/// ever returning — matching real runc's own `Container.Start`/`Run`
+/// (see `docs/design/0089`). Both write to the same shared,
+/// host-side order log (real `prestart`/`createRuntime` hooks run in
+/// the *runtime* namespace, same as `run`'s own equivalent test in
+/// `ocirun_hooks.rs`).
+#[test]
+fn create_runs_prestart_then_create_runtime_before_returning() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+    let log = bundle_dir.path().join("order.log");
+    let config_path = bundle_dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["hooks"] = serde_json::json!({
+        "prestart": [{"path": "/bin/sh", "args": ["sh", "-c", format!("echo prestart >> {}", log.display())]}],
+        "createRuntime": [{"path": "/bin/sh", "args": ["sh", "-c", format!("echo createRuntime >> {}", log.display())]}],
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let create = ocirun_create(root_dir.path(), bundle_dir.path(), "create-hooks-test");
+    assert!(
+        create.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    // Already true by the time `create` itself returns -- no polling
+    // needed, unlike hooks that run inside the container's own process.
+    let order = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        order, "prestart\ncreateRuntime\n",
+        "both hooks must have already run, in order, before create returns"
+    );
+
+    let kill = ocirun(root_dir.path(), &["kill", "create-hooks-test", "KILL"]);
+    assert!(kill.status.success());
+    wait_for_status(
+        root_dir.path(),
+        "create-hooks-test",
+        "stopped",
+        Duration::from_secs(5),
+    );
+    ocirun(root_dir.path(), &["delete", "create-hooks-test"]);
+}
+
+/// A failing `prestart` hook aborts `create` outright (matching real
+/// runc: `c.start()` returns the hook's own error, so `Container.
+/// Start`/`Run` never even reports a pid) -- no lingering state, no
+/// container process left behind.
+#[test]
+fn a_failing_prestart_hook_aborts_create_entirely() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+    let config_path = bundle_dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["hooks"] = serde_json::json!({
+        "prestart": [{"path": "/bin/sh", "args": ["sh", "-c", "exit 3"]}],
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let create = ocirun_create(root_dir.path(), bundle_dir.path(), "create-fail-hooks-test");
+    assert!(
+        !create.status.success(),
+        "a failing prestart hook must fail create: {create:?}"
+    );
+
+    let after = ocirun(root_dir.path(), &["state", "create-fail-hooks-test"]);
+    assert!(
+        !after.status.success(),
+        "no state should have been left behind after a failed create"
+    );
+}
+
+/// `start` runs `poststart` right after signalling the exec fifo, with
+/// a `"running"` status and the same real pid `ocirun state` reports —
+/// matching real runc's own `Container.exec()` (see `docs/design/0089`).
+#[test]
+fn start_runs_poststart_hook_with_a_running_state() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+    let out = bundle_dir.path().join("poststart-state.json");
+    add_dump_state_hook(bundle_dir.path(), "poststart", &out);
+
+    ocirun_create(root_dir.path(), bundle_dir.path(), "start-poststart-test");
+    let real_pid: i64 = {
+        let state = ocirun(root_dir.path(), &["state", "start-poststart-test"]);
+        let json: serde_json::Value = serde_json::from_slice(&state.stdout).unwrap();
+        json["pid"].as_i64().unwrap()
+    };
+
+    let start = ocirun(root_dir.path(), &["start", "start-poststart-test"]);
+    assert!(
+        start.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&out).unwrap()).expect("hook's stdin wasn't JSON");
+    assert_eq!(state["id"], "start-poststart-test");
+    assert_eq!(state["status"], "running");
+    assert_eq!(state["pid"].as_i64().unwrap(), real_pid);
+
+    let kill = ocirun(root_dir.path(), &["kill", "start-poststart-test", "KILL"]);
+    assert!(kill.status.success());
+    wait_for_status(
+        root_dir.path(),
+        "start-poststart-test",
+        "stopped",
+        Duration::from_secs(5),
+    );
+    ocirun(root_dir.path(), &["delete", "start-poststart-test"]);
+}
+
+/// `delete` runs `poststop` with a `"stopped"` status and `pid: 0` —
+/// matching real runc's own `destroy()`, which always runs it as part
+/// of tearing a container down (see `docs/design/0089`).
+#[test]
+fn delete_runs_poststop_hook_with_a_stopped_state() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+    let out = bundle_dir.path().join("poststop-state.json");
+    add_dump_state_hook(bundle_dir.path(), "poststop", &out);
+
+    ocirun_create(root_dir.path(), bundle_dir.path(), "delete-poststop-test");
+    let start = ocirun(root_dir.path(), &["start", "delete-poststop-test"]);
+    assert!(start.status.success());
+    let kill = ocirun(root_dir.path(), &["kill", "delete-poststop-test", "KILL"]);
+    assert!(kill.status.success());
+    wait_for_status(
+        root_dir.path(),
+        "delete-poststop-test",
+        "stopped",
+        Duration::from_secs(5),
+    );
+
+    let delete = ocirun(root_dir.path(), &["delete", "delete-poststop-test"]);
+    assert!(
+        delete.status.success(),
+        "delete failed: {}",
+        String::from_utf8_lossy(&delete.stderr)
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&out).unwrap()).expect("hook's stdin wasn't JSON");
+    assert_eq!(state["id"], "delete-poststop-test");
+    assert_eq!(state["status"], "stopped");
+    assert_eq!(state["pid"], 0);
 }
 
 /// `create --pid-file` writes the real container pid, atomically
