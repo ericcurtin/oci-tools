@@ -431,6 +431,17 @@ enum Command {
         #[arg(short, long, default_value = "KILL")]
         signal: String,
     },
+    /// Block until a container stops, then print its exit code —
+    /// matching real `docker wait`/`podman wait`. Returns immediately
+    /// (still printing the exit code) if the container has already
+    /// stopped.
+    Wait {
+        /// The container's ID or `--name`.
+        id: String,
+        /// Milliseconds to sleep between polls.
+        #[arg(short, long, default_value_t = 250)]
+        interval: u64,
+    },
     /// Run an additional process inside an already-running container,
     /// joining its existing namespaces.
     Exec {
@@ -548,6 +559,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
             Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, &signal),
             Some(Command::Kill { id, signal }) => cmd_kill(&id, &signal),
+            Some(Command::Wait { id, interval }) => cmd_wait(&id, interval),
             Some(Command::Exec {
                 id,
                 user,
@@ -1222,6 +1234,37 @@ fn cmd_kill(id: &str, signal: &str) -> anyhow::Result<()> {
 
     println!("{id}");
     Ok(())
+}
+
+/// Block until a container's own `effective_status()` becomes
+/// `Stopped` (returns immediately if it already is), then print its
+/// exit code — matching real `docker wait`/`podman wait` exactly
+/// (`~/git/podman/cmd/podman/containers/wait.go`: block, then print a
+/// bare exit-code integer per container, nothing else). The exit code
+/// itself is whatever `cmd_run`'s own foreground wait already recorded
+/// in [`ANNOTATION_EXIT_CODE`] (see its own doc comment) — `wait`
+/// needs no new state of its own at all, only a poll loop over
+/// already-persisted state. Prints `-1` in the (should not happen in
+/// practice) case the annotation is somehow missing once the
+/// container is genuinely stopped, rather than failing outright: the
+/// container really has stopped by then, so `wait` itself succeeding
+/// is still the more useful answer than an error.
+fn cmd_wait(id: &str, interval_ms: u64) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let resolved = resolve_container_id(&containers, id)?;
+    loop {
+        let state = containers.load(&resolved)?;
+        if state.effective_status() == Status::Stopped {
+            let exit_code: i32 = state
+                .annotations
+                .get(ANNOTATION_EXIT_CODE)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(-1);
+            println!("{exit_code}");
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+    }
 }
 
 /// Print a container's captured output (see `docs/design/0025`):
