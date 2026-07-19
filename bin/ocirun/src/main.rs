@@ -9,8 +9,11 @@
 //! `features` (real, checked support-surface introspection, see
 //! `features` module). `prestart`/`createRuntime`/`poststart`/
 //! `poststop` lifecycle hooks run for `run`; `createContainer`/
-//! `startContainer`, and hooks for the `create`/`start`/`kill`/
-//! `delete` lifecycle, remain — see `docs/design/0026`/`0035`.
+//! `startContainer` run for both `run` and the `create`/`start`
+//! two-phase lifecycle (shared code between the two, see
+//! `docs/design/0087`); `prestart`/`createRuntime`/`poststart`/
+//! `poststop` for the `create`/`start`/`kill`/`delete` lifecycle
+//! specifically still remain — see `docs/design/0026`/`0035`/`0087`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -376,7 +379,7 @@ fn cmd_create(
         // SAFETY: `ocirun`'s own process has not spawned any additional
         // threads by this point, same as `run`'s own safety note.
         #[allow(unsafe_code)]
-        let pid = unsafe { oci_runtime_core::launch::create(&loaded, &rootfs, &fifo_path) }
+        let pid = unsafe { oci_runtime_core::launch::create(id, &loaded, &rootfs, &fifo_path) }
             .context("creating container")?;
         Ok(pid)
     })();

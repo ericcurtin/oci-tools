@@ -94,17 +94,16 @@ pub struct Hook {
 /// (`~/go/pkg/mod/github.com/opencontainers/runtime-spec@.../specs-go/
 /// config.go`), not re-derived from the spec doc alone.
 ///
+/// All six real hook points are executed:
 /// [`Self::prestart`]/[`Self::create_runtime`]/[`Self::poststart`]/
-/// [`Self::poststop`] are executed by `oci_runtime_core::hooks` (see
+/// [`Self::poststop`] by `oci_runtime_core::hooks` (see
 /// `docs/design/0026`/`0035`); [`Self::create_container`]/
-/// [`Self::start_container`] still aren't — they need execution inside
-/// the container's own namespaces (a different mechanism from the
-/// "runtime namespace" hooks, which just need a synchronization point
-/// in the process that already forks the container, not namespace
-/// entry of any kind). All six are still parsed (and round-trip
-/// through `Spec`'s own `Serialize`/`Deserialize`) regardless, so a
-/// bundle that sets them doesn't silently lose them from `config.json`
-/// even though the two unimplemented ones are ignored at run time.
+/// [`Self::start_container`] execute inside the container's own
+/// namespaces instead (a different mechanism from the "runtime
+/// namespace" hooks, which just need a synchronization point in the
+/// process that already forks the container — see
+/// `oci_runtime_core::launch::ChildSetup::run_container_hooks`,
+/// `docs/design/0087`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Hooks {
     /// Deprecated in favor of [`Self::create_runtime`]; same timing.
@@ -121,7 +120,7 @@ pub struct Hooks {
     )]
     pub create_runtime: Vec<Hook>,
     /// Same timing as [`Self::create_runtime`], but run inside the
-    /// container's own namespaces. Not executed yet.
+    /// container's own namespaces.
     #[serde(
         rename = "createContainer",
         default,
@@ -129,7 +128,7 @@ pub struct Hooks {
     )]
     pub create_container: Vec<Hook>,
     /// Run inside the container's own namespaces, after `start` but
-    /// before the user's command executes. Not executed yet.
+    /// before the user's command executes.
     #[serde(
         rename = "startContainer",
         default,

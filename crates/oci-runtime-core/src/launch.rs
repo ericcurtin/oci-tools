@@ -13,14 +13,15 @@
 //! [`oci_mount::syscalls`] (the actual `mount(2)`/`pivot_root(2)` calls).
 //! This module is where they meet a real bundle for the first time.
 
+use std::collections::BTreeMap;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 
 use oci_spec_types::runtime::{
-    LinuxCapabilities, LinuxIdMapping, LinuxResources, LinuxSeccomp, NamespaceType, PosixRlimit,
-    User,
+    Hook, LinuxCapabilities, LinuxIdMapping, LinuxResources, LinuxSeccomp, NamespaceType,
+    PosixRlimit, User,
 };
 
 use crate::bundle::Bundle;
@@ -147,7 +148,7 @@ pub unsafe fn run_reporting_pid(
     cgroup_setup: CgroupSetup,
     on_pid: impl FnOnce(i32),
 ) -> io::Result<i32> {
-    let mut child_setup = build_child_setup(bundle, rootfs)?;
+    let mut child_setup = build_child_setup(bundle, rootfs, id)?;
     let (read_fd, write_fd) =
         rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)?;
     child_setup.pid_pipe_write = Some(write_fd);
@@ -288,7 +289,7 @@ pub unsafe fn run_reporting_pid(
     }
 
     on_pid(container_pid);
-    run_lifecycle_hooks(bundle, id, container_pid, "running", &Hook::Poststart);
+    run_lifecycle_hooks(bundle, id, container_pid, "running", &HookPoint::Poststart);
 
     let status = process::wait(direct_child_pid)?;
     if let Some(thread) = log_thread {
@@ -299,7 +300,7 @@ pub unsafe fn run_reporting_pid(
         let _ = thread.join();
     }
     remove_cgroup_directory_if_any(bundle);
-    run_lifecycle_hooks(bundle, id, 0, "stopped", &Hook::Poststop);
+    run_lifecycle_hooks(bundle, id, 0, "stopped", &HookPoint::Poststop);
     Ok(process::exit_code_from_wait_status(status))
 }
 
@@ -331,24 +332,24 @@ fn remove_cgroup_directory_if_any(bundle: &Bundle) {
 /// running — just selects which list off `bundle.spec.hooks` to use
 /// and whether a failing hook should still let the rest run
 /// ([`crate::hooks::run`]'s own `keep_going`).
-enum Hook {
+enum HookPoint {
     Poststart,
     Poststop,
 }
 
-/// Run `bundle.spec.hooks`'s `poststart`/`poststop` list (see [`Hook`])
+/// Run `bundle.spec.hooks`'s `poststart`/`poststop` list (see [`HookPoint`])
 /// with `id`/`pid`/`status` folded into the state JSON piped to each
 /// hook's stdin (see `crate::hooks::HookState`'s own doc comment for
 /// exactly which fields and why). A failure is logged via
 /// `tracing::warn!` and otherwise ignored — see this function's own
 /// caller's doc comment for why that's deliberate, not an oversight.
-fn run_lifecycle_hooks(bundle: &Bundle, id: &str, pid: i32, status: &str, which: &Hook) {
+fn run_lifecycle_hooks(bundle: &Bundle, id: &str, pid: i32, status: &str, which: &HookPoint) {
     let Some(hooks) = &bundle.spec.hooks else {
         return;
     };
     let (list, keep_going, name) = match which {
-        Hook::Poststart => (&hooks.poststart, false, "poststart"),
-        Hook::Poststop => (&hooks.poststop, true, "poststop"),
+        HookPoint::Poststart => (&hooks.poststart, false, "poststart"),
+        HookPoint::Poststop => (&hooks.poststop, true, "poststop"),
     };
     if list.is_empty() {
         return;
@@ -503,8 +504,13 @@ fn spawn_log_tee_thread(
 ///
 /// Same contract as [`run`].
 #[allow(unsafe_code)]
-pub unsafe fn create(bundle: &Bundle, rootfs: &Path, exec_fifo_path: &Path) -> io::Result<i32> {
-    let mut child_setup = build_child_setup(bundle, rootfs)?;
+pub unsafe fn create(
+    id: &str,
+    bundle: &Bundle,
+    rootfs: &Path,
+    exec_fifo_path: &Path,
+) -> io::Result<i32> {
+    let mut child_setup = build_child_setup(bundle, rootfs, id)?;
     let (read_fd, write_fd) =
         rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)?;
     child_setup.exec_fifo = Some(exec_fifo_path.to_path_buf());
@@ -545,7 +551,7 @@ fn read_container_pid(read_fd: rustix::fd::OwnedFd) -> io::Result<i32> {
 /// writes, and plan the rootfs setup sequence, bundled into a
 /// [`ChildSetup`] with `exec_fifo`/`pid_pipe_write` left unset (`run`'s
 /// shape); [`create`] fills those in afterward.
-fn build_child_setup(bundle: &Bundle, rootfs: &Path) -> io::Result<ChildSetup> {
+fn build_child_setup(bundle: &Bundle, rootfs: &Path, id: &str) -> io::Result<ChildSetup> {
     let process_spec = bundle
         .spec
         .process
@@ -592,6 +598,27 @@ fn build_child_setup(bundle: &Bundle, rootfs: &Path) -> io::Result<ChildSetup> {
         .unwrap_or_default();
 
     let plan = rootfs::plan_rootfs_setup(bundle, rootfs);
+
+    // Only actually populated when there's a real `createContainer`/
+    // `startContainer` hook to run — see `ContainerHooks`'s own doc
+    // comment for why, unlike `prestart`/`createRuntime`, these two
+    // need no synchronization pipe with the parent at all (they run
+    // directly in this same process, which already *is* the container
+    // namespace by the time `mount_pivot_and_exec` gets to them).
+    let container_hooks = bundle.spec.hooks.as_ref().and_then(|hooks| {
+        if hooks.create_container.is_empty() && hooks.start_container.is_empty() {
+            return None;
+        }
+        Some(ContainerHooks {
+            id: id.to_string(),
+            oci_version: bundle.spec.version.clone(),
+            bundle_path: bundle.path.display().to_string(),
+            annotations: bundle.spec.annotations.clone(),
+            create_container: hooks.create_container.clone(),
+            start_container: hooks.start_container.clone(),
+        })
+    });
+
     Ok(ChildSetup {
         flags,
         needs_self_mapping,
@@ -607,6 +634,7 @@ fn build_child_setup(bundle: &Bundle, rootfs: &Path) -> io::Result<ChildSetup> {
         seccomp: linux.and_then(|l| l.seccomp.clone()),
         exec_fifo: None,
         pid_pipe_write: None,
+        container_hooks,
         stdout_log_fd: None,
         stderr_log_fd: None,
         cgroup_ready_read: None,
@@ -615,6 +643,54 @@ fn build_child_setup(bundle: &Bundle, rootfs: &Path) -> io::Result<ChildSetup> {
         env: process_spec.env.clone(),
         cwd: process_spec.cwd.clone(),
     })
+}
+
+/// Everything needed to run `createContainer`/`startContainer` hooks
+/// (see `docs/design/0087`) — unlike `prestart`/`createRuntime`
+/// (`ChildSetup::hooks_ready_read`), these two run *directly inside*
+/// [`ChildSetup::mount_pivot_and_exec`] rather than being signaled to
+/// the parent, because the real spec requires them to execute inside
+/// the container's own namespaces (checked directly against real
+/// runc's `libcontainer/rootfs_linux.go`/`standard_init_linux.go`, not
+/// assumed): by the time `mount_pivot_and_exec` runs, this process
+/// already *is* in those namespaces (post-`unshare`, and post-relay-
+/// fork if a PID namespace was requested), so no extra synchronization
+/// with the parent is needed at all — a hook spawned here via
+/// `std::process::Command` (see `crate::hooks::run`) automatically
+/// inherits every one of them, exactly like a real `execve`'d hook
+/// process would. Only ever `Some` when `bundle.spec.hooks` has at
+/// least one `createContainer`/`startContainer` entry (the
+/// overwhelmingly common case — no bundle this project's own
+/// benchmark has ever used sets these — costs nothing beyond the one
+/// `Option` check the fields below already read from
+/// [`ChildSetup::container_hooks`]).
+struct ContainerHooks {
+    /// The container ID, for `crate::hooks::HookState::id`.
+    id: String,
+    /// `bundle.spec.version`, for `crate::hooks::HookState::oci_version`.
+    oci_version: String,
+    /// `bundle.path`, already rendered to a `String`, for
+    /// `crate::hooks::HookState::bundle`.
+    bundle_path: String,
+    /// `bundle.spec.annotations`, for
+    /// `crate::hooks::HookState::annotations`.
+    annotations: BTreeMap<String, String>,
+    /// Run right before the `RootfsAction::PivotRoot` step in
+    /// `ChildSetup::plan` — the real spec's own "after the container
+    /// has been created but before `pivot_root`" timing, status
+    /// `"creating"` (matching real runc's own
+    /// `s.Status = specs.StateCreating` at this exact call site).
+    create_container: Vec<Hook>,
+    /// Run right after the `exec_fifo` "start" wait unblocks, right
+    /// before the final `exec` — the real spec's own "after `start` is
+    /// called but before the container process is started" timing,
+    /// status `"created"` (matching real runc's own
+    /// `s.Status = specs.StateCreated` at this exact call site, right
+    /// after it writes to and closes its own exec-fifo equivalent).
+    /// For plain `run` (no separate `create`/`start`, `exec_fifo` is
+    /// always `None`), this still runs — there's no `start` to wait
+    /// for, but the timing relative to the final `exec` is identical.
+    start_container: Vec<Hook>,
 }
 
 /// Everything the forked child needs to `unshare`, map IDs, run the
@@ -642,6 +718,8 @@ struct ChildSetup {
     /// isn't necessarily this struct's own direct caller — see
     /// [`ChildSetup::run`]'s relay-fork note) to read back.
     pid_pipe_write: Option<rustix::fd::OwnedFd>,
+    /// See [`ContainerHooks`]'s own doc comment.
+    container_hooks: Option<ContainerHooks>,
     /// Set by [`run_reporting_pid`] (via [`setup_log_tee_pipe`]) when a
     /// log path was given: the write end of the pipe whose read end a
     /// background thread in the *caller's* process tees to both a log
@@ -810,6 +888,48 @@ impl ChildSetup {
         }
     }
 
+    /// Run `hooks` (either `createContainer` or `startContainer`'s own
+    /// list) directly in this process — already inside the container's
+    /// own to-be-pivoted namespaces at both call sites, see
+    /// [`ContainerHooks`]'s own doc comment — with `status` folded
+    /// into the state JSON exactly like `run_pre_pivot_hooks`/
+    /// `run_lifecycle_hooks` already do for the other four hook
+    /// points. A failure is **fatal** (`fail`, never returns), matching
+    /// `prestart`/`createRuntime`'s own semantics: these hook points
+    /// exist specifically so a hook can reject the container before it
+    /// actually runs the user's command, so silently continuing would
+    /// defeat their entire purpose.
+    fn run_container_hooks(&self, hooks: &[Hook], status: &str, name: &str) {
+        let Some(ctx) = &self.container_hooks else {
+            return;
+        };
+        // SAFETY: `getpid()` has no safety requirements. Always the
+        // real container init pid here: `mount_pivot_and_exec` only
+        // ever runs in the process that actually becomes the
+        // container's pid-namespace pid 1 (the relay-forked
+        // grandchild) or, with no PID namespace requested, this same
+        // direct child — never the relay itself.
+        let pid = rustix::process::getpid().as_raw_nonzero().get();
+        let state = crate::hooks::HookState {
+            oci_version: &ctx.oci_version,
+            id: &ctx.id,
+            status,
+            pid,
+            bundle: ctx.bundle_path.clone(),
+            annotations: ctx.annotations.clone(),
+        };
+        let state_json = match serde_json::to_vec(&state) {
+            Ok(json) => json,
+            Err(e) => fail(
+                SETUP_FAILURE_EXIT_CODE,
+                &format!("serializing {name} hook state: {e}"),
+            ),
+        };
+        if let Err(e) = crate::hooks::run(hooks, &state_json, false) {
+            fail(SETUP_FAILURE_EXIT_CODE, &format!("{name} hook failed: {e}"));
+        }
+    }
+
     /// Run the planned rootfs setup, then `exec` the container's
     /// process. Never returns: a successful `exec` replaces the process
     /// image outright, and any failure along the way prints an error and
@@ -843,6 +963,18 @@ impl ChildSetup {
         });
 
         for action in &self.plan {
+            // The real spec's own "after the container has been
+            // created but before `pivot_root`" timing for
+            // `createContainer` — run right before executing that one
+            // planned action, still inside the not-yet-pivoted
+            // rootfs, exactly like real runc's own call site (see
+            // `ContainerHooks::create_container`'s own doc comment).
+            if matches!(action, RootfsAction::PivotRoot { .. })
+                && let Some(ctx) = &self.container_hooks
+                && !ctx.create_container.is_empty()
+            {
+                self.run_container_hooks(&ctx.create_container, "creating", "createContainer");
+            }
             if let Err(e) = execute_rootfs_action(action) {
                 fail(SETUP_FAILURE_EXIT_CODE, &format!("{action:?}: {e}"));
             }
@@ -878,6 +1010,15 @@ impl ChildSetup {
             && let Err(e) = exec_fifo::wait_for_start(fd)
         {
             fail(SETUP_FAILURE_EXIT_CODE, &format!("waiting for start: {e}"));
+        }
+
+        // The real spec's own "after `start` is called but before the
+        // container process is started" timing for `startContainer` —
+        // see `ContainerHooks::start_container`'s own doc comment.
+        if let Some(ctx) = &self.container_hooks
+            && !ctx.start_container.is_empty()
+        {
+            self.run_container_hooks(&ctx.start_container, "created", "startContainer");
         }
 
         let mut command = std::process::Command::new(&self.args[0]);

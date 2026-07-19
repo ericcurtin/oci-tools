@@ -1,11 +1,14 @@
-//! `ocirun run` lifecycle hook tests: `poststart`/`poststop`/
-//! `prestart`/`createRuntime`, four of the six real hook points this
-//! project executes (see `docs/design/0026`/`0035`; `createContainer`/
-//! `startContainer` still aren't). Real hook processes run in the
-//! *runtime* namespace (the host, not the container), so a hook can
-//! write to an ordinary host-side temp file to prove it ran and with
-//! what state — no container rootfs involvement needed for the hook
-//! side of things.
+//! `ocirun run` lifecycle hook tests: all six real hook points this
+//! project executes (see `docs/design/0026`/`0035`/`0087`).
+//! `poststart`/`poststop`/`prestart`/`createRuntime` hook processes run
+//! in the *runtime* namespace (the host, not the container), so a hook
+//! can write to an ordinary host-side temp file to prove it ran and
+//! with what state — no container rootfs involvement needed for the
+//! hook side of things. `createContainer` also runs before
+//! `pivot_root` (same as `prestart`/`createRuntime`), so
+//! `add_dump_state_hook` works unchanged for it too;
+//! `startContainer` runs *after* `pivot_root`, so those hooks write
+//! into the container's own rootfs instead (see its own tests below).
 
 use std::path::Path;
 use std::process::Command;
@@ -232,6 +235,150 @@ fn a_failing_prestart_hook_aborts_the_container_entirely() {
     assert!(
         !should_not_run.exists(),
         "createRuntime must never run once prestart has already failed"
+    );
+}
+
+#[test]
+fn create_container_hook_receives_a_creating_state_with_host_paths_still_visible() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(dir.path(), &busybox, &["/bin/sh", "-c", "true"]);
+    // A real, host-only path -- `createContainer` runs before
+    // `pivot_root`, so it still sees the same filesystem view the
+    // runtime process itself does (matching real runc's own
+    // `s.Status = specs.StateCreating`, checked directly against
+    // `~/git/runc/libcontainer/rootfs_linux.go`, not assumed).
+    let out = dir.path().join("create-container-state.json");
+    add_dump_state_hook(dir.path(), "createContainer", &out);
+
+    let result = ocirun_run(dir.path(), "hooks-create-container-test");
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&out).unwrap()).expect("hook's stdin wasn't JSON");
+    assert_eq!(state["id"], "hooks-create-container-test");
+    assert_eq!(state["status"], "creating");
+    assert!(
+        state["pid"].as_i64().unwrap() > 0,
+        "expected a real pid: {state:?}"
+    );
+    assert_eq!(state["bundle"], dir.path().to_string_lossy().as_ref());
+}
+
+#[test]
+fn start_container_hook_receives_a_created_state_and_runs_inside_the_containers_own_rootfs() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(dir.path(), &busybox, &["/bin/sh", "-c", "true"]);
+    // `startContainer` runs *after* `pivot_root`: it sees the
+    // container's own root, not the host's -- checked directly against
+    // a real kernel first (see `docs/design/0087`), not assumed. A
+    // real, host-only path like `dir.path()` would not be reachable
+    // from here at all; the hook instead writes to `/` (its own,
+    // already-pivoted root), which the test reads back afterward at
+    // `rootfs/...` from the host side, since it's the very same
+    // underlying directory.
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    // The default rootless spec sets `root.readonly: true`; a hook
+    // that needs to write into the container's own rootfs needs it
+    // writable, same as the container's own command would.
+    config["root"]["readonly"] = serde_json::json!(false);
+    config["hooks"] = serde_json::json!({
+        "startContainer": [{"path": "/bin/sh", "args": ["sh", "-c", "cat > /start-container-state.json"]}]
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let result = ocirun_run(dir.path(), "hooks-start-container-test");
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let out = dir.path().join("rootfs/start-container-state.json");
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&out).unwrap()).expect("hook's stdin wasn't JSON");
+    assert_eq!(state["id"], "hooks-start-container-test");
+    assert_eq!(state["status"], "created");
+    assert!(
+        state["pid"].as_i64().unwrap() > 0,
+        "expected a real pid: {state:?}"
+    );
+}
+
+#[test]
+fn a_failing_create_container_hook_aborts_the_container_and_start_container_never_runs() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(dir.path(), &busybox, &["/bin/sh", "-c", "true"]);
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["root"]["readonly"] = serde_json::json!(false);
+    config["hooks"] = serde_json::json!({
+        "createContainer": [{"path": "/bin/sh", "args": ["sh", "-c", "exit 9"]}],
+        "startContainer": [{"path": "/bin/sh", "args": ["sh", "-c", "touch /should-not-run"]}],
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let result = ocirun_run(dir.path(), "hooks-failing-create-container-test");
+    assert!(
+        !result.status.success(),
+        "a failing createContainer hook must fail the whole `ocirun run`: {result:?}"
+    );
+    assert!(
+        !dir.path().join("rootfs/should-not-run").exists(),
+        "startContainer must never run once createContainer has already failed"
+    );
+}
+
+#[test]
+fn create_container_runs_before_start_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(dir.path(), &busybox, &["/bin/sh", "-c", "true"]);
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["root"]["readonly"] = serde_json::json!(false);
+    // `createContainer` runs pre-pivot (host paths visible);
+    // `startContainer` runs post-pivot (container paths only) -- so
+    // the shared order log has to live inside the container's own
+    // rootfs, reachable from both sides either way.
+    config["hooks"] = serde_json::json!({
+        "createContainer": [{"path": "/bin/sh", "args": ["sh", "-c", format!("echo createContainer >> {}/rootfs/order.log", dir.path().display())]}],
+        "startContainer": [{"path": "/bin/sh", "args": ["sh", "-c", "echo startContainer >> /order.log"]}],
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let result = ocirun_run(dir.path(), "hooks-create-start-order-test");
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let order = std::fs::read_to_string(dir.path().join("rootfs/order.log")).unwrap();
+    assert_eq!(
+        order, "createContainer\nstartContainer\n",
+        "createContainer must run, and finish, before startContainer"
     );
 }
 
