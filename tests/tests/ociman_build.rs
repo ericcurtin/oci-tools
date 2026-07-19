@@ -507,3 +507,287 @@ fn explicit_file_flag_overrides_the_default_search() {
         Some("explicit")
     );
 }
+
+/// A real, end-to-end `COPY`: a plain file, a whole directory (whose
+/// own *contents*, not the directory itself, must land inside the
+/// destination), and a relative destination resolved against a prior
+/// `WORKDIR` -- each committed as its own real new layer, then the
+/// built image is actually run to confirm every file really is there
+/// with the right content.
+#[test]
+fn copy_copies_real_files_and_directories_from_the_build_context() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copy-base:latest",
+        &busybox,
+        &["sh", "cat", "ls"],
+        ContainerConfig::default(),
+    );
+    let base_record = store
+        .resolve_image("docker.io/ociman-test/copy-base:latest")
+        .unwrap()
+        .unwrap();
+    let base_manifest = store.image_manifest(&base_record).unwrap();
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("hello.txt"), "file content\n").unwrap();
+    std::fs::create_dir(context_dir.path().join("subdir")).unwrap();
+    std::fs::write(
+        context_dir.path().join("subdir").join("nested.txt"),
+        "nested content\n",
+    )
+    .unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copy-base:latest\n\
+         COPY hello.txt /hello.txt\n\
+         COPY subdir /app/subdir\n\
+         WORKDIR /app\n\
+         COPY hello.txt into-workdir.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/copy-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/copy-result:latest")
+        .unwrap()
+        .unwrap();
+    let manifest = store.image_manifest(&record).unwrap();
+    // Three real COPY steps -> three new layers on top of the base
+    // image's own (this seeded image has exactly one).
+    assert_eq!(manifest.layers.len(), base_manifest.layers.len() + 3);
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/copy-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /hello.txt && cat /app/subdir/nested.txt && cat /app/into-workdir.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "file content\nnested content\nfile content\n"
+    );
+}
+
+/// Copying a file into a destination that already exists as a
+/// directory (no trailing `/` needed) places it inside, under its own
+/// basename -- matching real Docker/`cp` semantics, exercised
+/// separately from the "destination doesn't exist yet" case above.
+#[test]
+fn copy_into_an_existing_directory_keeps_the_sources_own_basename() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copy-existing-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("hello.txt"), "file content\n").unwrap();
+    std::fs::create_dir(context_dir.path().join("subdir")).unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copy-existing-base:latest\n\
+         COPY subdir /app/subdir\n\
+         COPY hello.txt /app/subdir\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/copy-existing-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/copy-existing-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /app/subdir/hello.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "file content\n");
+}
+
+#[test]
+fn copy_rejects_a_source_that_escapes_the_build_context() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copy-escape-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copy-escape-base:latest\nCOPY ../outside.txt /outside.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "x:latest",
+        ],
+    );
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(stderr.contains("escapes its own root"), "{stderr}");
+}
+
+#[test]
+fn copy_rejects_unsupported_flags_multiple_sources_and_globs() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copy-reject-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let cases = [
+        ("COPY --chown=1000:1000 a.txt /a.txt\n", "--chown"),
+        ("COPY --chmod=755 a.txt /a.txt\n", "--chmod"),
+        ("COPY --from=builder a.txt /a.txt\n", "--from"),
+        ("COPY a.txt b.txt /dest/\n", "more than one source"),
+        ("COPY *.txt /dest/\n", "wildcard"),
+    ];
+    for (instruction, expected_error_fragment) in cases {
+        let context_dir = tempfile::tempdir().unwrap();
+        std::fs::write(context_dir.path().join("a.txt"), "a").unwrap();
+        std::fs::write(context_dir.path().join("b.txt"), "b").unwrap();
+        write_containerfile(
+            context_dir.path(),
+            &format!("FROM ociman-test/copy-reject-base:latest\n{instruction}"),
+        );
+        let build = ociman(
+            storage_dir.path(),
+            &[
+                "build",
+                context_dir.path().to_str().unwrap(),
+                "-t",
+                "x:latest",
+            ],
+        );
+        assert!(!build.status.success(), "{instruction:?} should fail");
+        let stderr = String::from_utf8_lossy(&build.stderr);
+        assert!(
+            stderr.contains(expected_error_fragment),
+            "{instruction:?}: expected {expected_error_fragment:?} in {stderr}"
+        );
+    }
+}
+
+#[test]
+fn copy_rejects_a_missing_source() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copy-missing-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copy-missing-base:latest\nCOPY does-not-exist.txt /foo.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/should-fail:latest",
+        ],
+    );
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(stderr.contains("does not exist"), "{stderr}");
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/should-fail:latest")
+            .unwrap()
+            .is_none(),
+        "a failed build must not leave a partial image tagged"
+    );
+}

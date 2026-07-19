@@ -13,22 +13,33 @@
 //!   compute the dependency-ordered build plan a multi-stage build
 //!   would need, but nothing here drives that plan yet (a later
 //!   increment).
-//! * **`RUN` is supported; `COPY`/`ADD` are not yet.** A `RUN` step
-//!   materializes the base image's own layers into a real, persistent
-//!   scratch rootfs (created once per build, reused cumulatively
-//!   across every `RUN` in the same stage), runs the instruction's own
-//!   command in it via `oci_runtime_core::launch::run` (the same
-//!   namespace/rootless-uid-mapping/seccomp machinery `ocirun run`/
-//!   `ociman run` already use), diffs the rootfs before/after via
-//!   `oci_layer::{Snapshot,changes}`, and commits the result as a real
-//!   new layer via `oci_dockerfile::commit_layer`/`record_layer` (0048/
-//!   0049). A nonzero exit aborts the whole build, matching real
-//!   `docker build`/`podman build`. `COPY`/`ADD` still need real
-//!   build-context file access this increment doesn't set up yet —
-//!   rejected with a clear error rather than silently skipped or
-//!   misexecuted, matching this project's own established convention
-//!   for a deliberately unimplemented construct (e.g. `ONBUILD`/
-//!   `HEALTHCHECK` at parse time).
+//! * **`RUN` is supported.** A `RUN` step materializes the base
+//!   image's own layers into a real, persistent scratch rootfs
+//!   (created once per build, reused cumulatively across every `RUN`/
+//!   `COPY` in the same stage), runs the instruction's own command in
+//!   it via `oci_runtime_core::launch::run` (the same namespace/
+//!   rootless-uid-mapping/seccomp machinery `ocirun run`/`ociman run`
+//!   already use), diffs the rootfs before/after via `oci_layer::
+//!   {Snapshot,changes}`, and commits the result as a real new layer
+//!   via `oci_dockerfile::commit_layer`/`record_layer` (0048/0049). A
+//!   nonzero exit aborts the whole build, matching real `docker
+//!   build`/`podman build`.
+//! * **`COPY` from the build context is supported, narrowly.** Exactly
+//!   one source at a time (no multiple sources yet), no glob patterns,
+//!   no `--from=<stage-or-image>` (only single-stage builds exist so
+//!   far anyway), no `--chown`/`--chmod` (this project's own rootless
+//!   single-uid-mapping design, and `oci_layer::apply`'s own
+//!   already-documented "doesn't chown" scope limit, apply equally
+//!   here) — each rejected with a clear error rather than silently
+//!   ignored. A supported `COPY` commits a real new layer exactly like
+//!   `RUN` does (via the same diff/`commit_layer`/`record_layer`
+//!   path), just from a plain recursive file copy instead of running a
+//!   command. `ADD` (which also fetches remote URLs and auto-extracts
+//!   local archives, on top of everything `COPY` does) is not
+//!   implemented at all yet — rejected with a clear error, matching
+//!   this project's own established convention for a deliberately
+//!   unimplemented construct (e.g. `ONBUILD`/`HEALTHCHECK` at parse
+//!   time).
 //! * **`FROM scratch` is rejected too** (no base image to extend —
 //!   producing a genuinely empty rootfs is its own future increment).
 //! * **`-t`/`--tag` is required.** A real, taggable image needs a
@@ -51,7 +62,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use oci_dockerfile::{Instruction, ShellOrExec, commit_layer, record_layer};
+use oci_dockerfile::{CopyFlags, Instruction, ShellOrExec, commit_layer, record_layer};
 use oci_spec_types::Reference;
 use oci_spec_types::image::{
     ContainerConfig, Descriptor, ImageConfig, ImageManifest, MEDIA_TYPE_IMAGE_CONFIG,
@@ -119,14 +130,14 @@ pub fn cmd_build(
     let mut layers = base_manifest.layers.clone();
 
     // A scratch rootfs is only materialized if this stage actually
-    // runs anything in it -- every instruction 0050 already supported
-    // (metadata-only) never touches the filesystem at all, so paying
-    // for a tempdir plus a full base-image layer extraction for those
+    // touches the filesystem (`RUN`/`COPY`) -- every metadata-only
+    // instruction 0050 already supported never does, so paying for a
+    // tempdir plus a full base-image layer extraction for those
     // Containerfiles would be pure waste.
     let needs_rootfs = stage
         .instructions
         .iter()
-        .any(|instruction| matches!(instruction, Instruction::Run(_)));
+        .any(|instruction| matches!(instruction, Instruction::Run(_) | Instruction::Copy { .. }));
     let build_dir = if needs_rootfs {
         let dir = tempfile::tempdir().context("creating build scratch directory")?;
         let rootfs_dir = dir.path().join("rootfs");
@@ -154,6 +165,7 @@ pub fn cmd_build(
             &mut layers,
             &store,
             rootfs_dir.as_deref(),
+            context,
         )?;
     }
 
@@ -225,17 +237,18 @@ fn resolve_dockerfile_path(context: &Path, dockerfile: Option<&Path>) -> anyhow:
 }
 
 /// Apply one already-`$VAR`-expanded instruction to a working copy of
-/// the image config being built (and, for `RUN`, to `layers`/`store`/
-/// `rootfs` too). See this module's own doc comment for exactly which
-/// instructions are supported. `rootfs` is `Some` whenever the stage
-/// contains at least one `RUN` (see [`cmd_build`]); `Instruction::Run`
-/// is the only arm that ever needs it.
+/// the image config being built (and, for `RUN`/`COPY`, to `layers`/
+/// `store`/`rootfs`/`context` too). See this module's own doc comment
+/// for exactly which instructions are supported. `rootfs` is `Some`
+/// whenever the stage contains at least one `RUN`/`COPY` (see
+/// [`cmd_build`]); those are the only arms that ever need it.
 fn apply_instruction(
     instruction: &Instruction,
     config: &mut ImageConfig,
     layers: &mut Vec<Descriptor>,
     store: &oci_store::Store,
     rootfs: Option<&Path>,
+    context: &Path,
 ) -> anyhow::Result<()> {
     match instruction {
         Instruction::Run(shell_or_exec) => {
@@ -244,11 +257,20 @@ fn apply_instruction(
             );
             run_instruction(shell_or_exec, config, layers, store, rootfs)?;
         }
-        Instruction::Copy { .. } => anyhow::bail!(
-            "ociman build: COPY is not yet supported (no build-context file access wired in yet)"
-        ),
+        Instruction::Copy {
+            flags,
+            sources,
+            dest,
+        } => {
+            let rootfs = rootfs.expect(
+                "cmd_build always prepares a rootfs when the stage contains a COPY instruction",
+            );
+            copy_instruction(flags, sources, dest, config, layers, store, context, rootfs)?;
+        }
         Instruction::Add { .. } => anyhow::bail!(
-            "ociman build: ADD is not yet supported (no build-context file access wired in yet)"
+            "ociman build: ADD is not yet supported (COPY from the build context is; see this \
+             module's own doc comment for ADD's own still-missing remote-URL/archive-extraction \
+             behavior)"
         ),
         Instruction::From { .. } => {
             unreachable!("a stage's own instructions never include the FROM that started it")
@@ -437,6 +459,168 @@ fn run_step_spec(
     ));
 
     Ok(spec)
+}
+
+/// Copy one `COPY` instruction's own source (from the build context)
+/// into `rootfs`, commit the result as a real new layer exactly like
+/// [`run_instruction`] does (same diff/`commit_layer`/`record_layer`
+/// path), and record it into `config`/`layers`. See this module's own
+/// doc comment for exactly what's rejected (`--from`/`--chown`/
+/// `--chmod`, multiple sources, glob patterns) and why.
+#[allow(clippy::too_many_arguments)]
+fn copy_instruction(
+    flags: &CopyFlags,
+    sources: &[String],
+    dest: &str,
+    config: &mut ImageConfig,
+    layers: &mut Vec<Descriptor>,
+    store: &oci_store::Store,
+    context: &Path,
+    rootfs: &Path,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        flags.from.is_none(),
+        "ociman build: COPY --from is not yet supported (only copying from the build context \
+         is supported; only single-stage builds exist so far anyway)"
+    );
+    anyhow::ensure!(
+        flags.chown.is_none(),
+        "ociman build: COPY --chown is not yet supported"
+    );
+    anyhow::ensure!(
+        flags.chmod.is_none(),
+        "ociman build: COPY --chmod is not yet supported"
+    );
+    anyhow::ensure!(
+        sources.len() == 1,
+        "ociman build: COPY with more than one source is not yet supported"
+    );
+    let source = &sources[0];
+    anyhow::ensure!(
+        !source.contains(['*', '?', '[']),
+        "ociman build: COPY wildcard patterns are not yet supported ({source:?})"
+    );
+    let command_text = format!("COPY {source} {dest}");
+
+    // Real Docker/BuildKit rule, checked directly (`parser.go`'s own
+    // `parseCopy`): a source path is always relative to the build
+    // context, even one written with a leading `/` -- `COPY /foo
+    // /bar` copies `<context>/foo`, never a host-absolute `/foo`.
+    let source_path = safe_join(context, source.trim_start_matches('/'))
+        .with_context(|| format!("resolving COPY source {source:?}"))?;
+    anyhow::ensure!(
+        source_path.exists(),
+        "COPY source {source:?} does not exist in the build context ({})",
+        context.display()
+    );
+
+    // A relative destination is resolved against the working
+    // directory currently in effect, same as a `RUN` step's own `cwd`
+    // -- reusing `resolve_workdir`'s own join-then-normalize logic
+    // exactly (an in-container path is an in-container path, whether
+    // it's a process's `cwd` or a `COPY` destination).
+    let container_config = config.config.clone().unwrap_or_default();
+    let resolved_dest = resolve_workdir(container_config.working_dir.as_deref(), dest);
+    let dest_path = safe_join(rootfs, resolved_dest.trim_start_matches('/'))
+        .with_context(|| format!("resolving COPY destination {dest:?}"))?;
+
+    let source_metadata = std::fs::symlink_metadata(&source_path)
+        .with_context(|| format!("reading metadata for {}", source_path.display()))?;
+    // Real Docker rule: a directory source's own *contents* land
+    // inside `dest` (never renaming the directory itself); a file
+    // source is renamed to `dest` outright unless `dest` is written
+    // with a trailing `/` or already exists as a directory, in which
+    // case it's copied into `dest` under its own basename instead.
+    let target = if source_metadata.is_dir() || dest.ends_with('/') || dest_path.is_dir() {
+        if source_metadata.is_dir() {
+            dest_path.clone()
+        } else {
+            let file_name = source_path
+                .file_name()
+                .with_context(|| format!("COPY source {source:?} has no file name"))?;
+            dest_path.join(file_name)
+        }
+    } else {
+        dest_path.clone()
+    };
+
+    let before = oci_layer::Snapshot::capture(rootfs)
+        .with_context(|| format!("capturing rootfs state before {command_text}"))?;
+    copy_path_recursive(&source_path, &target)
+        .with_context(|| format!("copying {} to {}", source_path.display(), target.display()))?;
+    let diff = oci_layer::changes(rootfs, &before)
+        .with_context(|| format!("diffing rootfs after {command_text}"))?;
+    let committed = commit_layer(store, rootfs, &diff)
+        .with_context(|| format!("committing layer for {command_text}"))?;
+    record_layer(config, layers, &committed, command_text);
+    Ok(())
+}
+
+/// Join `relative` onto `base`, rejecting any `..` component that
+/// would escape it (a `COPY` source escaping the build context, or a
+/// destination escaping the rootfs, would otherwise let a Containerfile
+/// read or write arbitrary host paths). A leading `/` in `relative` is
+/// treated as context/rootfs-rooted, not host-absolute — see
+/// [`copy_instruction`]'s own doc comment on why `COPY /foo` doesn't
+/// mean the host's own `/foo`.
+fn safe_join(base: &Path, relative: &str) -> anyhow::Result<PathBuf> {
+    let mut out = base.to_path_buf();
+    for component in Path::new(relative).components() {
+        match component {
+            std::path::Component::Normal(part) => out.push(part),
+            std::path::Component::CurDir | std::path::Component::RootDir => {}
+            std::path::Component::ParentDir => {
+                anyhow::bail!("path {relative:?} escapes its own root with a `..` component")
+            }
+            std::path::Component::Prefix(_) => {
+                anyhow::bail!("path {relative:?} has an unsupported (Windows-style) prefix")
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Recursively copy `src` to `dest`: a directory is created and its
+/// own entries copied in one by one (so a directory `src` lands as
+/// `dest`'s own *contents*, not `dest/<src's own name>` — the caller
+/// decides that distinction by choosing `dest` itself, not this
+/// function); a symlink is recreated as a symlink, not followed
+/// (matching `oci_layer::apply`'s own established stance); a regular
+/// file is copied with `std::fs::copy`, which already preserves the
+/// source's own permission bits (matching `oci_layer::apply`'s own
+/// documented "keeps permission bits, doesn't chown" stance —
+/// consistent scope limit on both the read and write side of this
+/// project's own layer handling).
+fn copy_path_recursive(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(src)
+        .with_context(|| format!("reading metadata for {}", src.display()))?;
+    if metadata.is_dir() {
+        std::fs::create_dir_all(dest)
+            .with_context(|| format!("creating directory {}", dest.display()))?;
+        for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
+            let entry = entry.with_context(|| format!("reading {}", src.display()))?;
+            copy_path_recursive(&entry.path(), &dest.join(entry.file_name()))?;
+        }
+    } else if metadata.file_type().is_symlink() {
+        let link_target = std::fs::read_link(src)
+            .with_context(|| format!("reading symlink {}", src.display()))?;
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let _ = std::fs::remove_file(dest);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&link_target, dest)
+            .with_context(|| format!("creating symlink {}", dest.display()))?;
+    } else {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::copy(src, dest)
+            .with_context(|| format!("copying {} to {}", src.display(), dest.display()))?;
+    }
+    Ok(())
 }
 
 /// `docker`/`podman build`'s own shell-form wrapping: a shell-form
