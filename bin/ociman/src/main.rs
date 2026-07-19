@@ -9,8 +9,11 @@
 //!
 //! Milestone plan: `pull`/`images`/`inspect`/`run`/`ps`/`rm`/`stop`/
 //! `exec`/`logs` rootless (milestone 3, shipped); `build` (milestone
-//! 4), then the full podman-style v1 command set.
+//! 4, first increment shipped — see [`build`]'s own doc comment for
+//! its current, deliberately narrow scope), then the full podman-style
+//! v1 command set.
 
+mod build;
 mod user_resolve;
 
 use std::path::Path;
@@ -61,8 +64,8 @@ struct Cli {
     command: Option<Command>,
 }
 
-/// Subcommands shipped so far. `build` and the rest of the
-/// podman-style surface arrive with later milestones.
+/// Subcommands shipped so far. The rest of the podman-style surface
+/// arrives with later milestones.
 #[derive(Debug, clap::Subcommand)]
 enum Command {
     /// Pull an image from a registry into local storage.
@@ -70,6 +73,25 @@ enum Command {
         /// Image reference, e.g. `ubuntu`, `ubuntu:24.04`, or
         /// `quay.io/foo/bar@sha256:...`.
         reference: String,
+    },
+    /// Build an image from a Dockerfile/Containerfile. See the
+    /// `build` module's own doc comment for this first increment's
+    /// deliberately narrow scope (single-stage only, no `RUN`/`COPY`/
+    /// `ADD` yet).
+    Build {
+        /// Build context directory.
+        #[arg(default_value = ".")]
+        context: std::path::PathBuf,
+        /// Path to the Dockerfile/Containerfile (default: the
+        /// context's own `Containerfile`, falling back to
+        /// `Dockerfile`, matching real `podman build`'s own
+        /// preference).
+        #[arg(short = 'f', long = "file")]
+        file: Option<std::path::PathBuf>,
+        /// Tag the built image (`name[:tag]`) — currently required
+        /// (see the `build` module's own doc comment for why).
+        #[arg(short = 't', long = "tag")]
+        tag: Option<String>,
     },
     /// List images in local storage.
     Images,
@@ -210,10 +232,13 @@ fn main() -> std::process::ExitCode {
 
         match cli.command {
             None => anyhow::bail!(
-                "no command given; try `ociman --help` (`build` and the rest of the \
-                 podman-style surface arrive with later milestones)"
+                "no command given; try `ociman --help` (the rest of the podman-style surface \
+                 arrives with later milestones)"
             ),
             Some(Command::Pull { reference }) => cmd_pull(&reference, cli.global.json),
+            Some(Command::Build { context, file, tag }) => {
+                build::cmd_build(&context, file.as_deref(), tag.as_deref(), cli.global.json)
+            }
             Some(Command::Images) => cmd_images(cli.global.json),
             Some(Command::Inspect { reference }) => cmd_inspect(&reference, cli.global.json),
             Some(Command::Run {

@@ -897,6 +897,7 @@ dependencies = [
  "anyhow",
  "clap",
  "oci-cli-common",
+ "oci-dockerfile",
  "oci-layer",
  "oci-registry",
  "oci-runtime-core",
