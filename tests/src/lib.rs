@@ -14,7 +14,8 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use oci_spec_types::Reference;
 use oci_spec_types::digest::sha256;
@@ -178,4 +179,67 @@ pub fn seed_image(
             manifest_digest: manifest_ingested.digest,
         })
         .unwrap();
+}
+
+/// Run `ocirun --root <root> <args...>`, capturing its output.
+pub fn ocirun(root: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(bin_path("ocirun"))
+        .arg("--root")
+        .arg(root)
+        .args(args)
+        .env_remove("OCI_TOOLS_LOG")
+        .output()
+        .expect("failed to spawn ocirun")
+}
+
+/// `ocirun create <id> --bundle <bundle>`, with stdio explicitly
+/// detached from this test process's own captured pipes: `create`
+/// leaves the container's own process running in the background (see
+/// `docs/design/0017`), and it inherits whatever `create` had — a real
+/// pipe (like the one `Command::output()` otherwise sets up to capture
+/// output) would never see EOF until *every* process holding a copy of
+/// it exits, hanging this test process's own `output()` call for as
+/// long as the container itself keeps running. Caught by hitting
+/// exactly that hang once while manually verifying `create`/`start`
+/// against a real kernel, not foreseen in advance.
+pub fn ocirun_create(root: &Path, bundle: &Path, id: &str) -> std::process::Output {
+    Command::new(bin_path("ocirun"))
+        .arg("--root")
+        .arg(root)
+        .args(["create", id, "--bundle"])
+        .arg(bundle)
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .expect("failed to spawn ocirun create")
+}
+
+/// The `status` field from `ocirun state <id>` (as plain JSON output),
+/// asserting the command itself succeeded.
+pub fn state_status(root: &Path, id: &str) -> String {
+    let out = ocirun(root, &["state", id]);
+    assert!(
+        out.status.success(),
+        "ocirun state failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    json["status"].as_str().unwrap().to_string()
+}
+
+/// Poll [`state_status`] until it equals `want` or `timeout` elapses
+/// (status transitions — e.g. a killed container becoming "stopped" —
+/// aren't necessarily instantaneous from a separate process's point of
+/// view).
+pub fn wait_for_status(root: &Path, id: &str, want: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = state_status(root, id);
+        if status == want || Instant::now() >= deadline {
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

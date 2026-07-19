@@ -15,63 +15,11 @@
 //! once while manually verifying this against a real kernel, not
 //! foreseen in advance.
 
-use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use oci_tools_tests::{bin_path, busybox_path, write_bundle};
-
-fn ocirun(root: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(bin_path("ocirun"))
-        .arg("--root")
-        .arg(root)
-        .args(args)
-        .env_remove("OCI_TOOLS_LOG")
-        .output()
-        .expect("failed to spawn ocirun")
-}
-
-fn ocirun_create(root: &Path, bundle: &Path, id: &str) -> std::process::Output {
-    Command::new(bin_path("ocirun"))
-        .arg("--root")
-        .arg(root)
-        .args(["create", id, "--bundle"])
-        .arg(bundle)
-        .env_remove("OCI_TOOLS_LOG")
-        // See this file's own doc comment: the backgrounded container
-        // process inherits these, so they must not be an
-        // `output()`-captured pipe.
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .expect("failed to spawn ocirun create")
-}
-
-fn state_status(root: &Path, id: &str) -> String {
-    let out = ocirun(root, &["state", id]);
-    assert!(
-        out.status.success(),
-        "ocirun state failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    json["status"].as_str().unwrap().to_string()
-}
-
-/// Poll `state_status` until it equals `want` or `timeout` elapses
-/// (status transitions — e.g. a killed container becoming "stopped" —
-/// aren't necessarily instantaneous from this process's point of view).
-fn wait_for_status(root: &Path, id: &str, want: &str, timeout: Duration) -> String {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let status = state_status(root, id);
-        if status == want || Instant::now() >= deadline {
-            return status;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
+use oci_tools_tests::{
+    busybox_path, ocirun, ocirun_create, state_status, wait_for_status, write_bundle,
+};
 
 #[test]
 fn create_start_kill_delete_lifecycle() {

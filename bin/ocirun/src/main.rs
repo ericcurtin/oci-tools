@@ -2,10 +2,11 @@
 //!
 //! Thin, runc-CLI-compatible wrapper over `oci-runtime-core`, so it can be
 //! dropped into other engines. Shipped so far: `spec`, `state`, `list`,
-//! `run` (create-and-start in one step), and the separate `create`/
-//! `start`/`kill`/`delete` two-phase lifecycle (`exec` — running an
-//! *additional* process inside an already-running container — still
-//! isn't implemented).
+//! `run` (create-and-start in one step), the separate `create`/`start`/
+//! `kill`/`delete` two-phase lifecycle, and `exec` (running an
+//! *additional* process inside an already-running container, joining
+//! its existing namespaces rather than creating new ones). Lifecycle
+//! hooks (`prestart`/`createRuntime`/`startContainer`/...) remain.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -110,6 +111,16 @@ enum Command {
         #[arg(short, long)]
         force: bool,
     },
+    /// Run an additional process inside an already-running container,
+    /// joining its existing namespaces (rather than `create`/`run`,
+    /// which only ever start a container's *first* process).
+    Exec {
+        /// The container's ID.
+        id: String,
+        /// Command and arguments to run inside the container.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
 }
 
 /// Filename of the OCI runtime-spec bundle configuration, per the spec.
@@ -140,6 +151,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Start { id }) => cmd_start(&root, &id),
             Some(Command::Kill { id, signal }) => cmd_kill(&root, &id, signal.as_deref()),
             Some(Command::Delete { id, force }) => cmd_delete(&root, &id, force),
+            Some(Command::Exec { id, args }) => cmd_exec(&root, &id, &args),
         }
     })
 }
@@ -358,4 +370,59 @@ fn cmd_delete(root: &Path, id: &str, force: bool) -> anyhow::Result<()> {
 
     store.remove(id)?;
     Ok(())
+}
+
+fn cmd_exec(root: &Path, id: &str, args: &[String]) -> anyhow::Result<()> {
+    let store = StateStore::open(root)
+        .with_context(|| format!("opening container state root {}", root.display()))?;
+    let state = store.load(id)?;
+    let status = state.effective_status();
+    if status != Status::Running {
+        anyhow::bail!("cannot exec in a container in the {status} state");
+    }
+    let pid = state
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
+
+    // The exec'd process joins the *same* namespaces, user/capability
+    // set, working directory, and environment the container's own init
+    // process was given at `create`/`run` time — read back from its own
+    // bundle rather than re-specified on this command line, matching
+    // real `runc exec`'s default (no `--user`/`--cwd`/`--env` override
+    // support yet).
+    let bundle = oci_runtime_core::Bundle::load(Path::new(&state.bundle))
+        .with_context(|| format!("loading bundle from {}", state.bundle))?;
+    let process_spec = bundle
+        .spec
+        .process
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("bundle at {} has no process section", state.bundle))?;
+    let namespaces: Vec<_> = bundle
+        .spec
+        .linux
+        .as_ref()
+        .map_or(&[][..], |l| &l.namespaces)
+        .iter()
+        .map(|ns| ns.kind)
+        .collect();
+
+    let request = oci_runtime_core::exec::ExecRequest {
+        namespaces,
+        user: process_spec.user.clone(),
+        capabilities: process_spec.capabilities.clone(),
+        no_new_privileges: process_spec.no_new_privileges,
+        cwd: process_spec.cwd.clone(),
+        env: process_spec.env.clone(),
+        args: args.to_vec(),
+    };
+
+    // SAFETY: `ocirun`'s own process has not spawned any additional
+    // threads by this point, same as `run`'s/`create`'s own safety
+    // note.
+    #[allow(unsafe_code)]
+    let exit_code = unsafe { oci_runtime_core::exec::exec(pid, request) }.context("exec")?;
+
+    // The exec'd process's own exit code becomes ours, same convention
+    // `run`/`create` already follow.
+    std::process::exit(exit_code);
 }
