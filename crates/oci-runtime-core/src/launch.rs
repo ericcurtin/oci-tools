@@ -944,7 +944,34 @@ fn execute_rootfs_action(action: &RootfsAction) -> io::Result<()> {
             file_system_type,
             parsed,
         } => {
-            std::fs::create_dir_all(target)?;
+            // A bind mount whose *real* source is a regular file (e.g.
+            // `ociman run -v /etc/localtime:/etc/localtime:ro`) needs a
+            // regular-file target, not a directory — `mount(2)`
+            // rejects binding a file onto a directory (`ENOTDIR`).
+            // Checked directly against this crate's own
+            // `RootfsAction::BindMount` (used for `readonly_paths`/
+            // masked paths), which already makes exactly this
+            // distinction; `Mount` (this arm, used for every ordinary
+            // `spec.mounts` entry) didn't, before this fix — harmless
+            // for every mount this project ever generated on its own
+            // (`proc`/`tmpfs`/`sysfs`/`devpts`/`mqueue`/`cgroup`
+            // pseudo-sources, and `readonly_paths`' own always-
+            // existing-directory-or-already-mounted case), but a real,
+            // previously-latent bug for a genuine file-source bind
+            // mount, only now reachable via `-v`.
+            let is_bind = parsed.set_flags & oci_mount::options::flags::BIND != 0;
+            let source_is_file =
+                is_bind && source.as_deref().is_some_and(|s| Path::new(s).is_file());
+            if source_is_file {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if !target.exists() {
+                    std::fs::write(target, b"")?;
+                }
+            } else {
+                std::fs::create_dir_all(target)?;
+            }
             match oci_mount::mount(
                 source.as_deref(),
                 target,

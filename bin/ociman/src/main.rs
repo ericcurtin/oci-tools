@@ -363,6 +363,25 @@ enum Command {
         /// entirely, real docker/podman's own documented convention.
         #[arg(long)]
         entrypoint: Option<String>,
+        /// Bind-mount a real host path into the container:
+        /// `HOST-DIR:CONTAINER-DIR[:ro]`, matching real `docker run
+        /// -v`/`podman run -v`'s own bind-mount form exactly (both
+        /// paths absolute; `ro` is the only supported third field —
+        /// this project has no volume-management subsystem of its own
+        /// at all, so a bare container-only path or a named-volume
+        /// name, both real `docker`/`podman` features for volumes this
+        /// project doesn't have, are rejected with a clear error
+        /// rather than silently misinterpreted). Repeatable. The host
+        /// path is created as a directory if it doesn't already exist
+        /// (matching real `docker`'s own long-documented default for a
+        /// missing bind-mount source). See `docs/design/0086` for the
+        /// real rootless-uid-mapping caveat this shares with every
+        /// other path in the container's own rootfs: a host file/
+        /// directory not owned by the user actually running `ociman`
+        /// appears with an unmapped (`nobody`-like) owner inside the
+        /// container, not a bug specific to `-v`.
+        #[arg(short, long = "volume", value_name = "HOST:CONTAINER[:ro]")]
+        volume: Vec<String>,
     },
     /// List containers.
     Ps {
@@ -489,6 +508,7 @@ fn main() -> std::process::ExitCode {
                 hostname,
                 workdir,
                 entrypoint,
+                volume,
             }) => cmd_run(
                 &image,
                 &args,
@@ -509,6 +529,7 @@ fn main() -> std::process::ExitCode {
                 hostname.as_deref(),
                 workdir.as_deref(),
                 entrypoint.as_deref(),
+                &volume,
             ),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
@@ -669,8 +690,30 @@ fn cmd_run(
     hostname: Option<&str>,
     workdir: Option<&str>,
     entrypoint: Option<&str>,
+    volumes: &[String],
 ) -> anyhow::Result<()> {
     let entrypoint = entrypoint.map(parse_entrypoint);
+    let volumes = volumes
+        .iter()
+        .map(|v| parse_volume(v))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    // The host side of a bind mount is a real, separate side effect
+    // (creating something on the *caller's* own filesystem, not the
+    // container's), so it happens here in `cmd_run` rather than inside
+    // `synthesize_spec`, which otherwise only ever builds a `Spec`
+    // value without touching the host filesystem at all. Matches real
+    // `docker`'s own long-documented default for a missing bind-mount
+    // source: create it as a directory (a file source that doesn't
+    // exist yet is a real, surfaced error instead — there is no
+    // sensible "default content" for a file the way an empty directory
+    // is the sensible default for a directory).
+    for volume in &volumes {
+        let path = Path::new(&volume.host);
+        if !path.exists() {
+            std::fs::create_dir_all(path)
+                .with_context(|| format!("creating host volume directory {:?}", volume.host))?;
+        }
+    }
     let seccomp = resolve_seccomp(security_opts, privileged)?;
     let base_capabilities = if privileged {
         oci_runtime_core::identity::ALL_CAPABILITY_NAMES
@@ -764,6 +807,7 @@ fn cmd_run(
             hostname,
             workdir,
             entrypoint.as_deref(),
+            &volumes,
         )?;
         if let Some(process) = &spec.process {
             state
@@ -1223,6 +1267,7 @@ fn synthesize_spec(
     hostname: Option<&str>,
     workdir: Option<&str>,
     entrypoint: Option<&[String]>,
+    volumes: &[ParsedVolume],
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -1319,6 +1364,28 @@ fn synthesize_spec(
     // behavior (0044) while still allowing the same opt-out/override
     // real `docker run`/`podman run --security-opt seccomp=` do.
     linux.seccomp = seccomp;
+
+    // `-v`/`--volume` bind mounts, appended after the standard
+    // proc/sys/dev/... set `Spec::example()` already provides —
+    // matching real `docker`/`podman`'s own `Mount{..., Type: "bind"}`
+    // shape exactly (`~/git/moby/daemon/oci_linux.go`'s own
+    // `setupMounts`: `Type: "bind"`, options `["rbind"]` plus `"ro"`
+    // when read-only). `rbind` (not the newer, not-yet-supported
+    // `rro`-based recursive-read-only form real docker also now uses)
+    // matches this crate's own already-established, checked-directly
+    // `oci_mount::options` scope.
+    for volume in volumes {
+        let mut options = vec!["rbind".to_string()];
+        if volume.read_only {
+            options.push("ro".to_string());
+        }
+        spec.mounts.push(oci_spec_types::runtime::Mount {
+            destination: volume.container.clone(),
+            source: Some(volume.host.clone()),
+            kind: Some("bind".to_string()),
+            options,
+        });
+    }
 
     Ok(spec)
 }
@@ -1684,6 +1751,59 @@ fn parse_entrypoint(value: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(value).unwrap_or_else(|_| vec![value.to_string()])
 }
 
+/// A parsed `-v`/`--volume` bind-mount specification.
+struct ParsedVolume {
+    host: String,
+    container: String,
+    read_only: bool,
+}
+
+/// Parse a `--volume` value: `HOST-DIR:CONTAINER-DIR[:ro]`, matching
+/// real `docker run -v`/`podman run -v`'s own bind-mount form — both
+/// paths must be absolute (a bare container-only path, real docker/
+/// podman's own "anonymous volume" shorthand, and a name that isn't an
+/// absolute path at all, their own "named volume" shorthand, are both
+/// real features of a volume-management subsystem this project simply
+/// doesn't have, so both are rejected with a clear error rather than
+/// silently misinterpreted as something else). The only supported
+/// third field is `ro` (or, explicitly, `rw`, the default) — no
+/// propagation modes, no SELinux relabeling (`Z`/`z`, moot: this
+/// project doesn't implement SELinux at all), matching this project's
+/// own established "narrow, checked-directly first increment" pattern
+/// for every other multi-option flag.
+fn parse_volume(spec: &str) -> anyhow::Result<ParsedVolume> {
+    let mut parts = spec.splitn(3, ':');
+    let host = parts.next().filter(|s| !s.is_empty());
+    let container = parts.next().filter(|s| !s.is_empty());
+    let (host, container) = match (host, container) {
+        (Some(host), Some(container)) => (host, container),
+        _ => anyhow::bail!(
+            "--volume {spec:?}: expected HOST-DIR:CONTAINER-DIR[:ro] -- named/anonymous \
+             volumes are not supported yet, only a real host path bind mount"
+        ),
+    };
+    anyhow::ensure!(
+        host.starts_with('/'),
+        "--volume {spec:?}: the host path must be absolute"
+    );
+    anyhow::ensure!(
+        container.starts_with('/'),
+        "--volume {spec:?}: the container path must be absolute"
+    );
+    let read_only = match parts.next() {
+        None | Some("rw") => false,
+        Some("ro") => true,
+        Some(other) => anyhow::bail!(
+            "--volume {spec:?}: unsupported option {other:?} (only \"ro\"/\"rw\" are supported)"
+        ),
+    };
+    Ok(ParsedVolume {
+        host: host.to_string(),
+        container: container.to_string(),
+        read_only,
+    })
+}
+
 /// Resolve an image's `USER` string to a numeric `(uid, gid)` pair
 /// (see [`user_resolve::resolve`] for the name/`/etc/passwd`/
 /// `/etc/group` resolution rules), then reject anything this
@@ -1821,6 +1941,39 @@ mod tests {
         // single-literal-element fallback, matching real podman's own
         // exact behavior (checked directly).
         assert_eq!(parse_entrypoint(""), vec![String::new()]);
+    }
+
+    #[test]
+    fn parse_volume_two_field_form_defaults_to_read_write() {
+        let v = parse_volume("/host/data:/container/data").unwrap();
+        assert_eq!(v.host, "/host/data");
+        assert_eq!(v.container, "/container/data");
+        assert!(!v.read_only);
+    }
+
+    #[test]
+    fn parse_volume_three_field_ro_and_rw_both_work() {
+        let ro = parse_volume("/host:/container:ro").unwrap();
+        assert!(ro.read_only);
+        let rw = parse_volume("/host:/container:rw").unwrap();
+        assert!(!rw.read_only);
+    }
+
+    #[test]
+    fn parse_volume_rejects_a_bare_path_no_colon_at_all() {
+        assert!(parse_volume("/just/a/path").is_err());
+    }
+
+    #[test]
+    fn parse_volume_rejects_a_relative_host_or_container_path() {
+        assert!(parse_volume("relative:/container").is_err());
+        assert!(parse_volume("/host:relative").is_err());
+    }
+
+    #[test]
+    fn parse_volume_rejects_an_unsupported_third_field() {
+        assert!(parse_volume("/host:/container:Z").is_err());
+        assert!(parse_volume("/host:/container:shared").is_err());
     }
 
     fn config_with(entrypoint: Option<Vec<&str>>, cmd: Option<Vec<&str>>) -> ContainerConfig {
