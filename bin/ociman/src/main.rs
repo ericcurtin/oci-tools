@@ -418,6 +418,19 @@ enum Command {
         #[arg(short, long, default_value = "TERM")]
         signal: String,
     },
+    /// Send a signal to a running container's own init process — one
+    /// immediate send, no grace period, no escalation (unlike `stop`),
+    /// matching real `docker kill`/`podman kill` exactly (default
+    /// signal `KILL`, not `TERM`). A real, surfaced error on a
+    /// container that isn't running (matches real podman: `con.Kill`
+    /// on a non-running container returns `ErrCtrStateInvalid`).
+    Kill {
+        /// The container's ID or `--name`.
+        id: String,
+        /// Signal to send (name or number).
+        #[arg(short, long, default_value = "KILL")]
+        signal: String,
+    },
     /// Run an additional process inside an already-running container,
     /// joining its existing namespaces.
     Exec {
@@ -534,6 +547,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
             Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, &signal),
+            Some(Command::Kill { id, signal }) => cmd_kill(&id, &signal),
             Some(Command::Exec {
                 id,
                 user,
@@ -1176,6 +1190,35 @@ fn cmd_stop(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+
+    println!("{id}");
+    Ok(())
+}
+
+/// Send `signal` to a running container's own init process, once,
+/// with no grace period and no escalation — matches real `docker
+/// kill`/`podman kill` exactly (`~/git/podman/cmd/podman/containers/
+/// kill.go`: default signal `KILL`, a single `Kill(sig)` call, no
+/// waiting). Unlike `stop`, a container that isn't running is a real,
+/// surfaced error here (matches real podman's own `con.Kill` on a
+/// non-running container returning `ErrCtrStateInvalid`) rather than a
+/// silent no-op — `kill`'s entire point is sending a *specific*
+/// signal to a *live* process, so there is nothing sensible to do
+/// once it's already gone.
+fn cmd_kill(id: &str, signal: &str) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let resolved = resolve_container_id(&containers, id)?;
+    let state = containers.load(&resolved)?;
+    if state.effective_status() == Status::Stopped {
+        anyhow::bail!("container {id:?} is not running");
+    }
+    let pid = state
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
+
+    let sig = oci_runtime_core::signal::parse(signal)
+        .with_context(|| format!("parsing signal {signal:?}"))?;
+    oci_runtime_core::process::kill(pid, sig).context("sending signal")?;
 
     println!("{id}");
     Ok(())
