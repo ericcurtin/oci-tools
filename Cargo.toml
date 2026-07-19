@@ -16,6 +16,9 @@ authors = ["The oci-tools contributors"]
 # alternatives (structopt, snafu, ureq, ...) never sneak in alongside these.
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive", "env", "string", "wrap_help"] }
+# Pure-Rust (default `rust_backend`/miniz_oxide) gzip: OCI image layers are
+# overwhelmingly `tar+gzip` in practice; avoids a C zlib dependency.
+flate2 = "1.1"
 indicatif = "0.18"
 # Not in the "low-level unix syscalls" capability group below: it isn't an
 # alternative to rustix, it's the necessary escape hatch for the one
@@ -30,6 +33,7 @@ seccompiler = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
+tar = "0.4"
 tempfile = "3.14"
 thiserror = "2.0"
 ureq = "3.3"
@@ -42,6 +46,7 @@ oci-build-info = { path = "crates/oci-build-info" }
 oci-cli-common = { path = "crates/oci-cli-common" }
 oci-dockerfile = { path = "crates/oci-dockerfile" }
 oci-erofs = { path = "crates/oci-erofs" }
+oci-layer = { path = "crates/oci-layer" }
 oci-mount = { path = "crates/oci-mount" }
 oci-net = { path = "crates/oci-net" }
 oci-registry = { path = "crates/oci-registry" }

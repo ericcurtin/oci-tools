@@ -1,0 +1,21 @@
+[package]
+name = "oci-layer"
+description = "OCI image layer application: tar extraction and whiteout handling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+flate2.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
