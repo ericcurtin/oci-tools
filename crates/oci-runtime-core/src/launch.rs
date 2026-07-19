@@ -19,7 +19,8 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 
 use oci_spec_types::runtime::{
-    LinuxCapabilities, LinuxIdMapping, LinuxSeccomp, NamespaceType, PosixRlimit, User,
+    LinuxCapabilities, LinuxIdMapping, LinuxResources, LinuxSeccomp, NamespaceType, PosixRlimit,
+    User,
 };
 
 use crate::bundle::Bundle;
@@ -83,9 +84,12 @@ pub enum CgroupSetup {
     FromSpec,
     /// Ignore `cgroupsPath` entirely: create a transient systemd scope
     /// instead (`systemd_cgroup::create_scope`), named `scope_name`
-    /// with `description`. Falls back to no cgroup at all (logged via
-    /// `tracing::warn!`, not fatal) if no D-Bus session is reachable —
-    /// matches this project's own "tolerate known rootless
+    /// with `description`, translating `resources` (if any) into
+    /// systemd unit properties (see
+    /// `systemd_cgroup::resource_properties`) rather than dropping them
+    /// — see `docs/design/0037`. Falls back to no cgroup at all (logged
+    /// via `tracing::warn!`, not fatal) if no D-Bus session is
+    /// reachable — matches this project's own "tolerate known rootless
     /// limitations" pattern used elsewhere (e.g. a rootless `/sys`
     /// remount failure).
     Systemd {
@@ -95,6 +99,15 @@ pub enum CgroupSetup {
         /// Free-form text systemd stores as the unit's own
         /// `Description=`.
         description: String,
+        /// The same `LinuxResources` the cgroupfs driver
+        /// (`CgroupSetup::FromSpec`) would otherwise translate into
+        /// raw file writes — translated into systemd unit properties
+        /// instead here, so both drivers honor the same limits for
+        /// the same spec. Boxed: `LinuxResources` is large enough
+        /// (several nested structs) that an unboxed `Option` here
+        /// would make every `CgroupSetup::FromSpec` value pay for
+        /// space it never uses (clippy's own `large_enum_variant`).
+        resources: Option<Box<LinuxResources>>,
     },
 }
 
@@ -214,11 +227,15 @@ pub unsafe fn run_reporting_pid(
     if let CgroupSetup::Systemd {
         scope_name,
         description,
+        resources,
     } = &cgroup_setup
     {
-        if let Err(e) =
-            systemd_cgroup::create_scope(direct_child_pid as u32, scope_name, description)
-        {
+        if let Err(e) = systemd_cgroup::create_scope(
+            direct_child_pid as u32,
+            scope_name,
+            description,
+            resources.as_deref(),
+        ) {
             tracing::warn!(
                 scope = %scope_name,
                 error = %e,

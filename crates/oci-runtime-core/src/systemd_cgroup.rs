@@ -60,9 +60,12 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use oci_spec_types::runtime::LinuxResources;
 use zbus::MatchRule;
 use zbus::blocking::{Connection, MessageIterator};
 use zbus::zvariant::{OwnedObjectPath, Value};
+
+use crate::cgroups::{convert_cpu_shares_to_weight, convert_memory_swap_to_v2};
 
 const SYSTEMD_BUS_NAME: &str = "org.freedesktop.systemd1";
 const SYSTEMD_OBJECT_PATH: &str = "/org/freedesktop/systemd1";
@@ -122,7 +125,12 @@ const JOB_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// same repeated-concurrent-`ociman-run` stress test: every run either
 /// succeeds quickly or, under heavy contention, degrades gracefully to
 /// "no cgroup" within the bounded timeout — never hangs.
-pub fn create_scope(pid: u32, scope_name: &str, description: &str) -> io::Result<PathBuf> {
+pub fn create_scope(
+    pid: u32,
+    scope_name: &str,
+    description: &str,
+    resources: Option<&LinuxResources>,
+) -> io::Result<PathBuf> {
     if !scope_name.ends_with(".scope") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -132,6 +140,7 @@ pub fn create_scope(pid: u32, scope_name: &str, description: &str) -> io::Result
 
     let scope_name_owned = scope_name.to_string();
     let description_owned = description.to_string();
+    let resources_owned = resources.cloned();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     // Deliberately not joined: if the timeout below fires, this thread
     // is simply abandoned (there is no way to cancel a blocked `zbus`
@@ -140,7 +149,12 @@ pub fn create_scope(pid: u32, scope_name: &str, description: &str) -> io::Result
     // could ever matter again, and `create_scope`'s own caller must
     // not be held hostage by it either way.
     std::thread::spawn(move || {
-        let result = create_scope_dbus_roundtrip(pid, &scope_name_owned, &description_owned);
+        let result = create_scope_dbus_roundtrip(
+            pid,
+            &scope_name_owned,
+            &description_owned,
+            resources_owned.as_ref(),
+        );
         let _ = result_tx.send(result);
     });
 
@@ -167,6 +181,7 @@ fn create_scope_dbus_roundtrip(
     pid: u32,
     scope_name: &str,
     description: &str,
+    resources: Option<&LinuxResources>,
 ) -> io::Result<PathBuf> {
     let connection = Connection::session().map_err(to_io_error)?;
 
@@ -192,7 +207,7 @@ fn create_scope_dbus_roundtrip(
     // resource-limit writes, touch it), plus every accounting knob so
     // stats are always readable even when no explicit resource limit
     // is ever set.
-    let properties: Vec<(&str, Value)> = vec![
+    let mut properties: Vec<(&str, Value)> = vec![
         ("Description", Value::from(description)),
         ("DefaultDependencies", Value::from(false)),
         ("PIDs", Value::from(vec![pid])),
@@ -202,6 +217,9 @@ fn create_scope_dbus_roundtrip(
         ("IOAccounting", Value::from(true)),
         ("TasksAccounting", Value::from(true)),
     ];
+    if let Some(resources) = resources {
+        properties.extend(resource_properties(resources));
+    }
     let auxiliary_units: Vec<(&str, Vec<(&str, Value)>)> = vec![];
 
     let job_path: OwnedObjectPath = connection
@@ -221,6 +239,85 @@ fn create_scope_dbus_roundtrip(
 
     std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
         .and_then(|contents| parse_own_cgroup_path(&contents))
+}
+
+/// Translate `resources` into systemd unit properties for a transient
+/// scope, matching real `crun`'s own translation
+/// (`cgroup-systemd.c`'s `append_resources`, checked directly) for the
+/// cgroup-v2-unified case this project exclusively targets:
+/// `MemoryMax`/`MemoryLow` from `memory.limit`/`.reservation`,
+/// `TasksMax` from `pids.limit`, `CPUWeight` from `cpu.shares` (via the
+/// same conversion `cgroups::plan_cpu` already uses for the
+/// raw-cgroupfs driver, so both drivers treat the same
+/// `LinuxResources` identically), and `CPUQuotaPerSecUSec`/
+/// `CPUQuotaPeriodUSec` from `cpu.quota`/`.period`.
+///
+/// `MemorySwapMax` is **not** `memory.swap` used directly: that field
+/// is a *combined* memory+swap limit (the same runtime-spec/cgroup-v1
+/// convention `cgroups::plan_memory` already has to convert for the
+/// raw-cgroupfs driver — see its own doc comment), while systemd's own
+/// `MemorySwapMax` property, like the raw `memory.swap.max` cgroupfs
+/// file it ultimately controls, is *swap-only*. Reusing
+/// `cgroups::convert_memory_swap_to_v2` here (rather than passing the
+/// combined value straight through) keeps both drivers' behavior
+/// identical for the same input.
+///
+/// A `-1` value (the container-ecosystem "unlimited" convention — see
+/// `cgroups.rs`'s own doc comment) becomes `u64::MAX` once cast, which
+/// is also systemd's own "infinity" convention for every one of these
+/// properties — the same happy coincidence real `crun`'s own C code
+/// relies on (an `int64_t` of `-1` reinterpreted as `uint64_t` is also
+/// `UINT64_MAX`), not something this module invented.
+fn resource_properties(resources: &LinuxResources) -> Vec<(&'static str, Value<'static>)> {
+    let mut properties = Vec::new();
+    if let Some(memory) = &resources.memory {
+        if let Some(limit) = memory.limit {
+            properties.push(("MemoryMax", Value::from(limit as u64)));
+        }
+        if let Some(reservation) = memory.reservation {
+            properties.push(("MemoryLow", Value::from(reservation as u64)));
+        }
+        if let Some(combined_swap) = memory.swap
+            && let Ok(swap_only) =
+                convert_memory_swap_to_v2(combined_swap, memory.limit.unwrap_or(0))
+        {
+            properties.push(("MemorySwapMax", Value::from(swap_only as u64)));
+        }
+    }
+    if let Some(cpu) = &resources.cpu {
+        if let Some(shares) = cpu.shares {
+            let weight = convert_cpu_shares_to_weight(shares);
+            if weight != 0 {
+                properties.push(("CPUWeight", Value::from(weight)));
+            }
+        }
+        // Matches this project's own cgroupfs-driver convention
+        // (`cgroups::plan_cpu`): a period is only meaningful once a
+        // quota is actually set, defaulting to the kernel's own
+        // documented 100000 (100ms) when unset, so both drivers behave
+        // identically for the same `LinuxResources` input.
+        if let Some(quota) = cpu.quota
+            && quota > 0
+        {
+            let period = cpu.period.filter(|p| *p != 0).unwrap_or(100_000);
+            // Same conversion real crun's own `append_resources` uses
+            // (checked directly, not re-derived): microseconds of CPU
+            // time available per second, rounded up to the nearest
+            // 10000 (matches systemd's own internal granularity).
+            let mut quota_per_sec = (quota as u64 * 1_000_000) / period;
+            if !quota_per_sec.is_multiple_of(10_000) {
+                quota_per_sec = (quota_per_sec / 10_000 + 1) * 10_000;
+            }
+            properties.push(("CPUQuotaPerSecUSec", Value::from(quota_per_sec)));
+            properties.push(("CPUQuotaPeriodUSec", Value::from(period)));
+        }
+    }
+    if let Some(pids) = &resources.pids
+        && let Some(limit) = pids.limit
+    {
+        properties.push(("TasksMax", Value::from(limit as u64)));
+    }
+    properties
 }
 
 /// Block until a `JobRemoved` signal matching `job_path` arrives,
@@ -301,8 +398,131 @@ mod tests {
     }
 
     #[test]
+    fn resource_properties_translates_memory_cpu_and_pids() {
+        let resources = LinuxResources {
+            memory: Some(oci_spec_types::runtime::LinuxMemory {
+                limit: Some(268_435_456),
+                reservation: Some(134_217_728),
+                swap: Some(536_870_912),
+                ..Default::default()
+            }),
+            cpu: Some(oci_spec_types::runtime::LinuxCpu {
+                shares: Some(1024), // the cgroup v1 default -> weight 100
+                quota: Some(50_000),
+                period: Some(100_000),
+                ..Default::default()
+            }),
+            pids: Some(oci_spec_types::runtime::LinuxPids { limit: Some(64) }),
+            ..Default::default()
+        };
+        let properties = resource_properties(&resources);
+        let names: Vec<&str> = properties.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "MemoryMax",
+                "MemoryLow",
+                "MemorySwapMax",
+                "CPUWeight",
+                "CPUQuotaPerSecUSec",
+                "CPUQuotaPeriodUSec",
+                "TasksMax",
+            ]
+        );
+        let values: std::collections::HashMap<&str, &Value> = properties
+            .iter()
+            .map(|(name, value)| (*name, value))
+            .collect();
+        assert_eq!(*values["MemoryMax"], Value::from(268_435_456u64));
+        assert_eq!(*values["MemoryLow"], Value::from(134_217_728u64));
+        // `swap` (536870912) is a *combined* memory+swap limit; the
+        // swap-*only* value systemd's own `MemorySwapMax` expects is
+        // that minus the memory limit itself (268435456), matching
+        // `cgroups::convert_memory_swap_to_v2`.
+        assert_eq!(*values["MemorySwapMax"], Value::from(268_435_456u64));
+        assert_eq!(*values["CPUWeight"], Value::from(100u64));
+        // 50000/100000 quota/period ratio -> 500000us/sec, already a
+        // multiple of 10000 so no rounding needed.
+        assert_eq!(*values["CPUQuotaPerSecUSec"], Value::from(500_000u64));
+        assert_eq!(*values["CPUQuotaPeriodUSec"], Value::from(100_000u64));
+        assert_eq!(*values["TasksMax"], Value::from(64u64));
+    }
+
+    #[test]
+    fn resource_properties_setting_swap_equal_to_memory_disables_swap_entirely() {
+        // `memory == swap` is this ecosystem's own combined-value
+        // convention for "no additional swap at all" (see
+        // `cgroups::plan_memory`'s own doc comment) -- the exact case
+        // `ociman run --memory` relies on to make its own limit an
+        // actually-enforced, deterministic cap rather than something
+        // the kernel can silently work around by paging to swap.
+        let resources = LinuxResources {
+            memory: Some(oci_spec_types::runtime::LinuxMemory {
+                limit: Some(16_777_216),
+                swap: Some(16_777_216),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let properties = resource_properties(&resources);
+        let values: std::collections::HashMap<&str, &Value> = properties
+            .iter()
+            .map(|(name, value)| (*name, value))
+            .collect();
+        assert_eq!(
+            *values["MemorySwapMax"],
+            Value::from(0u64),
+            "swap == memory limit must translate to a swap-only limit of exactly 0"
+        );
+    }
+
+    #[test]
+    fn resource_properties_translates_unlimited_as_u64_max() {
+        // `-1` (this ecosystem's own "unlimited" convention) must
+        // become `u64::MAX`, systemd's own "infinity" convention for
+        // these same properties -- the same reinterpret-cast coincidence
+        // real crun's own C code relies on.
+        let resources = LinuxResources {
+            memory: Some(oci_spec_types::runtime::LinuxMemory {
+                limit: Some(-1),
+                ..Default::default()
+            }),
+            pids: Some(oci_spec_types::runtime::LinuxPids { limit: Some(-1) }),
+            ..Default::default()
+        };
+        let properties = resource_properties(&resources);
+        let values: std::collections::HashMap<&str, &Value> = properties
+            .iter()
+            .map(|(name, value)| (*name, value))
+            .collect();
+        assert_eq!(*values["MemoryMax"], Value::from(u64::MAX));
+        assert_eq!(*values["TasksMax"], Value::from(u64::MAX));
+    }
+
+    #[test]
+    fn resource_properties_skips_cpu_quota_without_a_positive_quota() {
+        let resources = LinuxResources {
+            cpu: Some(oci_spec_types::runtime::LinuxCpu {
+                period: Some(100_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            resource_properties(&resources).is_empty(),
+            "a period with no quota at all shouldn't produce any CPU property, matching real \
+             crun's own `quota > 0` requirement"
+        );
+    }
+
+    #[test]
+    fn resource_properties_is_empty_for_default_resources() {
+        assert!(resource_properties(&LinuxResources::default()).is_empty());
+    }
+
+    #[test]
     fn create_scope_rejects_a_name_not_ending_in_dot_scope() {
-        let err = create_scope(1, "not-a-scope", "test").unwrap_err();
+        let err = create_scope(1, "not-a-scope", "test", None).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
@@ -343,8 +563,34 @@ mod tests {
         // Give the child a moment to actually exist before targeting it.
         std::thread::sleep(Duration::from_millis(50));
 
+        // A real resource limit rides along -- proving
+        // `resource_properties` actually reaches systemd itself, not
+        // just that its own translation logic looks right in
+        // isolation (see the dedicated unit tests for that).
+        let resources = LinuxResources {
+            memory: Some(oci_spec_types::runtime::LinuxMemory {
+                limit: Some(134_217_728), // 128 MiB, a distinctive, unlikely-default value
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
         let scope_name = format!("oci-runtime-core-test-{child_pid}.scope");
-        let result = create_scope(child_pid as u32, &scope_name, "oci-runtime-core test scope");
+        let result = create_scope(
+            child_pid as u32,
+            &scope_name,
+            "oci-runtime-core test scope",
+            Some(&resources),
+        );
+
+        // Ask systemd itself what it actually recorded for MemoryMax,
+        // *before* tearing the scope down below.
+        let memory_max = result.is_ok().then(|| {
+            std::process::Command::new("systemctl")
+                .args(["--user", "show", &scope_name, "-p", "MemoryMax", "--value"])
+                .output()
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        });
 
         // Always reap the child and ask systemd to forget the scope,
         // regardless of whether `create_scope` itself succeeded.
@@ -360,6 +606,11 @@ mod tests {
             cgroup_path.to_string_lossy().contains(&scope_name),
             "expected the child's own cgroup to reflect the new scope: {}",
             cgroup_path.display()
+        );
+        assert_eq!(
+            memory_max.unwrap().unwrap(),
+            "134217728",
+            "systemd itself should report back the exact MemoryMax this scope was created with"
         );
 
         let own_pid_after = read_own_cgroup();

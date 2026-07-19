@@ -153,6 +153,52 @@ fn run_propagates_the_containers_exit_code() {
 }
 
 #[test]
+fn run_memory_limit_actually_gets_enforced_by_the_kernels_own_oom_killer() {
+    // Real, kernel-enforced verification (not just "the property got
+    // set" — that's covered directly in `oci_runtime_core::
+    // systemd_cgroup`'s own unit tests): a real container, under a
+    // real 16 MiB `--memory` limit, whose own shell allocates ~300 MB
+    // via a real memory-backed command substitution (`yes | head -c
+    // <n>` — no `/dev/zero` needed, which this rootless bundle's
+    // minimal `/dev` doesn't have) should be killed by the kernel's own
+    // cgroup v2 OOM killer (`SIGKILL`, exit code 137), never complete
+    // normally. See `docs/design/0037` for why a memory limit alone,
+    // with no swap limit at all, would *not* actually enforce anything
+    // (the kernel would just page out to swap instead) — this test
+    // would have caught that regression too.
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/memory-limit:latest",
+        &busybox,
+        &["sh", "yes", "head"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/memory-limit:latest",
+        &[
+            "--memory",
+            "16m",
+            "/bin/sh",
+            "-c",
+            "x=$(yes | head -c 300000000); echo ${#x}",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(137),
+        "expected the kernel's own OOM killer (SIGKILL, exit 137); got: {out:?}"
+    );
+}
+
+#[test]
 fn run_rejects_a_non_root_numeric_user() {
     let Some(busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");

@@ -105,6 +105,15 @@ enum Command {
         /// here").
         #[arg(long)]
         name: Option<String>,
+        /// Maximum memory the container's own cgroup may use, e.g.
+        /// `128m`/`1g` (binary units: `k`/`m`/`g`/`t` mean
+        /// 2^10/2^20/2^30/2^40 bytes, matching real `docker run
+        /// --memory`/`podman run --memory`) or a plain byte count with
+        /// no suffix. Exceeding it gets the container's own process
+        /// killed by the kernel's own cgroup v2 OOM killer, same as
+        /// real `docker`/`podman`.
+        #[arg(long)]
+        memory: Option<String>,
     },
     /// List containers.
     Ps {
@@ -195,7 +204,8 @@ fn main() -> std::process::ExitCode {
                 args,
                 rm,
                 name,
-            }) => cmd_run(&image, &args, rm, name.as_deref()),
+                memory,
+            }) => cmd_run(&image, &args, rm, name.as_deref(), memory.as_deref()),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
             Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, &signal),
@@ -334,7 +344,14 @@ fn cmd_inspect(reference_str: &str, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_run(image_ref: &str, args: &[String], rm: bool, name: Option<&str>) -> anyhow::Result<()> {
+fn cmd_run(
+    image_ref: &str,
+    args: &[String],
+    rm: bool,
+    name: Option<&str>,
+    memory: Option<&str>,
+) -> anyhow::Result<()> {
+    let memory_limit_bytes = memory.map(parse_memory_limit).transpose()?;
     let reference = Reference::parse(image_ref)
         .with_context(|| format!("parsing image reference {image_ref:?}"))?;
     let store = open_store()?;
@@ -383,7 +400,13 @@ fn cmd_run(image_ref: &str, args: &[String], rm: bool, name: Option<&str>) -> an
                 .with_context(|| format!("applying layer {}", layer.digest))?;
         }
 
-        let spec = synthesize_spec(&config, &container_id, args, &rootfs_dir)?;
+        let spec = synthesize_spec(
+            &config,
+            &container_id,
+            args,
+            &rootfs_dir,
+            memory_limit_bytes,
+        )?;
         if let Some(process) = &spec.process {
             state
                 .annotations
@@ -418,10 +441,18 @@ fn cmd_run(image_ref: &str, args: &[String], rm: bool, name: Option<&str>) -> an
         // (logged, not fatal) if no D-Bus session is reachable, so
         // this is a pure improvement over the previous "never any
         // cgroup at all" behavior, never a new hard requirement. See
-        // `docs/design/0033`/`0034`.
+        // `docs/design/0033`/`0034`. `resources` (if `--memory` set
+        // one) rides along, translated into systemd unit properties
+        // rather than dropped — see `docs/design/0037`.
         let cgroup_setup = oci_runtime_core::launch::CgroupSetup::Systemd {
             scope_name: format!("ociman-{container_id}.scope"),
             description: format!("oci-tools container {container_id}"),
+            resources: bundle
+                .spec
+                .linux
+                .as_ref()
+                .and_then(|l| l.resources.clone())
+                .map(Box::new),
         };
 
         // SAFETY: `ociman`'s own process has not spawned any additional
@@ -785,6 +816,7 @@ fn synthesize_spec(
     id: &str,
     args: &[String],
     rootfs: &Path,
+    memory_limit_bytes: Option<i64>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -810,7 +842,63 @@ fn synthesize_spec(
     }
 
     spec.hostname = Some(id.to_string());
+
+    if let Some(limit) = memory_limit_bytes {
+        spec.linux
+            .as_mut()
+            .expect("Spec::example always sets linux")
+            .resources = Some(oci_spec_types::runtime::LinuxResources {
+            memory: Some(oci_spec_types::runtime::LinuxMemory {
+                limit: Some(limit),
+                // No separate `--memory-swap` flag exists yet, so
+                // default the same way real `docker run --memory`
+                // does when it's left unset too: a *combined*
+                // memory+swap cap of twice the memory limit (i.e. up
+                // to one additional memory limit's worth of real
+                // swap) — checked directly against
+                // `~/git/moby/daemon/daemon_unix.go`'s
+                // `adaptContainerSettings`. Without this, the
+                // container's own cgroup would have *no* swap limit
+                // at all, letting it page out to swap indefinitely
+                // instead of ever actually hitting the OOM killer —
+                // silently defeating the entire point of `--memory`.
+                swap: limit.checked_mul(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+
     Ok(spec)
+}
+
+/// Parse a `--memory` value the same way real `docker run --memory`/
+/// `podman run --memory` do: a plain non-negative integer (bytes), or
+/// one followed by a single case-insensitive unit suffix — `b` (bytes,
+/// i.e. no-op), `k`/`m`/`g`/`t` for binary kibi-/mebi-/gibi-/tebibytes
+/// (`1024^1..4`, *not* decimal SI units — matches the real tools' own
+/// `RAMInBytes` helper, checked directly against
+/// `docker/go-units@v0.5.0/size.go` — vendored into `moby`/`podman`/
+/// `runc`/`cri-o`/`containerd` alike — not assumed).
+fn parse_memory_limit(value: &str) -> anyhow::Result<i64> {
+    let value = value.trim();
+    anyhow::ensure!(!value.is_empty(), "--memory value cannot be empty");
+    let (number, multiplier) = match value.chars().last().unwrap().to_ascii_lowercase() {
+        'b' => (&value[..value.len() - 1], 1u64),
+        'k' => (&value[..value.len() - 1], 1024u64),
+        'm' => (&value[..value.len() - 1], 1024 * 1024),
+        'g' => (&value[..value.len() - 1], 1024 * 1024 * 1024),
+        't' => (&value[..value.len() - 1], 1024u64 * 1024 * 1024 * 1024),
+        _ => (value, 1u64),
+    };
+    let number: u64 = number
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid --memory value {value:?}"))?;
+    let bytes = number
+        .checked_mul(multiplier)
+        .with_context(|| format!("--memory value {value:?} is too large"))?;
+    i64::try_from(bytes).with_context(|| format!("--memory value {value:?} is too large"))
 }
 
 /// `ENTRYPOINT` (always kept) followed by either `args` (if the caller
@@ -936,4 +1024,44 @@ fn cmd_exec(
     // The exec'd process's own exit code becomes ours, same convention
     // `run` already follows.
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `parse_memory_limit` is non-trivial parsing logic (unit-suffix
+    // handling, overflow checks) worth its own direct unit tests —
+    // unlike the rest of this binary, which relies entirely on
+    // `tests/tests/ociman_*.rs` spawning the real built binary, this
+    // one function has no process/filesystem/namespace involvement at
+    // all, so an ordinary in-process unit test is both possible and
+    // the most direct way to check it.
+    #[test]
+    fn parse_memory_limit_handles_every_real_docker_podman_unit_suffix() {
+        assert_eq!(parse_memory_limit("128").unwrap(), 128);
+        assert_eq!(parse_memory_limit("128b").unwrap(), 128);
+        assert_eq!(parse_memory_limit("128B").unwrap(), 128);
+        assert_eq!(parse_memory_limit("1k").unwrap(), 1024);
+        assert_eq!(parse_memory_limit("1K").unwrap(), 1024);
+        assert_eq!(parse_memory_limit("128m").unwrap(), 128 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("1g").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_memory_limit("1t").unwrap(),
+            1024i64 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn parse_memory_limit_trims_whitespace() {
+        assert_eq!(parse_memory_limit(" 128m ").unwrap(), 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_memory_limit_rejects_garbage_and_overflow() {
+        assert!(parse_memory_limit("").is_err());
+        assert!(parse_memory_limit("not-a-number").is_err());
+        assert!(parse_memory_limit("128x").is_err());
+        assert!(parse_memory_limit("99999999999999999999999t").is_err());
+    }
 }

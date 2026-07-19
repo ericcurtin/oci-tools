@@ -127,7 +127,14 @@ fn num_to_cgroup_str(value: i64) -> String {
 /// Convert a combined memory+swap limit (the runtime-spec's `swap`
 /// field) to the swap-only value `memory.swap.max` expects. Matches
 /// `cgroups.ConvertMemorySwapToCgroupV2Value`.
-fn convert_memory_swap_to_v2(memory_swap: i64, memory: i64) -> io::Result<i64> {
+///
+/// `pub(crate)`, not private: `systemd_cgroup`'s own resource-property
+/// translation (`MemorySwapMax`) needs the exact same conversion —
+/// `resources.memory.swap` is combined memory+swap either way, and
+/// systemd's own `MemorySwapMax` property is swap-only, exactly like
+/// the raw `memory.swap.max` cgroupfs file this function was written
+/// for — see its own doc comment.
+pub(crate) fn convert_memory_swap_to_v2(memory_swap: i64, memory: i64) -> io::Result<i64> {
     if memory == -1 && memory_swap == 0 {
         return Ok(-1);
     }
@@ -162,7 +169,11 @@ fn convert_memory_swap_to_v2(memory_swap: i64, memory: i64) -> io::Result<i64> {
 /// cgroup-v2-style CPU weight (1-10000, default 100), via the same
 /// quadratic curve-fit runc uses (chosen so shares' min/max/default map
 /// exactly to weight's min/max/default).
-fn convert_cpu_shares_to_weight(shares: u64) -> u64 {
+///
+/// `pub(crate)`, not private: `systemd_cgroup`'s own resource-property
+/// translation (`CPUWeight`) needs the exact same conversion — see its
+/// own doc comment.
+pub(crate) fn convert_cpu_shares_to_weight(shares: u64) -> u64 {
     if shares == 0 {
         return 0;
     }
