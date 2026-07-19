@@ -12,6 +12,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+oci-bls.workspace = true
 oci-cli-common.workspace = true
 tracing.workspace = true
 
