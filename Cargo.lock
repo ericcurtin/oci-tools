@@ -749,6 +749,9 @@ dependencies = [
 [[package]]
 name = "oci-dockerfile"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "oci-erofs"
