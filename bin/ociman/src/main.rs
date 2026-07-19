@@ -239,6 +239,32 @@ enum Command {
         /// none of which this flag touches) is not implemented.
         #[arg(long = "security-opt")]
         security_opt: Vec<String>,
+        /// Grant additional capabilities beyond this project's own
+        /// `podman`-default set, matching real `docker run
+        /// --cap-add`/`podman run --cap-add`. A bare name (`net_admin`)
+        /// or an already-`CAP_`-prefixed one (`CAP_NET_ADMIN`) both
+        /// work, case-insensitively — matching real `docker`/`podman`'s
+        /// own normalization (checked directly against
+        /// `~/git/container-libs/common/pkg/capabilities/
+        /// capabilities.go`'s own `NormalizeCapabilities`). The special
+        /// value `all` grants every capability this build recognizes.
+        /// Repeatable, and a single use may also be a comma-separated
+        /// list (`--cap-add=net_admin,sys_time`), matching real
+        /// `docker`/`podman`'s own flag (a `pflag.StringSlice`, which
+        /// supports both shapes at once).
+        #[arg(long = "cap-add", value_delimiter = ',')]
+        cap_add: Vec<String>,
+        /// Remove capabilities from this project's own `podman`-default
+        /// set, matching real `docker run --cap-drop`/`podman run
+        /// --cap-drop`. Same name normalization and `all` special value
+        /// as `--cap-add` (`--cap-drop=all` starts from an empty set
+        /// instead of the usual default, keeping only whatever
+        /// `--cap-add` separately grants — matching real `docker`/
+        /// `podman`'s own `MergeCapabilities` exactly). Giving the same
+        /// capability to both `--cap-add` and `--cap-drop` is a real,
+        /// surfaced error, not silently resolved one way or the other.
+        #[arg(long = "cap-drop", value_delimiter = ',')]
+        cap_drop: Vec<String>,
     },
     /// List containers.
     Ps {
@@ -348,6 +374,8 @@ fn main() -> std::process::ExitCode {
                 cpuset_cpus,
                 cpuset_mems,
                 security_opt,
+                cap_add,
+                cap_drop,
             }) => cmd_run(
                 &image,
                 &args,
@@ -360,6 +388,8 @@ fn main() -> std::process::ExitCode {
                 cpuset_cpus.as_deref(),
                 cpuset_mems.as_deref(),
                 &security_opt,
+                &cap_add,
+                &cap_drop,
             ),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
@@ -512,8 +542,15 @@ fn cmd_run(
     cpuset_cpus: Option<&str>,
     cpuset_mems: Option<&str>,
     security_opts: &[String],
+    cap_add: &[String],
+    cap_drop: &[String],
 ) -> anyhow::Result<()> {
     let seccomp = resolve_seccomp(security_opts)?;
+    let capabilities = merge_capabilities(
+        &oci_spec_types::runtime::podman_default_capabilities(),
+        cap_add,
+        cap_drop,
+    )?;
     let memory_limit_bytes = memory.map(parse_memory_limit).transpose()?;
     let memory_swap_bytes = memory_swap.map(parse_memory_swap_limit).transpose()?;
     anyhow::ensure!(
@@ -591,6 +628,7 @@ fn cmd_run(
             cpuset_cpus,
             cpuset_mems,
             seccomp,
+            capabilities,
         )?;
         if let Some(process) = &spec.process {
             state
@@ -1044,6 +1082,7 @@ fn synthesize_spec(
     cpuset_cpus: Option<&str>,
     cpuset_mems: Option<&str>,
     seccomp: Option<oci_spec_types::runtime::LinuxSeccomp>,
+    capabilities: Vec<String>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -1093,16 +1132,15 @@ fn synthesize_spec(
     // default_capabilities`'s own doc comment for why that must stay
     // byte-identical to real `runc`), but `ociman` is a real
     // container *engine* (a `podman` clone), which grants a much
-    // richer default (11 capabilities) to every container it starts.
-    // No `--cap-add`/`--cap-drop` override exists yet, matching this
-    // project's own already-established "ship the default first, an
-    // override flag can come later" pattern for `--security-opt
-    // seccomp=`/`--memory` before it.
-    if let Some(capabilities) = process.capabilities.as_mut() {
-        let podman_caps = oci_spec_types::runtime::podman_default_capabilities();
-        capabilities.bounding = podman_caps.clone();
-        capabilities.effective = podman_caps.clone();
-        capabilities.permitted = podman_caps;
+    // richer default (11 capabilities) to every container it starts,
+    // already merged with any `--cap-add`/`--cap-drop` by
+    // `merge_capabilities` before this function is ever called (kept
+    // out of this function entirely -- validating/merging a CLI
+    // override is `cmd_run`'s own concern, not spec-synthesis's).
+    if let Some(linux_caps) = process.capabilities.as_mut() {
+        linux_caps.bounding = capabilities.clone();
+        linux_caps.effective = capabilities.clone();
+        linux_caps.permitted = capabilities;
     }
 
     spec.hostname = Some(id.to_string());
@@ -1184,6 +1222,132 @@ fn resolve_seccomp(
             Ok(Some(profile))
         }
     }
+}
+
+/// The special `--cap-add`/`--cap-drop` value meaning "every
+/// capability this build recognizes" — matching real `docker`/
+/// `podman`'s own `capabilities.All` (`"ALL"`, compared
+/// case-insensitively on the way in, like every other name here).
+const CAP_ALL: &str = "ALL";
+
+/// Normalize one `--cap-add`/`--cap-drop` name the same way real
+/// `docker`/`podman` do (checked directly against
+/// `~/git/container-libs/common/pkg/capabilities/capabilities.go`'s
+/// own `NormalizeCapabilities`): upper-cased, `CAP_` prefixed if not
+/// already, and validated against every capability name this build
+/// actually recognizes (`oci_runtime_core::identity::
+/// ALL_CAPABILITY_NAMES` — the same list `oci_runtime_core::identity`'s
+/// own `capability_named` accepts, so a name this normalizes
+/// successfully is guaranteed to also be one the runtime itself can
+/// actually apply). `CAP_ALL`/`"all"`/`"ALL"` is left as the literal
+/// `"ALL"` marker, un-prefixed and unvalidated against the name list —
+/// it's a merge-time instruction, not a real capability name.
+fn normalize_capability(name: &str) -> anyhow::Result<String> {
+    let upper = name.to_ascii_uppercase();
+    if upper == CAP_ALL {
+        return Ok(upper);
+    }
+    let prefixed = if upper.starts_with("CAP_") {
+        upper
+    } else {
+        format!("CAP_{upper}")
+    };
+    anyhow::ensure!(
+        oci_runtime_core::identity::ALL_CAPABILITY_NAMES.contains(&prefixed.as_str()),
+        "unknown capability {name:?}"
+    );
+    Ok(prefixed)
+}
+
+fn normalize_capabilities(names: &[String]) -> anyhow::Result<Vec<String>> {
+    names
+        .iter()
+        .map(|name| normalize_capability(name))
+        .collect()
+}
+
+/// Compute `ociman run`'s own final capability set from `base` (the
+/// real `podman`-default 11 capabilities) plus `--cap-add`/`--cap-drop`
+/// overrides — a direct, checked-against-the-real-source port of real
+/// `docker`/`podman`'s own `MergeCapabilities`
+/// (`~/git/container-libs/common/pkg/capabilities/capabilities.go`),
+/// not an independently invented algorithm:
+///
+/// * `--cap-drop=all` (in any case) discards `base` entirely and keeps
+///   only whatever `--cap-add` separately grants — real `docker`/
+///   `podman`'s own documented behavior, not "drop everything and
+///   ignore `--cap-add` too".
+/// * `--cap-drop=all` together with `--cap-add=all` is a real, refused
+///   error (`"adding all capabilities and removing all capabilities
+///   not allowed"`), matching the real source exactly, not silently
+///   resolved either way.
+/// * `--cap-add=all` (without `--cap-drop=all`) replaces `base` with
+///   every capability this build recognizes
+///   (`oci_runtime_core::identity::ALL_CAPABILITY_NAMES`) — real
+///   `docker`/`podman` use the *calling process's own real bounding
+///   set* here instead, which has no equivalent meaning for a runtime-
+///   spec's own `bounding`/`effective`/`permitted` arrays (a
+///   declaration of what the *container* should have, independent of
+///   whatever privilege the invoking `ociman` process itself happens
+///   to hold) — using the full recognized-name list is the more
+///   literal, correct reading of "grant every capability" for that
+///   context.
+/// * The same capability appearing in both `--cap-add` and
+///   `--cap-drop` (after `all`-handling above) is a real, surfaced
+///   error, never silently resolved one way or the other.
+fn merge_capabilities(
+    base: &[String],
+    adds: &[String],
+    drops: &[String],
+) -> anyhow::Result<Vec<String>> {
+    if adds.is_empty() && drops.is_empty() {
+        return Ok(base.to_vec());
+    }
+    let adds = normalize_capabilities(adds)?;
+    let drops = normalize_capabilities(drops)?;
+
+    if drops.iter().any(|c| c == CAP_ALL) {
+        anyhow::ensure!(
+            !adds.iter().any(|c| c == CAP_ALL),
+            "adding all capabilities and removing all capabilities not allowed"
+        );
+        let mut result = adds;
+        result.sort();
+        result.dedup();
+        return Ok(result);
+    }
+
+    let (base, adds): (Vec<String>, Vec<String>) = if adds.iter().any(|c| c == CAP_ALL) {
+        (
+            oci_runtime_core::identity::ALL_CAPABILITY_NAMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            Vec::new(),
+        )
+    } else {
+        (base.to_vec(), adds)
+    };
+
+    for add in &adds {
+        anyhow::ensure!(
+            !drops.contains(add),
+            "capability {add:?} cannot be dropped and added"
+        );
+    }
+
+    let mut result: Vec<String> = base
+        .into_iter()
+        .filter(|cap| !drops.contains(cap))
+        .collect();
+    for add in adds {
+        if !result.contains(&add) {
+            result.push(add);
+        }
+    }
+    result.sort();
+    result.dedup();
+    Ok(result)
 }
 
 /// Build a `LinuxResources` from `ociman run`'s own `--memory`/
@@ -1640,5 +1804,99 @@ mod tests {
         ])
         .unwrap();
         assert!(seccomp.is_none());
+    }
+
+    fn strings(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn normalize_capability_adds_the_cap_prefix_and_upper_cases() {
+        assert_eq!(normalize_capability("chown").unwrap(), "CAP_CHOWN");
+        assert_eq!(normalize_capability("Chown").unwrap(), "CAP_CHOWN");
+        assert_eq!(normalize_capability("CAP_CHOWN").unwrap(), "CAP_CHOWN");
+        assert_eq!(normalize_capability("cap_chown").unwrap(), "CAP_CHOWN");
+    }
+
+    #[test]
+    fn normalize_capability_leaves_all_as_the_literal_marker() {
+        assert_eq!(normalize_capability("all").unwrap(), "ALL");
+        assert_eq!(normalize_capability("ALL").unwrap(), "ALL");
+        assert_eq!(normalize_capability("All").unwrap(), "ALL");
+    }
+
+    #[test]
+    fn normalize_capability_rejects_an_unknown_name() {
+        let err = normalize_capability("not_a_real_capability").unwrap_err();
+        assert!(err.to_string().contains("not_a_real_capability"), "{err}");
+    }
+
+    #[test]
+    fn merge_capabilities_is_the_base_untouched_when_nothing_is_given() {
+        let base = strings(&["CAP_CHOWN", "CAP_FOWNER"]);
+        assert_eq!(merge_capabilities(&base, &[], &[]).unwrap(), base);
+    }
+
+    #[test]
+    fn merge_capabilities_drops_a_base_capability() {
+        let base = strings(&["CAP_CHOWN", "CAP_FOWNER"]);
+        let result = merge_capabilities(&base, &[], &strings(&["chown"])).unwrap();
+        assert_eq!(result, strings(&["CAP_FOWNER"]));
+    }
+
+    #[test]
+    fn merge_capabilities_adds_a_capability_not_in_base() {
+        let base = strings(&["CAP_CHOWN"]);
+        let result = merge_capabilities(&base, &strings(&["net_admin"]), &[]).unwrap();
+        assert_eq!(result, strings(&["CAP_CHOWN", "CAP_NET_ADMIN"]));
+    }
+
+    #[test]
+    fn merge_capabilities_adding_a_capability_already_in_base_does_not_duplicate_it() {
+        let base = strings(&["CAP_CHOWN"]);
+        let result = merge_capabilities(&base, &strings(&["chown"]), &[]).unwrap();
+        assert_eq!(result, strings(&["CAP_CHOWN"]));
+    }
+
+    #[test]
+    fn merge_capabilities_rejects_the_same_capability_added_and_dropped() {
+        let base = strings(&["CAP_CHOWN"]);
+        let err = merge_capabilities(&base, &strings(&["net_admin"]), &strings(&["net_admin"]))
+            .unwrap_err();
+        assert!(err.to_string().contains("CAP_NET_ADMIN"), "{err}");
+    }
+
+    #[test]
+    fn merge_capabilities_drop_all_keeps_only_what_add_grants_ignoring_base() {
+        let base = strings(&["CAP_CHOWN", "CAP_FOWNER"]);
+        let result =
+            merge_capabilities(&base, &strings(&["net_admin"]), &strings(&["all"])).unwrap();
+        assert_eq!(result, strings(&["CAP_NET_ADMIN"]));
+    }
+
+    #[test]
+    fn merge_capabilities_add_all_replaces_base_with_every_recognized_capability() {
+        let base = strings(&["CAP_CHOWN"]);
+        let result = merge_capabilities(&base, &strings(&["all"]), &[]).unwrap();
+        let mut expected: Vec<String> = oci_runtime_core::identity::ALL_CAPABILITY_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn merge_capabilities_add_all_and_drop_all_together_is_a_real_error() {
+        let base = strings(&["CAP_CHOWN"]);
+        let err = merge_capabilities(&base, &strings(&["all"]), &strings(&["all"])).unwrap_err();
+        assert!(err.to_string().contains("not allowed"), "{err}");
+    }
+
+    #[test]
+    fn merge_capabilities_result_is_always_sorted_and_deduplicated() {
+        let base = strings(&["CAP_FOWNER", "CAP_CHOWN"]);
+        let result = merge_capabilities(&base, &strings(&["chown"]), &[]).unwrap();
+        assert_eq!(result, strings(&["CAP_CHOWN", "CAP_FOWNER"]));
     }
 }

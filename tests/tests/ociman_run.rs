@@ -98,6 +98,130 @@ fn run_grants_the_real_podman_default_capability_set() {
     );
 }
 
+/// `--cap-drop` genuinely removes a capability from the real
+/// podman-default set. `CAP_CHOWN` is bit 0 of the default mask
+/// (`0x800405fb`, see `run_grants_the_real_podman_default_capability_set`'s
+/// own doc comment) -- dropping it should leave exactly
+/// `0x800405fa`, confirmed by hand against a real running container
+/// before writing this assertion, not derived from the bitmask alone.
+#[test]
+fn run_cap_drop_removes_a_capability_from_the_default_set() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cap-drop:latest",
+        &busybox,
+        &["sh", "grep"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--cap-drop", "chown"])
+        .args(["ociman-test/cap-drop:latest"])
+        .args(["/bin/sh", "-c", "grep -E \"^CapEff:\" /proc/self/status"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "CapEff:\t00000000800405fa"
+    );
+}
+
+/// `--cap-add` genuinely grants a capability beyond the real
+/// podman-default set. `CAP_NET_ADMIN` is bit 12 (`0x1000`) --
+/// added to the default mask that becomes `0x800415fb`, confirmed by
+/// hand against a real running container first.
+#[test]
+fn run_cap_add_grants_a_capability_beyond_the_default_set() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cap-add:latest",
+        &busybox,
+        &["sh", "grep"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--cap-add", "net_admin"])
+        .args(["ociman-test/cap-add:latest"])
+        .args(["/bin/sh", "-c", "grep -E \"^CapEff:\" /proc/self/status"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "CapEff:\t00000000800415fb"
+    );
+}
+
+/// Giving the same capability to both `--cap-add` and `--cap-drop` is
+/// a real, surfaced CLI error, not silently resolved either way --
+/// the container never even starts.
+#[test]
+fn run_rejects_the_same_capability_added_and_dropped() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cap-conflict:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "--cap-add",
+            "net_admin",
+            "--cap-drop",
+            "net_admin",
+        ])
+        .args(["ociman-test/cap-conflict:latest", "/bin/true"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        !out.status.success(),
+        "should have refused a conflicting cap-add/cap-drop"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("CAP_NET_ADMIN"),
+        "stderr should name the conflicting capability: {stderr}"
+    );
+}
+
 #[test]
 fn run_uses_the_images_default_cmd_and_env() {
     let Some(busybox) = busybox_path() else {
