@@ -136,6 +136,23 @@ enum Command {
         /// real `docker`/`podman`.
         #[arg(long)]
         memory: Option<String>,
+        /// Total memory **+ swap** the container's own cgroup may use
+        /// (same units as `--memory`), matching real `docker run
+        /// --memory-swap`/`podman run --memory-swap`: a combined cap,
+        /// not a swap-only one. `-1` means unlimited swap. Requires
+        /// `--memory` to also be given (there is nothing to convert a
+        /// combined memory+swap figure relative to otherwise) —
+        /// matches real `docker`'s own validation
+        /// (`daemon/daemon_unix.go`'s `verifyPlatformContainerResources`).
+        /// If `--memory` is given but `--memory-swap` isn't, the
+        /// default is twice the memory limit (real `docker`'s own
+        /// default, `adaptContainerSettings`), unchanged from before
+        /// this flag existed. `allow_hyphen_values` so `-1` is
+        /// accepted as this flag's own value rather than misread as
+        /// an unrecognized flag of its own — see `--pids-limit`'s own
+        /// doc comment for why this matters.
+        #[arg(long = "memory-swap", allow_hyphen_values = true)]
+        memory_swap: Option<String>,
         /// Maximum number of CPUs the container's own cgroup may use
         /// (may be fractional, e.g. `1.5`), matching real `docker run
         /// --cpus`/`podman run --cpus`. Translated to a CPU-time quota
@@ -151,7 +168,17 @@ enum Command {
         /// means unlimited — matches real `docker`'s own convention
         /// (`daemon/daemon_unix.go`'s `getPidsLimit`), not a plain
         /// pass-through of whatever value is given.
-        #[arg(long = "pids-limit")]
+        ///
+        /// `allow_hyphen_values`: without it, clap treats `--pids-limit
+        /// -1` as an unrecognized `-1` *flag* rather than this flag's
+        /// own negative value (clap's default for any option whose
+        /// value merely *looks* like another flag) — caught by hand
+        /// running the exact real invocation real `docker run
+        /// --pids-limit -1`/`podman run --pids-limit -1` both accept
+        /// today, which this project's own CLI silently rejected
+        /// before this fix, a real drop-in-compatibility gap now
+        /// closed.
+        #[arg(long = "pids-limit", allow_hyphen_values = true)]
         pids_limit: Option<i64>,
     },
     /// List containers.
@@ -247,6 +274,7 @@ fn main() -> std::process::ExitCode {
                 rm,
                 name,
                 memory,
+                memory_swap,
                 cpus,
                 pids_limit,
             }) => cmd_run(
@@ -255,6 +283,7 @@ fn main() -> std::process::ExitCode {
                 rm,
                 name.as_deref(),
                 memory.as_deref(),
+                memory_swap.as_deref(),
                 cpus,
                 pids_limit,
             ),
@@ -396,16 +425,30 @@ fn cmd_inspect(reference_str: &str, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_run(
     image_ref: &str,
     args: &[String],
     rm: bool,
     name: Option<&str>,
     memory: Option<&str>,
+    memory_swap: Option<&str>,
     cpus: Option<f64>,
     pids_limit: Option<i64>,
 ) -> anyhow::Result<()> {
     let memory_limit_bytes = memory.map(parse_memory_limit).transpose()?;
+    let memory_swap_bytes = memory_swap.map(parse_memory_swap_limit).transpose()?;
+    anyhow::ensure!(
+        memory_swap_bytes.is_none() || memory_limit_bytes.is_some(),
+        "--memory-swap requires --memory to also be set (there is nothing to convert a \
+         combined memory+swap figure relative to otherwise)"
+    );
+    if let (Some(memory_limit), Some(swap_limit)) = (memory_limit_bytes, memory_swap_bytes) {
+        anyhow::ensure!(
+            swap_limit == -1 || swap_limit >= memory_limit,
+            "--memory-swap must be at least as large as --memory (or -1 for unlimited swap)"
+        );
+    }
     anyhow::ensure!(
         cpus.is_none_or(|c| c > 0.0 && c.is_finite()),
         "--cpus must be a positive, finite number"
@@ -464,6 +507,7 @@ fn cmd_run(
             args,
             &rootfs_dir,
             memory_limit_bytes,
+            memory_swap_bytes,
             cpus,
             pids_limit,
         )?;
@@ -906,12 +950,14 @@ fn compression_for_media_type(media_type: &str) -> anyhow::Result<oci_layer::Com
 /// Build a rootless runtime-spec for `config`'s container defaults,
 /// overridden by `args` if given (matching `docker run IMAGE args...`:
 /// `args` replaces `CMD`, `ENTRYPOINT` is always kept).
+#[allow(clippy::too_many_arguments)]
 fn synthesize_spec(
     config: &oci_spec_types::image::ImageConfig,
     id: &str,
     args: &[String],
     rootfs: &Path,
     memory_limit_bytes: Option<i64>,
+    memory_swap_bytes: Option<i64>,
     cpus: Option<f64>,
     pids_limit: Option<i64>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
@@ -965,7 +1011,7 @@ fn synthesize_spec(
         .as_mut()
         .expect("Spec::example always sets linux");
 
-    let resources = resources_from_cli(memory_limit_bytes, cpus, pids_limit);
+    let resources = resources_from_cli(memory_limit_bytes, memory_swap_bytes, cpus, pids_limit);
     if let Some(resources) = resources {
         linux.resources = Some(resources);
     }
@@ -985,12 +1031,13 @@ fn synthesize_spec(
     Ok(spec)
 }
 
-/// Build a `LinuxResources` from `ociman run`'s own `--memory`/`--cpus`/
-/// `--pids-limit` flags, `None` if none of the three were given at all
-/// (leaving `spec.linux.resources` untouched, exactly as before any of
-/// these flags existed).
+/// Build a `LinuxResources` from `ociman run`'s own `--memory`/
+/// `--memory-swap`/`--cpus`/`--pids-limit` flags, `None` if none of
+/// the four were given at all (leaving `spec.linux.resources`
+/// untouched, exactly as before any of these flags existed).
 fn resources_from_cli(
     memory_limit_bytes: Option<i64>,
+    memory_swap_bytes: Option<i64>,
     cpus: Option<f64>,
     pids_limit: Option<i64>,
 ) -> Option<oci_spec_types::runtime::LinuxResources> {
@@ -999,18 +1046,19 @@ fn resources_from_cli(
     }
     let memory = memory_limit_bytes.map(|limit| oci_spec_types::runtime::LinuxMemory {
         limit: Some(limit),
-        // No separate `--memory-swap` flag exists yet, so default the
-        // same way real `docker run --memory` does when it's left
-        // unset too: a *combined* memory+swap cap of twice the memory
-        // limit (i.e. up to one additional memory limit's worth of
-        // real swap) — checked directly against
+        // An explicit `--memory-swap` value is used as-is (including
+        // `-1` for unlimited); when it's not given, default the same
+        // way real `docker run --memory` does when `--memory-swap` is
+        // left unset too: a *combined* memory+swap cap of twice the
+        // memory limit (i.e. up to one additional memory limit's
+        // worth of real swap) — checked directly against
         // `~/git/moby/daemon/daemon_unix.go`'s
-        // `adaptContainerSettings`. Without this, the container's own
-        // cgroup would have *no* swap limit at all, letting it page
-        // out to swap indefinitely instead of ever actually hitting
-        // the OOM killer — silently defeating the entire point of
-        // `--memory`.
-        swap: limit.checked_mul(2),
+        // `adaptContainerSettings`'s own `MemorySwap == 0` gate.
+        // Without this, the container's own cgroup would have *no*
+        // swap limit at all, letting it page out to swap indefinitely
+        // instead of ever actually hitting the OOM killer — silently
+        // defeating the entire point of `--memory`.
+        swap: memory_swap_bytes.or_else(|| limit.checked_mul(2)),
         ..Default::default()
     });
     // `--cpus 1.5` -> a quota of 150_000 microseconds over a fixed
@@ -1065,6 +1113,19 @@ fn parse_memory_limit(value: &str) -> anyhow::Result<i64> {
         .checked_mul(multiplier)
         .with_context(|| format!("--memory value {value:?} is too large"))?;
     i64::try_from(bytes).with_context(|| format!("--memory value {value:?} is too large"))
+}
+
+/// Same syntax as [`parse_memory_limit`] (byte count + optional
+/// `k`/`m`/`g`/`t` suffix), plus real `docker run --memory-swap`'s own
+/// `-1` convention for "unlimited swap" (`LinuxMemory.swap == -1`,
+/// what [`oci_runtime_core::cgroups::convert_memory_swap_to_v2`]/its
+/// systemd-driver equivalent already treat as unlimited — see this
+/// module's own `resources_from_cli`).
+fn parse_memory_swap_limit(value: &str) -> anyhow::Result<i64> {
+    if value.trim() == "-1" {
+        return Ok(-1);
+    }
+    parse_memory_limit(value)
 }
 
 /// `ENTRYPOINT` (always kept) followed by either `args` (if the caller
@@ -1233,12 +1294,12 @@ mod tests {
 
     #[test]
     fn resources_from_cli_is_none_when_nothing_was_given() {
-        assert!(resources_from_cli(None, None, None).is_none());
+        assert!(resources_from_cli(None, None, None, None).is_none());
     }
 
     #[test]
     fn resources_from_cli_translates_cpus_to_a_quota_over_a_100ms_period() {
-        let resources = resources_from_cli(None, Some(1.5), None).unwrap();
+        let resources = resources_from_cli(None, None, Some(1.5), None).unwrap();
         let cpu = resources.cpu.unwrap();
         assert_eq!(cpu.quota, Some(150_000));
         assert_eq!(cpu.period, Some(100_000));
@@ -1247,7 +1308,7 @@ mod tests {
     #[test]
     fn resources_from_cli_pids_limit_zero_or_negative_means_unlimited() {
         assert_eq!(
-            resources_from_cli(None, None, Some(0))
+            resources_from_cli(None, None, None, Some(0))
                 .unwrap()
                 .pids
                 .unwrap()
@@ -1255,7 +1316,7 @@ mod tests {
             Some(-1)
         );
         assert_eq!(
-            resources_from_cli(None, None, Some(-5))
+            resources_from_cli(None, None, None, Some(-5))
                 .unwrap()
                 .pids
                 .unwrap()
@@ -1263,7 +1324,7 @@ mod tests {
             Some(-1)
         );
         assert_eq!(
-            resources_from_cli(None, None, Some(42))
+            resources_from_cli(None, None, None, Some(42))
                 .unwrap()
                 .pids
                 .unwrap()
@@ -1273,10 +1334,41 @@ mod tests {
     }
 
     #[test]
-    fn resources_from_cli_combines_all_three_independently() {
-        let resources = resources_from_cli(Some(1024), Some(0.5), Some(10)).unwrap();
+    fn resources_from_cli_combines_all_four_independently() {
+        let resources = resources_from_cli(Some(1024), None, Some(0.5), Some(10)).unwrap();
         assert_eq!(resources.memory.unwrap().limit, Some(1024));
         assert_eq!(resources.cpu.unwrap().quota, Some(50_000));
         assert_eq!(resources.pids.unwrap().limit, Some(10));
+    }
+
+    #[test]
+    fn resources_from_cli_defaults_swap_to_twice_memory_when_unset() {
+        let resources = resources_from_cli(Some(1024), None, None, None).unwrap();
+        assert_eq!(resources.memory.unwrap().swap, Some(2048));
+    }
+
+    #[test]
+    fn resources_from_cli_uses_an_explicit_memory_swap_value_untouched() {
+        let resources = resources_from_cli(Some(1024), Some(1500), None, None).unwrap();
+        assert_eq!(resources.memory.unwrap().swap, Some(1500));
+    }
+
+    #[test]
+    fn resources_from_cli_passes_through_unlimited_memory_swap() {
+        let resources = resources_from_cli(Some(1024), Some(-1), None, None).unwrap();
+        assert_eq!(resources.memory.unwrap().swap, Some(-1));
+    }
+
+    #[test]
+    fn parse_memory_swap_limit_accepts_negative_one_as_unlimited() {
+        assert_eq!(parse_memory_swap_limit("-1").unwrap(), -1);
+        assert_eq!(parse_memory_swap_limit(" -1 ").unwrap(), -1);
+    }
+
+    #[test]
+    fn parse_memory_swap_limit_otherwise_matches_parse_memory_limit() {
+        assert_eq!(parse_memory_swap_limit("512m").unwrap(), 512 * 1024 * 1024);
+        assert!(parse_memory_swap_limit("not-a-number").is_err());
+        assert!(parse_memory_swap_limit("-2").is_err());
     }
 }

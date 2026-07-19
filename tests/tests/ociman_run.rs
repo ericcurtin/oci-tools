@@ -418,6 +418,189 @@ fn run_cpus_flag_sets_the_real_systemd_scopes_own_cpu_quota() {
     );
 }
 
+/// Same technique as the `--cpus` test above (query the real systemd
+/// scope's own resource property rather than trying to prove kernel
+/// enforcement directly), for `--memory-swap`: a *combined*
+/// memory+swap cap, translated to cgroup v2's own swap-*only* value
+/// (`combined - memory`) by `oci_runtime_core::cgroups::
+/// convert_memory_swap_to_v2` before ever reaching systemd — confirmed
+/// by hand against a real running scope before writing this
+/// assertion (100m memory + 150m combined -> 50m real
+/// `MemorySwapMax`).
+#[test]
+fn run_memory_swap_flag_sets_the_real_systemd_scopes_own_swap_max() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/memswap:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "--memory",
+            "100m",
+            "--memory-swap",
+            "150m",
+            "ociman-test/memswap:latest",
+        ])
+        .args(["/bin/sh", "-c", "sleep 10"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run");
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    assert!(!container_id.is_empty(), "container never appeared in `ps`");
+    let status = wait_for_running(storage_dir.path(), &container_id, Duration::from_secs(20));
+    assert_eq!(status, "running", "container never reached `running`");
+    let scope_name = format!("ociman-{container_id}.scope");
+
+    let show = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            &scope_name,
+            "-p",
+            "MemorySwapMax",
+            "--value",
+        ])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let swap_max = String::from_utf8_lossy(&show.stdout).trim().to_string();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(
+        swap_max, "52428800",
+        "expected the real systemd scope's own MemorySwapMax to reflect 150m combined minus \
+         100m memory (50m swap-only, in bytes)"
+    );
+}
+
+/// `-1` (real `docker run --memory-swap -1`/`podman run --memory-swap
+/// -1`'s own "unlimited swap" convention) exercised through the real
+/// CLI, not just `resources_from_cli`'s own in-process unit tests —
+/// this specific case caught a real bug by hand while building this
+/// flag: clap's default `allow_hyphen_values` setting treats a value
+/// that merely *looks* like another flag (`-1`) as an unrecognized
+/// flag of its own rather than this option's own value, silently
+/// rejecting exactly the invocation real `docker`/`podman` accept.
+#[test]
+fn run_memory_swap_accepts_negative_one_via_the_real_cli_as_unlimited() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/memswap-unlimited:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "--memory",
+            "100m",
+            "--memory-swap",
+            "-1",
+            "ociman-test/memswap-unlimited:latest",
+        ])
+        .args(["/bin/sh", "-c", "sleep 10"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run");
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    assert!(!container_id.is_empty(), "container never appeared in `ps`");
+    let status = wait_for_running(storage_dir.path(), &container_id, Duration::from_secs(20));
+    assert_eq!(status, "running", "container never reached `running`");
+    let scope_name = format!("ociman-{container_id}.scope");
+
+    let show = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            &scope_name,
+            "-p",
+            "MemorySwapMax",
+            "--value",
+        ])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let swap_max = String::from_utf8_lossy(&show.stdout).trim().to_string();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(swap_max, "infinity");
+}
+
+/// Same real-CLI-not-just-a-unit-test concern as the `--memory-swap
+/// -1` test above, for `--pids-limit -1` specifically (real `docker
+/// run --pids-limit -1`/`podman run --pids-limit -1`'s own "no limit"
+/// convention) — the exact other flag `allow_hyphen_values` was
+/// missing for.
+#[test]
+fn run_pids_limit_negative_one_via_the_real_cli_means_unlimited() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/pids-limit-negative-one:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/pids-limit-negative-one:latest",
+        &["--pids-limit", "-1", "/bin/sh", "-c", "echo pids-ok"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "pids-ok\n");
+}
+
 fn wait_for_running(storage_root: &Path, id: &str, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     loop {
