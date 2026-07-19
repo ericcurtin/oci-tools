@@ -180,8 +180,12 @@ fn env_updates_an_existing_key_in_place_rather_than_duplicating() {
     );
 }
 
+/// A real, end-to-end `RUN` step: runs a real command in a real
+/// rootless container against the base image's own materialized
+/// layers, diffs what changed, and commits it as a genuinely new
+/// stored layer -- not a mock or a dry run.
 #[test]
-fn rejects_a_run_instruction_with_a_clear_error() {
+fn run_executes_a_real_command_and_commits_a_real_new_layer() {
     let Some(busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");
         return;
@@ -192,14 +196,116 @@ fn rejects_a_run_instruction_with_a_clear_error() {
         &store,
         "ociman-test/run-base:latest",
         &busybox,
-        &["sh"],
+        &["sh", "mkdir", "cat"],
+        ContainerConfig::default(),
+    );
+    let base_record = store
+        .resolve_image("docker.io/ociman-test/run-base:latest")
+        .unwrap()
+        .unwrap();
+    let base_manifest = store.image_manifest(&base_record).unwrap();
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/run-base:latest\n\
+         RUN echo hello > /marker.txt\n\
+         RUN mkdir -p /app && echo world > /app/second.txt\n\
+         ENV BUILT=yes\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/run-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/run-result:latest")
+        .unwrap()
+        .unwrap();
+    let manifest = store.image_manifest(&record).unwrap();
+    // Two real RUN steps -> two new layers on top of the base image's
+    // own (this seeded image has exactly one).
+    assert_eq!(manifest.layers.len(), base_manifest.layers.len() + 2);
+    assert_eq!(manifest.layers[0], base_manifest.layers[0]);
+
+    let config = store.image_config(&record).unwrap();
+    assert_eq!(config.rootfs.diff_ids.len(), manifest.layers.len());
+    // Real, non-empty-layer history entries recorded for both RUN
+    // steps, in order, plus the ENV instruction's own empty-layer one.
+    assert_eq!(config.history.len(), 3);
+    assert_eq!(
+        config.history[0].created_by.as_deref(),
+        Some("RUN /bin/sh -c echo hello > /marker.txt")
+    );
+    assert!(!config.history[0].empty_layer);
+    assert_eq!(
+        config.history[1].created_by.as_deref(),
+        Some("RUN /bin/sh -c mkdir -p /app && echo world > /app/second.txt")
+    );
+    assert!(!config.history[1].empty_layer);
+    assert!(config.history[2].empty_layer);
+
+    // The most convincing check: actually run the built image and
+    // confirm both files a RUN step wrote are really there, with the
+    // right content, and the ENV instruction's own var is set too --
+    // not just that *some* new layer blobs exist, but that they
+    // apply back into a real, working container.
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/run-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /marker.txt && cat /app/second.txt && echo BUILT=$BUILT",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert_eq!(stdout, "hello\nworld\nBUILT=yes\n");
+}
+
+/// A `RUN` step is a real container's own process -- a nonzero exit
+/// aborts the whole build, matching real `docker build`/`podman
+/// build`, and leaves nothing tagged (same "no partial image" contract
+/// every other rejection path in this file already checks).
+#[test]
+fn a_failing_run_aborts_the_build_and_leaves_nothing_tagged() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/run-fail-base:latest",
+        &busybox,
+        &["sh", "false"],
         ContainerConfig::default(),
     );
 
     let context_dir = tempfile::tempdir().unwrap();
     write_containerfile(
         context_dir.path(),
-        "FROM ociman-test/run-base:latest\nRUN echo hi\n",
+        "FROM ociman-test/run-fail-base:latest\nRUN false\n",
     );
 
     let build = ociman(
@@ -213,7 +319,10 @@ fn rejects_a_run_instruction_with_a_clear_error() {
     );
     assert!(!build.status.success());
     let stderr = String::from_utf8_lossy(&build.stderr);
-    assert!(stderr.contains("RUN is not yet supported"), "{stderr}");
+    assert!(
+        stderr.contains("RUN /bin/sh -c false failed with exit code"),
+        "{stderr}"
+    );
     assert!(
         store
             .resolve_image("docker.io/ociman-test/should-fail:latest")

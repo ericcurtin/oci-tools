@@ -917,6 +917,26 @@ fn synthesize_spec(
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
+    // `Spec::example()`'s own `root.readonly` is `true` -- a reasonable
+    // conservative default for a hand-written example spec, but not
+    // what a real container engine actually wants: real `docker run`/
+    // `podman run` give a container a writable rootfs by default
+    // (only `--read-only`, which neither `ociman run` nor `ociman
+    // build` exposes as a flag yet, makes it read-only). Left at
+    // `true`, *no* container this engine ever started could write
+    // anywhere in its own rootfs at all -- caught by hand while
+    // building `ociman build`'s own `RUN` support (0051), which needs
+    // exactly this to do anything useful, but the same bug already
+    // affected every `ociman run` container equally, just never
+    // exercised by a test that tried to write anything. Also a pure
+    // performance win, not just a correctness fix: `oci_runtime_core::
+    // rootfs`'s own bind-then-remount-readonly step is skipped
+    // entirely when `readonly` is `false` (one fewer mount syscall
+    // pair per container start).
+    spec.root
+        .as_mut()
+        .expect("Spec::example always sets root")
+        .readonly = false;
 
     let container_config = config.config.clone().unwrap_or_default();
     let full_args = command_for(&container_config, args)?;

@@ -31,15 +31,16 @@ Design pillars:
 
 Early development, milestone 4 of 8 in progress (`ociman build` works
 end to end for a real, deliberately narrow subset of Dockerfiles —
-single-stage, no `RUN`/`COPY`/`ADD` yet). See
-[docs/design/](docs/design/) for design notes per milestone.
+single-stage, `RUN` executes for real and commits real layers, no
+`COPY`/`ADD` yet). See [docs/design/](docs/design/) for design notes
+per milestone.
 
 | milestone | scope | status |
 |-----------|-------|--------|
 | 1 | workspace skeleton, `oci-cli-common`, 4-VM CI matrix | **done** |
 | 2 | `oci-spec-types`/`oci-registry`/`oci-store`; `ociman pull/images/inspect` | **done** |
 | 3 | `oci-runtime-core` + `ocirun`; `ociman run/exec/ps/logs` rootless | **done** (plus systemd cgroups, hooks, seccomp, resource limits beyond the original scope) |
-| 4 | `oci-dockerfile`; `ociman build` (multi-stage, cache) | in progress — single-stage, metadata-only builds work; `RUN`/`COPY`/`ADD`, multi-stage, and the build cache are not yet implemented (see `docs/design/0050`) |
+| 4 | `oci-dockerfile`; `ociman build` (multi-stage, cache) | in progress — single-stage builds with `RUN` work end to end (metadata instructions + real `RUN` execution/layer commits); `COPY`/`ADD`, multi-stage, and the build cache are not yet implemented (see `docs/design/0050`/`0051`) |
 | 5 | erofs/mount/BLS; `ociboot install to-disk`; dracut module; QEMU boot test | — |
 | 6 | upgrade/switch/rollback/status/gc; /etc merge; boot counting; layered mode | — |
 | 7 | `ocicri` (critest subset), `ocibox` | — |

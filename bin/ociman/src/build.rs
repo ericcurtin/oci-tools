@@ -13,14 +13,22 @@
 //!   compute the dependency-ordered build plan a multi-stage build
 //!   would need, but nothing here drives that plan yet (a later
 //!   increment).
-//! * **No `RUN`/`COPY`/`ADD`.** Each needs real machinery this
-//!   increment doesn't set up (`RUN`: a container-namespace execution
-//!   loop via `oci_runtime_core`, diffed and committed via
-//!   `oci_dockerfile::commit_layer`; `COPY`/`ADD`: real build-context
-//!   file access) — all three are rejected with a clear error rather
-//!   than silently skipped or misexecuted, matching this project's own
-//!   established convention for a deliberately unimplemented construct
-//!   (e.g. `ONBUILD`/`HEALTHCHECK` at parse time).
+//! * **`RUN` is supported; `COPY`/`ADD` are not yet.** A `RUN` step
+//!   materializes the base image's own layers into a real, persistent
+//!   scratch rootfs (created once per build, reused cumulatively
+//!   across every `RUN` in the same stage), runs the instruction's own
+//!   command in it via `oci_runtime_core::launch::run` (the same
+//!   namespace/rootless-uid-mapping/seccomp machinery `ocirun run`/
+//!   `ociman run` already use), diffs the rootfs before/after via
+//!   `oci_layer::{Snapshot,changes}`, and commits the result as a real
+//!   new layer via `oci_dockerfile::commit_layer`/`record_layer` (0048/
+//!   0049). A nonzero exit aborts the whole build, matching real
+//!   `docker build`/`podman build`. `COPY`/`ADD` still need real
+//!   build-context file access this increment doesn't set up yet —
+//!   rejected with a clear error rather than silently skipped or
+//!   misexecuted, matching this project's own established convention
+//!   for a deliberately unimplemented construct (e.g. `ONBUILD`/
+//!   `HEALTHCHECK` at parse time).
 //! * **`FROM scratch` is rejected too** (no base image to extend —
 //!   producing a genuinely empty rootfs is its own future increment).
 //! * **`-t`/`--tag` is required.** A real, taggable image needs a
@@ -30,19 +38,20 @@
 //!   untagged, ID-only image) — clear error instead of inventing that
 //!   plumbing here.
 //!
-//! Every other instruction (`ENV`/`LABEL`/`WORKDIR`/`USER`/
+//! Every metadata instruction (`ENV`/`LABEL`/`WORKDIR`/`USER`/
 //! `ENTRYPOINT`/`CMD`/`EXPOSE`/`VOLUME`/`STOPSIGNAL`/`MAINTAINER`,
 //! `SHELL`/`ARG` as no-ops) is fully applied to a working copy of the
 //! `FROM` base image's own config, matching real `docker build`'s own
-//! `history`/config-mutation behavior for each. Since nothing here can
-//! produce a new layer yet (no `RUN`/`COPY`/`ADD`), the built image's
-//! own layer list is always identical to its base image's.
+//! `history`/config-mutation behavior for each. A stage with no `RUN`
+//! at all never materializes a rootfs and its built image's own layer
+//! list stays byte-identical to its base image's — the scratch rootfs
+//! is only ever created when the stage actually contains a `RUN`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use oci_dockerfile::{Instruction, ShellOrExec};
+use oci_dockerfile::{Instruction, ShellOrExec, commit_layer, record_layer};
 use oci_spec_types::Reference;
 use oci_spec_types::image::{
     ContainerConfig, Descriptor, ImageConfig, ImageManifest, MEDIA_TYPE_IMAGE_CONFIG,
@@ -107,10 +116,45 @@ pub fn cmd_build(
     let mut config = store
         .image_config(&base_record)
         .with_context(|| format!("reading config for {base_reference}"))?;
-    let layers = base_manifest.layers.clone();
+    let mut layers = base_manifest.layers.clone();
+
+    // A scratch rootfs is only materialized if this stage actually
+    // runs anything in it -- every instruction 0050 already supported
+    // (metadata-only) never touches the filesystem at all, so paying
+    // for a tempdir plus a full base-image layer extraction for those
+    // Containerfiles would be pure waste.
+    let needs_rootfs = stage
+        .instructions
+        .iter()
+        .any(|instruction| matches!(instruction, Instruction::Run(_)));
+    let build_dir = if needs_rootfs {
+        let dir = tempfile::tempdir().context("creating build scratch directory")?;
+        let rootfs_dir = dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs_dir)
+            .with_context(|| format!("creating {}", rootfs_dir.display()))?;
+        for layer in &base_manifest.layers {
+            let compression = crate::compression_for_media_type(&layer.media_type)
+                .with_context(|| format!("layer {}", layer.digest))?;
+            let blob = store
+                .open_blob(&layer.digest)
+                .with_context(|| format!("opening layer blob {}", layer.digest))?;
+            oci_layer::apply(blob, compression, &rootfs_dir)
+                .with_context(|| format!("applying base layer {}", layer.digest))?;
+        }
+        Some(dir)
+    } else {
+        None
+    };
+    let rootfs_dir = build_dir.as_ref().map(|dir| dir.path().join("rootfs"));
 
     for instruction in &stage.instructions {
-        apply_instruction(instruction, &mut config)?;
+        apply_instruction(
+            instruction,
+            &mut config,
+            &mut layers,
+            &store,
+            rootfs_dir.as_deref(),
+        )?;
     }
 
     let config_bytes = serde_json::to_vec(&config).context("serializing image config")?;
@@ -181,13 +225,25 @@ fn resolve_dockerfile_path(context: &Path, dockerfile: Option<&Path>) -> anyhow:
 }
 
 /// Apply one already-`$VAR`-expanded instruction to a working copy of
-/// the image config being built. See this module's own doc comment
-/// for exactly which instructions are supported.
-fn apply_instruction(instruction: &Instruction, config: &mut ImageConfig) -> anyhow::Result<()> {
+/// the image config being built (and, for `RUN`, to `layers`/`store`/
+/// `rootfs` too). See this module's own doc comment for exactly which
+/// instructions are supported. `rootfs` is `Some` whenever the stage
+/// contains at least one `RUN` (see [`cmd_build`]); `Instruction::Run`
+/// is the only arm that ever needs it.
+fn apply_instruction(
+    instruction: &Instruction,
+    config: &mut ImageConfig,
+    layers: &mut Vec<Descriptor>,
+    store: &oci_store::Store,
+    rootfs: Option<&Path>,
+) -> anyhow::Result<()> {
     match instruction {
-        Instruction::Run(_) => anyhow::bail!(
-            "ociman build: RUN is not yet supported (no build-step execution wired in yet)"
-        ),
+        Instruction::Run(shell_or_exec) => {
+            let rootfs = rootfs.expect(
+                "cmd_build always prepares a rootfs when the stage contains a RUN instruction",
+            );
+            run_instruction(shell_or_exec, config, layers, store, rootfs)?;
+        }
         Instruction::Copy { .. } => anyhow::bail!(
             "ociman build: COPY is not yet supported (no build-context file access wired in yet)"
         ),
@@ -263,6 +319,124 @@ fn apply_instruction(instruction: &Instruction, config: &mut ImageConfig) -> any
         }
     }
     Ok(())
+}
+
+/// Run one `RUN` instruction against `rootfs` (already seeded with
+/// everything the stage has produced so far — the base image's own
+/// layers, plus every earlier `RUN` step's own committed changes,
+/// still sitting on disk from when they were captured), commit
+/// whatever it changed as a new layer, and record it into `config`/
+/// `layers`. A nonzero exit aborts the whole build (`anyhow::bail!`),
+/// matching real `docker build`/`podman build` — unlike `ociman run`,
+/// which forwards a container's own exit code as its own, a failed
+/// build step is *always* an error here, never a "successful build of
+/// a container that happened to exit nonzero".
+fn run_instruction(
+    shell_or_exec: &ShellOrExec,
+    config: &mut ImageConfig,
+    layers: &mut Vec<Descriptor>,
+    store: &oci_store::Store,
+    rootfs: &Path,
+) -> anyhow::Result<()> {
+    let args = args_for(shell_or_exec);
+    let command_text = args.join(" ");
+
+    let spec = run_step_spec(config, rootfs, args.clone())
+        .with_context(|| format!("preparing RUN {command_text}"))?;
+    let bundle_dir = rootfs
+        .parent()
+        .expect("rootfs is always a `rootfs` subdirectory of its own bundle directory");
+    let config_path = bundle_dir.join(oci_runtime_core::bundle::CONFIG_FILENAME);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&spec)?)
+        .with_context(|| format!("writing {}", config_path.display()))?;
+
+    let bundle = oci_runtime_core::Bundle::load(bundle_dir)
+        .with_context(|| format!("loading bundle from {}", bundle_dir.display()))?;
+    let validated_rootfs =
+        oci_runtime_core::validate::validate(&bundle).context("config.json failed validation")?;
+
+    let before = oci_layer::Snapshot::capture(rootfs)
+        .with_context(|| format!("capturing rootfs state before RUN {command_text}"))?;
+
+    // SAFETY: `ociman build`'s own process has not spawned any
+    // additional threads by this point -- argument parsing, pulling,
+    // base-layer extraction, and every earlier `RUN` step in this same
+    // build don't spawn any -- matching `cmd_run`'s own identical
+    // safety note for the same `oci_runtime_core::launch` entry point.
+    #[allow(unsafe_code)]
+    let exit_code =
+        unsafe { oci_runtime_core::launch::run("ociman-build", &bundle, &validated_rootfs) }
+            .with_context(|| format!("running RUN {command_text}"))?;
+    anyhow::ensure!(
+        exit_code == 0,
+        "RUN {command_text} failed with exit code {exit_code}"
+    );
+
+    let diff = oci_layer::changes(rootfs, &before)
+        .with_context(|| format!("diffing rootfs after RUN {command_text}"))?;
+    let committed = commit_layer(store, rootfs, &diff)
+        .with_context(|| format!("committing layer for RUN {command_text}"))?;
+    record_layer(config, layers, &committed, format!("RUN {command_text}"));
+    Ok(())
+}
+
+/// Build a minimal rootless runtime-spec for one `RUN` step: `args` is
+/// the whole command (no `ENTRYPOINT`-vs-`CMD` override logic — a
+/// `RUN` instruction's own argv *is* the command), and the working
+/// directory/environment/user come from `config`'s own container
+/// defaults *as of this point in the build* (whatever `WORKDIR`/`ENV`/
+/// `USER` instructions have already run) — deliberately narrower than
+/// `cmd_run`'s own `synthesize_spec`, which also handles CLI resource
+/// flags, image `CMD` fallback, and a container hostname, none of
+/// which apply to a build step.
+fn run_step_spec(
+    config: &ImageConfig,
+    rootfs: &Path,
+    args: Vec<String>,
+) -> anyhow::Result<oci_spec_types::runtime::Spec> {
+    let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
+    let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
+    // A `RUN` step needs a writable rootfs to do anything useful at
+    // all -- see `synthesize_spec`'s own identical fix and comment in
+    // `main.rs` for why `Spec::example()`'s own `readonly: true`
+    // default is wrong for a real running container, not just for a
+    // build step.
+    spec.root
+        .as_mut()
+        .expect("Spec::example always sets root")
+        .readonly = false;
+
+    let container_config = config.config.clone().unwrap_or_default();
+    let (uid, gid) = crate::resolve_user(rootfs, container_config.user.as_deref().unwrap_or(""))?;
+
+    let process = spec
+        .process
+        .as_mut()
+        .expect("Spec::example always sets process");
+    process.args = args;
+    process.terminal = false;
+    process.cwd = container_config
+        .working_dir
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/".to_string());
+    process.user.uid = uid;
+    process.user.gid = gid;
+    if !container_config.env.is_empty() {
+        process.env = container_config.env;
+    }
+
+    let linux = spec
+        .linux
+        .as_mut()
+        .expect("Spec::example always sets linux");
+    // Same default seccomp profile every other real container this
+    // project runs gets (0044) — a `RUN` step is a real container
+    // process too, not a special trusted case.
+    linux.seccomp = Some(oci_runtime_core::seccomp::filter_to_supported_syscalls(
+        &oci_runtime_core::seccomp::default_profile(),
+    ));
+
+    Ok(spec)
 }
 
 /// `docker`/`podman build`'s own shell-form wrapping: a shell-form
