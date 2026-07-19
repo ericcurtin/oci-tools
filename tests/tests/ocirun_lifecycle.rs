@@ -105,6 +105,127 @@ fn create_start_kill_delete_lifecycle() {
     );
 }
 
+/// `create --pid-file` writes the real container pid, atomically
+/// (never observable half-written — checked by simply reading it back
+/// once `create` itself has returned, which only happens after the
+/// real rename), matching real `runc create --pid-file` exactly. The
+/// same real `state.pid` this project's own `ocirun state` already
+/// reports is what the file should contain.
+#[test]
+fn create_pid_file_writes_the_real_pid() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    let pid_file = bundle_dir.path().join("container.pid");
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let create = Command::new(bin_path("ocirun"))
+        .arg("--root")
+        .arg(root_dir.path())
+        .args(["create", "pid-file-test", "--bundle"])
+        .arg(bundle_dir.path())
+        .args(["--pid-file"])
+        .arg(&pid_file)
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .expect("failed to spawn ocirun create");
+    assert!(
+        create.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert_eq!(state_status(root_dir.path(), "pid-file-test"), "created");
+
+    let state = ocirun(root_dir.path(), &["state", "pid-file-test"]);
+    let state_json: serde_json::Value = serde_json::from_slice(&state.stdout).unwrap();
+    let real_pid = state_json["pid"].as_i64().unwrap();
+
+    let file_content = std::fs::read_to_string(&pid_file).unwrap();
+    assert_eq!(
+        file_content,
+        real_pid.to_string(),
+        "--pid-file's own content should be exactly the bare decimal pid, no trailing newline, \
+         matching real runc's own createPidFile"
+    );
+
+    // Cleanup.
+    let kill = ocirun(root_dir.path(), &["kill", "pid-file-test", "KILL"]);
+    assert!(kill.status.success());
+    wait_for_status(
+        root_dir.path(),
+        "pid-file-test",
+        "stopped",
+        Duration::from_secs(5),
+    );
+    ocirun(root_dir.path(), &["delete", "pid-file-test"]);
+}
+
+/// `run --pid-file` writes the same real pid while the container is
+/// still running in the foreground -- checked by polling for the
+/// file's own appearance (real `run` blocks in the foreground, so this
+/// test spawns it detached, same reasoning `ocirun_create`'s own doc
+/// comment already established for `create`).
+#[test]
+fn run_pid_file_writes_the_real_pid() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    let pid_file = bundle_dir.path().join("container.pid");
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let mut run = Command::new(bin_path("ocirun"))
+        .arg("--root")
+        .arg(root_dir.path())
+        .args(["run", "pid-file-run-test", "--bundle"])
+        .arg(bundle_dir.path())
+        .args(["--pid-file"])
+        .arg(&pid_file)
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ocirun run");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !pid_file.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(pid_file.exists(), "--pid-file was never written");
+
+    let file_content = std::fs::read_to_string(&pid_file).unwrap();
+    let pid: i32 = file_content
+        .parse()
+        .unwrap_or_else(|_| panic!("not a bare decimal pid: {file_content:?}"));
+    // A real, live pid at this point -- `kill(pid, 0)` (no real signal
+    // sent, `rustix::process::test_kill_process`) succeeds only if
+    // `pid` is a real, currently-running process, the most direct
+    // proof this project's own `ocirun` process actually wrote its
+    // own real container pid, not a placeholder.
+    let real_pid = rustix::process::Pid::from_raw(pid).expect("a real pid is never 0");
+    assert!(
+        rustix::process::test_kill_process(real_pid).is_ok(),
+        "pid {pid} from --pid-file is not a live process"
+    );
+
+    // Cleanup: real `runc run`'s own container is this process's own
+    // foreground child (the container's init), so killing the
+    // reported container pid directly ends the whole thing; `run`
+    // itself then exits with the container's own signal-death exit
+    // code.
+    let _ = rustix::process::kill_process(real_pid, rustix::process::Signal::KILL);
+    let _ = run.wait();
+}
+
 #[test]
 fn delete_without_force_refuses_a_running_container() {
     let Some(busybox) = busybox_path() else {

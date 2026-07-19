@@ -81,6 +81,21 @@ enum Command {
         /// current directory).
         #[arg(short, long, value_name = "DIR")]
         bundle: Option<PathBuf>,
+        /// Write the container's own pid to this file as soon as it's
+        /// known, matching real `runc run --pid-file`/`crun run
+        /// --pid-file` — atomically (temp file + rename, matching real
+        /// runc's own `createPidFile` exactly, `~/git/runc/
+        /// utils_linux.go`), so a concurrent reader can never observe
+        /// a partially-written file. Unlike real runc (which aborts
+        /// the whole invocation if this write fails), a failure here
+        /// is logged and tolerated, not fatal — a deliberate,
+        /// documented divergence: this project's own established
+        /// pattern for auxiliary bookkeeping writes (`ociman run`'s
+        /// own state-record write, cgroup/hook fallbacks) is
+        /// "tolerate and log", not "abort a container that's already
+        /// running".
+        #[arg(long, value_name = "FILE")]
+        pid_file: Option<PathBuf>,
     },
     /// Create a container: set up namespaces/mounts/cgroups and leave
     /// its process blocked, waiting for `start`. Returns once setup
@@ -93,6 +108,9 @@ enum Command {
         /// current directory).
         #[arg(short, long, value_name = "DIR")]
         bundle: Option<PathBuf>,
+        /// Same as `run --pid-file` — see its own doc comment.
+        #[arg(long, value_name = "FILE")]
+        pid_file: Option<PathBuf>,
     },
     /// Start a previously `create`d container's process running.
     Start {
@@ -190,8 +208,16 @@ fn main() -> std::process::ExitCode {
             Some(Command::Spec { bundle, rootless }) => cmd_spec(bundle.as_deref(), rootless),
             Some(Command::State { id }) => cmd_state(&root, &id),
             Some(Command::List { format, quiet }) => cmd_list(&root, &format, quiet),
-            Some(Command::Run { id, bundle }) => cmd_run(&id, bundle.as_deref()),
-            Some(Command::Create { id, bundle }) => cmd_create(&root, &id, bundle.as_deref()),
+            Some(Command::Run {
+                id,
+                bundle,
+                pid_file,
+            }) => cmd_run(&id, bundle.as_deref(), pid_file.as_deref()),
+            Some(Command::Create {
+                id,
+                bundle,
+                pid_file,
+            }) => cmd_create(&root, &id, bundle.as_deref(), pid_file.as_deref()),
             Some(Command::Start { id }) => cmd_start(&root, &id),
             Some(Command::Kill { id, signal }) => cmd_kill(&root, &id, signal.as_deref()),
             Some(Command::Delete { id, force }) => cmd_delete(&root, &id, force),
@@ -280,7 +306,7 @@ fn cmd_list(root: &Path, format: &str, quiet: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_run(id: &str, bundle: Option<&Path>) -> anyhow::Result<()> {
+fn cmd_run(id: &str, bundle: Option<&Path>, pid_file: Option<&Path>) -> anyhow::Result<()> {
     let dir = bundle.unwrap_or_else(|| Path::new("."));
     tracing::debug!(container_id = id, bundle = %dir.display(), "run starting");
 
@@ -289,13 +315,33 @@ fn cmd_run(id: &str, bundle: Option<&Path>) -> anyhow::Result<()> {
     let rootfs =
         oci_runtime_core::validate::validate(&bundle).context("config.json failed validation")?;
 
+    // `launch::run` itself is just `run_reporting_pid` with a no-op
+    // callback (see its own doc comment) — called directly here
+    // instead so `--pid-file`'s own callback has somewhere to hook in,
+    // without this binary needing to duplicate `run`'s own choice of
+    // `CgroupSetup::FromSpec`/no log path.
+    //
     // SAFETY: `ocirun`'s own process has not spawned any additional
     // threads by this point (argument parsing and log initialization
-    // don't spawn any), so the fork `launch::run` performs is sound —
-    // see its own safety note for the requirement this satisfies.
+    // don't spawn any), so the fork `launch::run_reporting_pid`
+    // performs is sound — see its own safety note for the requirement
+    // this satisfies.
     #[allow(unsafe_code)]
-    let exit_code = unsafe { oci_runtime_core::launch::run(id, &bundle, &rootfs) }
-        .context("running container")?;
+    let exit_code = unsafe {
+        oci_runtime_core::launch::run_reporting_pid(
+            id,
+            &bundle,
+            &rootfs,
+            None,
+            oci_runtime_core::launch::CgroupSetup::FromSpec,
+            |pid| {
+                if let Some(path) = pid_file {
+                    write_pid_file(path, pid);
+                }
+            },
+        )
+    }
+    .context("running container")?;
 
     // The container's own exit code becomes ours, matching runc/crun's
     // `run`: exit code 0 must mean "the container's process exited 0",
@@ -304,7 +350,12 @@ fn cmd_run(id: &str, bundle: Option<&Path>) -> anyhow::Result<()> {
     std::process::exit(exit_code);
 }
 
-fn cmd_create(root: &Path, id: &str, bundle: Option<&Path>) -> anyhow::Result<()> {
+fn cmd_create(
+    root: &Path,
+    id: &str,
+    bundle: Option<&Path>,
+    pid_file: Option<&Path>,
+) -> anyhow::Result<()> {
     let dir = bundle.unwrap_or_else(|| Path::new("."));
     tracing::debug!(container_id = id, bundle = %dir.display(), "create starting");
 
@@ -343,9 +394,62 @@ fn cmd_create(root: &Path, id: &str, bundle: Option<&Path>) -> anyhow::Result<()
         }
     };
 
+    if let Some(path) = pid_file {
+        write_pid_file(path, pid);
+    }
+
     state.status = Status::Created;
     state.pid = Some(pid);
     store.write(&state)?;
+    Ok(())
+}
+
+/// Atomically write `pid` to `path`: create a temp file (`.
+/// <basename>`, same directory) then rename into place — matching
+/// real runc's own `createPidFile` exactly
+/// (`~/git/runc/utils_linux.go`), including its exact file content
+/// (the bare decimal pid, no trailing newline), permissions (`0o666`,
+/// reduced by umask same as any other file), and use of `O_SYNC` (the
+/// write reaches disk before the rename makes it visible) — so a
+/// concurrent reader (the whole point of `--pid-file`: a process
+/// supervisor watching for it) can never observe a partially-written
+/// file. Logged and tolerated on failure, not fatal — see `--pid-file`
+/// 's own doc comment on `Command::Run` for why this project
+/// deliberately diverges from real runc's own harder failure handling
+/// here.
+fn write_pid_file(path: &Path, pid: i32) {
+    if let Err(e) = write_pid_file_inner(path, pid) {
+        tracing::warn!(path = %path.display(), error = %e, "writing --pid-file (tolerated)");
+    }
+}
+
+fn write_pid_file_inner(path: &Path, pid: i32) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("{} has no file name", path.display()))?;
+    let tmp_name = {
+        let mut name = std::ffi::OsString::from(".");
+        name.push(file_name);
+        name
+    };
+    let tmp_path = dir.map_or_else(|| PathBuf::from(&tmp_name), |d| d.join(&tmp_name));
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o666)
+        .custom_flags(libc::O_SYNC)
+        .open(&tmp_path)
+        .with_context(|| format!("creating {}", tmp_path.display()))?;
+    std::io::Write::write_all(&mut file, pid.to_string().as_bytes())
+        .with_context(|| format!("writing {}", tmp_path.display()))?;
+    drop(file);
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("renaming {} to {}", tmp_path.display(), path.display()))?;
     Ok(())
 }
 

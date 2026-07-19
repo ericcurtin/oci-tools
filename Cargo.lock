@@ -929,6 +929,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "oci-cli-common",
  "oci-mount",
  "oci-runtime-core",

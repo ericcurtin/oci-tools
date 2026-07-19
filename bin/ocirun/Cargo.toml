@@ -12,6 +12,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+libc.workspace = true
 oci-cli-common.workspace = true
 oci-mount.workspace = true
 oci-runtime-core.workspace = true
