@@ -481,6 +481,116 @@ fn an_unreferenced_stage_is_pruned_and_never_built() {
     assert!(!labels.contains_key("unused"));
 }
 
+/// `--target <name>` builds only that named stage (and whatever it
+/// depends on), never the stages after it in the file -- proven the
+/// same way `an_unreferenced_stage_is_pruned_and_never_built` proves
+/// ordinary pruning: the *later*, non-targeted stage has a `FROM`
+/// reference to an image that doesn't exist anywhere, so the build
+/// would fail outright if it were built at all.
+#[test]
+fn target_builds_only_the_named_stage_and_prunes_everything_after_it() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/target-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/target-base:latest AS builder\n\
+         LABEL stage=builder\n\
+         FROM this-image-does-not-exist-anywhere:latest AS final\n\
+         LABEL stage=final\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/target-result:latest",
+            "--target",
+            "BUILDER", // deliberately mixed case -- matches real
+                       // BuildKit's own case-insensitive stage-name
+                       // matching.
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/target-result:latest")
+        .unwrap()
+        .unwrap();
+    let config = store.image_config(&record).unwrap();
+    let labels = config.config.unwrap().labels;
+    assert_eq!(labels.get("stage").map(String::as_str), Some("builder"));
+}
+
+/// A `--target` naming no real stage at all is a real, clear, surfaced
+/// error -- matching real BuildKit's own `"target stage %q could not
+/// be found"` wording -- not silently falling back to the last stage.
+#[test]
+fn target_naming_no_real_stage_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/target-missing-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/target-missing-base:latest AS builder\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/target-missing-result:latest",
+            "--target",
+            "no-such-stage",
+        ],
+    );
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("target stage \"no-such-stage\" could not be found"),
+        "{stderr}"
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/target-missing-result:latest")
+            .unwrap()
+            .is_none(),
+        "a failed build must not leave a partial image tagged"
+    );
+}
+
 #[test]
 fn rejects_from_scratch_with_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();

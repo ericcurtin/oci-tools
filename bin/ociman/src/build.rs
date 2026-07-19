@@ -14,10 +14,14 @@
 //!   materialized rootfs (`oci_dockerfile::
 //!   resolve_copy_from_dependencies`, 0054) — `stages_needed_for`
 //!   (0043) combines both into the one set of stages that actually need
-//!   building, in dependency order, for the target (always the *last*
-//!   stage in the file, matching real `docker build`'s own default with
-//!   no `--target`; stages neither kind of reference ever reaches are
-//!   pruned and never built at all). Each built stage's own
+//!   building, in dependency order, for the target (the last stage in
+//!   the file by default, or the stage named by **`--target`**, which
+//!   works too — matching real `docker build --target`/`podman build
+//!   --target` exactly, name matching case-insensitive, only a
+//!   *named* stage targetable, checked directly against real
+//!   BuildKit's own `resolveTarget`); stages neither kind of reference
+//!   ever reaches are pruned and never built at all, whether or not
+//!   they'd even build successfully on their own. Each built stage's own
 //!   `ImageConfig`, layer list, and (if it has one) rootfs directory are
 //!   kept around for the rest of the build, so a later stage can reuse
 //!   any of them directly — no re-pulling, no re-running anything.
@@ -137,6 +141,7 @@ pub fn cmd_build(
     dockerfile: Option<&Path>,
     tag: Option<&str>,
     build_args: &[String],
+    target: Option<&str>,
     json: bool,
 ) -> anyhow::Result<()> {
     let tag = tag.context(
@@ -160,16 +165,30 @@ pub fn cmd_build(
     let global_args = oci_dockerfile::expand_meta_args(&meta_args, &build_args)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    // The target is always the *last* stage in the file, matching real
-    // `docker build`'s own default when no `--target` is given
-    // (`--target` itself doesn't exist as a flag yet). Stages that
-    // don't actually contribute to it (an unrelated stage, or one only
-    // referenced via a not-yet-supported `COPY --from=<external
-    // image>`) are pruned by `stages_needed_for` and never built at
-    // all.
+    // With no `--target`, the target is the *last* stage in the file —
+    // matching real `docker build`/`podman build`'s own default
+    // (checked directly against real BuildKit's own `resolveTarget`,
+    // `dockerfile2llb/convert.go`: an empty target resolves to
+    // `lastTarget()`, exactly this). A given `--target` is resolved by
+    // name only (`find_stage`, case-insensitive) — real BuildKit's own
+    // `resolveTarget` only ever calls `findStateByName`, never a
+    // numeric fallback, so an anonymous (unnamed) stage can't be
+    // targeted this way either, matching real `docker build --target`/
+    // `podman build --target` exactly, including the real error
+    // message's own wording for a name matching no stage at all.
+    // Stages that don't actually contribute to the resolved target (an
+    // unrelated stage, or one only reachable via a stage this target
+    // doesn't depend on) are pruned by `stages_needed_for` and never
+    // built at all — including one that would otherwise fail to build
+    // (an invalid base image reference, an unsupported instruction),
+    // same as real `docker build --target`.
     let deps = oci_dockerfile::resolve_dependencies(&stages);
     let copy_from_deps = oci_dockerfile::resolve_copy_from_dependencies(&stages);
-    let target = stages.len() - 1;
+    let target = match target {
+        Some(name) => oci_dockerfile::find_stage(&stages, name)
+            .with_context(|| format!("ociman build: target stage {name:?} could not be found"))?,
+        None => stages.len() - 1,
+    };
     let build_order = oci_dockerfile::stages_needed_for(&deps, &copy_from_deps, target);
 
     // Every stage some *other* stage's own `COPY --from=` reads from

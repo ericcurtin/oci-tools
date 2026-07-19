@@ -75,9 +75,8 @@ enum Command {
         reference: String,
     },
     /// Build an image from a Dockerfile/Containerfile. See the
-    /// `build` module's own doc comment for this first increment's
-    /// deliberately narrow scope (single-stage only, no `RUN`/`COPY`/
-    /// `ADD` yet).
+    /// `build` module's own doc comment for exactly what's supported
+    /// so far.
     Build {
         /// Build context directory.
         #[arg(default_value = ".")]
@@ -101,6 +100,16 @@ enum Command {
         /// comment for the full, checked-directly rules).
         #[arg(long = "build-arg")]
         build_arg: Vec<String>,
+        /// Build only up to and including the named stage (a stage's
+        /// own `AS <name>`), rather than the last stage in the file —
+        /// matching real `docker build --target`/`podman build
+        /// --target` exactly (name matching is case-insensitive, and
+        /// only a *named* stage can be targeted, same as the real
+        /// implementations). Any stage neither the named target nor
+        /// anything it needs depends on is pruned and never built at
+        /// all, same as with no `--target` given.
+        #[arg(long = "target")]
+        target: Option<String>,
     },
     /// List images in local storage.
     Images,
@@ -373,11 +382,13 @@ fn main() -> std::process::ExitCode {
                 file,
                 tag,
                 build_arg,
+                target,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
                 tag.as_deref(),
                 &build_arg,
+                target.as_deref(),
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),
