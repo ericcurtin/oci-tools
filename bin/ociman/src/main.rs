@@ -92,6 +92,15 @@ enum Command {
         /// (see the `build` module's own doc comment for why).
         #[arg(short = 't', long = "tag")]
         tag: Option<String>,
+        /// Override an `ARG`'s own value: `KEY=value`, or bare `KEY`
+        /// to pull the value from `ociman`'s own process environment
+        /// (matching real `docker build --build-arg`/`podman build
+        /// --build-arg` exactly — repeatable, and only takes effect
+        /// for an `ARG` name actually declared somewhere in the
+        /// Dockerfile/Containerfile; see the `build` module's own doc
+        /// comment for the full, checked-directly rules).
+        #[arg(long = "build-arg")]
+        build_arg: Vec<String>,
     },
     /// List images in local storage.
     Images,
@@ -313,9 +322,18 @@ fn main() -> std::process::ExitCode {
                  arrives with later milestones)"
             ),
             Some(Command::Pull { reference }) => cmd_pull(&reference, cli.global.json),
-            Some(Command::Build { context, file, tag }) => {
-                build::cmd_build(&context, file.as_deref(), tag.as_deref(), cli.global.json)
-            }
+            Some(Command::Build {
+                context,
+                file,
+                tag,
+                build_arg,
+            }) => build::cmd_build(
+                &context,
+                file.as_deref(),
+                tag.as_deref(),
+                &build_arg,
+                cli.global.json,
+            ),
             Some(Command::Images) => cmd_images(cli.global.json),
             Some(Command::Inspect { reference }) => cmd_inspect(&reference, cli.global.json),
             Some(Command::Run {

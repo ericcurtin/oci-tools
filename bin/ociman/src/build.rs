@@ -55,6 +55,19 @@
 //!   time).
 //! * **`FROM scratch` is rejected too** (no base image to extend —
 //!   producing a genuinely empty rootfs is its own future increment).
+//! * **`--build-arg KEY=value` (or bare `--build-arg KEY`, pulling
+//!   from `ociman`'s own process environment) is supported**,
+//!   matching real `docker build --build-arg`/`podman build
+//!   --build-arg` exactly (checked directly against real `podman`'s
+//!   own vendored `buildah/pkg/cli/build.go`'s `readBuildArg`): an
+//!   override only takes effect for an `ARG` name actually *declared*
+//!   somewhere in the file (a meta-`ARG` or a stage-local one, with or
+//!   without its own inline default) and is used verbatim, never
+//!   re-`$VAR`-expanded — see `oci_dockerfile::expand_meta_args`'s own
+//!   doc comment for the exact, checked-directly rules. No warning is
+//!   printed yet for a `--build-arg` whose name nothing in the file
+//!   ever declares (real `docker`/`podman` both print one) — a
+//!   separate, smaller future increment.
 //! * **`-t`/`--tag` is required.** A real, taggable image needs a
 //!   reference to store it under; this project's `oci_store::Store`
 //!   has no "anonymous image, addressable only by ID" concept yet
@@ -64,8 +77,9 @@
 //!
 //! Every metadata instruction (`ENV`/`LABEL`/`WORKDIR`/`USER`/
 //! `ENTRYPOINT`/`CMD`/`EXPOSE`/`VOLUME`/`STOPSIGNAL`/`MAINTAINER`,
-//! `SHELL`/`ARG` as no-ops) is fully applied to a working copy of the
-//! `FROM` base image's own config, matching real `docker build`'s own
+//! `ARG` per its own `--build-arg` handling above, `SHELL` as a
+//! no-op) is fully applied to a working copy of the `FROM` base
+//! image's own config, matching real `docker build`'s own
 //! `history`/config-mutation behavior for each. A stage with no `RUN`
 //! at all never materializes a rootfs and its built image's own layer
 //! list stays byte-identical to its base image's — the scratch rootfs
@@ -99,12 +113,14 @@ pub fn cmd_build(
     context: &Path,
     dockerfile: Option<&Path>,
     tag: Option<&str>,
+    build_args: &[String],
     json: bool,
 ) -> anyhow::Result<()> {
     let tag = tag.context(
         "ociman build: -t/--tag is required (untagged, ID-only builds are not yet supported)",
     )?;
     let tag_reference = Reference::parse(tag).with_context(|| format!("parsing tag {tag:?}"))?;
+    let build_args = parse_build_args(build_args);
 
     let dockerfile_path = resolve_dockerfile_path(context, dockerfile)?;
     let text = std::fs::read_to_string(&dockerfile_path)
@@ -118,8 +134,8 @@ pub fn cmd_build(
         "ociman build: {} contains no `FROM` instruction",
         dockerfile_path.display()
     );
-    let global_args =
-        oci_dockerfile::expand_meta_args(&meta_args).map_err(|e| anyhow::anyhow!(e))?;
+    let global_args = oci_dockerfile::expand_meta_args(&meta_args, &build_args)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // The target is always the *last* stage in the file, matching real
     // `docker build`'s own default when no `--target` is given
@@ -143,7 +159,7 @@ pub fn cmd_build(
     let store = crate::open_store()?;
     let mut built: std::collections::HashMap<usize, BuiltStage> = std::collections::HashMap::new();
     for &stage_index in &build_order {
-        let stage = oci_dockerfile::expand_stage(&global_args, &stages[stage_index])
+        let stage = oci_dockerfile::expand_stage(&global_args, &build_args, &stages[stage_index])
             .map_err(|e| anyhow::anyhow!(e))?;
 
         let (base_config, base_layers) = match deps[stage_index] {
@@ -343,6 +359,43 @@ fn build_stage(
         rootfs_dir,
         _build_dir: build_dir,
     })
+}
+
+/// Parse `ociman build --build-arg`'s own raw `KEY=value`/bare `KEY`
+/// CLI strings into the resolved override map `oci_dockerfile::
+/// expand_meta_args`/`expand_stage` take — this parsing is entirely
+/// `ociman`'s own concern, not `oci-dockerfile`'s (see that crate's
+/// own top-level doc comment). Matches real `podman build
+/// --build-arg`'s own CLI-argument parser exactly (checked directly,
+/// `~/git/podman`'s own vendored `go.podman.io/buildah/pkg/cli/
+/// build.go`'s `readBuildArg`): `KEY=value` uses `value` verbatim;
+/// bare `KEY` (no `=`) pulls the value from `ociman`'s own current
+/// process environment if a variable of that name is set there, or is
+/// dropped entirely (not an empty-string override) if it isn't --
+/// `docker build --build-arg`'s own documented "pass through a host
+/// environment variable" convenience. Later `--build-arg` entries for
+/// the same key win over earlier ones (matches ordinary CLI-flag
+/// override-in-order semantics elsewhere in this project, e.g.
+/// `ENV`'s own last-write-wins merge in `build.rs`'s own
+/// `apply_instruction`).
+fn parse_build_args(build_args: &[String]) -> std::collections::HashMap<String, String> {
+    let mut resolved = std::collections::HashMap::new();
+    for arg in build_args {
+        match arg.split_once('=') {
+            Some((key, value)) => {
+                resolved.insert(key.to_string(), value.to_string());
+            }
+            None => match std::env::var(arg) {
+                Ok(value) => {
+                    resolved.insert(arg.clone(), value);
+                }
+                Err(_) => {
+                    resolved.remove(arg);
+                }
+            },
+        }
+    }
+    resolved
 }
 
 /// Real `podman build`'s own default preference when `-f`/`--file`
@@ -841,4 +894,61 @@ fn normalize_absolute_path(path: &str) -> String {
         }
     }
     format!("/{}", parts.join("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_build_args_uses_key_equals_value_verbatim() {
+        let resolved = parse_build_args(&["FOO=bar".to_string()]);
+        assert_eq!(resolved.get("FOO").map(String::as_str), Some("bar"));
+    }
+
+    #[test]
+    fn parse_build_args_bare_key_pulls_from_the_process_environment() {
+        // SAFETY: this test process is single-threaded for the
+        // duration of this call (no other test in this crate spawns
+        // threads that read/write environment variables concurrently
+        // -- `cargo test`'s own per-test-binary process is otherwise
+        // multi-threaded, but env var mutation races are a real,
+        // documented hazard only when *other* threads also touch the
+        // environment at the same time).
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("OCIMAN_TEST_BUILD_ARG_PROBE", "from-env");
+        }
+        let resolved = parse_build_args(&["OCIMAN_TEST_BUILD_ARG_PROBE".to_string()]);
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("OCIMAN_TEST_BUILD_ARG_PROBE");
+        }
+        assert_eq!(
+            resolved
+                .get("OCIMAN_TEST_BUILD_ARG_PROBE")
+                .map(String::as_str),
+            Some("from-env")
+        );
+    }
+
+    #[test]
+    fn parse_build_args_bare_key_not_in_the_environment_is_dropped_not_empty() {
+        let resolved = parse_build_args(&["OCIMAN_TEST_DEFINITELY_UNSET_XYZ".to_string()]);
+        assert!(!resolved.contains_key("OCIMAN_TEST_DEFINITELY_UNSET_XYZ"));
+    }
+
+    #[test]
+    fn parse_build_args_later_entries_for_the_same_key_win() {
+        let resolved = parse_build_args(&["FOO=first".to_string(), "FOO=second".to_string()]);
+        assert_eq!(resolved.get("FOO").map(String::as_str), Some("second"));
+    }
+
+    #[test]
+    fn parse_build_args_handles_several_independent_keys() {
+        let resolved = parse_build_args(&["A=1".to_string(), "B=2".to_string()]);
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved.get("A").map(String::as_str), Some("1"));
+        assert_eq!(resolved.get("B").map(String::as_str), Some("2"));
+    }
 }

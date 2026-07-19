@@ -1104,3 +1104,135 @@ fn an_unreferenced_stage_is_pruned_even_when_another_stage_is_used_only_via_copy
     );
     assert_eq!(String::from_utf8_lossy(&run.stdout), "hi\n");
 }
+
+/// A real, end-to-end `--build-arg KEY=value`: overrides a declared
+/// `ARG`'s own inline default, verbatim (not affecting an
+/// un-overridden sibling `ARG`'s own default), confirmed by actually
+/// running the built image and reading back the resulting `ENV` value
+/// it flowed into.
+#[test]
+fn build_arg_overrides_a_declared_args_own_default() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-arg-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-arg-base:latest\n\
+         ARG VERSION=1.0\n\
+         ARG UNUSED_ARG=default\n\
+         ENV APP_VERSION=${VERSION}\n\
+         ENV UNUSED=${UNUSED_ARG}\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-arg-result:latest",
+            "--build-arg",
+            "VERSION=2.5",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/build-arg-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo $APP_VERSION $UNUSED",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "2.5 default\n");
+}
+
+/// A `--build-arg` for a name nothing in the Containerfile ever
+/// declares has no effect at all (real `docker build`/`podman build`
+/// both just silently ignore it for the purposes of expansion,
+/// printing an "unconsumed build-arg" warning this project doesn't
+/// implement yet -- see `bin/ociman/src/build.rs`'s own module doc
+/// comment) -- the build still succeeds normally, using the
+/// declared `ARG`'s own original default.
+#[test]
+fn build_arg_for_an_undeclared_name_has_no_effect() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-arg-undeclared-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-arg-undeclared-base:latest\n\
+         ARG VERSION=1.0\n\
+         ENV APP_VERSION=${VERSION}\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-arg-undeclared-result:latest",
+            "--build-arg",
+            "NEVER_DECLARED=xyz",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/build-arg-undeclared-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo $APP_VERSION",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "1.0\n");
+}

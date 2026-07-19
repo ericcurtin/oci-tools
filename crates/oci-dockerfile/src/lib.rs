@@ -1,16 +1,17 @@
 //! Dockerfile/Containerfile parser, build graph, and build cache.
 //!
-//! **Status: parsing/build-graph plus one piece of layer-commit
-//! plumbing** — see this crate's own `docs/design/` notes for the
-//! exact scope. `parse` turns raw Dockerfile/Containerfile text into
-//! an ordered list of [`Instruction`]s; nothing here executes a build
-//! yet (that's `ociman build`'s own job, layered on top of this
-//! crate and `oci-runtime-core` for `RUN` steps — not implemented
-//! yet). [`commit_layer`] is the one exception: given a rootfs diff a
-//! future build executor has already computed (via
-//! [`oci_layer::changes`]), it turns that diff into a real, stored
-//! layer — the actual execution loop that would call it doesn't exist
-//! yet either.
+//! **Status: parsing/build-graph plus the layer-commit plumbing.**
+//! `parse` turns raw Dockerfile/Containerfile text into an ordered
+//! list of [`Instruction`]s; the actual build *executor* — driving
+//! `RUN` steps via `oci-runtime-core`, copying files for `COPY`,
+//! committing layers via [`commit_layer`], resolving `--build-arg`
+//! overrides via [`expand_meta_args`]/[`expand_stage`] — lives in
+//! `ociman build` (`bin/ociman/src/build.rs`), layered on top of this
+//! crate rather than in it (see `docs/design/0050`-`0059` for that
+//! side's own increments). This crate itself stays a pure, `ociman`-
+//! independent library: parsing, `$VAR` expansion, the dependency
+//! graph, and the one piece of layer-commit glue ([`commit_layer`])
+//! narrow enough to have no build-executor-loop concerns of its own.
 //!
 //! Every lexical/grammar rule this crate implements was checked
 //! directly against the real, current BuildKit Dockerfile frontend
@@ -41,26 +42,28 @@
 //! comment for this increment's own deliberate backward-references-
 //! only scope).
 //!
-//! **Deliberately not implemented yet**, each a separate, later
-//! increment of its own:
+//! **Deliberately not implemented yet** in this crate, each a
+//! separate, later increment of its own:
 //! - `ONBUILD`, `HEALTHCHECK`, heredocs (`<<EOF ... EOF`), and every
 //!   BuildKit-only flag (`RUN --mount=`, `COPY --link`/`--parents`/
 //!   `--exclude=`, `ADD --link`/`--keep-git-dir`/`--checksum=`/
 //!   `--unpack`) — a Containerfile using any of these fails to parse
 //!   with a clear error, rather than being silently misparsed.
-//! - Actual build execution (`RUN` steps via `oci-runtime-core`) and
-//!   the build cache this crate's own module doc has always planned —
-//!   the dependency graph above tells a future build-execution
-//!   increment *what order* to build stages in and *which* stages it
-//!   can skip for a given target, but nothing actually builds
-//!   anything yet. [`commit_layer`] can turn an already-computed diff
-//!   into a real stored layer, but nothing yet decides *when* to diff
-//!   a rootfs, drives a `RUN` step, or updates an image config's own
-//!   `rootfs`/`history` or a manifest's own `layers` list with
-//!   [`commit_layer`]'s own output.
-//! - `--build-arg` (an external override for a meta-`ARG`'s own
-//!   value) has no representation at all yet — [`expand_meta_args`]
-//!   only ever sees each `ARG`'s own inline default.
+//! - The build cache this crate's own module doc has always planned —
+//!   the dependency graph above tells `ociman build` *what order* to
+//!   build stages in and *which* stages it can skip for a given
+//!   target, but nothing actually caches a previous build's own
+//!   result yet.
+//! - `--build-arg`'s own CLI-string parsing (`KEY=value`/bare `KEY`
+//!   pulled from the calling process's own environment, matching real
+//!   `docker build --build-arg`/`podman build --build-arg`) is
+//!   `ociman build`'s own concern, not this crate's — this crate only
+//!   ever takes an already-resolved `HashMap<String, String>` of
+//!   overrides ([`expand_meta_args`]/[`expand_stage`]'s own `overrides`
+//!   parameter), applying them wherever a real `ARG` name is actually
+//!   declared, exactly the way real `docker build`/`podman build`'s
+//!   own engines do — see [`expand_stage`]'s own doc comment for the
+//!   exact, checked-directly rules.
 
 mod commit;
 mod dependencies;
