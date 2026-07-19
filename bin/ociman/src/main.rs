@@ -412,6 +412,18 @@ fn cmd_run(image_ref: &str, args: &[String], rm: bool, name: Option<&str>) -> an
             let _ = containers.write(&state);
         };
 
+        // Always attempt the systemd cgroup driver for `ociman`'s own
+        // containers (matching real `podman`'s own default on
+        // systemd-based distros) — falls back to no cgroup at all
+        // (logged, not fatal) if no D-Bus session is reachable, so
+        // this is a pure improvement over the previous "never any
+        // cgroup at all" behavior, never a new hard requirement. See
+        // `docs/design/0033`/`0034`.
+        let cgroup_setup = oci_runtime_core::launch::CgroupSetup::Systemd {
+            scope_name: format!("ociman-{container_id}.scope"),
+            description: format!("oci-tools container {container_id}"),
+        };
+
         // SAFETY: `ociman`'s own process has not spawned any additional
         // threads by this point (argument parsing, pulling, and layer
         // extraction don't spawn any), so the fork `launch::
@@ -424,6 +436,7 @@ fn cmd_run(image_ref: &str, args: &[String], rm: bool, name: Option<&str>) -> an
                 &bundle,
                 &rootfs,
                 Some(&log_path),
+                cgroup_setup,
                 record_running,
             )
         }

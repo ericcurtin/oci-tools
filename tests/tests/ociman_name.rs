@@ -39,6 +39,10 @@ fn ociman_run_detached(
         .expect("failed to spawn ociman run")
 }
 
+/// A generous timeout: `ociman run` now attempts a real systemd cgroup
+/// driver D-Bus round trip per container (`docs/design/0034`), which
+/// can occasionally take noticeably longer under heavy *concurrent*
+/// test-suite load — the ordinary case still resolves in milliseconds.
 fn wait_for_container_status(
     storage_root: &Path,
     id: &str,
@@ -247,7 +251,7 @@ fn logs_and_exec_accept_a_name_instead_of_an_id() {
     // image) is exactly equivalent to the more common `--name X image
     // args` form used elsewhere in this file.
     let id = {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let out = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
             let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -259,7 +263,7 @@ fn logs_and_exec_accept_a_name_instead_of_an_id() {
     };
     assert!(!id.is_empty());
     assert_eq!(
-        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(5)),
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
         "running"
     );
 

@@ -31,6 +31,7 @@ use crate::process;
 use crate::rlimits;
 use crate::rootfs::{self, MaskedPathKind, RootfsAction};
 use crate::seccomp;
+use crate::systemd_cgroup;
 
 /// The cgroup v2 unified hierarchy's mount point in production. Tests
 /// substitute a plain temp directory (see [`crate::cgroups`]'s own
@@ -68,7 +69,33 @@ pub const COMMAND_NOT_FOUND_EXIT_CODE: i32 = 127;
 #[allow(unsafe_code)]
 pub unsafe fn run(id: &str, bundle: &Bundle, rootfs: &Path) -> io::Result<i32> {
     // SAFETY: forwarded from this function's own contract.
-    unsafe { run_reporting_pid(id, bundle, rootfs, None, |_pid| {}) }
+    unsafe { run_reporting_pid(id, bundle, rootfs, None, CgroupSetup::FromSpec, |_pid| {}) }
+}
+
+/// How a container's cgroup gets set up — see `docs/design/0033` and
+/// `crate::systemd_cgroup` for why a second driver exists at all.
+pub enum CgroupSetup {
+    /// Whatever `bundle.spec.linux.cgroupsPath`/`resources` already
+    /// specify (the cgroupfs driver this crate has had since 0015, or
+    /// no cgroup at all if `cgroupsPath` is unset) — the *only* mode
+    /// `ocirun` itself uses, via plain [`run`], matching real
+    /// `runc`/`crun`'s own spec-driven behavior exactly.
+    FromSpec,
+    /// Ignore `cgroupsPath` entirely: create a transient systemd scope
+    /// instead (`systemd_cgroup::create_scope`), named `scope_name`
+    /// with `description`. Falls back to no cgroup at all (logged via
+    /// `tracing::warn!`, not fatal) if no D-Bus session is reachable —
+    /// matches this project's own "tolerate known rootless
+    /// limitations" pattern used elsewhere (e.g. a rootless `/sys`
+    /// remount failure).
+    Systemd {
+        /// Must end in `.scope` — see
+        /// `systemd_cgroup::create_scope`'s own doc comment.
+        scope_name: String,
+        /// Free-form text systemd stores as the unit's own
+        /// `Description=`.
+        description: String,
+    },
 }
 
 /// Like [`run`], but calls `on_pid` with the container's own pid as
@@ -104,6 +131,7 @@ pub unsafe fn run_reporting_pid(
     bundle: &Bundle,
     rootfs: &Path,
     log_path: Option<&Path>,
+    cgroup_setup: CgroupSetup,
     on_pid: impl FnOnce(i32),
 ) -> io::Result<i32> {
     let mut child_setup = build_child_setup(bundle, rootfs)?;
@@ -121,6 +149,24 @@ pub unsafe fn run_reporting_pid(
         .map(|_| setup_log_tee_pipe(&mut child_setup))
         .transpose()?;
 
+    // If the systemd driver is in use, the spec's own `cgroupsPath`-
+    // derived plan (if any) is entirely superseded, and the child
+    // needs a way to pause until this process has actually finished
+    // trying to migrate it into a real cgroup over D-Bus — see
+    // `CgroupSetup::Systemd`'s own doc comment and `docs/design/0033`.
+    let cgroup_ready_write = match &cgroup_setup {
+        CgroupSetup::FromSpec => None,
+        CgroupSetup::Systemd { .. } => {
+            child_setup.cgroup_dir = None;
+            child_setup.cgroup_writes = Vec::new();
+            let (ready_read, ready_write) =
+                rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+                    .map_err(io::Error::from)?;
+            child_setup.cgroup_ready_read = Some(ready_read);
+            Some(ready_write)
+        }
+    };
+
     // SAFETY: forwarded from this function's own contract. Unlike
     // `create`, this direct child's own pid *is* what gets waited on
     // below — no relay-fork subtlety here, since `ChildSetup::run`
@@ -129,6 +175,43 @@ pub unsafe fn run_reporting_pid(
     // child always yields the right final status regardless.
     #[allow(unsafe_code)]
     let direct_child_pid = unsafe { process::fork(move || child_setup.run()) }?;
+
+    // Attempt the D-Bus migration for the *direct* child — not
+    // `container_pid` below, which isn't known yet at this point, and
+    // critically must not be waited for here either: the direct
+    // child's own `cgroup_ready_read` wait happens *before* it does
+    // any pid-namespace relay-forking of its own (see
+    // `ChildSetup::run`'s doc comment on ordering), which is also
+    // *before* it ever reports a container pid over the separate
+    // pid-reporting pipe below — waiting for `container_pid` first
+    // would deadlock against the child waiting for this signal first.
+    // Migrating the direct child specifically still correctly covers
+    // the eventual real container pid too (the grandchild in the
+    // pid-namespace case): cgroup membership is inherited across
+    // `fork`, exactly like the cgroupfs driver's own migration
+    // (`cgroups::enter`, called by the same direct child before any of
+    // its own further forking) already relies on.
+    if let CgroupSetup::Systemd {
+        scope_name,
+        description,
+    } = &cgroup_setup
+    {
+        if let Err(e) =
+            systemd_cgroup::create_scope(direct_child_pid as u32, scope_name, description)
+        {
+            tracing::warn!(
+                scope = %scope_name,
+                error = %e,
+                "systemd cgroup driver unavailable (tolerated, container has no cgroup)"
+            );
+        }
+        if let Some(write_fd) = &cgroup_ready_write {
+            // Best-effort: if this write somehow fails, the child's own
+            // read below still eventually unblocks on `EOF` once this
+            // function returns and drops `write_fd`.
+            let _ = rustix::io::write(write_fd, b"\0");
+        }
+    }
 
     // Safe to spawn the reader thread now: the fork this process is
     // ever going to do for this container has already happened.
@@ -420,6 +503,7 @@ fn build_child_setup(bundle: &Bundle, rootfs: &Path) -> io::Result<ChildSetup> {
         pid_pipe_write: None,
         stdout_log_fd: None,
         stderr_log_fd: None,
+        cgroup_ready_read: None,
         args: process_spec.args.clone(),
         env: process_spec.env.clone(),
         cwd: process_spec.cwd.clone(),
@@ -464,6 +548,14 @@ struct ChildSetup {
     /// end of the very same one) — both streams are combined, not kept
     /// separate, see `docs/design/0025`.
     stderr_log_fd: Option<rustix::fd::OwnedFd>,
+    /// Set only when [`CgroupSetup::Systemd`] is in use (`None` for
+    /// `create`, and for plain [`run`]'s own `CgroupSetup::FromSpec`):
+    /// the read end of a pipe the child blocks on, right where the
+    /// cgroupfs driver's own migration would otherwise happen (see
+    /// [`ChildSetup::run`]'s own doc comment on why that ordering
+    /// matters), until [`run_reporting_pid`] has finished attempting
+    /// the real, D-Bus-driven migration.
+    cgroup_ready_read: Option<rustix::fd::OwnedFd>,
     args: Vec<String>,
     env: Vec<String>,
     cwd: String,
@@ -505,7 +597,11 @@ impl ChildSetup {
         // *before* a `CLONE_NEWCGROUP` unshare is what makes that
         // namespace root at the container's own cgroup rather than
         // whatever the host process was in — see `cgroups::enter`'s own
-        // doc comment.
+        // doc comment. The systemd driver (`cgroup_ready_read`) needs
+        // the exact same ordering guarantee, just achieved a different
+        // way: blocking here until the *parent* has finished migrating
+        // this same process into a real cgroup over D-Bus, rather than
+        // this process writing `cgroup.procs` directly.
         if let Some(dir) = &self.cgroup_dir {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 fail(
@@ -521,6 +617,14 @@ impl ChildSetup {
             }
             if let Err(e) = cgroups::enter(dir) {
                 fail(SETUP_FAILURE_EXIT_CODE, &format!("entering cgroup: {e}"));
+            }
+        } else if let Some(ready_read) = &self.cgroup_ready_read {
+            let mut buf = [0u8; 1];
+            if let Err(e) = rustix::io::read(ready_read, &mut buf) {
+                fail(
+                    SETUP_FAILURE_EXIT_CODE,
+                    &format!("waiting for cgroup migration: {e}"),
+                );
             }
         }
         if let Err(e) = namespaces::unshare(self.flags) {

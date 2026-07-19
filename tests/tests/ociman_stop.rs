@@ -45,6 +45,10 @@ fn ociman_run_detached(
         .expect("failed to spawn ociman run")
 }
 
+/// A generous timeout: `ociman run` now attempts a real systemd cgroup
+/// driver D-Bus round trip per container (`docs/design/0034`), which
+/// can occasionally take noticeably longer under heavy *concurrent*
+/// test-suite load — the ordinary case still resolves in milliseconds.
 fn only_container_id(storage_root: &Path, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     loop {
@@ -117,10 +121,10 @@ fn stop_lets_a_signal_handling_container_exit_gracefully() {
             "trap 'exit 0' TERM; while true; do sleep 0.2; done",
         ],
     );
-    let id = only_container_id(storage_dir.path(), Duration::from_secs(5));
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
     assert!(!id.is_empty());
     assert_eq!(
-        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(5)),
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
         "running"
     );
 
@@ -184,10 +188,10 @@ fn stop_escalates_to_kill_when_the_container_ignores_the_signal() {
         "ociman-test/stop-escalate:latest",
         &["/bin/sh", "-c", "sleep 30"],
     );
-    let id = only_container_id(storage_dir.path(), Duration::from_secs(5));
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
     assert!(!id.is_empty());
     assert_eq!(
-        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(5)),
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
         "running"
     );
 
@@ -204,7 +208,7 @@ fn stop_escalates_to_kill_when_the_container_ignores_the_signal() {
 
     run.wait().unwrap();
     assert_eq!(
-        wait_for_container_status(storage_dir.path(), &id, "stopped", Duration::from_secs(5)),
+        wait_for_container_status(storage_dir.path(), &id, "stopped", Duration::from_secs(20)),
         "stopped"
     );
 
@@ -239,7 +243,7 @@ fn stop_is_a_noop_on_an_already_stopped_container() {
         &["run", "ociman-test/stop-already-stopped:latest"],
     );
     assert!(run.status.success());
-    let id = only_container_id(storage_dir.path(), Duration::from_secs(5));
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
     assert!(!id.is_empty());
 
     let stop = ociman(storage_dir.path(), &["stop", &id]);

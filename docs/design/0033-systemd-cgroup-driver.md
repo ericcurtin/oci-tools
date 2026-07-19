@@ -1,7 +1,8 @@
 # Design note 0033: the systemd cgroup driver (foundational primitive)
 
-Status: implemented (the primitive itself; **not yet wired into
-`ociman run`/`ocirun`** — see "What's still not here")
+Status: implemented (the primitive itself; **wired into `ociman run`
+by 0034** — see "What's still not here" for what was true when this
+note was first written)
 Scope: `crates/oci-runtime-core/src/systemd_cgroup.rs`.
 
 ## The gap
@@ -137,30 +138,21 @@ sessions).
 
 ## What's still not here
 
-* **Not wired into `ociman run`/`ocirun` at all yet.** This increment
-  ships and thoroughly tests the primitive on its own, matching how
-  this project's own foundational pieces (`namespaces.rs`, `rootfs.rs`,
-  `process.rs`) were each built and unit-tested independently across
-  several earlier increments *before* `launch.rs` ever assembled them
-  into a real `ocirun run` — the natural next increment is deciding
-  when to prefer this over the cgroupfs driver (falling back
-  gracefully when no D-Bus session is reachable, matching this
-  project's existing "tolerate known rootless limitations" pattern),
-  computing a real per-container scope name, and translating
-  `LinuxResources` into systemd unit properties (real `crun`'s own
-  `append_resources`) rather than raw cgroupfs file writes.
+* **Not wired into `ociman run`/`ocirun` at all yet** — true when this
+  note was written; done by 0034, which also found and fixed two real
+  bugs (a deadlock from migrating the wrong pid, and a hang from a
+  timeout that didn't actually bound a blocking D-Bus call) that only
+  surfaced once the primitive was actually exercised for real.
 * Failed/never-completed transient scopes aren't explicitly cleaned up
   (`systemctl --user reset-failed` or equivalent) — observed directly
   as a real, not hypothetical, leftover-state possibility during this
-  module's own development, deferred to the wiring increment above,
-  which will have an actual container lifecycle to hook cleanup into.
+  module's own development; still not closed by 0034 either (see its
+  own "What's still not here").
 * System-bus (root) support — irrelevant to this rootless-only project
   so far, but the same `create_scope` shape would need a
   `Connection::system()` variant if that ever changes.
 * Resource-limit properties (`MemoryMax`, `CPUQuota`, ...) aren't
   translated to systemd unit properties at all yet — `create_scope`
   only ever creates a plain, unlimited-but-delegated-and-accounted
-  scope; that's the wiring increment's job too, alongside deciding
-  whether raw cgroupfs writes into the delegated (but now
-  systemd-owned) cgroup remain a valid fallback for properties systemd
-  itself doesn't expose a unit property for.
+  scope; still not done by 0034 either, which only wired in the
+  no-resource-limits case.

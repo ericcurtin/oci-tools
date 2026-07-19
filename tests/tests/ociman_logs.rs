@@ -48,6 +48,10 @@ fn ociman_run_detached(
         .expect("failed to spawn ociman run")
 }
 
+/// A generous timeout: `ociman run` now attempts a real systemd cgroup
+/// driver D-Bus round trip per container (`docs/design/0034`), which
+/// can occasionally take noticeably longer under heavy *concurrent*
+/// test-suite load — the ordinary case still resolves in milliseconds.
 fn only_container_id(storage_root: &Path, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     loop {
@@ -92,7 +96,7 @@ fn logs_shows_a_finished_containers_combined_output() {
         String::from_utf8_lossy(&run.stderr)
     );
 
-    let id = only_container_id(storage_dir.path(), Duration::from_secs(5));
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
     assert!(!id.is_empty());
 
     let logs = ociman(storage_dir.path(), &["logs", &id]);
@@ -132,12 +136,12 @@ fn logs_shows_output_so_far_from_a_still_running_container() {
         ],
     );
 
-    let id = only_container_id(storage_dir.path(), Duration::from_secs(5));
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
     assert!(!id.is_empty());
 
     // Poll `logs` until the pre-sleep line shows up (the tee thread
     // writing it is racing this test, not synchronized with it).
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(20);
     let stdout = loop {
         let logs = ociman(storage_dir.path(), &["logs", &id]);
         let stdout = String::from_utf8_lossy(&logs.stdout).into_owned();

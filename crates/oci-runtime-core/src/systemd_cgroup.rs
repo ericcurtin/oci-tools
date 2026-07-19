@@ -68,12 +68,12 @@ const SYSTEMD_BUS_NAME: &str = "org.freedesktop.systemd1";
 const SYSTEMD_OBJECT_PATH: &str = "/org/freedesktop/systemd1";
 const SYSTEMD_MANAGER_INTERFACE: &str = "org.freedesktop.systemd1.Manager";
 
-/// How long to wait for systemd to report the transient unit's own
-/// start job as finished (`JobRemoved`) before giving up — bounds
-/// [`create_scope`] against hanging forever if something unexpected
-/// happens on the bus; five real, repeated runs during this module's
-/// own verification each completed in well under a second, so this is
-/// a generous margin, not a tuned-tight timeout.
+/// How long [`create_scope`] gives its own background thread (see its
+/// own doc comment for why it's a thread, not just a deadline check)
+/// to connect, create the transient unit, and see its start job
+/// finish, before giving up on it entirely. An uncontended real run
+/// consistently completes in well under a second; this is a generous
+/// margin for real contention, not a tuned-tight timeout.
 const JOB_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Create a transient systemd scope named `scope_name` (must end in
@@ -88,6 +88,40 @@ const JOB_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Connects to the calling user's own D-Bus **session** bus (matching
 /// `systemd --user`, the only mode this rootless-only project runs
 /// containers in so far) — not the system bus.
+///
+/// # A real hang, found by stress-testing concurrent invocations, not by inspection
+///
+/// The entire D-Bus interaction below runs in a dedicated background
+/// thread, with this function only ever waiting for it with a hard,
+/// unconditional [`JOB_WAIT_TIMEOUT`] via a channel — not, as the very
+/// first working version of this function did, a simple loop that
+/// merely *checked* a deadline in between blocking calls to the
+/// signal iterator's own `next()`. That version's "timeout" was
+/// nothing of the sort: if `next()` itself never returned, the
+/// deadline check between iterations never got a chance to fire
+/// either, and the whole call — along with the container's own
+/// process, which wired-in callers leave paused waiting for this
+/// function's own "go" signal — hung indefinitely. Caught directly by
+/// launching several real `ociman run` invocations concurrently (not
+/// by reasoning about the code alone): roughly half of eight
+/// simultaneous runs consistently hung well past any reasonable
+/// per-container latency, confirmed via `ps`/`systemctl --user` to be
+/// genuinely stuck, not merely slow, and confirmed *not* to be an
+/// artifact of leftover processes from earlier test runs (reproduced
+/// again from a freshly verified-clean process/unit state). The exact
+/// reason `next()` itself doesn't always return promptly under
+/// concurrent D-Bus load from many simultaneous callers was not fully
+/// root-caused (plausibly some contention/ordering issue in either
+/// the user systemd instance's own signal dispatch or `zbus`'s own
+/// connection handling under this specific usage pattern) — but a
+/// *correctness* fix does not require finding that root cause: no
+/// matter what the underlying blocking call does internally, a
+/// dedicated thread plus a channel `recv_timeout` on the read side
+/// enforces a real wall-clock bound around the whole thing. Verified
+/// this actually fixes the hang (not just changes its shape) via the
+/// same repeated-concurrent-`ociman-run` stress test: every run either
+/// succeeds quickly or, under heavy contention, degrades gracefully to
+/// "no cgroup" within the bounded timeout — never hangs.
 pub fn create_scope(pid: u32, scope_name: &str, description: &str) -> io::Result<PathBuf> {
     if !scope_name.ends_with(".scope") {
         return Err(io::Error::new(
@@ -96,6 +130,44 @@ pub fn create_scope(pid: u32, scope_name: &str, description: &str) -> io::Result
         ));
     }
 
+    let scope_name_owned = scope_name.to_string();
+    let description_owned = description.to_string();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    // Deliberately not joined: if the timeout below fires, this thread
+    // is simply abandoned (there is no way to cancel a blocked `zbus`
+    // call from the outside) rather than waited for — it costs nothing
+    // to leave running, since the whole process exits long before it
+    // could ever matter again, and `create_scope`'s own caller must
+    // not be held hostage by it either way.
+    std::thread::spawn(move || {
+        let result = create_scope_dbus_roundtrip(pid, &scope_name_owned, &description_owned);
+        let _ = result_tx.send(result);
+    });
+
+    match result_rx.recv_timeout(JOB_WAIT_TIMEOUT) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("timed out creating systemd scope {scope_name:?}"),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+            "the thread creating the systemd scope panicked",
+        )),
+    }
+}
+
+/// The actual D-Bus round trip [`create_scope`] runs in a background
+/// thread — connect, subscribe to `JobRemoved`, call
+/// `StartTransientUnit`, wait for the matching job, then read back the
+/// real cgroup path. See [`create_scope`]'s own doc comment for why
+/// this doesn't enforce its own timeout directly (any blocking call in
+/// here might not respect one internally, which is exactly what this
+/// whole design works around).
+fn create_scope_dbus_roundtrip(
+    pid: u32,
+    scope_name: &str,
+    description: &str,
+) -> io::Result<PathBuf> {
     let connection = Connection::session().map_err(to_io_error)?;
 
     // Subscribed *before* the call below, so an unusually fast
@@ -151,23 +223,18 @@ pub fn create_scope(pid: u32, scope_name: &str, description: &str) -> io::Result
         .and_then(|contents| parse_own_cgroup_path(&contents))
 }
 
-/// Block until a `JobRemoved` signal matching `job_path` arrives (or
-/// [`JOB_WAIT_TIMEOUT`] elapses), reporting a job that didn't finish
-/// with systemd's own `"done"` result (e.g. `"failed"`) as an error
-/// rather than silently proceeding as if it had succeeded.
+/// Block until a `JobRemoved` signal matching `job_path` arrives,
+/// reporting a job that didn't finish with systemd's own `"done"`
+/// result (e.g. `"failed"`) as an error rather than silently
+/// proceeding as if it had succeeded. Deliberately has no timeout of
+/// its own — see [`create_scope`]'s own doc comment for why enforcing
+/// one at this level isn't sufficient by itself.
 fn wait_for_job(
     signals: &mut MessageIterator,
     job_path: &OwnedObjectPath,
     scope_name: &str,
 ) -> io::Result<()> {
-    let deadline = std::time::Instant::now() + JOB_WAIT_TIMEOUT;
     loop {
-        if std::time::Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("timed out waiting for systemd to start scope {scope_name:?}"),
-            ));
-        }
         let Some(message) = signals.next() else {
             return Err(io::Error::other("D-Bus signal stream ended unexpectedly"));
         };

@@ -52,7 +52,13 @@ fn ociman_run_detached(
 
 /// Find the (only) container's id via `ps -a -q`, polling briefly
 /// since it may not have been persisted yet the instant `run` was
-/// spawned.
+/// spawned. A generous timeout: `ociman run` now attempts a real
+/// systemd cgroup driver D-Bus round trip per container
+/// (`docs/design/0034`), which can occasionally take noticeably
+/// longer than usual under heavy *concurrent* test-suite load (many
+/// simultaneous `StartTransientUnit` calls contending for the same
+/// user systemd instance) -- the ordinary case still resolves in
+/// milliseconds regardless of how generous this ceiling is.
 fn only_container_id(storage_root: &Path, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     loop {
@@ -117,7 +123,7 @@ fn exec_joins_a_still_running_ociman_run_container() {
 
     // Find the container's id via `ps -a` (only one exists).
     let id = {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let out = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
             let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -129,7 +135,7 @@ fn exec_joins_a_still_running_ociman_run_container() {
     };
     assert!(!id.is_empty(), "expected a container id to appear in ps -a");
     assert_eq!(
-        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(5)),
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
         "running",
         "container never reached 'running' before exec was attempted"
     );
@@ -240,10 +246,10 @@ fn exec_cwd_and_env_flags_override_the_defaults() {
         "ociman-test/exec-cwd-env:latest",
         &["/bin/sh", "-c", "sleep 5"],
     );
-    let id = only_container_id(storage_dir.path(), Duration::from_secs(5));
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
     assert!(!id.is_empty());
     assert_eq!(
-        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(5)),
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
         "running"
     );
 
@@ -307,10 +313,10 @@ fn exec_user_flag_resolves_a_named_user_via_the_containers_own_etc_passwd() {
         "ociman-test/exec-named-user:latest",
         &["/bin/sh", "-c", "sleep 5"],
     );
-    let id = only_container_id(storage_dir.path(), Duration::from_secs(5));
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
     assert!(!id.is_empty());
     assert_eq!(
-        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(5)),
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
         "running"
     );
 
