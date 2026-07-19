@@ -33,7 +33,7 @@ use oci_spec_types::image::{
 };
 use oci_store::{ImageRecord, Store};
 
-use oci_tools_tests::{bin_path, busybox_path, seed_image};
+use oci_tools_tests::{bin_path, busybox_path, seed_image, seed_image_with_files};
 
 fn ociman_run(storage_root: &Path, image: &str, args: &[&str]) -> std::process::Output {
     Command::new(bin_path("ociman"))
@@ -177,6 +177,88 @@ fn run_rejects_a_non_root_numeric_user() {
         !out.status.success(),
         "run should refuse an image requesting a non-root numeric user \
          (see resolve_user's own doc comment: not mappable yet)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot map"), "got stderr: {stderr:?}");
+}
+
+/// A named `USER` (as opposed to a bare numeric one) resolved against
+/// the image's own `/etc/passwd` — real images very commonly say `USER
+/// root` rather than `USER 0`. Only container uid 0 is mappable yet
+/// (see `run_rejects_a_non_root_numeric_user`), so `root` is the one
+/// name that can actually succeed end to end right now.
+#[test]
+fn run_accepts_a_named_root_user_resolved_via_etc_passwd() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image_with_files(
+        &store,
+        "ociman-test/named-root-user:latest",
+        &busybox,
+        &["sh"],
+        &[("etc/passwd", b"root:x:0:0:root:/root:/bin/sh\n".as_slice())],
+        ContainerConfig {
+            user: Some("root".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/named-root-user:latest",
+        &["/bin/sh", "-c", "echo named-root-user-worked"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("named-root-user-worked"),
+        "got stdout: {stdout:?}"
+    );
+}
+
+/// A named non-root `USER` still hits the same "can't map it" wall a
+/// numeric one does (`run_rejects_a_non_root_numeric_user`) — proving
+/// resolution and the mapping-limitation check are correctly wired
+/// together end to end, not just at the `user_resolve` unit-test level.
+#[test]
+fn run_rejects_a_named_non_root_user() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image_with_files(
+        &store,
+        "ociman-test/named-non-root-user:latest",
+        &busybox,
+        &["sh"],
+        &[(
+            "etc/passwd",
+            b"root:x:0:0:root:/root:/bin/sh\napp:x:1000:1000:App:/home/app:/bin/sh\n".as_slice(),
+        )],
+        ContainerConfig {
+            user: Some("app".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/named-non-root-user:latest",
+        &["/bin/sh", "-c", "true"],
+    );
+    assert!(
+        !out.status.success(),
+        "run should refuse an image requesting a named non-root user, same as a numeric one"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("cannot map"), "got stderr: {stderr:?}");

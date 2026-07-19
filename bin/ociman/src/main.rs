@@ -7,12 +7,13 @@
 //! through `oci-runtime-core` directly, as a library — never by
 //! exec'ing `ocirun` (see the top-level README's design pillars).
 //!
-//! Milestone plan: `pull`/`images`/`inspect` (milestone 2, shipped),
-//! `run`/`ps`/`rm` rootless (milestone 3, this and the previous
-//! increment — foreground only, `exec`/`logs` remain, since those need
-//! a detached/backgrounded container to run against, which `run` still
-//! doesn't support), `build` (milestone 4), then the full podman-style
-//! v1 command set.
+//! Milestone plan: `pull`/`images`/`inspect`/`run`/`ps`/`rm`/`exec`
+//! rootless (milestone 3, shipped); `logs` remains, since it needs a
+//! container's stdio actually captured somewhere persistent, which
+//! `run` still just inherits straight from the terminal; `build`
+//! (milestone 4), then the full podman-style v1 command set.
+
+mod user_resolve;
 
 use std::path::Path;
 
@@ -304,7 +305,7 @@ fn cmd_run(image_ref: &str, args: &[String], rm: bool) -> anyhow::Result<()> {
                 .with_context(|| format!("applying layer {}", layer.digest))?;
         }
 
-        let spec = synthesize_spec(&config, &container_id, args)?;
+        let spec = synthesize_spec(&config, &container_id, args, &rootfs_dir)?;
         if let Some(process) = &spec.process {
             state
                 .annotations
@@ -538,13 +539,14 @@ fn synthesize_spec(
     config: &oci_spec_types::image::ImageConfig,
     id: &str,
     args: &[String],
+    rootfs: &Path,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
 
     let container_config = config.config.clone().unwrap_or_default();
     let full_args = command_for(&container_config, args)?;
-    let (uid, gid) = resolve_user(container_config.user.as_deref().unwrap_or(""))?;
+    let (uid, gid) = resolve_user(rootfs, container_config.user.as_deref().unwrap_or(""))?;
 
     let process = spec
         .process
@@ -583,28 +585,19 @@ fn command_for(container_config: &ContainerConfig, args: &[String]) -> anyhow::R
     Ok(full)
 }
 
-/// Parse an image's `USER` string (`""`, `"0"`, `"0:0"` are the only
-/// forms actually supported yet — see the error messages for why).
-fn resolve_user(user: &str) -> anyhow::Result<(u32, u32)> {
-    if user.is_empty() {
-        return Ok((0, 0));
-    }
-    let (uid_str, gid_str) = user.split_once(':').unwrap_or((user, "0"));
-    let uid: u32 = uid_str.parse().map_err(|_| {
-        anyhow::anyhow!(
-            "image USER {user:?} is not numeric; named users need /etc/passwd \
-             resolution inside the rootfs, which isn't implemented yet"
-        )
-    })?;
-    let gid: u32 = gid_str.parse().map_err(|_| {
-        anyhow::anyhow!(
-            "image USER {user:?} has a non-numeric group; named groups need \
-             /etc/group resolution inside the rootfs, which isn't implemented yet"
-        )
-    })?;
+/// Resolve an image's `USER` string to a numeric `(uid, gid)` pair
+/// (see [`user_resolve::resolve`] for the name/`/etc/passwd`/
+/// `/etc/group` resolution rules), then reject anything this
+/// rootless runtime can't actually satisfy yet: only container uid 0
+/// is mapped (to the host's own euid), so a resolved non-root uid —
+/// whether given numerically or via a name — still can't run. A
+/// subordinate uid range via `/etc/subuid` would be needed for
+/// anything else.
+fn resolve_user(rootfs: &Path, user: &str) -> anyhow::Result<(u32, u32)> {
+    let (uid, gid) = user_resolve::resolve(rootfs, user)?;
     if uid != 0 {
         anyhow::bail!(
-            "image USER {user:?} requests non-root container uid {uid}, which this \
+            "image USER {user:?} resolves to non-root container uid {uid}, which this \
              rootless runtime cannot map yet (only container uid 0 is mapped, to the \
              host's own euid; a subordinate uid range via /etc/subuid would be needed \
              for anything else)"

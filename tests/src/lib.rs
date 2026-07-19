@@ -104,6 +104,21 @@ pub fn seed_image(
     applets: &[&str],
     container_config: ContainerConfig,
 ) {
+    seed_image_with_files(store, reference, busybox, applets, &[], container_config);
+}
+
+/// [`seed_image`], plus `extra_files` — additional regular files (path
+/// relative to the rootfs root, contents) baked into the same layer.
+/// Used by tests that need something beyond a bare busybox rootfs, e.g.
+/// an `/etc/passwd` to resolve a named image `USER` against.
+pub fn seed_image_with_files(
+    store: &Store,
+    reference: &str,
+    busybox: &Path,
+    applets: &[&str],
+    extra_files: &[(&str, &[u8])],
+    container_config: ContainerConfig,
+) {
     let mut builder = tar::Builder::new(Vec::new());
     let busybox_bytes = std::fs::read(busybox).unwrap();
     let mut header = tar::Header::new_gnu();
@@ -120,6 +135,15 @@ pub fn seed_image(
         link_header.set_size(0);
         builder
             .append_link(&mut link_header, format!("bin/{applet}"), "busybox")
+            .unwrap();
+    }
+    for (path, contents) in extra_files {
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_entry_type(tar::EntryType::Regular);
+        file_header.set_size(contents.len() as u64);
+        file_header.set_mode(0o644);
+        builder
+            .append_data(&mut file_header, path, *contents)
             .unwrap();
     }
     let tar_bytes = builder.into_inner().unwrap();
