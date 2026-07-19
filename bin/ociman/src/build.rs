@@ -1371,11 +1371,43 @@ fn args_for(value: &ShellOrExec) -> Vec<String> {
 /// or appends a new one — matching real Docker's own `ENV` merge
 /// behavior (a later `ENV` for an already-set key updates it in
 /// place, it doesn't duplicate or reorder the list).
-fn set_env_var(env: &mut Vec<String>, key: &str, value: &str) {
+pub(crate) fn set_env_var(env: &mut Vec<String>, key: &str, value: &str) {
     let prefix = format!("{key}=");
     match env.iter_mut().find(|e| e.starts_with(&prefix)) {
         Some(existing) => *existing = format!("{key}={value}"),
         None => env.push(format!("{key}={value}")),
+    }
+}
+
+/// Apply `-e`/`--env` overrides to `env` (an already-resolved process
+/// environment — an image's own default, or a bundle's already-loaded
+/// one for `exec`), matching real `docker run -e`/`podman run -e`
+/// exactly: `KEY=value` sets or replaces it; a bare `KEY` (no `=` at
+/// all) pulls the value from `ociman`'s own process environment,
+/// dropped entirely if unset there — the same bare-name convention
+/// `parse_build_args` already established for `--build-arg`, checked
+/// directly against real docker's own documented `-e`/`--env` behavior
+/// ("pass the value through from the local environment").
+///
+/// Reuses [`set_env_var`]'s own "replace an already-present key in
+/// place, otherwise append" semantics rather than blindly appending a
+/// duplicate `KEY=` entry: a real container init process's own
+/// `getenv(3)`-style lookup scans `environ` from the start and
+/// returns the *first* match, so a naive append would leave the
+/// original (pre-override) value in effect for exactly the callers
+/// that actually call `getenv` — a real, meaningful difference, not a
+/// cosmetic one, checked directly against `man 3 getenv`'s own
+/// documented linear-scan behavior.
+pub(crate) fn apply_env_overrides(env: &mut Vec<String>, overrides: &[String]) {
+    for over in overrides {
+        match over.split_once('=') {
+            Some((key, value)) => set_env_var(env, key, value),
+            None => {
+                if let Ok(value) = std::env::var(over) {
+                    set_env_var(env, over, &value);
+                }
+            }
+        }
     }
 }
 
@@ -1437,6 +1469,54 @@ mod tests {
             "symbolic mode not supported yet"
         );
         assert!(chmod_mode("").is_err());
+    }
+
+    #[test]
+    fn apply_env_overrides_replaces_an_existing_key_in_place_not_a_duplicate_append() {
+        let mut env = vec!["PATH=/usr/bin".to_string(), "HOME=/root".to_string()];
+        apply_env_overrides(&mut env, &["PATH=/custom/bin".to_string()]);
+        assert_eq!(
+            env,
+            vec!["PATH=/custom/bin".to_string(), "HOME=/root".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_env_overrides_appends_a_genuinely_new_key() {
+        let mut env = vec!["PATH=/usr/bin".to_string()];
+        apply_env_overrides(&mut env, &["EXTRA=value".to_string()]);
+        assert_eq!(
+            env,
+            vec!["PATH=/usr/bin".to_string(), "EXTRA=value".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_env_overrides_bare_key_pulls_from_the_process_environment() {
+        // SAFETY: same single-threaded-for-the-duration-of-this-call
+        // reasoning as `parse_build_args_bare_key_pulls_from_the_
+        // process_environment` above.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("OCIMAN_TEST_ENV_OVERRIDE_PROBE", "from-env");
+        }
+        let mut env = Vec::new();
+        apply_env_overrides(&mut env, &["OCIMAN_TEST_ENV_OVERRIDE_PROBE".to_string()]);
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("OCIMAN_TEST_ENV_OVERRIDE_PROBE");
+        }
+        assert_eq!(
+            env,
+            vec!["OCIMAN_TEST_ENV_OVERRIDE_PROBE=from-env".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_env_overrides_bare_key_not_in_the_environment_is_dropped() {
+        let mut env = vec!["PATH=/usr/bin".to_string()];
+        apply_env_overrides(&mut env, &["OCIMAN_TEST_DEFINITELY_UNSET_XYZ".to_string()]);
+        assert_eq!(env, vec!["PATH=/usr/bin".to_string()]);
     }
 
     #[test]

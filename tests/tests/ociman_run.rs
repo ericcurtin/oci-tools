@@ -456,6 +456,53 @@ fn run_without_read_only_keeps_a_writable_rootfs() {
     );
 }
 
+/// `-e`/`--env` both adds a genuinely new variable and overrides an
+/// existing one *in place* (not as a second, shadowed entry) --
+/// matching real `docker run -e`/`podman run -e` exactly. Checked the
+/// most direct way available: actually printing `$PATH` from inside
+/// the running container, which would only ever show the *original*
+/// value if a real container init process's own `getenv(3)`-style
+/// lookup found the first (pre-override) entry in a naively
+/// duplicated list.
+#[test]
+fn run_env_flag_overrides_an_existing_variable_and_adds_a_new_one() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/env-flag:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            env: vec!["PATH=/bin".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "-e", "PATH=/custom/bin", "-e", "EXTRA=hi"])
+        .args(["ociman-test/env-flag:latest"])
+        .args(["/bin/sh", "-c", "echo \"$PATH\" \"$EXTRA\""])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "/custom/bin hi\n",
+        "PATH should be overridden in place (not a second, shadowed entry) and EXTRA added"
+    );
+}
+
 #[test]
 fn run_uses_the_images_default_cmd_and_env() {
     let Some(busybox) = busybox_path() else {

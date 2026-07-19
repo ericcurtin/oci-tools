@@ -49,7 +49,7 @@ real
 `--memory-swap`/
 `--cpuset-cpus`/`--cpuset-mems`/`--security-opt seccomp=`/a real
 `podman`-default capability set/`--cap-add`/`--cap-drop`/`--privileged`/
-`--read-only`/
+`--read-only`/`-e`/`--env`/
 `ocirun features` (real, checked support-surface introspection,
 independently verified byte-for-byte identical to real installed
 `runc features` for namespaces/capabilities) beyond its
@@ -77,7 +77,7 @@ milestone.
 |-----------|-------|--------|
 | 1 | workspace skeleton, `oci-cli-common`, 4-VM CI matrix | **done** |
 | 2 | `oci-spec-types`/`oci-registry`/`oci-store`; `ociman pull/images/inspect` | **done** |
-| 3 | `oci-runtime-core` + `ocirun`; `ociman run/exec/ps/logs` rootless | **done** (plus systemd cgroups, hooks, seccomp, resource limits, `--security-opt seccomp=`, a real `podman`-default capability set, `--cap-add`/`--cap-drop`, `--privileged`, `--read-only`, `ocirun features`, beyond the original scope) |
+| 3 | `oci-runtime-core` + `ocirun`; `ociman run/exec/ps/logs` rootless | **done** (plus systemd cgroups, hooks, seccomp, resource limits, `--security-opt seccomp=`, a real `podman`-default capability set, `--cap-add`/`--cap-drop`, `--privileged`, `--read-only`, `-e`/`--env`, `ocirun features`, beyond the original scope) |
 | 4 | `oci-dockerfile`; `ociman build` (multi-stage, cache) | in progress — `RUN`/`COPY`/`ADD`/`--build-arg`/`--target` work end to end and commit real layers, including multiple explicit sources, glob patterns, `COPY --from=<external-image>`, `ADD` from a remote URL, multiple `ARG` names on one line, and `COPY`/`ADD --chmod` (the build cache is not yet implemented) (see `docs/design/0050`-`0060`, `0068`, `0072`-`0079`) |
 | 5 | erofs/mount/BLS; `ociboot install to-disk`; dracut module; QEMU boot test | in progress — `oci-erofs` builds real, verified-deterministic erofs images via `mkfs.erofs`, seals/verifies them with real fs-verity ioctls, and has a detached dm-verity fallback via `veritysetup`; `oci-bls` reads/writes the real grubenv block and Type #1 BLS entries, scans `/loader/entries/` as a directory, implements the real spec's own boot-counting filename convention, and sorts entries per the real spec's own "Sorting" section including full UAPI.10 version comparison (all verified against the real uapi-group spec/tools); `oci-mount` attaches/detaches real loop devices (see `docs/design/0061`-`0066`, `0070`-`0071`); the `boot_success` grubenv protocol, actually mounting a verified image at boot, `ociboot`'s own subcommands, and the dracut module are not started yet |
 | 6 | upgrade/switch/rollback/status/gc; /etc merge; boot counting; layered mode | — |

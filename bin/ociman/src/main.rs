@@ -301,6 +301,17 @@ enum Command {
         /// the default is writable.
         #[arg(long = "read-only")]
         read_only: bool,
+        /// Set an additional environment variable, `KEY=value`, or
+        /// pull one from `ociman`'s own process environment by bare
+        /// name (`KEY`, dropped entirely if unset there) — matching
+        /// real `docker run -e`/`podman run -e` exactly, including the
+        /// bare-name pass-through (same convention `--build-arg`
+        /// already uses). Repeatable; overrides an image's own default
+        /// value for the same name rather than adding a second,
+        /// shadowed entry (see `apply_env_overrides`'s own doc
+        /// comment for why that distinction is real, not cosmetic).
+        #[arg(short, long = "env")]
+        env: Vec<String>,
     },
     /// List containers.
     Ps {
@@ -352,9 +363,16 @@ enum Command {
         /// Current working directory inside the container.
         #[arg(long)]
         cwd: Option<String>,
-        /// Additional `KEY=value` environment variables, appended to
-        /// (not replacing) the container's own process environment.
-        /// Repeatable.
+        /// Set an additional environment variable, `KEY=value`, or
+        /// pull one from `ociman`'s own process environment by bare
+        /// name (`KEY`, dropped entirely if unset there) — matching
+        /// real `podman exec -e`/`docker exec -e` exactly. Repeatable;
+        /// overrides the container's own already-running process
+        /// environment for the same name (see `apply_env_overrides`'s
+        /// own doc comment for why replacing in place, rather than
+        /// appending a second, shadowed entry, is a real correctness
+        /// fix, not just a cosmetic one) rather than adding a second
+        /// entry for it.
         #[arg(short, long = "env")]
         env: Vec<String>,
         /// Command and arguments to run inside the container.
@@ -416,6 +434,7 @@ fn main() -> std::process::ExitCode {
                 cap_drop,
                 privileged,
                 read_only,
+                env,
             }) => cmd_run(
                 &image,
                 &args,
@@ -432,6 +451,7 @@ fn main() -> std::process::ExitCode {
                 &cap_drop,
                 privileged,
                 read_only,
+                &env,
             ),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
@@ -588,6 +608,7 @@ fn cmd_run(
     cap_drop: &[String],
     privileged: bool,
     read_only: bool,
+    env: &[String],
 ) -> anyhow::Result<()> {
     let seccomp = resolve_seccomp(security_opts, privileged)?;
     let base_capabilities = if privileged {
@@ -678,6 +699,7 @@ fn cmd_run(
             seccomp,
             capabilities,
             read_only,
+            env,
         )?;
         if let Some(process) = &spec.process {
             state
@@ -1133,6 +1155,7 @@ fn synthesize_spec(
     seccomp: Option<oci_spec_types::runtime::LinuxSeccomp>,
     capabilities: Vec<String>,
     read_only: bool,
+    env: &[String],
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -1177,6 +1200,7 @@ fn synthesize_spec(
     if !container_config.env.is_empty() {
         process.env = container_config.env;
     }
+    build::apply_env_overrides(&mut process.env, env);
     // `Spec::example()`'s own capability set is real `runc spec`'s own
     // bare-scaffold default (3 capabilities) -- correct for `ocirun`
     // (a runc clone, see `oci_spec_types::runtime::
@@ -1627,7 +1651,7 @@ fn cmd_exec(
         effective_user.gid = gid;
     }
     let mut effective_env = process_spec.env.clone();
-    effective_env.extend(extra_env.iter().cloned());
+    build::apply_env_overrides(&mut effective_env, extra_env);
 
     let request = oci_runtime_core::exec::ExecRequest {
         namespaces,

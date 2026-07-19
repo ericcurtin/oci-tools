@@ -288,6 +288,68 @@ fn exec_cwd_and_env_flags_override_the_defaults() {
     ociman(storage_dir.path(), &["rm", "--force", &id]);
 }
 
+/// `exec --env` overrides a variable name the container's own process
+/// environment *already* has, in place — not as a second, shadowed
+/// entry a real `getenv(3)`-style lookup would never actually see
+/// (see `apply_env_overrides`'s own doc comment).
+#[test]
+fn exec_env_flag_overrides_an_existing_variable_in_place() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/exec-env-override:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            env: vec!["PATH=/bin".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/exec-env-override:latest",
+        &["/bin/sh", "-c", "sleep 5"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let exec = ociman(
+        storage_dir.path(),
+        &[
+            "exec",
+            "--env",
+            "PATH=/custom/bin",
+            &id,
+            "/bin/sh",
+            "-c",
+            "echo \"$PATH\"",
+        ],
+    );
+    assert!(
+        exec.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&exec.stdout),
+        "/custom/bin\n",
+        "PATH should be overridden in place, not shadowed by an earlier, still-first entry"
+    );
+
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "--force", &id]);
+}
+
 #[test]
 fn exec_user_flag_resolves_a_named_user_via_the_containers_own_etc_passwd() {
     let Some(busybox) = busybox_path() else {
