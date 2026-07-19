@@ -23,14 +23,19 @@
 //! [`lexer`]/[`instruction`]'s own doc comments for the specifics).
 //!
 //! `parse` -> [`group_stages`] -> [`expand_meta_args`]/[`expand_stage`]
-//! is the full pipeline so far: raw text to a flat instruction list,
-//! grouped into stages by `FROM` boundaries, then fully `$VAR`/
-//! `${VAR}`-expanded (every instruction field real BuildKit itself
-//! expands — `RUN`/`CMD`/`ENTRYPOINT`/`SHELL`'s own command-line text
-//! is deliberately never touched, see [`expand_stage`]'s own doc
-//! comment) with real per-stage environment scoping (each stage starts
-//! fresh; meta-`ARG`s declared before the first `FROM` only carry into
-//! a stage if re-declared there).
+//! -> [`resolve_dependencies`]/[`stages_needed_for`] is the full
+//! pipeline so far: raw text to a flat instruction list, grouped into
+//! stages by `FROM` boundaries, fully `$VAR`/`${VAR}`-expanded (every
+//! instruction field real BuildKit itself expands — `RUN`/`CMD`/
+//! `ENTRYPOINT`/`SHELL`'s own command-line text is deliberately never
+//! touched, see [`expand_stage`]'s own doc comment) with real per-stage
+//! environment scoping (each stage starts fresh; meta-`ARG`s declared
+//! before the first `FROM` only carry into a stage if re-declared
+//! there), then resolved into a dependency graph (which stages depend
+//! on an earlier stage's own build output, vs. an external image to
+//! pull) with target-stage pruning (see [`dependencies`]'s own doc
+//! comment for this increment's own deliberate backward-references-
+//! only scope).
 //!
 //! **Deliberately not implemented yet**, each a separate, later
 //! increment of its own:
@@ -39,21 +44,24 @@
 //!   `--exclude=`, `ADD --link`/`--keep-git-dir`/`--checksum=`/
 //!   `--unpack`) — a Containerfile using any of these fails to parse
 //!   with a clear error, rather than being silently misparsed.
-//! - Dependency-ordered execution and target-stage selection (`FROM
-//!   builder` referencing an earlier stage by name isn't resolved to
-//!   an actual dependency edge yet — [`find_stage`] exists as the
-//!   building block for that, but nothing calls it that way yet) and
-//!   the build cache this crate's own module doc has always planned.
+//! - Actual build execution (`RUN` steps via `oci-runtime-core`, layer
+//!   commits via `oci-store`) and the build cache this crate's own
+//!   module doc has always planned — the dependency graph above tells
+//!   a future build-execution increment *what order* to build stages
+//!   in and *which* stages it can skip for a given target, but nothing
+//!   actually builds anything yet.
 //! - `--build-arg` (an external override for a meta-`ARG`'s own
 //!   value) has no representation at all yet — [`expand_meta_args`]
 //!   only ever sees each `ARG`'s own inline default.
 
+mod dependencies;
 mod expand_stage;
 mod instruction;
 mod lexer;
 mod shell_expand;
 mod stage;
 
+pub use dependencies::{resolve_dependencies, stages_needed_for};
 pub use expand_stage::{expand_meta_args, expand_stage};
 pub use instruction::{AddFlags, CopyFlags, Instruction, ShellOrExec};
 pub use shell_expand::expand;
