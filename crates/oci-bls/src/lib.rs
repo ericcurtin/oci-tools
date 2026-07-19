@@ -15,11 +15,18 @@
 //! - [`boot_count`] — the real spec's own `+tries_left-tries_done`
 //!   filename-suffix boot-counting convention (parse/format/
 //!   decrement/increment), verified against its own worked examples.
+//! - [`version`] — version string comparison per the real,
+//!   authoritative UAPI.10 Version Format Specification, verified
+//!   against every one of its own worked examples and cross-checked
+//!   against the real `systemd-analyze compare-versions` binary.
+//! - [`sort`] — the real Boot Loader Specification's own "Sorting"
+//!   section, built on [`version::compare`]: bad (boot-counted)
+//!   entries sort last; entries with `sort-key` sort by
+//!   `sort-key`/`machine-id`/version, in that priority order; entries
+//!   without fall back to their own file name, decreasing version
+//!   order, boot-counting suffix removed.
 //!
 //! Planned scope (still ahead):
-//! - the real spec's own "Sorting" section (`sort-key`/`machine-id`/
-//!   version-order comparison) — [`scan_entries`] discovers entries
-//!   but doesn't order them yet
 //! - atomic default-entry flips built on [`grubenv`] (upgrade keeps
 //!   the previous deployment's entry for rollback)
 //! - the `boot_success`/`boot_indeterminate_count` *grubenv* protocol
@@ -36,8 +43,11 @@ pub mod boot_count;
 pub mod entry;
 pub mod grubenv;
 pub mod scan;
+pub mod sort;
+pub mod version;
 
 pub use boot_count::{BootCount, parse_suffix};
 pub use entry::Entry;
 pub use grubenv::GrubEnv;
 pub use scan::{DiscoveredEntry, scan_entries};
+pub use sort::sort_entries;
