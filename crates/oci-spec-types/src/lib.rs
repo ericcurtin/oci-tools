@@ -10,6 +10,10 @@
 //!   `ocirun spec` needs (process/root/mounts/namespaces/ID-mappings/
 //!   device-cgroup allow-list); full resource limits, seccomp, and hooks
 //!   land with actual container creation (milestone 3, in progress)
+//! - [`time`]: RFC 3339 UTC timestamp formatting, without a date/time
+//!   dependency (shared by `oci-runtime-core`'s own state file and
+//!   this crate's own [`image::ImageConfig`]/[`image::HistoryEntry`]
+//!   `created` fields)
 //!
 //! Planned:
 //! - distribution-spec: tag lists, error payloads, auth challenge parsing
@@ -24,6 +28,8 @@ pub mod digest;
 pub mod image;
 pub mod reference;
 pub mod runtime;
+pub mod time;
 
 pub use digest::{Algorithm, Digest};
 pub use reference::Reference;
+pub use time::format_rfc3339_utc;

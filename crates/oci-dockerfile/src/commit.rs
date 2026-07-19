@@ -8,19 +8,25 @@
 //! an image manifest's own layer list and an image config's own
 //! `rootfs.diff_ids`/`history` need them.
 //!
-//! This module owns exactly that handoff and nothing more: it does not
-//! parse a Dockerfile, run a `RUN` step, or decide *when* to diff a
-//! rootfs (a future build executor's own job, still not implemented —
-//! see this crate's own top-level doc comment) — it only turns an
-//! already-computed [`oci_layer::Change`] list plus the live rootfs
-//! it was computed from into one new, real, stored layer.
+//! This module owns exactly that handoff, plus recording the result
+//! into an image being built ([`record_layer`]/[`record_empty_history`]),
+//! and nothing more: it does not parse a Dockerfile, run a `RUN` step,
+//! or decide *when* to diff a rootfs (a future build executor's own
+//! job, still not implemented — see this crate's own top-level doc
+//! comment) — it only turns an already-computed [`oci_layer::Change`]
+//! list plus the live rootfs it was computed from into one new, real,
+//! stored layer, and knows how to fold that (or a non-layer-producing
+//! instruction) into an [`ImageConfig`]/manifest layer list a future
+//! build executor is assembling stage by stage.
 
 use std::collections::BTreeMap;
 use std::io;
+use std::time::SystemTime;
 
 use oci_layer::Change;
 use oci_spec_types::Digest;
-use oci_spec_types::image::{Descriptor, MEDIA_TYPE_IMAGE_LAYER_GZIP};
+use oci_spec_types::image::{Descriptor, HistoryEntry, ImageConfig, MEDIA_TYPE_IMAGE_LAYER_GZIP};
+use oci_spec_types::time::format_rfc3339_utc;
 use oci_store::Store;
 
 /// Errors from [`commit_layer`].
@@ -91,6 +97,55 @@ pub fn commit_layer(
         },
         diff_id,
     })
+}
+
+/// Record `committed` (as just produced by [`commit_layer`]) into an
+/// image being built: append its own [`Descriptor`] to `layers` (the
+/// manifest's own layer list a future build executor is assembling)
+/// and its own `diff_id`, plus a new non-empty [`HistoryEntry`]
+/// timestamped now, to `config`'s own `rootfs.diff_ids`/`history`
+/// (both bottom-layer-first, matching `layers`' own append order —
+/// this function only ever appends to both together, so the two lists
+/// can never drift out of the relative order the image-spec requires
+/// between them).
+///
+/// `created_by` is a free-form description of the instruction that
+/// produced this layer (real `docker build`'s own convention is
+/// something shell-quoted like `RUN /bin/sh -c "..."`; this function
+/// doesn't prescribe a format, since it has no idea yet what a future
+/// build executor's own instruction text will look like).
+pub fn record_layer(
+    config: &mut ImageConfig,
+    layers: &mut Vec<Descriptor>,
+    committed: &CommittedLayer,
+    created_by: impl Into<String>,
+) {
+    layers.push(committed.descriptor.clone());
+    config.rootfs.diff_ids.push(committed.diff_id.clone());
+    config.history.push(HistoryEntry {
+        created: Some(format_rfc3339_utc(SystemTime::now())),
+        created_by: Some(created_by.into()),
+        author: None,
+        comment: None,
+        empty_layer: false,
+    });
+}
+
+/// Record a build instruction that produced *no* new layer (e.g.
+/// `ENV`/`LABEL`/`CMD`/`WORKDIR`/`ARG` — anything that only changes
+/// `config`'s own runtime defaults, not the rootfs) as a history-only
+/// entry: no `rootfs.diff_ids` entry, `empty_layer: true` — matching
+/// real `docker build`'s own `history` shape exactly (`docker history`
+/// on any real image shows these interleaved with real layer-producing
+/// entries, most with no corresponding layer size at all).
+pub fn record_empty_history(config: &mut ImageConfig, created_by: impl Into<String>) {
+    config.history.push(HistoryEntry {
+        created: Some(format_rfc3339_utc(SystemTime::now())),
+        created_by: Some(created_by.into()),
+        author: None,
+        comment: None,
+        empty_layer: true,
+    });
 }
 
 /// [`oci_layer::LayerError`] doesn't implement [`std::error::Error`]
@@ -194,5 +249,60 @@ mod tests {
         assert_ne!(committed_a.diff_id, committed_b.diff_id);
         assert!(store.has_blob(&committed_a.descriptor.digest));
         assert!(store.has_blob(&committed_b.descriptor.digest));
+    }
+
+    #[test]
+    fn record_layer_keeps_layers_and_diff_ids_in_the_same_relative_order() {
+        let (_store_dir, store) = temp_store();
+        let root = tempfile::tempdir().unwrap();
+        let before = Snapshot::capture(root.path()).unwrap();
+
+        write_file(&root.path().join("a.txt"), b"first");
+        let diff_a = changes(root.path(), &before).unwrap();
+        let committed_a = commit_layer(&store, root.path(), &diff_a).unwrap();
+
+        let before2 = Snapshot::capture(root.path()).unwrap();
+        write_file(&root.path().join("b.txt"), b"second");
+        let diff_b = changes(root.path(), &before2).unwrap();
+        let committed_b = commit_layer(&store, root.path(), &diff_b).unwrap();
+
+        let mut config = ImageConfig::default();
+        let mut layers = Vec::new();
+        record_layer(&mut config, &mut layers, &committed_a, "RUN echo a");
+        record_layer(&mut config, &mut layers, &committed_b, "RUN echo b");
+
+        assert_eq!(layers, vec![committed_a.descriptor, committed_b.descriptor]);
+        assert_eq!(
+            config.rootfs.diff_ids,
+            vec![committed_a.diff_id, committed_b.diff_id]
+        );
+        assert_eq!(config.history.len(), 2);
+        assert!(!config.history[0].empty_layer);
+        assert!(!config.history[1].empty_layer);
+        assert_eq!(config.history[0].created_by.as_deref(), Some("RUN echo a"));
+        assert_eq!(config.history[1].created_by.as_deref(), Some("RUN echo b"));
+        // A real, present-day timestamp, not a placeholder -- loosely
+        // sanity-checked by prefix rather than pinned to one instant.
+        assert!(
+            config.history[0]
+                .created
+                .as_ref()
+                .unwrap()
+                .starts_with("20")
+        );
+    }
+
+    #[test]
+    fn record_empty_history_touches_only_history_not_rootfs_or_layers() {
+        let mut config = ImageConfig::default();
+        let layers: Vec<Descriptor> = Vec::new();
+
+        record_empty_history(&mut config, "ENV FOO=bar");
+
+        assert!(layers.is_empty());
+        assert!(config.rootfs.diff_ids.is_empty());
+        assert_eq!(config.history.len(), 1);
+        assert!(config.history[0].empty_layer);
+        assert_eq!(config.history[0].created_by.as_deref(), Some("ENV FOO=bar"));
     }
 }

@@ -1,12 +1,19 @@
 //! RFC 3339 UTC timestamp formatting, without a date/time dependency.
 //!
-//! `PersistedState::created` needs exactly one thing: a
-//! `YYYY-MM-DDTHH:MM:SSZ` string for `SystemTime::now()`. Pulling in
-//! `chrono`/`time` for that is a lot of dependency weight (and a new
-//! "date/time" capability group `ci/guards.py` would have to start
-//! policing) for one conversion, so this hand-rolls the civil-calendar
-//! math instead: Howard Hinnant's `civil_from_days` algorithm (public
-//! domain; see
+//! Originally written for `oci_runtime_core::PersistedState::created`
+//! (a `YYYY-MM-DDTHH:MM:SSZ` string for `SystemTime::now()`); moved
+//! here so [`image::ImageConfig::created`](crate::image::ImageConfig)
+//! and [`image::HistoryEntry::created`](crate::image::HistoryEntry) —
+//! both defined in this same crate — can format a real timestamp for
+//! themselves too (`oci_dockerfile::commit_layer`'s own future caller
+//! needs exactly this), without either duplicating the same hand-
+//! rolled math a second time or making `oci-dockerfile` depend on
+//! `oci-runtime-core` just for a date string. Pulling in `chrono`/
+//! `time` for this one conversion would also be a lot of dependency
+//! weight (and a new "date/time" capability group `ci/guards.py`
+//! would have to start policing), so this hand-rolls the civil-
+//! calendar math instead: Howard Hinnant's `civil_from_days` algorithm
+//! (public domain; see
 //! <http://howardhinnant.github.io/date_algorithms.html#civil_from_days>),
 //! which is a small, well-known, exhaustively-tested-elsewhere formula for
 //! days-since-epoch -> (year, month, day) and back.

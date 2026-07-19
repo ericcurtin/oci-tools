@@ -19,7 +19,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::time::format_rfc3339_utc;
+use oci_spec_types::format_rfc3339_utc;
 
 /// The runtime-spec version this crate reports in [`PersistedState::oci_version`]
 /// (matches `oci_spec_types::runtime::VERSION`).
