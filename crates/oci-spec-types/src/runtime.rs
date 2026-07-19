@@ -181,6 +181,10 @@ pub struct Linux {
     /// yet synthesize a default path when it's unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cgroups_path: Option<String>,
+    /// Syscall filtering (`seccomp(2)` BPF program) applied to the
+    /// container process before `exec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seccomp: Option<LinuxSeccomp>,
     /// Paths made unreadable (bind-mounted from `/dev/null` or similar)
     /// inside the container.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -399,6 +403,74 @@ pub struct LinuxDeviceCgroup {
     pub access: Option<String>,
 }
 
+/// Syscall filtering (`seccomp(2)`), per the runtime-spec's own
+/// `linux.seccomp` shape (field names/casing checked against runc's
+/// vendored `runtime-spec` Go types, not re-derived from the human-
+/// readable spec doc).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinuxSeccomp {
+    /// `SCMP_ACT_*` action taken for a syscall that matches no rule
+    /// below.
+    pub default_action: String,
+    /// `errno` value returned for a `SCMP_ACT_ERRNO` default action with
+    /// no explicit `errnoRet`; `None` means the kernel's own default
+    /// (`EPERM`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_errno_ret: Option<u32>,
+    /// `SCMP_ARCH_*` names this profile additionally applies to, beyond
+    /// the runtime's own native architecture.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub architectures: Vec<String>,
+    /// `SECCOMP_FILTER_FLAG_*` names to pass to `seccomp(2)` itself.
+    /// Parsed but not yet acted on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<String>,
+    /// Per-syscall (or syscall-group) rules, each overriding the default
+    /// action for the syscalls it names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub syscalls: Vec<LinuxSyscall>,
+}
+
+/// One rule in [`LinuxSeccomp::syscalls`]: an action for every syscall in
+/// `names`, optionally gated on argument-value conditions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinuxSyscall {
+    /// Syscall names this rule matches (e.g. `"chmod"`).
+    pub names: Vec<String>,
+    /// `SCMP_ACT_*` action taken when this rule matches.
+    pub action: String,
+    /// `errno` value returned for a `SCMP_ACT_ERRNO` action; `None`
+    /// means the kernel's own default (`EPERM`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errno_ret: Option<u32>,
+    /// Argument-value conditions that must *all* match (empty means the
+    /// rule matches regardless of arguments).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<LinuxSeccompArg>,
+}
+
+/// One argument-value condition within a [`LinuxSyscall`] rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinuxSeccompArg {
+    /// Zero-based syscall argument index (0-5).
+    pub index: u32,
+    /// The value to compare the argument against.
+    pub value: u64,
+    /// A second value, only meaningful for `SCMP_CMP_MASKED_EQ` (the
+    /// mask to apply to both `value` and the argument before comparing).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub value_two: u64,
+    /// `SCMP_CMP_*` comparison operator.
+    pub op: String,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 impl Spec {
     /// A starter bundle spec matching `runc spec`'s default output:
     /// `sh` as the entrypoint, the standard proc/dev/sys mount set, the
@@ -463,6 +535,7 @@ impl Spec {
                     pids: None,
                 }),
                 cgroups_path: None,
+                seccomp: None,
                 masked_paths: default_masked_paths(),
                 readonly_paths: default_readonly_paths(),
             }),
@@ -785,6 +858,50 @@ mod tests {
         assert_eq!(cpu.cpus, "0-1");
 
         assert_eq!(resources.pids.unwrap().limit, Some(100));
+    }
+
+    #[test]
+    fn parses_real_podman_generated_config_with_seccomp() {
+        // A real `podman run` container's own on-disk config.json
+        // (captured from `overlay-containers/<id>/userdata/config.json`
+        // after `podman run --rm -d alpine sleep 60`, podman 4.9.3 /
+        // crun 1.14.1, aarch64 — not hand-written), including its full
+        // default seccomp profile (container-libs' pkg/seccomp
+        // seccomp.json, translated to the runtime-spec's
+        // linux.seccomp shape).
+        let raw = include_str!("../tests/fixtures/podman-generated-config-with-seccomp.json");
+        let spec: Spec = serde_json::from_str(raw).expect("parses real podman generated config");
+        let seccomp = spec.linux.unwrap().seccomp.unwrap();
+
+        assert_eq!(seccomp.default_action, "SCMP_ACT_ERRNO");
+        assert_eq!(seccomp.default_errno_ret, Some(38));
+        assert_eq!(
+            seccomp.architectures,
+            vec!["SCMP_ARCH_AARCH64", "SCMP_ARCH_ARM"]
+        );
+        assert_eq!(seccomp.syscalls.len(), 21);
+
+        let no_args_rule = &seccomp.syscalls[0];
+        assert!(no_args_rule.names.contains(&"bdflush".to_string()));
+        assert_eq!(no_args_rule.action, "SCMP_ACT_ERRNO");
+        assert_eq!(no_args_rule.errno_ret, Some(1));
+        assert!(no_args_rule.args.is_empty());
+
+        let personality_rule = seccomp
+            .syscalls
+            .iter()
+            .find(|s| s.names == vec!["personality".to_string()])
+            .expect("personality rule present");
+        assert_eq!(personality_rule.action, "SCMP_ACT_ALLOW");
+        assert_eq!(
+            personality_rule.args,
+            vec![LinuxSeccompArg {
+                index: 0,
+                value: 0,
+                value_two: 0,
+                op: "SCMP_CMP_EQ".to_string(),
+            }]
+        );
     }
 
     #[test]

@@ -28,6 +28,10 @@
 //!   spec's declared `process.user`, capability sets, and
 //!   `no_new_privileges`, in the exact kernel-required order.
 //! - [`rlimits`] — `process.rlimits` -> `setrlimit(2)`.
+//! - [`seccomp`] — `linux.seccomp` -> a compiled, installed
+//!   `seccomp(2)` BPF filter (single-shared-action profiles only — see
+//!   its own doc comment for the real, verified reason full multi-
+//!   action profiles need more work).
 //! - [`launch`] — assembling all of the above (plus `oci_mount`) into an
 //!   actual `create`-and-`start`-in-one-step container run, the shape
 //!   `ocirun run` uses.
@@ -46,8 +50,10 @@
 //! - the systemd cgroup driver and automatic rootless delegated-subtree
 //!   discovery (the `cgroupfs` driver and manual directory creation +
 //!   process migration are done — see [`cgroups`])
-//! - seccomp profiles (uid/gid, capability sets, `no_new_privileges`,
-//!   and POSIX rlimits are done — see [`identity`] and [`rlimits`])
+//! - full multi-action seccomp profiles (single-shared-action profiles
+//!   are done — see [`seccomp`]); uid/gid, capability sets,
+//!   `no_new_privileges`, and POSIX rlimits are done too (see
+//!   [`identity`] and [`rlimits`])
 //! - pivot_root into the prepared rootfs (via `oci-mount`)
 //! - terminal handling: PTY allocation, console socket protocol
 //!
@@ -64,6 +70,7 @@ pub mod namespaces;
 pub mod process;
 pub mod rlimits;
 pub mod rootfs;
+pub mod seccomp;
 pub mod state;
 mod time;
 pub mod validate;

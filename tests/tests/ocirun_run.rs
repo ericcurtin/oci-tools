@@ -360,6 +360,88 @@ fn run_creates_and_enters_the_requested_cgroup() {
 }
 
 #[test]
+fn run_applies_a_seccomp_profile_that_blocks_a_syscall() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(
+        dir.path(),
+        &busybox,
+        &["/bin/sh", "-c", "mkdir /blocked; echo mkdir_exit=$?"],
+    );
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    // `mkdirat` (not `mkdir`) because raw `mkdir` isn't a valid syscall
+    // on aarch64 (this project's own CI/dev architecture — see
+    // docs/design/0016); every C library's `mkdir()` on this
+    // architecture already compiles down to `mkdirat(AT_FDCWD, ...)`.
+    config["linux"]["seccomp"] = serde_json::json!({
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "syscalls": [
+            {"names": ["mkdirat"], "action": "SCMP_ACT_ERRNO", "errnoRet": 13}
+        ]
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let out = ocirun_run(dir.path(), "seccomp-test");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // busybox's `mkdir` reports any failure as exit code 1, not the raw
+    // errno — proof enough the syscall itself was actually denied.
+    assert_eq!(stdout.trim(), "mkdir_exit=1");
+}
+
+#[test]
+fn run_applies_a_seccomp_profile_with_an_argument_condition() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    // `kill(pid, 0)` (checking whether a process exists, sending no
+    // actual signal) should be denied by this profile; any *other*
+    // signal number wouldn't match the argument condition at all —
+    // proving `index`/`value`/`op` actually distinguish argument values
+    // at the syscall level, not just the syscall name.
+    write_bundle(
+        dir.path(),
+        &busybox,
+        &["/bin/sh", "-c", "kill -0 $$; echo kill0_exit=$?"],
+    );
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["linux"]["seccomp"] = serde_json::json!({
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "syscalls": [
+            {
+                "names": ["kill"],
+                "action": "SCMP_ACT_ERRNO",
+                "errnoRet": 1,
+                "args": [{"index": 1, "value": 0, "op": "SCMP_CMP_EQ"}]
+            }
+        ]
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let out = ocirun_run(dir.path(), "seccomp-arg-test");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout.trim(), "kill0_exit=1");
+}
+
+#[test]
 fn run_isolates_hostname_from_the_host() {
     let Some(busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");

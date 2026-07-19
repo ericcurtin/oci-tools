@@ -18,7 +18,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 
 use oci_spec_types::runtime::{
-    LinuxCapabilities, LinuxIdMapping, NamespaceType, PosixRlimit, User,
+    LinuxCapabilities, LinuxIdMapping, LinuxSeccomp, NamespaceType, PosixRlimit, User,
 };
 
 use crate::bundle::Bundle;
@@ -28,6 +28,7 @@ use crate::namespaces;
 use crate::process;
 use crate::rlimits;
 use crate::rootfs::{self, MaskedPathKind, RootfsAction};
+use crate::seccomp;
 
 /// The cgroup v2 unified hierarchy's mount point in production. Tests
 /// substitute a plain temp directory (see [`crate::cgroups`]'s own
@@ -122,6 +123,7 @@ pub unsafe fn run(bundle: &Bundle, rootfs: &Path) -> io::Result<i32> {
         capabilities: process_spec.capabilities.clone(),
         no_new_privileges: process_spec.no_new_privileges,
         rlimits: process_spec.rlimits.clone(),
+        seccomp: linux.and_then(|l| l.seccomp.clone()),
         args: process_spec.args.clone(),
         env: process_spec.env.clone(),
         cwd: process_spec.cwd.clone(),
@@ -148,6 +150,7 @@ struct ChildSetup {
     capabilities: Option<LinuxCapabilities>,
     no_new_privileges: bool,
     rlimits: Vec<PosixRlimit>,
+    seccomp: Option<LinuxSeccomp>,
     args: Vec<String>,
     env: Vec<String>,
     cwd: String,
@@ -259,6 +262,17 @@ impl ChildSetup {
             self.no_new_privileges,
         ) {
             fail(SETUP_FAILURE_EXIT_CODE, &format!("applying identity: {e}"));
+        }
+
+        // Last of all, right before exec: matches real crun (seccomp is
+        // applied after the uid/gid/capability drop), and means a
+        // rejected profile (see `seccomp`'s own doc comment on its
+        // scope limits) still fails loudly before the container's
+        // command ever runs, rather than running unfiltered.
+        if let Some(profile) = &self.seccomp
+            && let Err(e) = seccomp::apply(profile)
+        {
+            fail(SETUP_FAILURE_EXIT_CODE, &format!("applying seccomp: {e}"));
         }
 
         let mut command = std::process::Command::new(&self.args[0]);

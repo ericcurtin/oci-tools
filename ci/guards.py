@@ -56,6 +56,7 @@ CAPABILITY_GROUPS: dict[str, list[str]] = {
     "progress bars": ["indicatif", "pbr", "linya", "kdam"],
     "temporary files": ["tempfile", "tempdir", "mktemp"],
     "low-level unix syscalls": ["rustix", "nix"],
+    "seccomp-bpf filtering": ["seccompiler", "libseccomp", "libseccomp-sys", "syscallz"],
 }
 
 
