@@ -75,6 +75,9 @@ use std::path::{Component, Path, PathBuf};
 mod diff;
 pub use diff::{Change, ChangeKind, Snapshot, changes};
 
+mod export;
+pub use export::export;
+
 /// How a layer's tar stream is compressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
