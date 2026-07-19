@@ -81,6 +81,9 @@ pub use export::export;
 mod compress;
 pub use compress::compress_for_storage;
 
+mod detect;
+pub use detect::detect_archive;
+
 /// How a layer's tar stream is compressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {

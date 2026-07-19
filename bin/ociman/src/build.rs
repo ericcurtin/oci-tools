@@ -46,13 +46,20 @@
 //!   rather than silently ignored. A supported `COPY` commits a real
 //!   new layer exactly like `RUN` does (via the same diff/
 //!   `commit_layer`/`record_layer` path), just from a plain recursive
-//!   file copy instead of running a command. `ADD` (which also fetches
-//!   remote URLs and auto-extracts local archives, on top of
-//!   everything `COPY` does) is not implemented at all yet — rejected
-//!   with a clear error, matching
-//!   this project's own established convention for a deliberately
-//!   unimplemented construct (e.g. `ONBUILD`/`HEALTHCHECK` at parse
-//!   time).
+//!   file copy instead of running a command.
+//! * **`ADD` is supported for local sources.** Same scope limits as
+//!   `COPY` above (one source, no globs, no `--chown`/`--chmod`), plus
+//!   real docker's own documented archive-auto-extraction: a
+//!   non-directory local source that's a real tar archive (plain,
+//!   gzip, or zstd-compressed — `oci_layer::detect_archive`'s own doc
+//!   comment has the exact scope, checked directly against the
+//!   currently-vendored `~/git/moby`'s own archive-detection code) is
+//!   unpacked into the destination directory (created along with any
+//!   missing parents) instead of being copied as one file. A remote
+//!   URL source (`http://`/`https://`) is rejected with a clear error
+//!   — not yet supported, a separate future increment (this project
+//!   has no sanctioned general-purpose HTTP client for build-time use
+//!   outside `oci-registry`'s own registry-protocol-specific one).
 //! * **`FROM scratch` is rejected too** (no base image to extend —
 //!   producing a genuinely empty rootfs is its own future increment).
 //! * **`--build-arg KEY=value` (or bare `--build-arg KEY`, pulling
@@ -89,7 +96,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use oci_dockerfile::{CopyFlags, Instruction, ShellOrExec, commit_layer, record_layer};
+use oci_dockerfile::{AddFlags, CopyFlags, Instruction, ShellOrExec, commit_layer, record_layer};
 use oci_spec_types::Reference;
 use oci_spec_types::image::{
     ContainerConfig, Descriptor, ImageConfig, ImageManifest, MEDIA_TYPE_IMAGE_CONFIG,
@@ -321,7 +328,10 @@ fn build_stage(
 
     let needs_rootfs = force_rootfs
         || stage.instructions.iter().any(|instruction| {
-            matches!(instruction, Instruction::Run(_) | Instruction::Copy { .. })
+            matches!(
+                instruction,
+                Instruction::Run(_) | Instruction::Copy { .. } | Instruction::Add { .. }
+            )
         });
     let build_dir = if needs_rootfs {
         let dir = tempfile::tempdir().context("creating build scratch directory")?;
@@ -502,11 +512,16 @@ fn apply_instruction(
                 flags, sources, dest, config, layers, store, context, rootfs, stage_ctx,
             )?;
         }
-        Instruction::Add { .. } => anyhow::bail!(
-            "ociman build: ADD is not yet supported (COPY from the build context is; see this \
-             module's own doc comment for ADD's own still-missing remote-URL/archive-extraction \
-             behavior)"
-        ),
+        Instruction::Add {
+            flags,
+            sources,
+            dest,
+        } => {
+            let rootfs = rootfs.expect(
+                "cmd_build always prepares a rootfs when the stage contains an ADD instruction",
+            );
+            add_instruction(flags, sources, dest, config, layers, store, context, rootfs)?;
+        }
         Instruction::From { .. } => {
             unreachable!("a stage's own instructions never include the FROM that started it")
         }
@@ -804,6 +819,130 @@ fn copy_instruction(
         .with_context(|| format!("capturing rootfs state before {command_text}"))?;
     copy_path_recursive(&source_path, &target)
         .with_context(|| format!("copying {} to {}", source_path.display(), target.display()))?;
+    let diff = oci_layer::changes(rootfs, &before)
+        .with_context(|| format!("diffing rootfs after {command_text}"))?;
+    let committed = commit_layer(store, rootfs, &diff)
+        .with_context(|| format!("committing layer for {command_text}"))?;
+    record_layer(config, layers, &committed, command_text);
+    Ok(())
+}
+
+/// `ADD` — like [`copy_instruction`], but a *local, non-directory*
+/// source that's a real tar archive (plain, gzip, or zstd-compressed —
+/// [`oci_layer::detect_archive`]'s own doc comment has the exact,
+/// checked-against-the-real-source scope) is unpacked into `dest`
+/// instead of being copied as one file, matching real `docker`'s own
+/// documented `ADD` behavior. Remote URL sources
+/// (`http://`/`https://`) are not yet supported — a real, separate
+/// increment (this project has no sanctioned HTTP client for build-time
+/// use yet outside `oci-registry`'s own registry-protocol-specific
+/// one; see `ci/guards.py`'s "one crate per capability" list).
+#[allow(clippy::too_many_arguments)]
+fn add_instruction(
+    flags: &AddFlags,
+    sources: &[String],
+    dest: &str,
+    config: &mut ImageConfig,
+    layers: &mut Vec<Descriptor>,
+    store: &oci_store::Store,
+    context: &Path,
+    rootfs: &Path,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        flags.chown.is_none(),
+        "ociman build: ADD --chown is not yet supported"
+    );
+    anyhow::ensure!(
+        flags.chmod.is_none(),
+        "ociman build: ADD --chmod is not yet supported"
+    );
+    anyhow::ensure!(
+        sources.len() == 1,
+        "ociman build: ADD with more than one source is not yet supported"
+    );
+    let source = &sources[0];
+    anyhow::ensure!(
+        !source.contains(['*', '?', '[']),
+        "ociman build: ADD wildcard patterns are not yet supported ({source:?})"
+    );
+    anyhow::ensure!(
+        !source.starts_with("http://") && !source.starts_with("https://"),
+        "ociman build: ADD from a remote URL is not yet supported ({source:?})"
+    );
+    let command_text = format!("ADD {source} {dest}");
+
+    // `ADD` has no `--from` at all (see `AddFlags`'s own doc comment)
+    // -- always relative to the build context, unlike `COPY`, which
+    // can also reach into an earlier stage's own rootfs.
+    let source_path = safe_join(context, source.trim_start_matches('/'))
+        .with_context(|| format!("resolving ADD source {source:?}"))?;
+    anyhow::ensure!(
+        source_path.exists(),
+        "ADD source {source:?} does not exist in {}",
+        context.display()
+    );
+
+    let container_config = config.config.clone().unwrap_or_default();
+    let resolved_dest = resolve_workdir(container_config.working_dir.as_deref(), dest);
+    let dest_path = safe_join(rootfs, resolved_dest.trim_start_matches('/'))
+        .with_context(|| format!("resolving ADD destination {dest:?}"))?;
+
+    let source_metadata = std::fs::symlink_metadata(&source_path)
+        .with_context(|| format!("reading metadata for {}", source_path.display()))?;
+
+    // Real docker only ever auto-extracts a *non-directory* source —
+    // checked directly against `~/git/moby/daemon/builder/dockerfile/
+    // copy.go`'s own `performCopy`, which branches on `src.IsDir()`
+    // before ever reaching the archive-detection step.
+    let archive_compression = if source_metadata.is_dir() {
+        None
+    } else {
+        let bytes = std::fs::read(&source_path)
+            .with_context(|| format!("reading {}", source_path.display()))?;
+        oci_layer::detect_archive(&bytes)
+    };
+
+    let before = oci_layer::Snapshot::capture(rootfs)
+        .with_context(|| format!("capturing rootfs state before {command_text}"))?;
+
+    if let Some(compression) = archive_compression {
+        // Real docker's own documented behavior: the destination is
+        // always a directory for archive extraction, created (along
+        // with any missing parents) if it doesn't already exist yet —
+        // never the "rename to dest as a single file" dance a
+        // non-archive `ADD`/`COPY` source gets.
+        std::fs::create_dir_all(&dest_path)
+            .with_context(|| format!("creating {}", dest_path.display()))?;
+        let file = std::fs::File::open(&source_path)
+            .with_context(|| format!("opening {}", source_path.display()))?;
+        oci_layer::apply(file, compression, &dest_path).with_context(|| {
+            format!(
+                "extracting {} into {}",
+                source_path.display(),
+                dest_path.display()
+            )
+        })?;
+    } else {
+        // Same file-vs-directory target resolution as `copy_instruction`
+        // -- see its own doc comment for the exact real-docker rule
+        // this matches.
+        let target = if source_metadata.is_dir() || dest.ends_with('/') || dest_path.is_dir() {
+            if source_metadata.is_dir() {
+                dest_path.clone()
+            } else {
+                let file_name = source_path
+                    .file_name()
+                    .with_context(|| format!("ADD source {source:?} has no file name"))?;
+                dest_path.join(file_name)
+            }
+        } else {
+            dest_path.clone()
+        };
+        copy_path_recursive(&source_path, &target).with_context(|| {
+            format!("copying {} to {}", source_path.display(), target.display())
+        })?;
+    }
+
     let diff = oci_layer::changes(rootfs, &before)
         .with_context(|| format!("diffing rootfs after {command_text}"))?;
     let committed = commit_layer(store, rootfs, &diff)

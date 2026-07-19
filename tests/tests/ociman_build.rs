@@ -915,6 +915,216 @@ fn copy_rejects_a_missing_source() {
     );
 }
 
+fn write_gzip_tar(path: &Path, files: &[(&str, &[u8])]) {
+    let gz_file = std::fs::File::create(path).unwrap();
+    let encoder = flate2::write::GzEncoder::new(gz_file, flate2::Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    for (name, content) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, *content).unwrap();
+    }
+    builder.into_inner().unwrap().finish().unwrap();
+}
+
+/// `ADD` real docker's own documented archive-auto-extraction
+/// behavior: a local gzip-compressed tar archive is unpacked into the
+/// destination directory (created, along with any missing parents),
+/// not copied verbatim as one file the way `COPY`/a non-archive `ADD`
+/// source would be.
+#[test]
+fn add_extracts_a_local_gzip_tar_archive_into_the_destination_directory() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-archive-base:latest",
+        &busybox,
+        &["sh", "cat", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_gzip_tar(
+        &context_dir.path().join("payload.tar.gz"),
+        &[
+            ("file1.txt", b"hello from archive\n"),
+            ("subdir/file2.txt", b"nested\n"),
+        ],
+    );
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/add-archive-base:latest\n\
+         ADD payload.tar.gz /extracted\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/add-archive-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/add-archive-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /extracted/file1.txt && cat /extracted/subdir/file2.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "hello from archive\nnested\n"
+    );
+}
+
+/// `ADD` of a source that isn't a recognized archive behaves exactly
+/// like `COPY` -- including a gzip-compressed file that just isn't
+/// secretly a tar archive, the real false-positive plain magic-byte
+/// sniffing alone would miss (`oci_layer::detect_archive`'s own tests
+/// already cover the sniffing logic directly; this confirms
+/// `ociman build` itself wires it correctly end to end).
+#[test]
+fn add_copies_a_non_archive_source_like_copy() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-plain-base:latest",
+        &busybox,
+        &["sh", "cat", "zcat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("plain.txt"), "plain content\n").unwrap();
+    // A real gzip stream (correct magic bytes, genuinely decompresses)
+    // whose content is deliberately *not* a tar archive.
+    let gz_path = context_dir.path().join("notarchive.txt.gz");
+    let gz_file = std::fs::File::create(&gz_path).unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(gz_file, flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, b"just gzipped text, not a tar\n").unwrap();
+    encoder.finish().unwrap();
+
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/add-plain-base:latest\n\
+         ADD plain.txt /copied.txt\n\
+         ADD notarchive.txt.gz /still-gzipped.gz\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/add-plain-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/add-plain-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /copied.txt && zcat /still-gzipped.gz",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "plain content\njust gzipped text, not a tar\n"
+    );
+}
+
+/// `ADD` from a remote URL is a real, clear, surfaced error -- not
+/// yet supported, not silently treated as a local path.
+#[test]
+fn add_rejects_a_remote_url_source() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-url-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/add-url-base:latest\n\
+         ADD https://example.com/file.txt /file.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/add-url-result:latest",
+        ],
+    );
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(stderr.contains("remote URL"), "{stderr}");
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/add-url-result:latest")
+            .unwrap()
+            .is_none(),
+        "a failed build must not leave a partial image tagged"
+    );
+}
+
 /// The classic multi-stage pattern: build an artifact in one stage,
 /// then `COPY --from=<that stage>` just the artifact into a fresh
 /// final stage. The final image's own manifest must have exactly one
