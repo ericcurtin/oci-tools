@@ -25,8 +25,16 @@
 //! **Deliberately not implemented yet**, each a separate, later
 //! increment of its own:
 //! - `ARG`/`ENV` variable substitution/interpolation within other
-//!   instructions' own argument text (e.g. `RUN echo $FOO`) — every
-//!   [`Instruction`] here carries its arguments exactly as written.
+//!   instructions' own argument text (e.g. `RUN echo $FOO`) is *not
+//!   yet applied* — every [`Instruction`] `parse` produces carries its
+//!   arguments exactly as written. The expansion engine itself
+//!   ([`expand`], in [`shell_expand`]) is implemented and thoroughly
+//!   tested on its own, deliberately *not yet wired into*
+//!   `Instruction` dispatch — see its own module doc comment for
+//!   exactly why (it needs to know each instruction's own accumulated
+//!   `ARG`/`ENV` environment, which only makes sense once
+//!   instructions are grouped into build stages, the next bullet
+//!   below).
 //! - `ONBUILD`, `HEALTHCHECK`, heredocs (`<<EOF ... EOF`), and every
 //!   BuildKit-only flag (`RUN --mount=`, `COPY --link`/`--parents`/
 //!   `--exclude=`, `ADD --link`/`--keep-git-dir`/`--checksum=`/
@@ -40,8 +48,10 @@
 
 mod instruction;
 mod lexer;
+mod shell_expand;
 
 pub use instruction::{AddFlags, CopyFlags, Instruction, ShellOrExec};
+pub use shell_expand::expand;
 
 /// Parse a whole Dockerfile/Containerfile's contents into an ordered
 /// list of [`Instruction`]s.
