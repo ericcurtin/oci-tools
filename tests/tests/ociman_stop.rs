@@ -127,13 +127,22 @@ fn stop_lets_a_signal_handling_container_exit_gracefully() {
     // A generous grace window: what actually matters here is *whether*
     // the trap gets to run at all before any `KILL` escalation, not
     // exactly how many milliseconds that takes (real OS scheduling
-    // jitter, especially under a loaded CI host, makes any assertion
-    // on elapsed wall-clock time flaky by nature -- an earlier version
-    // of this test asserted `stop` returned quickly and intermittently
+    // jitter, especially under a loaded host, makes any assertion on
+    // elapsed wall-clock time flaky by nature -- an earlier version of
+    // this test asserted `stop` returned quickly and intermittently
     // failed under host load for exactly that reason; the *exit code*
     // check below is the deterministic, meaningful assertion: a `KILL`
-    // escalation would produce 137, not the trap's own `exit 0`).
-    let stop = ociman(storage_dir.path(), &["stop", "--time", "20", &id]);
+    // escalation would produce 137, not the trap's own `exit 0`). 60s
+    // (not the original 20s) after this test was *still* observed to
+    // occasionally take the entire window and escalate to `KILL` on
+    // this project's own shared dev host under heavy, unrelated
+    // concurrent load (a separate session's own `cargo build --release
+    // -C lto=fat -C codegen-units=1`, confirmed directly via `ps` at
+    // the exact time of the failure) — the normal, uncontended case
+    // still finishes in milliseconds regardless of how generous this
+    // ceiling is, so raising it only helps, never slows down the
+    // common case.
+    let stop = ociman(storage_dir.path(), &["stop", "--time", "60", &id]);
     assert!(
         stop.status.success(),
         "stderr: {}",

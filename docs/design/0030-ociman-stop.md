@@ -116,6 +116,29 @@ meaningful check (`0` only ever comes from the trap, `137` only ever
 from `KILL`), so it alone is what actually matters, and doesn't care
 how many milliseconds getting there took.
 
+Even with the timing assertion gone, the *grace window itself*
+(`--time`) still needs to be long enough for the trap to actually get a
+turn to run at all before `stop` gives up and escalates — and this
+project's own shared development host (not the dedicated, uncontended
+CI VMs) turned out to occasionally make even a generous 20s window
+insufficient: caught directly via `ps` showing an unrelated concurrent
+session's own `cargo build --release -C lto=fat -C codegen-units=1`
+(a different project entirely, sharing the same machine) pegging every
+CPU at the exact moment this test failed locally. Raised to 60s for
+extra headroom — the ordinary, uncontended case still finishes in
+milliseconds regardless of how generous the ceiling is, so this only
+helps, never slows down the common case — but this is fundamentally a
+property of preemptive scheduling under severe contention, not
+something any fixed timeout can *guarantee* away entirely: an
+arbitrarily loaded shared host could in principle still delay any
+process's next scheduling turn past any finite deadline. The
+authoritative correctness signal for this test (and every other one in
+this project) is the dedicated CI VM matrix, which runs with no such
+competing tenant and has consistently passed cleanly across many
+repeated runs; occasional, rare local flakiness specifically under
+heavy *unrelated* concurrent load on this shared dev machine is a known
+property of the local environment, not of the code being tested.
+
 ## Performance
 
 Doesn't touch `oci_runtime_core::launch`/`process`/`exec` at all — pure
