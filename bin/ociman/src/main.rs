@@ -7,9 +7,9 @@
 //! through `oci-runtime-core` directly, as a library — never by
 //! exec'ing `ocirun` (see the top-level README's design pillars).
 //!
-//! Milestone plan: `pull`/`images`/`inspect`/`run`/`ps`/`rm`/`exec`/
-//! `logs` rootless (milestone 3, shipped); `build` (milestone 4), then
-//! the full podman-style v1 command set.
+//! Milestone plan: `pull`/`images`/`inspect`/`run`/`ps`/`rm`/`stop`/
+//! `exec`/`logs` rootless (milestone 3, shipped); `build` (milestone
+//! 4), then the full podman-style v1 command set.
 
 mod user_resolve;
 
@@ -109,6 +109,22 @@ enum Command {
         #[arg(short, long)]
         force: bool,
     },
+    /// Gracefully stop a running container: send it a signal (`TERM`
+    /// by default) and wait up to `--time` seconds for it to exit on
+    /// its own, then `KILL` it outright if it hasn't — matching real
+    /// `docker stop`/`podman stop`. A no-op (not an error) on an
+    /// already-stopped container.
+    Stop {
+        /// The container's ID.
+        id: String,
+        /// Seconds to wait after the initial signal before escalating
+        /// to `KILL`.
+        #[arg(short, long, default_value_t = 10)]
+        time: u64,
+        /// Signal to send initially (name or number).
+        #[arg(short, long, default_value = "TERM")]
+        signal: String,
+    },
     /// Run an additional process inside an already-running container,
     /// joining its existing namespaces.
     Exec {
@@ -161,6 +177,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Run { image, args, rm }) => cmd_run(&image, &args, rm),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
+            Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, &signal),
             Some(Command::Exec {
                 id,
                 user,
@@ -537,6 +554,53 @@ fn cmd_rm(id: &str, force: bool) -> anyhow::Result<()> {
     }
 
     containers.remove(id)?;
+    println!("{id}");
+    Ok(())
+}
+
+/// Gracefully stop a running container (see [`Command::Stop`]'s own
+/// doc comment for the exact policy): a no-op on one that's already
+/// stopped, matching real `docker stop`/`podman stop`'s own
+/// idempotent behavior rather than erroring on a redundant call.
+fn cmd_stop(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let state = containers.load(id)?;
+    if state.effective_status() == Status::Stopped {
+        println!("{id}");
+        return Ok(());
+    }
+    let pid = state
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
+
+    let sig = oci_runtime_core::signal::parse(signal)
+        .with_context(|| format!("parsing signal {signal:?}"))?;
+    let _ = oci_runtime_core::process::kill(pid, sig);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(time_secs);
+    while std::time::Instant::now() < deadline {
+        if !oci_runtime_core::process::alive(pid) {
+            println!("{id}");
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Still running after the graceful window: matches real `docker
+    // stop`/`podman stop` escalating to an unmaskable `KILL` rather
+    // than waiting forever for a container that never handled (or
+    // outright ignores) the initial signal — the same reasoning
+    // `ocirun kill`'s own SIGTERM-is-ignorable-by-a-pid-namespace-init
+    // finding (0017) already established elsewhere in this project.
+    let sigkill = oci_runtime_core::signal::parse("KILL").expect("KILL is always valid");
+    let _ = oci_runtime_core::process::kill(pid, sigkill);
+    for _ in 0..50 {
+        if !oci_runtime_core::process::alive(pid) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
     println!("{id}");
     Ok(())
 }
