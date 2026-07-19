@@ -16,7 +16,8 @@ if command -v dnf >/dev/null 2>&1; then
         make \
         tar \
         xz \
-        e2fsprogs
+        e2fsprogs \
+        erofs-utils
 elif command -v apt-get >/dev/null 2>&1; then
     sudo apt-get update -qq
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
@@ -25,7 +26,8 @@ elif command -v apt-get >/dev/null 2>&1; then
         curl \
         tar \
         xz-utils \
-        e2fsprogs
+        e2fsprogs \
+        erofs-utils
 
     # Ubuntu 24.04+ auto-confines any unconfined process that creates an
     # unprivileged user namespace into a restrictive built-in AppArmor
