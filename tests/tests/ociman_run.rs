@@ -28,101 +28,12 @@ use std::process::Command;
 use oci_spec_types::Reference;
 use oci_spec_types::digest::sha256;
 use oci_spec_types::image::{
-    ContainerConfig, Descriptor, ImageConfig, ImageManifest, MEDIA_TYPE_IMAGE_CONFIG,
-    MEDIA_TYPE_IMAGE_LAYER_GZIP, MEDIA_TYPE_IMAGE_MANIFEST, RootFs,
+    ContainerConfig, Descriptor, ImageManifest, MEDIA_TYPE_IMAGE_CONFIG,
+    MEDIA_TYPE_IMAGE_LAYER_GZIP, MEDIA_TYPE_IMAGE_MANIFEST,
 };
 use oci_store::{ImageRecord, Store};
 
-use oci_tools_tests::{bin_path, busybox_path};
-
-/// Seed `store` with a synthetic single-layer image at `reference`,
-/// whose one layer is a real `busybox` binary at `bin/busybox` plus the
-/// given symlinked applets, and whose `ContainerConfig` is
-/// `container_config`. Afterward the image is retrievable exactly like
-/// a real `ociman pull` would have left it.
-fn seed_image(
-    store: &Store,
-    reference: &str,
-    busybox: &Path,
-    applets: &[&str],
-    container_config: ContainerConfig,
-) {
-    let mut builder = tar::Builder::new(Vec::new());
-    let busybox_bytes = std::fs::read(busybox).unwrap();
-    let mut header = tar::Header::new_gnu();
-    header.set_entry_type(tar::EntryType::Regular);
-    header.set_size(busybox_bytes.len() as u64);
-    header.set_mode(0o755);
-    builder
-        .append_data(&mut header, "bin/busybox", busybox_bytes.as_slice())
-        .unwrap();
-    for applet in applets {
-        let mut link_header = tar::Header::new_gnu();
-        link_header.set_entry_type(tar::EntryType::Symlink);
-        link_header.set_mode(0o777);
-        link_header.set_size(0);
-        builder
-            .append_link(&mut link_header, format!("bin/{applet}"), "busybox")
-            .unwrap();
-    }
-    let tar_bytes = builder.into_inner().unwrap();
-    let diff_id = sha256(&tar_bytes);
-
-    // gzip it, exactly like a real registry blob would be.
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(&tar_bytes).unwrap();
-    let gzipped = encoder.finish().unwrap();
-    let layer = store.ingest(gzipped.as_slice()).unwrap();
-
-    let image_config = ImageConfig {
-        architecture: Some(std::env::consts::ARCH.to_string()),
-        os: Some("linux".to_string()),
-        created: None,
-        author: None,
-        config: Some(container_config),
-        rootfs: RootFs {
-            kind: "layers".to_string(),
-            diff_ids: vec![diff_id],
-        },
-        history: vec![],
-    };
-    let config = store
-        .ingest(serde_json::to_vec(&image_config).unwrap().as_slice())
-        .unwrap();
-
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: Some(MEDIA_TYPE_IMAGE_MANIFEST.to_string()),
-        config: Descriptor {
-            media_type: MEDIA_TYPE_IMAGE_CONFIG.to_string(),
-            digest: config.digest,
-            size: config.size,
-            urls: vec![],
-            annotations: Default::default(),
-            platform: None,
-        },
-        layers: vec![Descriptor {
-            media_type: MEDIA_TYPE_IMAGE_LAYER_GZIP.to_string(),
-            digest: layer.digest,
-            size: layer.size,
-            urls: vec![],
-            annotations: Default::default(),
-            platform: None,
-        }],
-        annotations: Default::default(),
-    };
-    let manifest_ingested = store
-        .ingest(serde_json::to_vec(&manifest).unwrap().as_slice())
-        .unwrap();
-
-    let normalized = Reference::parse(reference).unwrap().to_string();
-    store
-        .put_image(&ImageRecord {
-            reference: normalized,
-            manifest_digest: manifest_ingested.digest,
-        })
-        .unwrap();
-}
+use oci_tools_tests::{bin_path, busybox_path, seed_image};
 
 fn ociman_run(storage_root: &Path, image: &str, args: &[&str]) -> std::process::Output {
     Command::new(bin_path("ociman"))
