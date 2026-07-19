@@ -206,6 +206,169 @@ fn run_applies_a_default_seccomp_profile_blocking_a_real_syscall() {
     );
 }
 
+/// `--security-opt seccomp=unconfined` genuinely removes seccomp
+/// confinement -- checked the most direct, unambiguous way available:
+/// reading the real `config.json` this invocation actually wrote back
+/// out (rather than picking a probe syscall, which turned out to be
+/// surprisingly hard to make unambiguous by hand while building this
+/// test: this project's own rootless default capability set is
+/// extremely minimal, `CAP_AUDIT_WRITE`/`CAP_KILL`/
+/// `CAP_NET_BIND_SERVICE` only, so most syscalls the default seccomp
+/// profile blocks *also* fail for a completely different reason, a
+/// missing capability, once seccomp itself is out of the way --
+/// `run_security_opt_custom_profile_is_loaded_and_really_enforced`
+/// below is the real, unambiguous, behavioral proof that a
+/// `--security-opt seccomp=` value genuinely reaches the container).
+#[test]
+fn run_security_opt_seccomp_unconfined_disables_confinement_in_the_real_spec() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/unconfined:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/unconfined:latest",
+        &[
+            "--security-opt",
+            "seccomp=unconfined",
+            "/bin/sh",
+            "-c",
+            "exit 0",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    let config_path = storage_dir
+        .path()
+        .join("containers")
+        .join(&container_id)
+        .join("config.json");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    assert!(
+        config["linux"]["seccomp"].is_null(),
+        "expected --security-opt seccomp=unconfined to leave linux.seccomp unset entirely, \
+         got: {config:?}"
+    );
+}
+
+/// A real, unambiguous, capability-independent proof that
+/// `--security-opt seccomp=<path>` genuinely loads and enforces a
+/// caller-supplied profile: a minimal custom profile that allows
+/// everything *except* an explicit `SCMP_ACT_ERRNO` rule for
+/// `getcwd` (a syscall every unprivileged process can always make on
+/// its own current directory, unlike the default profile's own
+/// blocked syscalls, which turned out to mostly *also* need a
+/// capability this project's own minimal rootless default doesn't
+/// grant — see the `--security-opt seccomp=unconfined` test above).
+/// `/bin/pwd` (which calls `getcwd(2)`) fails with exactly
+/// `Operation not permitted` under the custom profile, and succeeds
+/// under the (unmodified) default profile — confirmed by hand against
+/// a real running container before encoding this as an automated
+/// test.
+#[test]
+fn run_security_opt_custom_profile_is_loaded_and_really_enforced() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/custom-seccomp:latest",
+        &busybox,
+        &["sh", "pwd"],
+        ContainerConfig::default(),
+    );
+
+    let profile_dir = tempfile::tempdir().unwrap();
+    let profile_path = profile_dir.path().join("block-getcwd.json");
+    std::fs::write(
+        &profile_path,
+        r#"{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["getcwd"],"action":"SCMP_ACT_ERRNO","errnoRet":1}]}"#,
+    )
+    .unwrap();
+
+    // Baseline: `pwd` succeeds under the ordinary default profile
+    // (`getcwd` isn't one of its blocked syscalls).
+    let baseline = ociman_run(
+        storage_dir.path(),
+        "ociman-test/custom-seccomp:latest",
+        &["--rm", "/bin/pwd"],
+    );
+    assert!(
+        baseline.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+
+    // The same command, under the custom profile blocking `getcwd`
+    // specifically, must now fail with exactly `Operation not
+    // permitted` -- proof the profile was actually loaded and
+    // enforced, not merely accepted and ignored.
+    let blocked = ociman_run(
+        storage_dir.path(),
+        "ociman-test/custom-seccomp:latest",
+        &[
+            "--rm",
+            "--security-opt",
+            &format!("seccomp={}", profile_path.display()),
+            "/bin/pwd",
+        ],
+    );
+    assert!(!blocked.status.success());
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("Operation not permitted"),
+        "stderr: {}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+}
+
+#[test]
+fn run_security_opt_rejects_an_unsupported_key() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/security-opt-reject:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/security-opt-reject:latest",
+        &["--security-opt", "apparmor=unconfined", "/bin/true"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("apparmor=unconfined"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn run_memory_limit_actually_gets_enforced_by_the_kernels_own_oom_killer() {
     // Real, kernel-enforced verification (not just "the property got

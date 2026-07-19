@@ -207,6 +207,29 @@ enum Command {
         /// and the same rootless delegation caveat, as `--cpuset-cpus`.
         #[arg(long = "cpuset-mems")]
         cpuset_mems: Option<String>,
+        /// Override the container's own seccomp confinement, matching
+        /// real `docker run --security-opt seccomp=<value>`/`podman
+        /// run --security-opt seccomp=<value>` (repeatable, like real
+        /// `docker`/`podman`, though only the `seccomp=` key is
+        /// implemented so far — any other key, e.g. real `docker`/
+        /// `podman`'s own `apparmor=`/`label=`/`no-new-privileges`,
+        /// is rejected with a clear error rather than silently
+        /// ignored). `seccomp=unconfined` disables seccomp entirely;
+        /// `seccomp=<path>` reads a JSON seccomp profile (the same
+        /// `{"defaultAction": ..., "syscalls": [...]}` shape real
+        /// `docker`'s own default profile uses) from `<path>` and uses
+        /// it verbatim instead of this project's own bundled default
+        /// (0044) — unlike the bundled default, a custom profile is
+        /// never filtered down to this build's own supported syscall
+        /// set first: an unknown syscall name in a file the caller
+        /// explicitly supplied is a real, surfaced error (from
+        /// `oci_runtime_core::seccomp::apply`'s own existing strict
+        /// validation), not something to silently drop. `--privileged`
+        /// (which disables far more than just seccomp in real
+        /// `docker`/`podman` — capabilities, device access, and more,
+        /// none of which this flag touches) is not implemented.
+        #[arg(long = "security-opt")]
+        security_opt: Vec<String>,
     },
     /// List containers.
     Ps {
@@ -306,6 +329,7 @@ fn main() -> std::process::ExitCode {
                 pids_limit,
                 cpuset_cpus,
                 cpuset_mems,
+                security_opt,
             }) => cmd_run(
                 &image,
                 &args,
@@ -317,6 +341,7 @@ fn main() -> std::process::ExitCode {
                 pids_limit,
                 cpuset_cpus.as_deref(),
                 cpuset_mems.as_deref(),
+                &security_opt,
             ),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
@@ -468,7 +493,9 @@ fn cmd_run(
     pids_limit: Option<i64>,
     cpuset_cpus: Option<&str>,
     cpuset_mems: Option<&str>,
+    security_opts: &[String],
 ) -> anyhow::Result<()> {
+    let seccomp = resolve_seccomp(security_opts)?;
     let memory_limit_bytes = memory.map(parse_memory_limit).transpose()?;
     let memory_swap_bytes = memory_swap.map(parse_memory_swap_limit).transpose()?;
     anyhow::ensure!(
@@ -545,6 +572,7 @@ fn cmd_run(
             pids_limit,
             cpuset_cpus,
             cpuset_mems,
+            seccomp,
         )?;
         if let Some(process) = &spec.process {
             state
@@ -997,6 +1025,7 @@ fn synthesize_spec(
     pids_limit: Option<i64>,
     cpuset_cpus: Option<&str>,
     cpuset_mems: Option<&str>,
+    seccomp: Option<oci_spec_types::runtime::LinuxSeccomp>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -1060,19 +1089,66 @@ fn synthesize_spec(
         linux.resources = Some(resources);
     }
 
-    // Always apply a default seccomp profile, matching real `podman
-    // run`'s own default on every container it starts — there's no
-    // `--security-opt seccomp=`/`--privileged` escape hatch yet (this
-    // is a pure improvement over the previous "zero seccomp
-    // confinement at all" behavior, never a new hard requirement: see
-    // `docs/design/0044`). Filtered to this build's own architecture
-    // first, so an aarch64 (or any other non-x86_64) container isn't
-    // rejected over syscall names that only exist on a different one.
-    linux.seccomp = Some(oci_runtime_core::seccomp::filter_to_supported_syscalls(
-        &oci_runtime_core::seccomp::default_profile(),
-    ));
+    // `seccomp` is already fully resolved by `resolve_seccomp` (the
+    // bundled default, filtered to this build's own supported syscall
+    // set; `None` for `--security-opt seccomp=unconfined`; or a
+    // caller-supplied profile used verbatim, unfiltered) — matching
+    // real `podman run`'s own default-every-container-gets-one
+    // behavior (0044) while still allowing the same opt-out/override
+    // real `docker run`/`podman run --security-opt seccomp=` do.
+    linux.seccomp = seccomp;
 
     Ok(spec)
+}
+
+/// Resolve `ociman run`'s own `--security-opt` flags into the
+/// effective seccomp confinement for a container: `None` if seccomp
+/// should be disabled entirely (`seccomp=unconfined`), or `Some` (the
+/// bundled default, or a caller-supplied profile) otherwise — matching
+/// real `docker run`/`podman run --security-opt
+/// seccomp=<unconfined|path>`. Only the `seccomp=` key is implemented;
+/// any other `--security-opt` value (real `docker`/`podman` also
+/// support `apparmor=`/`label=`/`no-new-privileges`/...) is rejected
+/// with a clear error rather than silently ignored.
+///
+/// A caller-supplied profile (`seccomp=<path>`) is used exactly as
+/// read — unlike the bundled default, it is *not* passed through
+/// `filter_to_supported_syscalls`: a profile the caller explicitly
+/// wrote is presumed to already be scoped to whatever architecture
+/// they intend it for, and an unknown syscall name in it should
+/// surface as a real, visible error (via `oci_runtime_core::
+/// seccomp::apply`'s own existing strict validation, at container
+/// launch) rather than being silently dropped the way this project's
+/// own bundled default's rarely-relevant, architecture-specific extras
+/// are.
+fn resolve_seccomp(
+    security_opts: &[String],
+) -> anyhow::Result<Option<oci_spec_types::runtime::LinuxSeccomp>> {
+    let mut seccomp_opt: Option<&str> = None;
+    for opt in security_opts {
+        match opt.split_once('=') {
+            Some(("seccomp", value)) => seccomp_opt = Some(value),
+            _ => anyhow::bail!(
+                "ociman run: --security-opt {opt:?} is not yet supported (only \
+                 seccomp=unconfined or seccomp=<path to a JSON seccomp profile> are)"
+            ),
+        }
+    }
+    match seccomp_opt {
+        None => Ok(Some(
+            oci_runtime_core::seccomp::filter_to_supported_syscalls(
+                &oci_runtime_core::seccomp::default_profile(),
+            ),
+        )),
+        Some("unconfined") => Ok(None),
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading seccomp profile {path:?}"))?;
+            let profile: oci_spec_types::runtime::LinuxSeccomp = serde_json::from_str(&text)
+                .with_context(|| format!("parsing seccomp profile {path:?}"))?;
+            Ok(Some(profile))
+        }
+    }
 }
 
 /// Build a `LinuxResources` from `ociman run`'s own `--memory`/
@@ -1467,5 +1543,67 @@ mod tests {
         assert_eq!(parse_memory_swap_limit("512m").unwrap(), 512 * 1024 * 1024);
         assert!(parse_memory_swap_limit("not-a-number").is_err());
         assert!(parse_memory_swap_limit("-2").is_err());
+    }
+
+    #[test]
+    fn resolve_seccomp_with_no_security_opt_at_all_returns_the_bundled_default() {
+        let seccomp = resolve_seccomp(&[]).unwrap().unwrap();
+        assert_eq!(
+            seccomp,
+            oci_runtime_core::seccomp::filter_to_supported_syscalls(
+                &oci_runtime_core::seccomp::default_profile()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_seccomp_unconfined_disables_seccomp_entirely() {
+        let seccomp = resolve_seccomp(&["seccomp=unconfined".to_string()]).unwrap();
+        assert!(seccomp.is_none());
+    }
+
+    #[test]
+    fn resolve_seccomp_loads_a_real_custom_profile_file_verbatim_unfiltered() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_path = dir.path().join("custom-seccomp.json");
+        // A minimal, real-shaped custom profile -- deliberately naming
+        // a syscall this build's own bundled default filters out on
+        // some architectures, to prove a caller-supplied profile is
+        // *not* run through `filter_to_supported_syscalls` the way
+        // the bundled default is.
+        std::fs::write(
+            &profile_path,
+            r#"{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["made_up_syscall_name"],"action":"SCMP_ACT_ERRNO"}]}"#,
+        )
+        .unwrap();
+
+        let seccomp = resolve_seccomp(&[format!("seccomp={}", profile_path.display())])
+            .unwrap()
+            .unwrap();
+        assert_eq!(seccomp.default_action, "SCMP_ACT_ALLOW");
+        assert_eq!(seccomp.syscalls.len(), 1);
+        assert_eq!(seccomp.syscalls[0].names, vec!["made_up_syscall_name"]);
+    }
+
+    #[test]
+    fn resolve_seccomp_rejects_a_missing_custom_profile_file() {
+        let err = resolve_seccomp(&["seccomp=/no/such/file.json".to_string()]).unwrap_err();
+        assert!(format!("{err:#}").contains("/no/such/file.json"));
+    }
+
+    #[test]
+    fn resolve_seccomp_rejects_an_unsupported_security_opt_key() {
+        let err = resolve_seccomp(&["apparmor=unconfined".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("apparmor=unconfined"), "{err}");
+    }
+
+    #[test]
+    fn resolve_seccomp_last_seccomp_value_wins_when_repeated() {
+        let seccomp = resolve_seccomp(&[
+            "seccomp=/no/such/file.json".to_string(),
+            "seccomp=unconfined".to_string(),
+        ])
+        .unwrap();
+        assert!(seccomp.is_none());
     }
 }
