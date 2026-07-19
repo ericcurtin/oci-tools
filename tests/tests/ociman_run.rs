@@ -663,6 +663,125 @@ fn run_without_workdir_flag_uses_the_images_own_workdir() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "/bin\n");
 }
 
+/// `--entrypoint` replaces the image's own `ENTRYPOINT` *and*
+/// suppresses the image's own default `CMD` fallback entirely, even
+/// with no trailing command given -- checked directly against real
+/// podman's own `makeCommand` rule ("only use image command if the
+/// user did not manually set an entrypoint"), not just this project's
+/// own unit tests: a real running container.
+#[test]
+fn run_entrypoint_flag_replaces_the_images_own_entrypoint_and_cmd() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/entrypoint-flag:latest",
+        &busybox,
+        &["sh", "echo"],
+        ContainerConfig {
+            entrypoint: Some(vec!["/bin/echo".to_string()]),
+            cmd: Some(vec!["from-image-cmd".to_string()]),
+            ..Default::default()
+        },
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "--entrypoint",
+            "/bin/sh -c \"echo overridden\"",
+        ])
+        .args(["ociman-test/entrypoint-flag:latest"])
+        .output()
+        .expect("failed to spawn ociman run");
+    // The whole `--entrypoint` string was one literal argument (not
+    // valid JSON), so the real command run is a single, literal
+    // `/bin/sh -c "echo overridden"` executable name -- which doesn't
+    // exist as a real path, so this genuinely fails to exec, same as
+    // real `docker`/`podman`'s own `--entrypoint` would too. That
+    // failure itself is exactly what this test checks: the exec
+    // error names the literal, unsplit string as the executable it
+    // tried and failed to run, proving the image's own `from-image-
+    // cmd` was never appended as a second argument at all (checked
+    // directly; see the next test for a real, successfully-executed
+    // override).
+    assert!(
+        !out.status.success(),
+        "a literal, unsplit `--entrypoint` value naming a real path that doesn't exist should \
+         fail to exec"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("from-image-cmd"),
+        "the image's own default CMD must not be appended when --entrypoint overrides it: \
+         {combined:?}"
+    );
+    assert!(
+        combined.contains("/bin/sh -c \"echo overridden\""),
+        "the exec error should name the literal, unsplit --entrypoint value: {combined:?}"
+    );
+}
+
+/// A real, successfully-executed `--entrypoint` override, using the
+/// JSON-array form real podman also supports -- printing real,
+/// distinguishable output from inside the running container proves
+/// both that the override took effect and that the image's own CMD
+/// was correctly suppressed.
+#[test]
+fn run_entrypoint_flag_json_array_form_actually_executes() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/entrypoint-json:latest",
+        &busybox,
+        &["sh", "echo"],
+        ContainerConfig {
+            entrypoint: Some(vec!["/bin/echo".to_string()]),
+            cmd: Some(vec!["from-image-cmd".to_string()]),
+            ..Default::default()
+        },
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "--entrypoint",
+            r#"["/bin/sh", "-c", "echo overridden-entrypoint"]"#,
+        ])
+        .args(["ociman-test/entrypoint-json:latest"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "overridden-entrypoint\n",
+        "the image's own from-image-cmd must not have been appended"
+    );
+}
+
 #[test]
 fn run_uses_the_images_default_cmd_and_env() {
     let Some(busybox) = busybox_path() else {

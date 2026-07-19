@@ -347,6 +347,22 @@ enum Command {
         /// own analogous override for an already-running container.
         #[arg(short = 'w', long = "workdir")]
         workdir: Option<String>,
+        /// Override the image's own `ENTRYPOINT`, matching real
+        /// `docker run --entrypoint`/`podman run --entrypoint`
+        /// exactly: a JSON string array (`'["a", "b"]'`), or, if that
+        /// fails to parse, the whole value as one literal argument —
+        /// checked directly against real podman's own exact fallback
+        /// rule (`specgenutil::specgen`'s own `Entrypoint` handling).
+        /// Unlike the image's own default `ENTRYPOINT`, an override
+        /// also suppresses the image's own default `CMD` fallback
+        /// entirely when no trailing command is given on the command
+        /// line too (checked directly against real podman's own
+        /// `makeCommand`, `pkg/specgen/generate/oci.go` — see
+        /// `command_for`'s own doc comment for the exact rule). An
+        /// empty value (`--entrypoint ""`) clears `ENTRYPOINT`
+        /// entirely, real docker/podman's own documented convention.
+        #[arg(long)]
+        entrypoint: Option<String>,
     },
     /// List containers.
     Ps {
@@ -472,6 +488,7 @@ fn main() -> std::process::ExitCode {
                 env,
                 hostname,
                 workdir,
+                entrypoint,
             }) => cmd_run(
                 &image,
                 &args,
@@ -491,6 +508,7 @@ fn main() -> std::process::ExitCode {
                 &env,
                 hostname.as_deref(),
                 workdir.as_deref(),
+                entrypoint.as_deref(),
             ),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
@@ -650,7 +668,9 @@ fn cmd_run(
     env: &[String],
     hostname: Option<&str>,
     workdir: Option<&str>,
+    entrypoint: Option<&str>,
 ) -> anyhow::Result<()> {
+    let entrypoint = entrypoint.map(parse_entrypoint);
     let seccomp = resolve_seccomp(security_opts, privileged)?;
     let base_capabilities = if privileged {
         oci_runtime_core::identity::ALL_CAPABILITY_NAMES
@@ -743,6 +763,7 @@ fn cmd_run(
             env,
             hostname,
             workdir,
+            entrypoint.as_deref(),
         )?;
         if let Some(process) = &spec.process {
             state
@@ -1201,6 +1222,7 @@ fn synthesize_spec(
     env: &[String],
     hostname: Option<&str>,
     workdir: Option<&str>,
+    entrypoint: Option<&[String]>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -1227,7 +1249,7 @@ fn synthesize_spec(
         .readonly = read_only;
 
     let container_config = config.config.clone().unwrap_or_default();
-    let full_args = command_for(&container_config, args)?;
+    let full_args = command_for(&container_config, entrypoint, args)?;
     let (uid, gid) = resolve_user(rootfs, container_config.user.as_deref().unwrap_or(""))?;
 
     let process = spec
@@ -1602,21 +1624,64 @@ fn parse_memory_swap_limit(value: &str) -> anyhow::Result<i64> {
     parse_memory_limit(value)
 }
 
-/// `ENTRYPOINT` (always kept) followed by either `args` (if the caller
-/// gave any) or the image's own default `CMD` — the same override rule
-/// real `docker run`/`podman run` use.
-fn command_for(container_config: &ContainerConfig, args: &[String]) -> anyhow::Result<Vec<String>> {
-    let entrypoint = container_config.entrypoint.clone().unwrap_or_default();
-    let cmd = if args.is_empty() {
-        container_config.cmd.clone().unwrap_or_default()
-    } else {
-        args.to_vec()
+/// `ENTRYPOINT` (always kept, unless it's real docker/podman's own
+/// documented "cleared" convention — an entrypoint of exactly
+/// `[""]`, checked directly against real podman's own `makeCommand`,
+/// `~/git/podman/pkg/specgen/generate/oci.go`) followed by either
+/// `args` (if the caller gave any) or the image's own default `CMD` —
+/// the same override rule real `docker run`/`podman run` use.
+///
+/// `entrypoint_override`, when given (`--entrypoint`), replaces the
+/// image's own `ENTRYPOINT` *and* suppresses the image's own `CMD`
+/// fallback entirely, even if `args` is empty — checked directly
+/// against real podman's own `makeCommand`: `"Only use image command
+/// if the user did not manually set an entrypoint"` (`len(command) ==
+/// 0 && ... && len(s.Entrypoint) == 0`, `s.Entrypoint` being the CLI's
+/// own override, not the image's). A real, meaningful difference from
+/// this function's own pre-`--entrypoint` behavior, not a cosmetic
+/// one: `ociman run --entrypoint /bin/sh some-image` (no trailing
+/// args) must run `/bin/sh` alone, never `/bin/sh <image's own CMD>`.
+fn command_for(
+    container_config: &ContainerConfig,
+    entrypoint_override: Option<&[String]>,
+    args: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let (entrypoint, entrypoint_overridden) = match entrypoint_override {
+        Some(e) => (e.to_vec(), true),
+        None => (
+            container_config.entrypoint.clone().unwrap_or_default(),
+            false,
+        ),
     };
-    let full: Vec<String> = entrypoint.into_iter().chain(cmd).collect();
+    let cmd = if !args.is_empty() {
+        args.to_vec()
+    } else if entrypoint_overridden {
+        Vec::new()
+    } else {
+        container_config.cmd.clone().unwrap_or_default()
+    };
+    let mut full = Vec::new();
+    if entrypoint != [String::new()] {
+        full.extend(entrypoint);
+    }
+    full.extend(cmd);
     if full.is_empty() {
         anyhow::bail!("no command to run: the image has no ENTRYPOINT/CMD, and none was given");
     }
     Ok(full)
+}
+
+/// Parse a `--entrypoint` value: a JSON string array (`'["a", "b"]'`)
+/// or, if that fails to parse, the whole string as one literal
+/// element — matching real podman's own exact fallback rule
+/// (`~/git/podman/pkg/specgenutil/specgen.go`). An entrypoint that
+/// parses to exactly `[""]` (a bare `--entrypoint ""`, the common
+/// case, naturally falls into this fallback since `""` isn't valid
+/// JSON) is real docker/podman's own documented convention for
+/// clearing `ENTRYPOINT` entirely — handled by `command_for`'s own
+/// existing "skip if exactly `[\"\"]`" check, not specially here.
+fn parse_entrypoint(value: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(value).unwrap_or_else(|_| vec![value.to_string()])
 }
 
 /// Resolve an image's `USER` string to a numeric `(uid, gid)` pair
@@ -1740,6 +1805,100 @@ mod tests {
     // one function has no process/filesystem/namespace involvement at
     // all, so an ordinary in-process unit test is both possible and
     // the most direct way to check it.
+    #[test]
+    fn parse_entrypoint_parses_a_json_array() {
+        assert_eq!(
+            parse_entrypoint(r#"["/bin/sh", "-c"]"#),
+            vec!["/bin/sh".to_string(), "-c".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_entrypoint_falls_back_to_one_literal_element() {
+        assert_eq!(parse_entrypoint("/bin/sh"), vec!["/bin/sh".to_string()]);
+        // Real docker/podman's own "clear ENTRYPOINT" convention --
+        // `""` isn't valid JSON, so this naturally falls into the
+        // single-literal-element fallback, matching real podman's own
+        // exact behavior (checked directly).
+        assert_eq!(parse_entrypoint(""), vec![String::new()]);
+    }
+
+    fn config_with(entrypoint: Option<Vec<&str>>, cmd: Option<Vec<&str>>) -> ContainerConfig {
+        ContainerConfig {
+            entrypoint: entrypoint.map(|v| v.into_iter().map(str::to_string).collect()),
+            cmd: cmd.map(|v| v.into_iter().map(str::to_string).collect()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn command_for_uses_image_entrypoint_and_cmd_when_nothing_is_given() {
+        let config = config_with(Some(vec!["/entry"]), Some(vec!["default-cmd"]));
+        assert_eq!(
+            command_for(&config, None, &[]).unwrap(),
+            vec!["/entry".to_string(), "default-cmd".to_string()]
+        );
+    }
+
+    #[test]
+    fn command_for_cli_args_override_the_images_own_cmd_but_not_entrypoint() {
+        let config = config_with(Some(vec!["/entry"]), Some(vec!["default-cmd"]));
+        let args = vec!["custom".to_string(), "args".to_string()];
+        assert_eq!(
+            command_for(&config, None, &args).unwrap(),
+            vec![
+                "/entry".to_string(),
+                "custom".to_string(),
+                "args".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn command_for_entrypoint_override_replaces_the_images_own_entrypoint() {
+        let config = config_with(Some(vec!["/entry"]), Some(vec!["default-cmd"]));
+        let entrypoint = vec!["/bin/sh".to_string()];
+        assert_eq!(
+            command_for(&config, Some(&entrypoint), &[]).unwrap(),
+            vec!["/bin/sh".to_string()],
+            "an overridden entrypoint must suppress the image's own default CMD too, \
+             matching real podman's own checked-directly makeCommand rule"
+        );
+    }
+
+    #[test]
+    fn command_for_entrypoint_override_still_combines_with_explicit_trailing_args() {
+        let config = config_with(Some(vec!["/entry"]), Some(vec!["default-cmd"]));
+        let entrypoint = vec!["/bin/sh".to_string(), "-c".to_string()];
+        let args = vec!["echo hi".to_string()];
+        assert_eq!(
+            command_for(&config, Some(&entrypoint), &args).unwrap(),
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo hi".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn command_for_empty_string_entrypoint_clears_it_entirely() {
+        let config = config_with(Some(vec!["/entry"]), None);
+        let entrypoint = vec![String::new()];
+        let args = vec!["/bin/echo".to_string(), "hi".to_string()];
+        assert_eq!(
+            command_for(&config, Some(&entrypoint), &args).unwrap(),
+            vec!["/bin/echo".to_string(), "hi".to_string()],
+            "--entrypoint '' should clear ENTRYPOINT, real docker/podman's own convention"
+        );
+    }
+
+    #[test]
+    fn command_for_errors_when_nothing_at_all_is_given() {
+        let config = config_with(None, None);
+        assert!(command_for(&config, None, &[]).is_err());
+    }
+
     #[test]
     fn parse_memory_limit_handles_every_real_docker_podman_unit_suffix() {
         assert_eq!(parse_memory_limit("128").unwrap(), 128);
