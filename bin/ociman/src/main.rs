@@ -354,6 +354,7 @@ fn cmd_run(image_ref: &str, args: &[String], rm: bool) -> anyhow::Result<()> {
         #[allow(unsafe_code)]
         let exit_code = unsafe {
             oci_runtime_core::launch::run_reporting_pid(
+                &container_id,
                 &bundle,
                 &rootfs,
                 Some(&log_path),

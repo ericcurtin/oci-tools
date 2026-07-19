@@ -66,9 +66,9 @@ pub const COMMAND_NOT_FOUND_EXIT_CODE: i32 = 127;
 /// Must be called from a single-threaded process — this forks (see
 /// [`crate::process::fork_and_wait`]'s safety note, which this inherits).
 #[allow(unsafe_code)]
-pub unsafe fn run(bundle: &Bundle, rootfs: &Path) -> io::Result<i32> {
+pub unsafe fn run(id: &str, bundle: &Bundle, rootfs: &Path) -> io::Result<i32> {
     // SAFETY: forwarded from this function's own contract.
-    unsafe { run_reporting_pid(bundle, rootfs, None, |_pid| {}) }
+    unsafe { run_reporting_pid(id, bundle, rootfs, None, |_pid| {}) }
 }
 
 /// Like [`run`], but calls `on_pid` with the container's own pid as
@@ -87,11 +87,20 @@ pub unsafe fn run(bundle: &Bundle, rootfs: &Path) -> io::Result<i32> {
 /// callback and no log path, so ordinary callers pay only the cost of
 /// one extra pipe and a 4-byte read, not a behavioral difference.
 ///
+/// Also runs `bundle.spec.hooks`'s `poststart` (right after `on_pid`)
+/// and `poststop` (right after the container exits) hooks, if any are
+/// configured — see `docs/design/0026` for why only those two of the
+/// six real hook points are executed here. A failing hook is logged
+/// and tolerated, never changes the container's own exit code: a
+/// broken notify/cleanup script isn't a reason to report the
+/// container itself as having failed.
+///
 /// # Safety
 ///
 /// Same contract as [`run`].
 #[allow(unsafe_code)]
 pub unsafe fn run_reporting_pid(
+    id: &str,
     bundle: &Bundle,
     rootfs: &Path,
     log_path: Option<&Path>,
@@ -130,6 +139,7 @@ pub unsafe fn run_reporting_pid(
 
     let container_pid = read_container_pid(read_fd)?;
     on_pid(container_pid);
+    run_lifecycle_hooks(bundle, id, container_pid, "running", &Hook::Poststart);
 
     let status = process::wait(direct_child_pid)?;
     if let Some(thread) = log_thread {
@@ -139,7 +149,54 @@ pub unsafe fn run_reporting_pid(
         // isn't a reason to fail the whole `run`.
         let _ = thread.join();
     }
+    run_lifecycle_hooks(bundle, id, 0, "stopped", &Hook::Poststop);
     Ok(process::exit_code_from_wait_status(status))
+}
+
+/// Which of the two implemented hook points [`run_lifecycle_hooks`] is
+/// running — just selects which list off `bundle.spec.hooks` to use
+/// and whether a failing hook should still let the rest run
+/// ([`crate::hooks::run`]'s own `keep_going`).
+enum Hook {
+    Poststart,
+    Poststop,
+}
+
+/// Run `bundle.spec.hooks`'s `poststart`/`poststop` list (see [`Hook`])
+/// with `id`/`pid`/`status` folded into the state JSON piped to each
+/// hook's stdin (see `crate::hooks::HookState`'s own doc comment for
+/// exactly which fields and why). A failure is logged via
+/// `tracing::warn!` and otherwise ignored — see this function's own
+/// caller's doc comment for why that's deliberate, not an oversight.
+fn run_lifecycle_hooks(bundle: &Bundle, id: &str, pid: i32, status: &str, which: &Hook) {
+    let Some(hooks) = &bundle.spec.hooks else {
+        return;
+    };
+    let (list, keep_going, name) = match which {
+        Hook::Poststart => (&hooks.poststart, false, "poststart"),
+        Hook::Poststop => (&hooks.poststop, true, "poststop"),
+    };
+    if list.is_empty() {
+        return;
+    }
+    let state = crate::hooks::HookState {
+        oci_version: &bundle.spec.version,
+        id,
+        status,
+        pid,
+        bundle: bundle.path.display().to_string(),
+        annotations: bundle.spec.annotations.clone(),
+    };
+    let state_json = match serde_json::to_vec(&state) {
+        Ok(json) => json,
+        Err(e) => {
+            tracing::warn!(hook = name, error = %e, "serializing hook state (tolerated)");
+            return;
+        }
+    };
+    if let Err(e) = crate::hooks::run(list, &state_json, keep_going) {
+        tracing::warn!(hook = name, error = %e, "lifecycle hook failed (tolerated)");
+    }
 }
 
 /// Wire `child_setup`'s stdout and stderr to two ends of a fresh pipe

@@ -243,8 +243,8 @@ fn cmd_run(id: &str, bundle: Option<&Path>) -> anyhow::Result<()> {
     // don't spawn any), so the fork `launch::run` performs is sound —
     // see its own safety note for the requirement this satisfies.
     #[allow(unsafe_code)]
-    let exit_code =
-        unsafe { oci_runtime_core::launch::run(&bundle, &rootfs) }.context("running container")?;
+    let exit_code = unsafe { oci_runtime_core::launch::run(id, &bundle, &rootfs) }
+        .context("running container")?;
 
     // The container's own exit code becomes ours, matching runc/crun's
     // `run`: exit code 0 must mean "the container's process exited 0",

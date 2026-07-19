@@ -78,6 +78,7 @@ pub mod bundle;
 pub mod cgroups;
 pub mod exec;
 pub mod exec_fifo;
+pub mod hooks;
 pub mod identity;
 pub mod launch;
 pub mod namespaces;

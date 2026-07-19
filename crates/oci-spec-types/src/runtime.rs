@@ -4,11 +4,14 @@
 //! **Scope shipped so far**: exactly the fields `ocirun spec` needs to
 //! produce a runc-compatible default bundle config (`Spec::example`) and
 //! its rootless variant (`Spec::into_rootless`) — process, root, mounts,
-//! namespaces, ID mappings, and the device-cgroup allow-list. Fields the
-//! actual container-creation milestone will need (full `LinuxResources`
-//! memory/cpu/pids limits, seccomp profiles, hooks execution, `IntelRdt`,
-//! `Personality`, scheduler/IO-priority) are intentionally not modeled yet;
-//! adding an unused field now would be undocumented, untested surface.
+//! namespaces, ID mappings, the device-cgroup allow-list, seccomp
+//! profiles, and lifecycle hooks (`Hooks`, only `poststart`/`poststop`
+//! actually executed yet — see `oci_runtime_core::hooks` and
+//! `docs/design/0026`). Fields the actual container-creation milestone
+//! will still need (full `LinuxResources` memory/cpu/pids limits,
+//! `IntelRdt`, `Personality`, scheduler/IO-priority) are intentionally
+//! not modeled yet; adding an unused field now would be undocumented,
+//! untested surface.
 //!
 //! Field names and defaults are checked against the real, installed
 //! `runc spec`/`runc spec --rootless` output (runc 1.3.4, runtime-spec
@@ -44,12 +47,99 @@ pub struct Spec {
     /// Filesystems to mount inside the rootfs before the process starts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<Mount>,
+    /// Lifecycle hooks (see [`Hooks`] for which of the six are actually
+    /// executed yet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<Hooks>,
     /// Linux-specific configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linux: Option<Linux>,
     /// Arbitrary metadata, opaque to the runtime.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub annotations: BTreeMap<String, String>,
+}
+
+/// A single lifecycle hook: an external program run with `state` (see
+/// [`crate::runtime`]'s own module doc, and `oci_runtime_core::hooks`)
+/// piped to its stdin.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Hook {
+    /// Absolute path to the program to run (not resolved against
+    /// `PATH` — matches the real spec: this is `execve`'d directly,
+    /// same as a runtime-spec `process.args[0]`).
+    pub path: String,
+    /// Arguments, `argv[0]` included (matching the real spec's own
+    /// example: `args[0]` is conventionally the program's own name,
+    /// not implicitly prepended).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// `key=value` environment variables for the hook process. If
+    /// empty, the hook inherits the runtime's own ambient environment;
+    /// if non-empty, it *replaces* it entirely — matching real
+    /// `crun`'s own behavior (checked against
+    /// `~/git/crun/src/libcrun/container.c`'s `do_hooks`), not merely
+    /// the spec prose alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
+    /// Seconds to wait for the hook before treating it as failed.
+    /// `None` waits indefinitely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<i64>,
+}
+
+/// Lifecycle hooks (`config.json`'s top-level `hooks` field). Field
+/// names/casing and the six hook points themselves are checked against
+/// the real, vendored `opencontainers/runtime-spec` Go module
+/// (`~/go/pkg/mod/github.com/opencontainers/runtime-spec@.../specs-go/
+/// config.go`), not re-derived from the spec doc alone.
+///
+/// Only [`Self::poststart`]/[`Self::poststop`] are actually executed by
+/// `oci_runtime_core::hooks` yet — see `docs/design/0026` for why the
+/// other four (`prestart`/`createRuntime`/`createContainer`/
+/// `startContainer`) aren't: they need either pivot_root-relative
+/// timing or execution inside the container's own namespaces, neither
+/// of which this increment's scope covers. All six are still parsed
+/// (and round-trip through `Spec`'s own `Serialize`/`Deserialize`)
+/// regardless, so a bundle that sets them doesn't silently lose them
+/// from `config.json` even though the unimplemented four are ignored
+/// at run time.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Hooks {
+    /// Deprecated in favor of [`Self::create_runtime`]; same timing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prestart: Vec<Hook>,
+    /// Runtime-namespace hooks run after the container's own namespaces
+    /// exist but before `pivot_root`. Not executed yet.
+    #[serde(
+        rename = "createRuntime",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub create_runtime: Vec<Hook>,
+    /// Same timing as [`Self::create_runtime`], but run inside the
+    /// container's own namespaces. Not executed yet.
+    #[serde(
+        rename = "createContainer",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub create_container: Vec<Hook>,
+    /// Run inside the container's own namespaces, after `start` but
+    /// before the user's command executes. Not executed yet.
+    #[serde(
+        rename = "startContainer",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub start_container: Vec<Hook>,
+    /// Run in the runtime's own namespace once the container's process
+    /// has started.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub poststart: Vec<Hook>,
+    /// Run in the runtime's own namespace once the container's process
+    /// has exited.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub poststop: Vec<Hook>,
 }
 
 /// The container process to run: `args`, environment, working directory,
@@ -511,6 +601,7 @@ impl Spec {
             }),
             hostname: Some("ocirun".to_string()),
             mounts: default_mounts(),
+            hooks: None,
             linux: Some(Linux {
                 namespaces: vec![
                     LinuxNamespace::new(NamespaceType::Pid),
@@ -937,5 +1028,82 @@ mod tests {
         assert!(json.get("cpu").is_none());
         assert!(json.get("pids").is_none());
         assert!(json.get("cpus").is_none());
+    }
+
+    /// The runtime-spec doc's own `hooks` example
+    /// (`~/go/pkg/mod/github.com/opencontainers/runtime-spec@.../
+    /// config.md`'s "Example" section), verbatim — proves every field
+    /// name/casing for all six hook points, not just the two this
+    /// crate's own runtime actually executes yet.
+    #[test]
+    fn hooks_parse_the_real_spec_docs_own_example_verbatim() {
+        let json = serde_json::json!({
+            "prestart": [
+                {
+                    "path": "/usr/bin/fix-mounts",
+                    "args": ["fix-mounts", "arg1", "arg2"],
+                    "env": ["key1=value1"]
+                }
+            ],
+            "createRuntime": [
+                {
+                    "path": "/usr/bin/set-up-something",
+                    "timeout": 5
+                }
+            ],
+            "createContainer": [
+                {
+                    "path": "/usr/bin/set-up-something-in-container"
+                }
+            ],
+            "startContainer": [
+                {
+                    "path": "/usr/bin/set-up-something-just-before-container-starts"
+                }
+            ],
+            "poststart": [
+                {
+                    "path": "/usr/bin/notify-start",
+                    "timeout": 5
+                }
+            ],
+            "poststop": [
+                {
+                    "path": "/usr/sbin/cleanup.sh",
+                    "args": ["cleanup.sh", "-f"]
+                }
+            ]
+        });
+        let hooks: Hooks = serde_json::from_value(json).unwrap();
+
+        assert_eq!(hooks.prestart[0].path, "/usr/bin/fix-mounts");
+        assert_eq!(hooks.prestart[0].args, vec!["fix-mounts", "arg1", "arg2"]);
+        assert_eq!(hooks.prestart[0].env, vec!["key1=value1"]);
+        assert_eq!(hooks.create_runtime[0].timeout, Some(5));
+        assert_eq!(
+            hooks.create_container[0].path,
+            "/usr/bin/set-up-something-in-container"
+        );
+        assert_eq!(
+            hooks.start_container[0].path,
+            "/usr/bin/set-up-something-just-before-container-starts"
+        );
+        assert_eq!(hooks.poststart[0].path, "/usr/bin/notify-start");
+        assert_eq!(hooks.poststart[0].timeout, Some(5));
+        assert_eq!(hooks.poststop[0].path, "/usr/sbin/cleanup.sh");
+        assert_eq!(hooks.poststop[0].args, vec!["cleanup.sh", "-f"]);
+
+        // Round-trips back to the same wire shape (rename attributes
+        // applied on the way out too, not just parsed on the way in).
+        let round_tripped = serde_json::to_value(&hooks).unwrap();
+        assert!(round_tripped.get("createRuntime").is_some());
+        assert!(round_tripped.get("createContainer").is_some());
+        assert!(round_tripped.get("startContainer").is_some());
+    }
+
+    #[test]
+    fn spec_without_hooks_omits_the_field_entirely() {
+        let json = serde_json::to_value(Spec::example()).unwrap();
+        assert!(json.get("hooks").is_none());
     }
 }
