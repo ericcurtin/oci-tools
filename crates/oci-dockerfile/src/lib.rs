@@ -80,7 +80,7 @@ pub use dependencies::{resolve_copy_from_dependencies, resolve_dependencies, sta
 pub use expand_stage::{expand_meta_args, expand_stage};
 pub use instruction::{AddFlags, CopyFlags, Instruction, ShellOrExec};
 pub use shell_expand::expand;
-pub use stage::{Stage, find_stage, group_stages};
+pub use stage::{Stage, declared_arg_names, find_stage, group_stages};
 
 /// Parse a whole Dockerfile/Containerfile's contents into an ordered
 /// list of [`Instruction`]s.

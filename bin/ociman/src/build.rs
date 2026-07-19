@@ -245,6 +245,8 @@ pub fn cmd_build(
         })
         .context("recording built image")?;
 
+    warn_on_unused_build_args(&meta_args, &stages, &build_args);
+
     if json {
         oci_cli_common::output::print_json(&BuildResult {
             reference: tag_reference.to_string(),
@@ -359,6 +361,49 @@ fn build_stage(
         rootfs_dir,
         _build_dir: build_dir,
     })
+}
+
+/// Warn (to stderr, never mixed into `--json`'s own machine-readable
+/// stdout output) about any `--build-arg` name that isn't declared by
+/// an `ARG` instruction anywhere in the file — matching real `docker
+/// build`/`podman build`'s own well-established `"[Warning] one or
+/// more build-args ... were not consumed"` message exactly (checked
+/// directly: real dockerd's own `buildargs.go`'s `WarnOnUnusedBuildArgs`
+/// and real buildah's own `imagebuildah/executor.go` both print this
+/// same shape after a build finishes, not as a hard error — an unused
+/// `--build-arg` is a real, common mistake worth flagging, not
+/// something worth failing an otherwise-successful build over).
+/// Deterministic order (sorted), unlike a plain `HashSet` iteration
+/// order, so the message is stable across runs.
+fn warn_on_unused_build_args(
+    meta_args: &[Instruction],
+    stages: &[oci_dockerfile::Stage],
+    build_args: &std::collections::HashMap<String, String>,
+) {
+    let unused = unused_build_arg_names(meta_args, stages, build_args);
+    if !unused.is_empty() {
+        eprintln!("[Warning] one or more build-args {unused:?} were not consumed");
+    }
+}
+
+/// The actual "which `--build-arg` names went unused" computation,
+/// factored out of [`warn_on_unused_build_args`] so it can be tested
+/// directly without capturing `stderr` — sorted (unlike a plain
+/// `HashSet` iteration order) so the eventual warning message is
+/// stable across runs.
+fn unused_build_arg_names<'a>(
+    meta_args: &[Instruction],
+    stages: &[oci_dockerfile::Stage],
+    build_args: &'a std::collections::HashMap<String, String>,
+) -> Vec<&'a str> {
+    let declared = oci_dockerfile::declared_arg_names(meta_args, stages);
+    let mut unused: Vec<&str> = build_args
+        .keys()
+        .filter(|key| !declared.contains(*key))
+        .map(String::as_str)
+        .collect();
+    unused.sort_unstable();
+    unused
 }
 
 /// Parse `ociman build --build-arg`'s own raw `KEY=value`/bare `KEY`
@@ -950,5 +995,44 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved.get("A").map(String::as_str), Some("1"));
         assert_eq!(resolved.get("B").map(String::as_str), Some("2"));
+    }
+
+    fn meta_args_and_stages(input: &str) -> (Vec<Instruction>, Vec<oci_dockerfile::Stage>) {
+        let instructions = oci_dockerfile::parse(input).unwrap();
+        oci_dockerfile::group_stages(instructions).unwrap()
+    }
+
+    #[test]
+    fn unused_build_arg_names_is_empty_when_every_override_matches_a_declared_arg() {
+        let (meta_args, stages) = meta_args_and_stages("ARG VERSION=1.0\nFROM scratch\n");
+        let build_args =
+            std::collections::HashMap::from([("VERSION".to_string(), "2.0".to_string())]);
+        assert!(unused_build_arg_names(&meta_args, &stages, &build_args).is_empty());
+    }
+
+    #[test]
+    fn unused_build_arg_names_flags_a_name_nothing_declares() {
+        let (meta_args, stages) = meta_args_and_stages("FROM scratch\n");
+        let build_args = std::collections::HashMap::from([
+            ("NEVER_DECLARED".to_string(), "x".to_string()),
+            ("ALSO_UNUSED".to_string(), "y".to_string()),
+        ]);
+        assert_eq!(
+            unused_build_arg_names(&meta_args, &stages, &build_args),
+            vec!["ALSO_UNUSED", "NEVER_DECLARED"],
+            "sorted, deterministic order"
+        );
+    }
+
+    #[test]
+    fn unused_build_arg_names_does_not_flag_a_name_declared_only_in_a_pruned_stage() {
+        // Matches real docker/podman: a stage nothing depends on is
+        // still scanned for its own `ARG` declarations when computing
+        // "consumed" names, even though it never actually gets built.
+        let (meta_args, stages) =
+            meta_args_and_stages("FROM alpine AS unrelated\nARG UNRELATED_ARG\nFROM scratch\n");
+        let build_args =
+            std::collections::HashMap::from([("UNRELATED_ARG".to_string(), "x".to_string())]);
+        assert!(unused_build_arg_names(&meta_args, &stages, &build_args).is_empty());
     }
 }

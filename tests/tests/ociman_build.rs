@@ -1236,3 +1236,107 @@ fn build_arg_for_an_undeclared_name_has_no_effect() {
     assert!(run.status.success());
     assert_eq!(String::from_utf8_lossy(&run.stdout), "1.0\n");
 }
+
+/// A `--build-arg` for a name nothing declares also prints real
+/// `docker build`/`podman build`'s own well-known `"[Warning] one or
+/// more build-args ... were not consumed"` message (to stderr, not
+/// mixed into the build's own stdout output) -- a successful build
+/// still gets tagged; this is a warning, not a hard error.
+#[test]
+fn build_arg_for_an_undeclared_name_prints_the_real_unused_warning() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-arg-warn-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-arg-warn-base:latest\nARG VERSION=1.0\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-arg-warn-result:latest",
+            "--build-arg",
+            "NEVER_DECLARED=xyz",
+            "--build-arg",
+            "VERSION=2.0",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("[Warning]") && stderr.contains("NEVER_DECLARED"),
+        "{stderr}"
+    );
+    // The consumed `VERSION` override must *not* be listed as unused.
+    assert!(!stderr.contains("\"VERSION\""), "{stderr}");
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/build-arg-warn-result:latest")
+            .unwrap()
+            .is_some(),
+        "a build that only warns must still tag the image"
+    );
+}
+
+/// The common, unremarkable case: every `--build-arg` given is
+/// actually consumed, so no warning is printed at all.
+#[test]
+fn build_arg_prints_no_warning_when_every_override_is_consumed() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-arg-no-warn-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-arg-no-warn-base:latest\nARG VERSION=1.0\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-arg-no-warn-result:latest",
+            "--build-arg",
+            "VERSION=2.0",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&build.stderr).contains("[Warning]"));
+}

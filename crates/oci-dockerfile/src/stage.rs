@@ -99,6 +99,32 @@ pub fn find_stage(stages: &[Stage], name: &str) -> Option<usize> {
     })
 }
 
+/// Every `ARG` name declared anywhere in the file — every meta-`ARG`
+/// (`meta_args`) plus every stage-local `ARG` in *every* stage,
+/// including one `stages_needed_for` would prune as unreferenced by
+/// the current build target. Matches real `docker build`/`podman
+/// build`'s own "which `--build-arg` names were actually consumed"
+/// bookkeeping (checked directly against real buildah's own
+/// `imagebuildah/executor.go`, which token-scans every `ARG` line in
+/// the *whole raw file* this same way — before knowing anything about
+/// dependency pruning or even which stage is the target — to compute
+/// its own `unusedArgs` set): a `--build-arg` for a name declared only
+/// in a stage the current target doesn't need is still "consumed", not
+/// warned about, exactly like real `docker`/`podman`.
+pub fn declared_arg_names(
+    meta_args: &[Instruction],
+    stages: &[Stage],
+) -> std::collections::HashSet<String> {
+    meta_args
+        .iter()
+        .chain(stages.iter().flat_map(|stage| &stage.instructions))
+        .filter_map(|instruction| match instruction {
+            Instruction::Arg { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +181,52 @@ ENTRYPOINT [\"/app\"]
             &stages[1].instructions[1],
             Instruction::Entrypoint(ShellOrExec::Exec(args)) if args == &["/app".to_string()]
         ));
+    }
+
+    #[test]
+    fn declared_arg_names_collects_meta_args_and_every_stage_local_arg() {
+        let input = "\
+ARG GLOBAL=1
+FROM golang:1.22 AS builder
+ARG BUILD_ONLY=x
+RUN go build -o /app
+FROM scratch AS final
+ARG FINAL_ONLY
+COPY --from=builder /app /app
+";
+        let instructions = crate::parse(input).unwrap();
+        let (meta_args, stages) = group_stages(instructions).unwrap();
+        let declared = declared_arg_names(&meta_args, &stages);
+        assert_eq!(
+            declared,
+            std::collections::HashSet::from([
+                "GLOBAL".to_string(),
+                "BUILD_ONLY".to_string(),
+                "FINAL_ONLY".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn declared_arg_names_includes_a_stage_pruned_from_the_current_target() {
+        // Real, checked-directly rule: real buildah's own `unusedArgs`
+        // bookkeeping scans every `ARG` line in the whole raw file up
+        // front, before it even knows which stages the current
+        // `--target` actually needs -- an `ARG` declared only in a
+        // stage nothing depends on is still "consumed" by that
+        // declaration alone, not warned about.
+        let input = "FROM alpine AS unrelated\nARG UNRELATED_ARG\nFROM scratch\n";
+        let instructions = crate::parse(input).unwrap();
+        let (meta_args, stages) = group_stages(instructions).unwrap();
+        let declared = declared_arg_names(&meta_args, &stages);
+        assert!(declared.contains("UNRELATED_ARG"));
+    }
+
+    #[test]
+    fn declared_arg_names_is_empty_when_no_arg_exists_anywhere() {
+        let instructions = crate::parse("FROM scratch\nRUN echo hi\n").unwrap();
+        let (meta_args, stages) = group_stages(instructions).unwrap();
+        assert!(declared_arg_names(&meta_args, &stages).is_empty());
     }
 
     #[test]

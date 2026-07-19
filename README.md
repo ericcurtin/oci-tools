@@ -45,7 +45,7 @@ implemented yet). Milestone 3 also grew real `--memory-swap`/
 | 1 | workspace skeleton, `oci-cli-common`, 4-VM CI matrix | **done** |
 | 2 | `oci-spec-types`/`oci-registry`/`oci-store`; `ociman pull/images/inspect` | **done** |
 | 3 | `oci-runtime-core` + `ocirun`; `ociman run/exec/ps/logs` rootless | **done** (plus systemd cgroups, hooks, seccomp, resource limits, `--security-opt seccomp=`, a real `podman`-default capability set beyond the original scope) |
-| 4 | `oci-dockerfile`; `ociman build` (multi-stage, cache) | in progress — `RUN`/`COPY`/`--build-arg` work end to end and commit real layers; multi-stage builds work via both `FROM <earlier-stage>` and `COPY --from=<earlier-stage>`; `ADD` and the build cache are not yet implemented (see `docs/design/0050`-`0059`) |
+| 4 | `oci-dockerfile`; `ociman build` (multi-stage, cache) | in progress — `RUN`/`COPY`/`--build-arg` work end to end and commit real layers; multi-stage builds work via both `FROM <earlier-stage>` and `COPY --from=<earlier-stage>`; `ADD` and the build cache are not yet implemented (see `docs/design/0050`-`0060`) |
 | 5 | erofs/mount/BLS; `ociboot install to-disk`; dracut module; QEMU boot test | — |
 | 6 | upgrade/switch/rollback/status/gc; /etc merge; boot counting; layered mode | — |
 | 7 | `ocicri` (critest subset), `ocibox` | — |
