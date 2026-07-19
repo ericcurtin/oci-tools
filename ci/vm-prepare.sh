@@ -18,7 +18,8 @@ if command -v dnf >/dev/null 2>&1; then
         xz \
         e2fsprogs \
         erofs-utils \
-        cryptsetup
+        cryptsetup \
+        grub2-tools
 elif command -v apt-get >/dev/null 2>&1; then
     sudo apt-get update -qq
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
@@ -29,7 +30,8 @@ elif command -v apt-get >/dev/null 2>&1; then
         xz-utils \
         e2fsprogs \
         erofs-utils \
-        cryptsetup-bin
+        cryptsetup-bin \
+        grub-common
 
     # Ubuntu 24.04+ auto-confines any unconfined process that creates an
     # unprivileged user namespace into a restrictive built-in AppArmor

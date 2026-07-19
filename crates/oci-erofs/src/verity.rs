@@ -316,7 +316,7 @@ mod tests {
             "unsealed file has no digest yet"
         );
 
-        enable(&file).unwrap();
+        enable_retrying_on_text_file_busy(&file).unwrap();
 
         let digest = measure(&file).unwrap().expect("digest after enable");
         assert_ne!(
@@ -336,6 +336,33 @@ mod tests {
         );
     }
 
+    /// [`enable`], tolerating the kernel's own well-documented
+    /// `ETXTBSY` ("Text file busy"): fs-verity's real `FS_IOC_ENABLE_
+    /// VERITY` genuinely refuses to enable while *any* file descriptor
+    /// anywhere still has the file open for writing (so its content
+    /// can't change out from under the Merkle tree being built) --
+    /// confirmed to be a real, if rare, race on this shared,
+    /// multi-tenant development host (observed directly: a freshly
+    /// `std::fs::write`-created, already-closed file's own `enable`
+    /// call failed with exactly this error, presumably some other
+    /// process on the host briefly opening it, e.g. a filesystem
+    /// indexer). A handful of retries with a short backoff is exactly
+    /// how a real caller (`ociboot`) should also handle this
+    /// documented condition -- this isn't papering over a bug in
+    /// [`enable`] itself, which correctly returns the kernel's own
+    /// real error either way.
+    fn enable_retrying_on_text_file_busy(path: &Path) -> io::Result<()> {
+        for attempt in 0..5 {
+            match enable(path) {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempt < 4 => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                other => return other,
+            }
+        }
+        unreachable!()
+    }
+
     #[test]
     fn sealed_file_becomes_immutable() {
         let Some(fs) = verity_capable_ext4() else {
@@ -344,7 +371,7 @@ mod tests {
         };
         let file = fs.mountpoint.join("immutable.txt");
         std::fs::write(&file, b"before\n").unwrap();
-        enable(&file).unwrap();
+        enable_retrying_on_text_file_busy(&file).unwrap();
 
         // Still readable...
         assert_eq!(std::fs::read(&file).unwrap(), b"before\n");
@@ -370,7 +397,7 @@ mod tests {
         };
         let file = fs.mountpoint.join("twice.txt");
         std::fs::write(&file, b"data\n").unwrap();
-        enable(&file).unwrap();
+        enable_retrying_on_text_file_busy(&file).unwrap();
 
         let err = enable(&file).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
@@ -408,6 +435,10 @@ mod tests {
             // way, so tolerate success too rather than failing on an
             // environment this test can't control.
             Ok(()) => {}
+            // The same real, documented `ETXTBSY` race
+            // `enable_retrying_on_text_file_busy` exists for -- see
+            // its own doc comment.
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {}
             Err(e) => panic!("unexpected error: {e}"),
         }
     }

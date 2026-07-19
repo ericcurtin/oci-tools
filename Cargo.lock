@@ -728,6 +728,9 @@ dependencies = [
 [[package]]
 name = "oci-bls"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "oci-build-info"

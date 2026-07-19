@@ -38,12 +38,14 @@ builds work via both `FROM <earlier-stage>` and `COPY
 implemented yet). Milestone 3 also grew real `--memory-swap`/
 `--cpuset-cpus`/`--cpuset-mems`/`--security-opt seccomp=`/a real
 `podman`-default capability set beyond its own original scope.
-Milestone 5 also now has its first three real pieces: `oci-erofs`
-builds verified-deterministic erofs images via `mkfs.erofs`,
-seals/verifies them with real fs-verity ioctls, and has a detached
-dm-verity fallback via `veritysetup` for state filesystems without
-fs-verity support. See [docs/design/](docs/design/) for design notes
-per milestone.
+Milestone 5 also now has real pieces: `oci-erofs` builds
+verified-deterministic erofs images via `mkfs.erofs`, seals/verifies
+them with real fs-verity ioctls, and has a detached dm-verity fallback
+via `veritysetup` for state filesystems without fs-verity support;
+`oci-bls` reads/writes the real GRUB environment block
+(`saved_entry`/boot-counting), verified byte-for-byte against the real
+`grub-editenv`. See [docs/design/](docs/design/) for design notes per
+milestone.
 
 | milestone | scope | status |
 |-----------|-------|--------|
@@ -51,7 +53,7 @@ per milestone.
 | 2 | `oci-spec-types`/`oci-registry`/`oci-store`; `ociman pull/images/inspect` | **done** |
 | 3 | `oci-runtime-core` + `ocirun`; `ociman run/exec/ps/logs` rootless | **done** (plus systemd cgroups, hooks, seccomp, resource limits, `--security-opt seccomp=`, a real `podman`-default capability set beyond the original scope) |
 | 4 | `oci-dockerfile`; `ociman build` (multi-stage, cache) | in progress — `RUN`/`COPY`/`--build-arg` work end to end and commit real layers; multi-stage builds work via both `FROM <earlier-stage>` and `COPY --from=<earlier-stage>`; `ADD` and the build cache are not yet implemented (see `docs/design/0050`-`0060`) |
-| 5 | erofs/mount/BLS; `ociboot install to-disk`; dracut module; QEMU boot test | in progress — `oci-erofs` builds real, verified-deterministic erofs images via `mkfs.erofs`, seals/verifies them with real fs-verity ioctls, and has a detached dm-verity fallback via `veritysetup` (see `docs/design/0061`-`0063`); mounting a verified image at boot, `ociboot`'s own subcommands, and the dracut module are not started yet |
+| 5 | erofs/mount/BLS; `ociboot install to-disk`; dracut module; QEMU boot test | in progress — `oci-erofs` builds real, verified-deterministic erofs images via `mkfs.erofs`, seals/verifies them with real fs-verity ioctls, and has a detached dm-verity fallback via `veritysetup`; `oci-bls` reads/writes the real grubenv block (see `docs/design/0061`-`0064`); BLS entry files, mounting a verified image at boot, `ociboot`'s own subcommands, and the dracut module are not started yet |
 | 6 | upgrade/switch/rollback/status/gc; /etc merge; boot counting; layered mode | — |
 | 7 | `ocicri` (critest subset), `ocibox` | — |
 | 8 | packaging (rpm/deb), docs polish, release workflow | — |
