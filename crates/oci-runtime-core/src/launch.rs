@@ -66,11 +66,49 @@ pub const COMMAND_NOT_FOUND_EXIT_CODE: i32 = 127;
 /// [`crate::process::fork_and_wait`]'s safety note, which this inherits).
 #[allow(unsafe_code)]
 pub unsafe fn run(bundle: &Bundle, rootfs: &Path) -> io::Result<i32> {
-    let child_setup = build_child_setup(bundle, rootfs)?;
-
     // SAFETY: forwarded from this function's own contract.
+    unsafe { run_reporting_pid(bundle, rootfs, |_pid| {}) }
+}
+
+/// Like [`run`], but calls `on_pid` with the container's own pid as
+/// soon as it's known — before the container's process has necessarily
+/// finished setup or started running the user's command — rather than
+/// only ever returning the final exit code once everything is over.
+///
+/// For callers that need a live pid a *concurrent* invocation can act
+/// on (`ociman run`, unlike `ocirun run`, persists a container record
+/// other `ociman` commands look at while this one is still foreground
+/// — see `docs/design/0023`); `run` itself is just this with a no-op
+/// callback, so ordinary callers pay only the cost of one extra pipe
+/// and a 4-byte read, not a behavioral difference.
+///
+/// # Safety
+///
+/// Same contract as [`run`].
+#[allow(unsafe_code)]
+pub unsafe fn run_reporting_pid(
+    bundle: &Bundle,
+    rootfs: &Path,
+    on_pid: impl FnOnce(i32),
+) -> io::Result<i32> {
+    let mut child_setup = build_child_setup(bundle, rootfs)?;
+    let (read_fd, write_fd) =
+        rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)?;
+    child_setup.pid_pipe_write = Some(write_fd);
+
+    // SAFETY: forwarded from this function's own contract. Unlike
+    // `create`, this direct child's own pid *is* what gets waited on
+    // below — no relay-fork subtlety here, since `ChildSetup::run`
+    // already relays the grandchild's exit status as its own when one
+    // happens (see its own doc comment), so waiting on the direct
+    // child always yields the right final status regardless.
     #[allow(unsafe_code)]
-    let status = unsafe { process::fork_and_wait(move || child_setup.run()) }?;
+    let direct_child_pid = unsafe { process::fork(move || child_setup.run()) }?;
+
+    let container_pid = read_container_pid(read_fd)?;
+    on_pid(container_pid);
+
+    let status = process::wait(direct_child_pid)?;
     Ok(process::exit_code_from_wait_status(status))
 }
 

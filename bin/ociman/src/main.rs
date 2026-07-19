@@ -14,6 +14,8 @@
 //! doesn't support), `build` (milestone 4), then the full podman-style
 //! v1 command set.
 
+use std::path::Path;
+
 use anyhow::Context as _;
 use clap::Parser;
 use oci_runtime_core::StateStore;
@@ -108,6 +110,15 @@ enum Command {
         #[arg(short, long)]
         force: bool,
     },
+    /// Run an additional process inside an already-running container,
+    /// joining its existing namespaces.
+    Exec {
+        /// The container's ID.
+        id: String,
+        /// Command and arguments to run inside the container.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -130,6 +141,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Run { image, args, rm }) => cmd_run(&image, &args, rm),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
+            Some(Command::Exec { id, args }) => cmd_exec(&id, &args),
         }
     })
 }
@@ -308,14 +320,29 @@ fn cmd_run(image_ref: &str, args: &[String], rm: bool) -> anyhow::Result<()> {
         let rootfs = oci_runtime_core::validate::validate(&bundle)
             .context("config.json failed validation")?;
 
+        // Records a *live* pid (and status `Running`) before blocking
+        // on the container, unlike a plain `launch::run` — this is
+        // what makes a concurrent `ociman exec`/`ps`/`rm` against this
+        // same container, issued from another invocation while this
+        // one is still foreground, actually see something real rather
+        // than the "Creating" placeholder from above (see
+        // `docs/design/0023`).
+        let record_running = |pid: i32| {
+            state.status = Status::Running;
+            state.pid = Some(pid);
+            let _ = containers.write(&state);
+        };
+
         // SAFETY: `ociman`'s own process has not spawned any additional
         // threads by this point (argument parsing, pulling, and layer
-        // extraction don't spawn any), so the fork `launch::run`
-        // performs is sound — see its own safety note for the
-        // requirement this satisfies.
+        // extraction don't spawn any), so the fork `launch::
+        // run_reporting_pid` performs is sound — see its own safety
+        // note for the requirement this satisfies.
         #[allow(unsafe_code)]
-        let exit_code = unsafe { oci_runtime_core::launch::run(&bundle, &rootfs) }
-            .context("running container")?;
+        let exit_code = unsafe {
+            oci_runtime_core::launch::run_reporting_pid(&bundle, &rootfs, record_running)
+        }
+        .context("running container")?;
         Ok(exit_code)
     })();
 
@@ -593,4 +620,56 @@ fn short_id() -> String {
     let seed = format!("{:?}-{}", std::time::SystemTime::now(), std::process::id());
     let digest = oci_spec_types::digest::sha256(seed.as_bytes());
     digest.hex()[..12].to_string()
+}
+
+fn cmd_exec(id: &str, args: &[String]) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let state = containers.load(id)?;
+    let status = state.effective_status();
+    if status != Status::Running {
+        anyhow::bail!("cannot exec in a container in the {status} state");
+    }
+    let pid = state
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
+
+    // The exec'd process joins the *same* namespaces, user/capability
+    // set, working directory, and environment the container's own init
+    // process was given, read back from its own bundle — matching real
+    // `podman exec`'s default (no `--user`/`--workdir`/`--env` override
+    // support yet), same as `ocirun exec` (0022).
+    let bundle = oci_runtime_core::Bundle::load(Path::new(&state.bundle))
+        .with_context(|| format!("loading bundle from {}", state.bundle))?;
+    let process_spec = bundle
+        .spec
+        .process
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("bundle at {} has no process section", state.bundle))?;
+    let namespaces: Vec<_> = bundle
+        .spec
+        .linux
+        .as_ref()
+        .map_or(&[][..], |l| &l.namespaces)
+        .iter()
+        .map(|ns| ns.kind)
+        .collect();
+
+    let request = oci_runtime_core::exec::ExecRequest {
+        namespaces,
+        user: process_spec.user.clone(),
+        capabilities: process_spec.capabilities.clone(),
+        no_new_privileges: process_spec.no_new_privileges,
+        cwd: process_spec.cwd.clone(),
+        env: process_spec.env.clone(),
+        args: args.to_vec(),
+    };
+
+    // SAFETY: `ociman`'s own process has not spawned any additional
+    // threads by this point, same as `run`'s own safety note.
+    #[allow(unsafe_code)]
+    let exit_code = unsafe { oci_runtime_core::exec::exec(pid, request) }.context("exec")?;
+
+    // The exec'd process's own exit code becomes ours, same convention
+    // `run` already follows.
+    std::process::exit(exit_code);
 }
