@@ -340,6 +340,36 @@ fn to_relocatable_segment(program: Vec<sock_filter>, is_first: bool) -> Vec<sock
     segment
 }
 
+/// Every `SCMP_ACT_*` name [`action_value`]/[`action_json`] actually
+/// recognize — deliberately excludes `SCMP_ACT_NOTIFY`, which both
+/// reject with a clear "not supported yet" error (see
+/// [`action_value`]'s own doc comment). Used by `ocirun features`'s
+/// own `seccomp.actions` list; kept honest by a test asserting every
+/// name here really round-trips through [`action_value`].
+pub const SUPPORTED_SECCOMP_ACTIONS: &[&str] = &[
+    "SCMP_ACT_ALLOW",
+    "SCMP_ACT_ERRNO",
+    "SCMP_ACT_KILL",
+    "SCMP_ACT_KILL_THREAD",
+    "SCMP_ACT_KILL_PROCESS",
+    "SCMP_ACT_TRAP",
+    "SCMP_ACT_LOG",
+    "SCMP_ACT_TRACE",
+];
+
+/// Every `SCMP_CMP_*` name [`op_json`] recognizes. Used by `ocirun
+/// features`'s own `seccomp.operators` list; kept honest by a test
+/// asserting every name here really round-trips through [`op_json`].
+pub const SUPPORTED_SECCOMP_OPERATORS: &[&str] = &[
+    "SCMP_CMP_NE",
+    "SCMP_CMP_LT",
+    "SCMP_CMP_LE",
+    "SCMP_CMP_EQ",
+    "SCMP_CMP_GE",
+    "SCMP_CMP_GT",
+    "SCMP_CMP_MASKED_EQ",
+];
+
 /// Map an `SCMP_ACT_*` name (plus its `errnoRet`, when the action needs
 /// one) to `seccompiler`'s JSON action representation — used for the
 /// per-syscall `match_action`s embedded in a compiled document (see
@@ -559,6 +589,31 @@ mod tests {
             op_json("SCMP_CMP_MADE_UP", 0).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn supported_seccomp_actions_all_round_trip_and_notify_is_deliberately_excluded() {
+        for name in SUPPORTED_SECCOMP_ACTIONS {
+            assert!(
+                action_value(name, None).is_ok(),
+                "{name:?} is in SUPPORTED_SECCOMP_ACTIONS but action_value rejects it"
+            );
+        }
+        assert!(!SUPPORTED_SECCOMP_ACTIONS.contains(&"SCMP_ACT_NOTIFY"));
+        assert_eq!(
+            action_value("SCMP_ACT_NOTIFY", None).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn supported_seccomp_operators_all_round_trip() {
+        for name in SUPPORTED_SECCOMP_OPERATORS {
+            assert!(
+                op_json(name, 0).is_ok(),
+                "{name:?} is in SUPPORTED_SECCOMP_OPERATORS but op_json rejects it"
+            );
+        }
     }
 
     #[test]

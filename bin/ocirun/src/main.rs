@@ -3,12 +3,14 @@
 //! Thin, runc-CLI-compatible wrapper over `oci-runtime-core`, so it can be
 //! dropped into other engines. Shipped so far: `spec`, `state`, `list`,
 //! `run` (create-and-start in one step), the separate `create`/`start`/
-//! `kill`/`delete` two-phase lifecycle, and `exec` (running an
+//! `kill`/`delete` two-phase lifecycle, `exec` (running an
 //! *additional* process inside an already-running container, joining
-//! its existing namespaces rather than creating new ones).
-//! `poststart`/`poststop` lifecycle hooks run for `run`; the other four
-//! hook points, and hooks for the `create`/`start`/`kill`/`delete`
-//! lifecycle, remain — see `docs/design/0026`.
+//! its existing namespaces rather than creating new ones), and
+//! `features` (real, checked support-surface introspection, see
+//! `features` module). `prestart`/`createRuntime`/`poststart`/
+//! `poststop` lifecycle hooks run for `run`; `createContainer`/
+//! `startContainer`, and hooks for the `create`/`start`/`kill`/
+//! `delete` lifecycle, remain — see `docs/design/0026`/`0035`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,6 +19,8 @@ use anyhow::Context as _;
 use clap::Parser;
 use oci_runtime_core::state::Status;
 use oci_runtime_core::{StateStore, exec_fifo};
+
+mod features;
 
 /// Command-line interface.
 #[derive(Debug, Parser)]
@@ -38,8 +42,7 @@ struct Cli {
     command: Option<Command>,
 }
 
-/// Subcommands shipped so far. `exec`/`features` arrive with the rest
-/// of milestone 3.
+/// Subcommands shipped so far.
 #[derive(Debug, clap::Subcommand)]
 enum Command {
     /// Create a new specification file (`config.json`) for a bundle.
@@ -138,6 +141,11 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
     },
+    /// Show this runtime's own real, checked support surface (hooks,
+    /// mount options, namespaces, capabilities, cgroup/seccomp
+    /// details) as parsable JSON — see the `features` module's own
+    /// doc comment for exactly what's reported and why.
+    Features,
 }
 
 /// Parse a `runc exec --user`-style `<uid>[:<gid>]` string: `uid` is
@@ -178,10 +186,7 @@ fn main() -> std::process::ExitCode {
             .unwrap_or_else(|| oci_cli_common::runtime_root::default_root("ocirun"));
 
         match cli.command {
-            None => anyhow::bail!(
-                "no command given; try `ocirun --help` (`exec`/`features` arrive with the \
-                 rest of milestone 3)"
-            ),
+            None => anyhow::bail!("no command given; try `ocirun --help`"),
             Some(Command::Spec { bundle, rootless }) => cmd_spec(bundle.as_deref(), rootless),
             Some(Command::State { id }) => cmd_state(&root, &id),
             Some(Command::List { format, quiet }) => cmd_list(&root, &format, quiet),
@@ -197,6 +202,7 @@ fn main() -> std::process::ExitCode {
                 env,
                 args,
             }) => cmd_exec(&root, &id, user.as_deref(), cwd.as_deref(), &env, &args),
+            Some(Command::Features) => oci_cli_common::output::print_json(&features::features()),
         }
     })
 }

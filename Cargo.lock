@@ -930,6 +930,7 @@ dependencies = [
  "anyhow",
  "clap",
  "oci-cli-common",
+ "oci-mount",
  "oci-runtime-core",
  "oci-spec-types",
  "serde",

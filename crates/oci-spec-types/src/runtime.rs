@@ -5,9 +5,10 @@
 //! produce a runc-compatible default bundle config (`Spec::example`) and
 //! its rootless variant (`Spec::into_rootless`) — process, root, mounts,
 //! namespaces, ID mappings, the device-cgroup allow-list, seccomp
-//! profiles, and lifecycle hooks (`Hooks`, only `poststart`/`poststop`
-//! actually executed yet — see `oci_runtime_core::hooks` and
-//! `docs/design/0026`). Fields the actual container-creation milestone
+//! profiles, and lifecycle hooks (`Hooks`; `prestart`/`createRuntime`/
+//! `poststart`/`poststop` are executed, `createContainer`/
+//! `startContainer` still aren't — see `oci_runtime_core::hooks` and
+//! `docs/design/0026`/`0035`). Fields the actual container-creation milestone
 //! will still need (full `LinuxResources` memory/cpu/pids limits,
 //! `IntelRdt`, `Personality`, scheduler/IO-priority) are intentionally
 //! not modeled yet; adding an unused field now would be undocumented,

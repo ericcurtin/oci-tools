@@ -13,6 +13,7 @@ publish = false
 anyhow.workspace = true
 clap.workspace = true
 oci-cli-common.workspace = true
+oci-mount.workspace = true
 oci-runtime-core.workspace = true
 oci-spec-types.workspace = true
 serde.workspace = true

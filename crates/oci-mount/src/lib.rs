@@ -29,5 +29,5 @@ pub mod options;
 pub mod syscalls;
 
 pub use loop_device::{AttachOptions, attach, detach};
-pub use options::{ParsedMountOptions, parse_mount_options};
+pub use options::{ParsedMountOptions, known_option_names, parse_mount_options};
 pub use syscalls::{MountPlan, mount, pivot_root};

@@ -120,6 +120,58 @@ pub fn parse_mount_options<S: AsRef<str>>(options: &[S]) -> ParsedMountOptions {
     result
 }
 
+/// Every option name [`mount_flag`] or [`propagation_flag`] recognizes,
+/// combined into one list — matching real runc's own
+/// `specconv.KnownMountOptions()` (`mountFlags` keys plus
+/// `mountPropagationMapping` keys; this project has no counterpart to
+/// runc's newer `recAttrFlags` table, see this module's own top doc
+/// comment for why). Used by `ocirun features`'s own `mountOptions`
+/// list — kept honest by a test asserting every name here really does
+/// round-trip through one of the two lookup functions, so this list
+/// can never silently drift out of sync with the match tables below.
+pub fn known_option_names() -> Vec<&'static str> {
+    vec![
+        "async",
+        "atime",
+        "bind",
+        "dev",
+        "diratime",
+        "dirsync",
+        "exec",
+        "lazytime",
+        "loud",
+        "mand",
+        "noatime",
+        "nodev",
+        "nodiratime",
+        "noexec",
+        "nolazytime",
+        "nomand",
+        "norelatime",
+        "nostrictatime",
+        "nosuid",
+        "nosymfollow",
+        "rbind",
+        "relatime",
+        "remount",
+        "ro",
+        "rw",
+        "silent",
+        "strictatime",
+        "suid",
+        "sync",
+        "symfollow",
+        "rprivate",
+        "private",
+        "rslave",
+        "slave",
+        "rshared",
+        "shared",
+        "runbindable",
+        "unbindable",
+    ]
+}
+
 /// `(flag, clear)` for one recognized `mount(2)`-flag option name, or
 /// `None` if `option` isn't one (it's either a propagation setting or
 /// filesystem-specific data). `clear` mirrors runc's table: most options
@@ -191,6 +243,29 @@ mod tests {
 
     fn opts(strs: &[&str]) -> Vec<String> {
         strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn known_option_names_all_round_trip_through_the_real_lookup_functions() {
+        // Guards against known_option_names() silently drifting out of
+        // sync with mount_flag/propagation_flag: every name it lists
+        // must actually be recognized by one of the two. Same
+        // hand-maintained-list-plus-round-trip-test discipline this
+        // project already uses for `identity::ALL_CAPABILITY_NAMES`.
+        for name in known_option_names() {
+            assert!(
+                mount_flag(name).is_some() || propagation_flag(name).is_some(),
+                "{name:?} is in known_option_names() but neither lookup function recognizes it"
+            );
+        }
+        // No duplicates, and a length sanity check -- catches an
+        // accidental copy-paste repeat without needing a second,
+        // independently-typed copy of the list.
+        let mut names = known_option_names();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), known_option_names().len());
+        assert_eq!(known_option_names().len(), 38);
     }
 
     #[test]

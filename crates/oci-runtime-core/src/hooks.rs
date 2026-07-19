@@ -1,8 +1,10 @@
-//! OCI runtime-spec lifecycle hooks — `poststart`/`poststop` only for
-//! now, wired into [`crate::launch::run_reporting_pid`]. See
-//! `docs/design/0026` for why the other four hook points
-//! (`prestart`/`createRuntime`/`createContainer`/`startContainer`)
-//! aren't executed yet.
+//! OCI runtime-spec lifecycle hooks — `prestart`/`createRuntime`/
+//! `poststart`/`poststop` are executed (wired into
+//! [`crate::launch::run_reporting_pid`]/`run_pre_pivot_hooks`; see
+//! `docs/design/0026`/`0035`). `createContainer`/`startContainer`
+//! still aren't — they need execution from *inside* the forked child
+//! at specific pre-/post-`pivot_root` points, real, substantial
+//! architectural complexity deliberately not tackled yet.
 //!
 //! Unlike everything else in this crate, a hook process is an ordinary,
 //! independent process with no namespace/rootfs concerns of its own —
