@@ -172,6 +172,85 @@ pub fn apply(seccomp: &LinuxSeccomp) -> io::Result<()> {
     seccompiler::apply_filter(&combined).map_err(|e| io::Error::other(e.to_string()))
 }
 
+/// The real `container-libs`-style default seccomp profile a fresh
+/// rootless container gets — the *default* capability set's own
+/// resolution of `~/git/container-libs/common/pkg/seccomp/
+/// seccomp.json`'s own richer, per-capability-conditional (`includes`/
+/// `excludes`) schema, captured as an actual `podman run`'s own
+/// on-disk `config.json` (podman 4.9.3 / crun 1.14.1 — see
+/// `docs/design/0016`'s own note on this capture) rather than
+/// reimplemented from the conditional schema directly: this project
+/// has no capability-conditional seccomp-profile resolution logic of
+/// its own, and every container this project runs so far gets exactly
+/// the same (default) capability set, so a single, already-resolved,
+/// flat profile is both correct and far simpler than reimplementing
+/// that resolution machinery.
+const DEFAULT_SECCOMP_PROFILE_JSON: &str = include_str!("data/default_seccomp_profile.json");
+
+/// Parse the bundled default seccomp profile (see
+/// [`DEFAULT_SECCOMP_PROFILE_JSON`]'s own doc comment for where it
+/// came from). Panics on malformed JSON — this is this project's own
+/// bundled, version-controlled data, not external/untrusted input, so
+/// a parse failure here can only mean this crate itself shipped a
+/// broken resource, exactly the kind of thing a test (see this
+/// module's own `default_profile_parses_and_survives_filtering`)
+/// should catch long before it ever reaches a real build.
+pub fn default_profile() -> LinuxSeccomp {
+    serde_json::from_str(DEFAULT_SECCOMP_PROFILE_JSON)
+        .expect("the bundled default seccomp profile must always be valid JSON")
+}
+
+/// Drop every syscall name in `seccomp` that doesn't actually resolve
+/// on the current architecture, rather than letting [`apply`] fail
+/// the whole container over it.
+///
+/// Matches real `container-libs`' own documented behavior exactly
+/// (`common/pkg/seccomp/filter_linux.go`'s `matchSyscall`, checked
+/// directly): *"If we can't resolve the syscall, assume it's not
+/// supported on this kernel. Ignore it, don't error out."* The bundled
+/// default profile ([`default_profile`]) is a real capture that itself
+/// still lists names from `container-libs`' own union-of-every-
+/// architecture syscall table (legacy 32-bit-compat names like
+/// `bdflush`/`fcntl64`/`chown32` genuinely don't exist as syscalls on
+/// aarch64, for example, confirmed directly against a real kernel
+/// while first verifying this profile end to end in `docs/design/
+/// 0036`) — real `podman`/`crun`, via real `libseccomp`, silently
+/// tolerate exactly this on every architecture they run on, so this
+/// project does too, for the *default* profile specifically. A
+/// user-supplied profile (once this project has a way to accept one)
+/// should stay strict — an unknown name there is much more likely to
+/// be a real typo worth surfacing loudly, not an architecture
+/// portability non-issue.
+pub fn filter_to_supported_syscalls(seccomp: &LinuxSeccomp) -> LinuxSeccomp {
+    let Ok(arch) = std::env::consts::ARCH.try_into() else {
+        // An architecture `seccompiler` itself doesn't know about at
+        // all: nothing can be resolved, but that's `apply`'s own
+        // problem to report loudly if this profile is ever actually
+        // applied -- filtering everything away here would silently
+        // turn "unsupported architecture" into "empty, harmless
+        // profile", which is worse.
+        return seccomp.clone();
+    };
+    let mut filtered = seccomp.clone();
+    filtered.syscalls.retain_mut(|syscall| {
+        syscall
+            .names
+            .retain(|name| is_syscall_name_supported(arch, name));
+        !syscall.names.is_empty()
+    });
+    filtered
+}
+
+/// Whether `name` resolves to a real syscall number on `arch` at all —
+/// checked by actually attempting to compile a trivial single-syscall
+/// document for it, reusing [`compile_single_syscall`]'s own name
+/// resolution (`seccompiler`'s syscall table has no other, cheaper way
+/// to query this — see this module's own top doc comment for why that
+/// table isn't reachable any other way).
+fn is_syscall_name_supported(arch: seccompiler::TargetArch, name: &str) -> bool {
+    compile_single_syscall(arch, name, &json!("allow"), &[]).is_ok()
+}
+
 /// Compile a document matching exactly one syscall (`name`, with
 /// `args` conditions if any) to `match_action`, paired with an
 /// arbitrary `mismatch_action` placeholder distinct from it (the value
@@ -367,6 +446,58 @@ mod tests {
             flags: vec![],
             syscalls,
         }
+    }
+
+    #[test]
+    fn default_profile_parses_and_survives_filtering() {
+        let profile = default_profile();
+        assert_eq!(profile.default_action, "SCMP_ACT_ERRNO");
+        assert_eq!(profile.default_errno_ret, Some(38));
+        assert!(!profile.syscalls.is_empty());
+
+        let filtered = filter_to_supported_syscalls(&profile);
+        // Every syscall entry that survives filtering must have at
+        // least one name left (an entry that loses *every* one of its
+        // own names on this architecture is dropped outright, not
+        // left behind empty).
+        assert!(filtered.syscalls.iter().all(|s| !s.names.is_empty()));
+        // Bundled from a real capture that itself lists some
+        // architecture-portability-only names (see this profile's own
+        // doc comment) -- on a real, supported architecture, at least
+        // some names should have been dropped, proving filtering
+        // actually does something rather than being a no-op by
+        // accident.
+        let before: usize = profile.syscalls.iter().map(|s| s.names.len()).sum();
+        let after: usize = filtered.syscalls.iter().map(|s| s.names.len()).sum();
+        assert!(
+            after < before,
+            "expected filtering to drop at least one name: {before} -> {after}"
+        );
+        assert!(after > 0, "expected filtering to keep at least one name");
+    }
+
+    #[test]
+    fn filter_to_supported_syscalls_keeps_a_real_syscall_and_drops_a_fake_one() {
+        let profile = seccomp(
+            "SCMP_ACT_ALLOW",
+            vec![
+                syscall("mkdirat", "SCMP_ACT_ERRNO"),
+                syscall("not_a_real_syscall_at_all", "SCMP_ACT_ERRNO"),
+            ],
+        );
+        let filtered = filter_to_supported_syscalls(&profile);
+        assert_eq!(filtered.syscalls.len(), 1);
+        assert_eq!(filtered.syscalls[0].names, vec!["mkdirat".to_string()]);
+    }
+
+    #[test]
+    fn is_syscall_name_supported_matches_real_availability() {
+        let arch = test_arch();
+        assert!(is_syscall_name_supported(arch, "mkdirat"));
+        assert!(!is_syscall_name_supported(
+            arch,
+            "not_a_real_syscall_at_all"
+        ));
     }
 
     #[test]

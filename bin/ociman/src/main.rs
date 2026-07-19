@@ -751,6 +751,41 @@ fn cmd_stop(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
         .with_context(|| format!("parsing signal {signal:?}"))?;
     let _ = oci_runtime_core::process::kill(pid, sig);
 
+    // Re-send the same signal a few more times, early on — a real,
+    // genuinely observed race (not hypothetical: see `docs/design/
+    // 0044`), distinct from 0017's own already-documented "no handler
+    // installed at all, ever" case: the container's own process is
+    // this pid-namespace's own init, and the kernel's documented rule
+    // for *that* process is to *silently ignore* a signal whose
+    // default action would be to terminate it, for as long as it has
+    // no handler installed *at the moment the signal arrives* (`man 7
+    // pid_namespaces`) — not "queued until a handler eventually shows
+    // up". A container whose own signal handler isn't installed yet
+    // (e.g. still finishing its own `oci-tools`-side startup work —
+    // rootfs setup, applying `seccomp`, ...) when the very first send
+    // above lands can therefore lose that specific signal outright,
+    // even though the same container's command installs a real
+    // handler moments later and would otherwise have handled it
+    // correctly. Only during this short initial window, though, *not*
+    // for the entire grace period: plenty of real entrypoints treat a
+    // *second* signal as "stop being graceful, exit now" (`docker`'s
+    // own documented convention, among others), so resending
+    // indefinitely would risk forcing an ordinary, correctly-behaving
+    // graceful shutdown that simply takes a few seconds to finish.
+    // Skipped entirely for an explicit `--time 0` (immediate
+    // escalation, no grace at all requested) rather than still adding
+    // this small fixed delay first.
+    if time_secs > 0 {
+        for _ in 0..4 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if !oci_runtime_core::process::alive(pid) {
+                println!("{id}");
+                return Ok(());
+            }
+            let _ = oci_runtime_core::process::kill(pid, sig);
+        }
+    }
+
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(time_secs);
     while std::time::Instant::now() < deadline {
         if !oci_runtime_core::process::alive(pid) {
@@ -880,13 +915,27 @@ fn synthesize_spec(
 
     spec.hostname = Some(id.to_string());
 
+    let linux = spec
+        .linux
+        .as_mut()
+        .expect("Spec::example always sets linux");
+
     let resources = resources_from_cli(memory_limit_bytes, cpus, pids_limit);
     if let Some(resources) = resources {
-        spec.linux
-            .as_mut()
-            .expect("Spec::example always sets linux")
-            .resources = Some(resources);
+        linux.resources = Some(resources);
     }
+
+    // Always apply a default seccomp profile, matching real `podman
+    // run`'s own default on every container it starts — there's no
+    // `--security-opt seccomp=`/`--privileged` escape hatch yet (this
+    // is a pure improvement over the previous "zero seccomp
+    // confinement at all" behavior, never a new hard requirement: see
+    // `docs/design/0044`). Filtered to this build's own architecture
+    // first, so an aarch64 (or any other non-x86_64) container isn't
+    // rejected over syscall names that only exist on a different one.
+    linux.seccomp = Some(oci_runtime_core::seccomp::filter_to_supported_syscalls(
+        &oci_runtime_core::seccomp::default_profile(),
+    ));
 
     Ok(spec)
 }

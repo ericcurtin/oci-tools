@@ -154,6 +154,59 @@ fn run_propagates_the_containers_exit_code() {
 }
 
 #[test]
+fn run_applies_a_default_seccomp_profile_blocking_a_real_syscall() {
+    // Real, unconfounded verification that a real default seccomp
+    // profile is now always applied (`docs/design/0044`) -- not just
+    // that some error occurred, which could just as easily come from
+    // an unrelated kernel/filesystem check. `swapon` against a real,
+    // existing-but-not-swap-formatted file:
+    //
+    // * with *no* seccomp at all (confirmed separately, by hand, via
+    //   `ocirun run` with an unset `linux.seccomp`), the syscall
+    //   itself actually executes and the kernel's own swap-file
+    //   validation logic rejects it distinctly ("file has holes" or
+    //   similar) -- proof the syscall really reached the kernel.
+    // * with the default profile applied, it instead fails with
+    //   `Operation not permitted` (`EPERM`) -- seccomp's own `ERRNO`
+    //   action for `swapon`, which real `podman`'s own default profile
+    //   also blocks by default -- *before* the syscall ever reaches
+    //   that filesystem-level check at all.
+    //
+    // Asserting specifically on `Operation not permitted` (rather than
+    // just "the command failed somehow") is what makes this test
+    // actually distinguish "seccomp blocked it" from any other reason
+    // the same command could fail.
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/default-seccomp:latest",
+        &busybox,
+        &["sh", "swapon"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/default-seccomp:latest",
+        &["/bin/sh", "-c", "swapon /bin/busybox"],
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Operation not permitted"),
+        "expected the default seccomp profile to block `swapon` with EPERM: {combined:?}"
+    );
+}
+
+#[test]
 fn run_memory_limit_actually_gets_enforced_by_the_kernels_own_oom_killer() {
     // Real, kernel-enforced verification (not just "the property got
     // set" — that's covered directly in `oci_runtime_core::
