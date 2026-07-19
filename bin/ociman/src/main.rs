@@ -7,11 +7,9 @@
 //! through `oci-runtime-core` directly, as a library — never by
 //! exec'ing `ocirun` (see the top-level README's design pillars).
 //!
-//! Milestone plan: `pull`/`images`/`inspect`/`run`/`ps`/`rm`/`exec`
-//! rootless (milestone 3, shipped); `logs` remains, since it needs a
-//! container's stdio actually captured somewhere persistent, which
-//! `run` still just inherits straight from the terminal; `build`
-//! (milestone 4), then the full podman-style v1 command set.
+//! Milestone plan: `pull`/`images`/`inspect`/`run`/`ps`/`rm`/`exec`/
+//! `logs` rootless (milestone 3, shipped); `build` (milestone 4), then
+//! the full podman-style v1 command set.
 
 mod user_resolve;
 
@@ -59,8 +57,8 @@ struct Cli {
     command: Option<Command>,
 }
 
-/// Subcommands shipped so far. `run`/`exec`/`ps`/`logs`/`build` and the
-/// rest of the podman-style surface arrive with later milestones.
+/// Subcommands shipped so far. `build` and the rest of the
+/// podman-style surface arrive with later milestones.
 #[derive(Debug, clap::Subcommand)]
 enum Command {
     /// Pull an image from a registry into local storage.
@@ -120,6 +118,12 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
     },
+    /// Print a container's captured stdout/stderr (combined, not kept
+    /// separate — see `docs/design/0025`).
+    Logs {
+        /// The container's ID.
+        id: String,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -133,8 +137,8 @@ fn main() -> std::process::ExitCode {
 
         match cli.command {
             None => anyhow::bail!(
-                "no command given; try `ociman --help` (`pull`, `images`, `inspect` are \
-                 implemented; `run`/`exec`/`build` and the rest arrive with later milestones)"
+                "no command given; try `ociman --help` (`build` and the rest of the \
+                 podman-style surface arrive with later milestones)"
             ),
             Some(Command::Pull { reference }) => cmd_pull(&reference, cli.global.json),
             Some(Command::Images) => cmd_images(cli.global.json),
@@ -143,6 +147,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
             Some(Command::Exec { id, args }) => cmd_exec(&id, &args),
+            Some(Command::Logs { id }) => cmd_logs(&id),
         }
     })
 }
@@ -291,6 +296,13 @@ fn cmd_run(image_ref: &str, args: &[String], rm: bool) -> anyhow::Result<()> {
 
     let bundle_dir = containers.container_dir(&container_id);
     let rootfs_dir = bundle_dir.join("rootfs");
+    // Read by `cmd_logs`; written by the tee thread `launch::
+    // run_reporting_pid` spawns once the container itself is running
+    // (see `docs/design/0025`) — co-located with `state.json`/
+    // `config.json`/`rootfs/` in the same per-container directory, so
+    // it survives (or gets wiped by `rm`) along with the rest of the
+    // container's own storage.
+    let log_path = bundle_dir.join("container.log");
     let result = (|| -> anyhow::Result<i32> {
         std::fs::create_dir_all(&rootfs_dir)
             .with_context(|| format!("creating {}", rootfs_dir.display()))?;
@@ -341,7 +353,12 @@ fn cmd_run(image_ref: &str, args: &[String], rm: bool) -> anyhow::Result<()> {
         // note for the requirement this satisfies.
         #[allow(unsafe_code)]
         let exit_code = unsafe {
-            oci_runtime_core::launch::run_reporting_pid(&bundle, &rootfs, record_running)
+            oci_runtime_core::launch::run_reporting_pid(
+                &bundle,
+                &rootfs,
+                Some(&log_path),
+                record_running,
+            )
         }
         .context("running container")?;
         Ok(exit_code)
@@ -499,6 +516,41 @@ fn cmd_rm(id: &str, force: bool) -> anyhow::Result<()> {
 
     containers.remove(id)?;
     println!("{id}");
+    Ok(())
+}
+
+/// Print a container's captured output (see `docs/design/0025`):
+/// everything its process has written to stdout/stderr since `run`
+/// started it, combined in the order it was produced. Doesn't yet
+/// support `-f`/`--follow` (tailing a still-running container's
+/// output live) — only ever prints what's been captured so far and
+/// exits, matching real `podman logs`/`docker logs`'s own *default*
+/// (non-`-f`) behavior.
+///
+/// A container that exists but has no log file yet (e.g. `rm --force`
+/// killed it before it produced any output, or it predates this
+/// feature) prints nothing rather than erroring — only an unknown
+/// container ID itself is an error, via the same `containers.load`
+/// every other subcommand already uses.
+fn cmd_logs(id: &str) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let _state = containers
+        .load(id)
+        .with_context(|| format!("looking up container {id:?}"))?;
+
+    let log_path = containers.container_dir(id).join("container.log");
+    match std::fs::read(&log_path) {
+        Ok(bytes) => {
+            use std::io::Write as _;
+            std::io::stdout()
+                .write_all(&bytes)
+                .context("writing logs to stdout")?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading {}", log_path.display()));
+        }
+    }
     Ok(())
 }
 

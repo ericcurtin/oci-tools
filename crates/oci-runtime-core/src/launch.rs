@@ -13,7 +13,8 @@
 //! [`oci_mount::syscalls`] (the actual `mount(2)`/`pivot_root(2)` calls).
 //! This module is where they meet a real bundle for the first time.
 
-use std::io;
+use std::io::{self, Read as _, Write as _};
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 
@@ -67,20 +68,24 @@ pub const COMMAND_NOT_FOUND_EXIT_CODE: i32 = 127;
 #[allow(unsafe_code)]
 pub unsafe fn run(bundle: &Bundle, rootfs: &Path) -> io::Result<i32> {
     // SAFETY: forwarded from this function's own contract.
-    unsafe { run_reporting_pid(bundle, rootfs, |_pid| {}) }
+    unsafe { run_reporting_pid(bundle, rootfs, None, |_pid| {}) }
 }
 
 /// Like [`run`], but calls `on_pid` with the container's own pid as
 /// soon as it's known — before the container's process has necessarily
 /// finished setup or started running the user's command — rather than
-/// only ever returning the final exit code once everything is over.
+/// only ever returning the final exit code once everything is over,
+/// and (if `log_path` is given) also captures the container's own
+/// stdout/stderr to that file as it runs, in addition to this
+/// process's own stdout — see [`setup_log_tee_pipe`]'s doc comment for
+/// how and why.
 ///
 /// For callers that need a live pid a *concurrent* invocation can act
 /// on (`ociman run`, unlike `ocirun run`, persists a container record
 /// other `ociman` commands look at while this one is still foreground
 /// — see `docs/design/0023`); `run` itself is just this with a no-op
-/// callback, so ordinary callers pay only the cost of one extra pipe
-/// and a 4-byte read, not a behavioral difference.
+/// callback and no log path, so ordinary callers pay only the cost of
+/// one extra pipe and a 4-byte read, not a behavioral difference.
 ///
 /// # Safety
 ///
@@ -89,12 +94,23 @@ pub unsafe fn run(bundle: &Bundle, rootfs: &Path) -> io::Result<i32> {
 pub unsafe fn run_reporting_pid(
     bundle: &Bundle,
     rootfs: &Path,
+    log_path: Option<&Path>,
     on_pid: impl FnOnce(i32),
 ) -> io::Result<i32> {
     let mut child_setup = build_child_setup(bundle, rootfs)?;
     let (read_fd, write_fd) =
         rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)?;
     child_setup.pid_pipe_write = Some(write_fd);
+
+    // Only the pipe(s) are created here, deliberately not yet a reader
+    // thread for the log one below: spawning a thread before the fork
+    // a few lines down would make *this* process multi-threaded right
+    // at the moment it forks, which `process::fork`'s own safety
+    // contract forbids (see its doc comment) — the thread has to wait
+    // until after the fork returns here.
+    let log_read_fd = log_path
+        .map(|_| setup_log_tee_pipe(&mut child_setup))
+        .transpose()?;
 
     // SAFETY: forwarded from this function's own contract. Unlike
     // `create`, this direct child's own pid *is* what gets waited on
@@ -105,11 +121,87 @@ pub unsafe fn run_reporting_pid(
     #[allow(unsafe_code)]
     let direct_child_pid = unsafe { process::fork(move || child_setup.run()) }?;
 
+    // Safe to spawn the reader thread now: the fork this process is
+    // ever going to do for this container has already happened.
+    let log_thread = match (log_read_fd, log_path) {
+        (Some(read_fd), Some(path)) => Some(spawn_log_tee_thread(read_fd, path)?),
+        _ => None,
+    };
+
     let container_pid = read_container_pid(read_fd)?;
     on_pid(container_pid);
 
     let status = process::wait(direct_child_pid)?;
+    if let Some(thread) = log_thread {
+        // Best-effort: once the container itself has finished, a
+        // panic in the tee thread (which would only ever come from a
+        // poisoned stdout lock, not from anything this container did)
+        // isn't a reason to fail the whole `run`.
+        let _ = thread.join();
+    }
     Ok(process::exit_code_from_wait_status(status))
+}
+
+/// Wire `child_setup`'s stdout and stderr to two ends of a fresh pipe
+/// (both streams combined into one — this doesn't yet distinguish
+/// which produced which byte, see `docs/design/0025`), returning the
+/// read end for [`spawn_log_tee_thread`] to consume once it's safe to
+/// spawn a thread (i.e. after the fork in [`run_reporting_pid`], not
+/// before).
+///
+/// The two write ends are stored as genuine `OwnedFd`s (moved wholesale
+/// into `child_setup`, exactly like `pid_pipe_write` already is), not
+/// plain numbers: that's what makes *this* process's own copies of
+/// them actually get closed once `process::fork` returns here (the
+/// closure — and everything it captured, including these two fds —
+/// gets dropped normally when `fork`'s own stack frame unwinds in the
+/// parent, since the parent branch never calls it). Without that, this
+/// process would itself retain the pipe's write end open forever,
+/// and its own reader thread would never see EOF even after the
+/// container has fully exited — caught by exactly that hang the first
+/// time this was tried with plain `RawFd`s taken via `into_raw_fd`
+/// (which does not close anything, unlike letting `OwnedFd`'s own
+/// `Drop` run).
+fn setup_log_tee_pipe(child_setup: &mut ChildSetup) -> io::Result<rustix::fd::OwnedFd> {
+    let (read_fd, write_fd) =
+        rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)?;
+    let write_fd_2 = rustix::io::dup(&write_fd).map_err(io::Error::from)?;
+    child_setup.stdout_log_fd = Some(write_fd);
+    child_setup.stderr_log_fd = Some(write_fd_2);
+    Ok(read_fd)
+}
+
+/// Spawn the background thread that actually implements the "tee":
+/// copy everything written to `read_fd` (the container's combined
+/// stdout/stderr, see [`setup_log_tee_pipe`]) to both this process's
+/// own stdout (so a foreground `run` still shows live output, exactly
+/// as it did before logging existed) and appended to `log_path`.
+///
+/// Must only be called after the fork that (indirectly, via
+/// `ChildSetup`) handed the *other* end of this same pipe to the
+/// container — see [`run_reporting_pid`]'s own fork-safety note on why.
+fn spawn_log_tee_thread(
+    read_fd: rustix::fd::OwnedFd,
+    log_path: &Path,
+) -> io::Result<std::thread::JoinHandle<()>> {
+    let mut log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let mut reader = std::fs::File::from(read_fd);
+    Ok(std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let mut stdout = io::stdout();
+            let _ = stdout.write_all(&buf[..n]);
+            let _ = stdout.flush();
+            let _ = log_file.write_all(&buf[..n]);
+        }
+    }))
 }
 
 /// Create `bundle`'s container: fork and run the exact same setup
@@ -244,6 +336,8 @@ fn build_child_setup(bundle: &Bundle, rootfs: &Path) -> io::Result<ChildSetup> {
         seccomp: linux.and_then(|l| l.seccomp.clone()),
         exec_fifo: None,
         pid_pipe_write: None,
+        stdout_log_fd: None,
+        stderr_log_fd: None,
         args: process_spec.args.clone(),
         env: process_spec.env.clone(),
         cwd: process_spec.cwd.clone(),
@@ -275,6 +369,19 @@ struct ChildSetup {
     /// isn't necessarily this struct's own direct caller — see
     /// [`ChildSetup::run`]'s relay-fork note) to read back.
     pid_pipe_write: Option<rustix::fd::OwnedFd>,
+    /// Set by [`run_reporting_pid`] (via [`setup_log_tee_pipe`]) when a
+    /// log path was given: the write end of the pipe whose read end a
+    /// background thread in the *caller's* process tees to both a log
+    /// file and its own stdout. `None` for every other caller (`create`
+    /// never sets these; plain [`run`] leaves them `None` too). A real
+    /// `OwnedFd`, not a plain number, for the same reason
+    /// [`Self::pid_pipe_write`] is: see [`setup_log_tee_pipe`]'s own
+    /// doc comment.
+    stdout_log_fd: Option<rustix::fd::OwnedFd>,
+    /// Same pipe as [`Self::stdout_log_fd`] (a second, `dup`'d write
+    /// end of the very same one) — both streams are combined, not kept
+    /// separate, see `docs/design/0025`.
+    stderr_log_fd: Option<rustix::fd::OwnedFd>,
     args: Vec<String>,
     env: Vec<String>,
     cwd: String,
@@ -455,6 +562,24 @@ impl ChildSetup {
             if let Some((key, value)) = kv.split_once('=') {
                 command.env(key, value);
             }
+        }
+        // `self` is only ever a shared reference here, so the `OwnedFd`s
+        // themselves can't be moved out of it directly; reconstructing
+        // a fresh `Stdio` from the same raw number is sound because
+        // this process (which never uses `self.stdout_log_fd`/
+        // `stderr_log_fd` again) always terminates from here on by
+        // either a successful `exec` (replacing the process image,
+        // which reclaims every fd via ordinary kernel process teardown
+        // — Rust's own `Drop` for the original `OwnedFd` field never
+        // gets to run either way) or `fail`'s `std::process::exit`
+        // (same reclaiming, same reasoning).
+        #[allow(unsafe_code)]
+        if let Some(fd) = &self.stdout_log_fd {
+            command.stdout(unsafe { std::process::Stdio::from_raw_fd(fd.as_raw_fd()) });
+        }
+        #[allow(unsafe_code)]
+        if let Some(fd) = &self.stderr_log_fd {
+            command.stderr(unsafe { std::process::Stdio::from_raw_fd(fd.as_raw_fd()) });
         }
         // `exec` only returns (as an `Err`) if it failed; on success the
         // process image is replaced and this line never returns at all.
