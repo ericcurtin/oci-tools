@@ -35,8 +35,10 @@ end to end for a real, deliberately narrow subset of Dockerfiles —
 local-archive-auto-extraction matches real docker's documented
 behavior; remote URL sources aren't supported yet); multi-stage builds
 work via both `FROM <earlier-stage>` and `COPY --from=<earlier-stage>`;
-`--build-arg` works; `COPY --from=<external-image>` and multi-source/
-glob `COPY`/`ADD` are not implemented yet). Milestone 3 also grew real
+`--build-arg` works; multiple explicit sources in one `COPY`/`ADD` work
+too (each landing under the destination by its own basename); `COPY
+--from=<external-image>` and glob `COPY`/`ADD` are not implemented
+yet). Milestone 3 also grew real
 `--memory-swap`/
 `--cpuset-cpus`/`--cpuset-mems`/`--security-opt seccomp=`/a real
 `podman`-default capability set/`--cap-add`/`--cap-drop`/`--privileged`
@@ -66,7 +68,7 @@ milestone.
 | 1 | workspace skeleton, `oci-cli-common`, 4-VM CI matrix | **done** |
 | 2 | `oci-spec-types`/`oci-registry`/`oci-store`; `ociman pull/images/inspect` | **done** |
 | 3 | `oci-runtime-core` + `ocirun`; `ociman run/exec/ps/logs` rootless | **done** (plus systemd cgroups, hooks, seccomp, resource limits, `--security-opt seccomp=`, a real `podman`-default capability set, `--cap-add`/`--cap-drop`, `--privileged`, beyond the original scope) |
-| 4 | `oci-dockerfile`; `ociman build` (multi-stage, cache) | in progress — `RUN`/`COPY`/`ADD`/`--build-arg` work end to end and commit real layers (`ADD`'s remote-URL sources and the build cache are not yet implemented) (see `docs/design/0050`-`0060`, `0068`) |
+| 4 | `oci-dockerfile`; `ociman build` (multi-stage, cache) | in progress — `RUN`/`COPY`/`ADD`/`--build-arg` work end to end and commit real layers, including multiple explicit sources in one `COPY`/`ADD` (glob patterns, `ADD`'s remote-URL sources, and the build cache are not yet implemented) (see `docs/design/0050`-`0060`, `0068`, `0072`) |
 | 5 | erofs/mount/BLS; `ociboot install to-disk`; dracut module; QEMU boot test | in progress — `oci-erofs` builds real, verified-deterministic erofs images via `mkfs.erofs`, seals/verifies them with real fs-verity ioctls, and has a detached dm-verity fallback via `veritysetup`; `oci-bls` reads/writes the real grubenv block and Type #1 BLS entries, scans `/loader/entries/` as a directory, implements the real spec's own boot-counting filename convention, and sorts entries per the real spec's own "Sorting" section including full UAPI.10 version comparison (all verified against the real uapi-group spec/tools); `oci-mount` attaches/detaches real loop devices (see `docs/design/0061`-`0066`, `0070`-`0071`); the `boot_success` grubenv protocol, actually mounting a verified image at boot, `ociboot`'s own subcommands, and the dracut module are not started yet |
 | 6 | upgrade/switch/rollback/status/gc; /etc merge; boot counting; layered mode | — |
 | 7 | `ocicri` (critest subset), `ocibox` | — |

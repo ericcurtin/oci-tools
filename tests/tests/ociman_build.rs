@@ -787,6 +787,79 @@ fn copy_into_an_existing_directory_keeps_the_sources_own_basename() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), "file content\n");
 }
 
+/// Multiple explicit sources in one `COPY`, matching real Docker's own
+/// documented rule: each source lands under `dest` by its own
+/// basename, and (checked directly against the real source,
+/// `performCopyForInfo` in `copy.go`) a directory source's own
+/// contents are still flattened directly into `dest`, never nested
+/// under the directory's own basename even with other sources
+/// alongside it.
+#[test]
+fn copy_with_multiple_sources_places_each_under_its_own_basename() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copy-multi-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("a.txt"), "aaa\n").unwrap();
+    std::fs::write(context_dir.path().join("b.txt"), "bbb\n").unwrap();
+    std::fs::create_dir(context_dir.path().join("subdir")).unwrap();
+    std::fs::write(
+        context_dir.path().join("subdir").join("nested.txt"),
+        "nested\n",
+    )
+    .unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copy-multi-base:latest\n\
+         COPY a.txt b.txt subdir /app/\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/copy-multi-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/copy-multi-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /app/a.txt /app/b.txt /app/nested.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "aaa\nbbb\nnested\n");
+}
+
 #[test]
 fn copy_rejects_a_source_that_escapes_the_build_context() {
     let Some(busybox) = busybox_path() else {
@@ -843,7 +916,10 @@ fn copy_rejects_unsupported_flags_multiple_sources_and_globs() {
         ("COPY --chown=1000:1000 a.txt /a.txt\n", "--chown"),
         ("COPY --chmod=755 a.txt /a.txt\n", "--chmod"),
         ("COPY --from=builder a.txt /a.txt\n", "--from"),
-        ("COPY a.txt b.txt /dest/\n", "more than one source"),
+        (
+            "COPY a.txt b.txt /a.txt\n",
+            "must be a directory and end with a /",
+        ),
         ("COPY *.txt /dest/\n", "wildcard"),
     ];
     for (instruction, expected_error_fragment) in cases {
@@ -1123,6 +1199,70 @@ fn add_rejects_a_remote_url_source() {
             .is_none(),
         "a failed build must not leave a partial image tagged"
     );
+}
+
+/// `ADD` shares `COPY`'s own multi-source support exactly, by design
+/// (see `bin/ociman/src/build.rs`'s own module doc comment): multiple
+/// explicit sources, each landing under the destination by its own
+/// basename, requiring a trailing `/` on the destination.
+#[test]
+fn add_with_multiple_sources_places_each_under_its_own_basename() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-multi-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("a.txt"), "aaa\n").unwrap();
+    std::fs::write(context_dir.path().join("b.txt"), "bbb\n").unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/add-multi-base:latest\n\
+         ADD a.txt b.txt /app/\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/add-multi-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/add-multi-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /app/a.txt /app/b.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "aaa\nbbb\n");
 }
 
 /// The classic multi-stage pattern: build an artifact in one stage,
