@@ -114,6 +114,23 @@ enum Command {
         /// real `docker`/`podman`.
         #[arg(long)]
         memory: Option<String>,
+        /// Maximum number of CPUs the container's own cgroup may use
+        /// (may be fractional, e.g. `1.5`), matching real `docker run
+        /// --cpus`/`podman run --cpus`. Translated to a CPU-time quota
+        /// over a fixed 100ms period (`quota = cpus * 100_000`,
+        /// microseconds) — checked directly against real `moby`'s own
+        /// `NanoCPUs`-to-`cpu.quota` conversion
+        /// (`daemon/daemon_unix.go`).
+        #[arg(long)]
+        cpus: Option<f64>,
+        /// Maximum number of processes/threads the container's own
+        /// cgroup may create, matching real `docker run
+        /// --pids-limit`/`podman run --pids-limit`. `0` or negative
+        /// means unlimited — matches real `docker`'s own convention
+        /// (`daemon/daemon_unix.go`'s `getPidsLimit`), not a plain
+        /// pass-through of whatever value is given.
+        #[arg(long = "pids-limit")]
+        pids_limit: Option<i64>,
     },
     /// List containers.
     Ps {
@@ -205,7 +222,17 @@ fn main() -> std::process::ExitCode {
                 rm,
                 name,
                 memory,
-            }) => cmd_run(&image, &args, rm, name.as_deref(), memory.as_deref()),
+                cpus,
+                pids_limit,
+            }) => cmd_run(
+                &image,
+                &args,
+                rm,
+                name.as_deref(),
+                memory.as_deref(),
+                cpus,
+                pids_limit,
+            ),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
             Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, &signal),
@@ -350,8 +377,14 @@ fn cmd_run(
     rm: bool,
     name: Option<&str>,
     memory: Option<&str>,
+    cpus: Option<f64>,
+    pids_limit: Option<i64>,
 ) -> anyhow::Result<()> {
     let memory_limit_bytes = memory.map(parse_memory_limit).transpose()?;
+    anyhow::ensure!(
+        cpus.is_none_or(|c| c > 0.0 && c.is_finite()),
+        "--cpus must be a positive, finite number"
+    );
     let reference = Reference::parse(image_ref)
         .with_context(|| format!("parsing image reference {image_ref:?}"))?;
     let store = open_store()?;
@@ -406,6 +439,8 @@ fn cmd_run(
             args,
             &rootfs_dir,
             memory_limit_bytes,
+            cpus,
+            pids_limit,
         )?;
         if let Some(process) = &spec.process {
             state
@@ -817,6 +852,8 @@ fn synthesize_spec(
     args: &[String],
     rootfs: &Path,
     memory_limit_bytes: Option<i64>,
+    cpus: Option<f64>,
+    pids_limit: Option<i64>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -843,33 +880,68 @@ fn synthesize_spec(
 
     spec.hostname = Some(id.to_string());
 
-    if let Some(limit) = memory_limit_bytes {
+    let resources = resources_from_cli(memory_limit_bytes, cpus, pids_limit);
+    if let Some(resources) = resources {
         spec.linux
             .as_mut()
             .expect("Spec::example always sets linux")
-            .resources = Some(oci_spec_types::runtime::LinuxResources {
-            memory: Some(oci_spec_types::runtime::LinuxMemory {
-                limit: Some(limit),
-                // No separate `--memory-swap` flag exists yet, so
-                // default the same way real `docker run --memory`
-                // does when it's left unset too: a *combined*
-                // memory+swap cap of twice the memory limit (i.e. up
-                // to one additional memory limit's worth of real
-                // swap) — checked directly against
-                // `~/git/moby/daemon/daemon_unix.go`'s
-                // `adaptContainerSettings`. Without this, the
-                // container's own cgroup would have *no* swap limit
-                // at all, letting it page out to swap indefinitely
-                // instead of ever actually hitting the OOM killer —
-                // silently defeating the entire point of `--memory`.
-                swap: limit.checked_mul(2),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
+            .resources = Some(resources);
     }
 
     Ok(spec)
+}
+
+/// Build a `LinuxResources` from `ociman run`'s own `--memory`/`--cpus`/
+/// `--pids-limit` flags, `None` if none of the three were given at all
+/// (leaving `spec.linux.resources` untouched, exactly as before any of
+/// these flags existed).
+fn resources_from_cli(
+    memory_limit_bytes: Option<i64>,
+    cpus: Option<f64>,
+    pids_limit: Option<i64>,
+) -> Option<oci_spec_types::runtime::LinuxResources> {
+    if memory_limit_bytes.is_none() && cpus.is_none() && pids_limit.is_none() {
+        return None;
+    }
+    let memory = memory_limit_bytes.map(|limit| oci_spec_types::runtime::LinuxMemory {
+        limit: Some(limit),
+        // No separate `--memory-swap` flag exists yet, so default the
+        // same way real `docker run --memory` does when it's left
+        // unset too: a *combined* memory+swap cap of twice the memory
+        // limit (i.e. up to one additional memory limit's worth of
+        // real swap) — checked directly against
+        // `~/git/moby/daemon/daemon_unix.go`'s
+        // `adaptContainerSettings`. Without this, the container's own
+        // cgroup would have *no* swap limit at all, letting it page
+        // out to swap indefinitely instead of ever actually hitting
+        // the OOM killer — silently defeating the entire point of
+        // `--memory`.
+        swap: limit.checked_mul(2),
+        ..Default::default()
+    });
+    // `--cpus 1.5` -> a quota of 150_000 microseconds over a fixed
+    // 100_000-microsecond (100ms) period, the same fixed period and
+    // conversion real `moby`'s own `NanoCPUs`-handling code uses
+    // (`daemon/daemon_unix.go`: `quota := NanoCPUs * period / 1e9`,
+    // with `period` always `100 * time.Millisecond`).
+    const CPU_PERIOD_USEC: u64 = 100_000;
+    let cpu = cpus.map(|cpus| oci_spec_types::runtime::LinuxCpu {
+        quota: Some((cpus * CPU_PERIOD_USEC as f64).round() as i64),
+        period: Some(CPU_PERIOD_USEC),
+        ..Default::default()
+    });
+    let pids = pids_limit.map(|limit| oci_spec_types::runtime::LinuxPids {
+        // `0` or negative means unlimited, matching real docker's own
+        // convention (`daemon/daemon_unix.go`'s `getPidsLimit`) rather
+        // than passing whatever value was given straight through.
+        limit: Some(if limit > 0 { limit } else { -1 }),
+    });
+    Some(oci_spec_types::runtime::LinuxResources {
+        memory,
+        cpu,
+        pids,
+        ..Default::default()
+    })
 }
 
 /// Parse a `--memory` value the same way real `docker run --memory`/
@@ -1063,5 +1135,54 @@ mod tests {
         assert!(parse_memory_limit("not-a-number").is_err());
         assert!(parse_memory_limit("128x").is_err());
         assert!(parse_memory_limit("99999999999999999999999t").is_err());
+    }
+
+    #[test]
+    fn resources_from_cli_is_none_when_nothing_was_given() {
+        assert!(resources_from_cli(None, None, None).is_none());
+    }
+
+    #[test]
+    fn resources_from_cli_translates_cpus_to_a_quota_over_a_100ms_period() {
+        let resources = resources_from_cli(None, Some(1.5), None).unwrap();
+        let cpu = resources.cpu.unwrap();
+        assert_eq!(cpu.quota, Some(150_000));
+        assert_eq!(cpu.period, Some(100_000));
+    }
+
+    #[test]
+    fn resources_from_cli_pids_limit_zero_or_negative_means_unlimited() {
+        assert_eq!(
+            resources_from_cli(None, None, Some(0))
+                .unwrap()
+                .pids
+                .unwrap()
+                .limit,
+            Some(-1)
+        );
+        assert_eq!(
+            resources_from_cli(None, None, Some(-5))
+                .unwrap()
+                .pids
+                .unwrap()
+                .limit,
+            Some(-1)
+        );
+        assert_eq!(
+            resources_from_cli(None, None, Some(42))
+                .unwrap()
+                .pids
+                .unwrap()
+                .limit,
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn resources_from_cli_combines_all_three_independently() {
+        let resources = resources_from_cli(Some(1024), Some(0.5), Some(10)).unwrap();
+        assert_eq!(resources.memory.unwrap().limit, Some(1024));
+        assert_eq!(resources.cpu.unwrap().quota, Some(50_000));
+        assert_eq!(resources.pids.unwrap().limit, Some(10));
     }
 }

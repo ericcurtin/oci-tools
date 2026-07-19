@@ -23,7 +23,8 @@
 
 use std::io::Write as _;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use oci_spec_types::Reference;
 use oci_spec_types::digest::sha256;
@@ -196,6 +197,226 @@ fn run_memory_limit_actually_gets_enforced_by_the_kernels_own_oom_killer() {
         Some(137),
         "expected the kernel's own OOM killer (SIGKILL, exit 137); got: {out:?}"
     );
+}
+
+/// The actual shell script both `--pids-limit` tests below run: attempt
+/// far more background forks than any reasonable `--pids-limit` would
+/// allow, so the *kernel itself* (not the script) is what decides
+/// whether the loop can finish.
+const FORK_MANY_SCRIPT: &str = "\
+i=0
+while [ $i -lt 50 ]; do
+  sleep 30 &
+  i=$((i + 1))
+done
+echo all-forks-succeeded";
+
+#[test]
+fn run_pids_limit_actually_gets_enforced_by_the_kernels_own_pids_controller() {
+    // Real, kernel-enforced verification: a real container under a
+    // real `--pids-limit 5` whose own shell tries to fork 50 background
+    // processes should hit a real `fork()` failure partway through
+    // (the kernel's own cgroup v2 `pids.max` refusing the `clone()`
+    // outright, matching this project's own earlier confirmed manual
+    // `strace`-free evidence: busybox `sh` reports `can't fork:
+    // Resource temporarily unavailable` and exits non-zero) rather
+    // than ever reaching `echo all-forks-succeeded`.
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/pids-limit:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/pids-limit:latest",
+        &["--pids-limit", "5", "/bin/sh", "-c", FORK_MANY_SCRIPT],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        !out.status.success(),
+        "expected the kernel's own pids controller to abort the fork loop; got: {out:?}"
+    );
+    assert!(
+        !stdout.contains("all-forks-succeeded"),
+        "the fork loop should never have reached its own end: {out:?}"
+    );
+}
+
+#[test]
+fn run_without_pids_limit_can_fork_far_more_than_five_processes() {
+    // The counterpart to the test above: the *same* script, same
+    // image, no `--pids-limit` at all, must complete normally —
+    // proving the failure above is really caused by the limit, not
+    // some unrelated fork-loop fragility.
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/no-pids-limit:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/no-pids-limit:latest",
+        &["/bin/sh", "-c", FORK_MANY_SCRIPT],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("all-forks-succeeded"), "got: {out:?}");
+}
+
+#[test]
+fn run_cpus_flag_sets_the_real_systemd_scopes_own_cpu_quota() {
+    // `--cpus` translates to a *rate* limit (how much CPU time is
+    // available per wall-clock second), not a hard cap that fails an
+    // operation outright the way `--memory`/`--pids-limit` do — there's
+    // no clean, fast, contention-proof way to prove *throttling*
+    // happened without a flaky, timing-based test. Verifying the real
+    // systemd scope's own `CPUQuotaPerSecUSec`/`CPUQuotaPeriodUSec`
+    // properties instead (the same technique
+    // `oci_runtime_core::systemd_cgroup`'s own
+    // `create_scope_migrates_a_real_child_pid_and_leaves_the_caller_
+    // alone` test already established for `MemoryMax`) is deterministic
+    // and still real: it queries the actual running container's own
+    // scope, not a value this test already knows in isolation.
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cpus:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--cpus", "1.5", "ociman-test/cpus:latest"])
+        .args(["/bin/sh", "-c", "sleep 10"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run");
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    assert!(!container_id.is_empty(), "container never appeared in `ps`");
+    // Must actually be `running`, not merely present in `ps -a` (which
+    // also lists a container still in its own earlier `creating`
+    // state) -- `record_running` only fires *after* the systemd scope
+    // (and its own resource properties) has already been created, so
+    // waiting for this status is what guarantees the property query
+    // below isn't racing ahead of the scope's own creation.
+    let status = wait_for_running(storage_dir.path(), &container_id, Duration::from_secs(20));
+    assert_eq!(status, "running", "container never reached `running`");
+    let scope_name = format!("ociman-{container_id}.scope");
+
+    let show = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            &scope_name,
+            "-p",
+            "CPUQuotaPerSecUSec",
+            "--value",
+        ])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let quota = String::from_utf8_lossy(&show.stdout).trim().to_string();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Real `systemd`'s own human-readable rendering of 1.5 CPUs'
+    // worth of quota over its own 100ms period, confirmed by hand
+    // against a real running scope before writing this assertion.
+    assert_eq!(
+        quota, "1.500000s",
+        "expected the real systemd scope's own CPUQuotaPerSecUSec to reflect --cpus 1.5"
+    );
+}
+
+fn wait_for_running(storage_root: &Path, id: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = Command::new(bin_path("ociman"))
+            .env("OCI_TOOLS_STORAGE_ROOT", storage_root)
+            .env_remove("OCI_TOOLS_LOG")
+            .args(["ps", "-a", "--json"])
+            .output()
+            .expect("failed to spawn ociman ps");
+        if out.status.success()
+            && let Ok(views) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            && let Some(entry) = views
+                .as_array()
+                .and_then(|a| a.iter().find(|e| e["id"] == id))
+        {
+            let status = entry["status"].as_str().unwrap_or_default().to_string();
+            if status == "running" || Instant::now() >= deadline {
+                return status;
+            }
+        } else if Instant::now() >= deadline {
+            return String::new();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn only_container_id(storage_root: &Path, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = Command::new(bin_path("ociman"))
+            .env("OCI_TOOLS_STORAGE_ROOT", storage_root)
+            .env_remove("OCI_TOOLS_LOG")
+            .args(["ps", "-a", "-q"])
+            .output()
+            .expect("failed to spawn ociman ps");
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !id.is_empty() || Instant::now() >= deadline {
+            return id;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Same probe `docs/design/0015`'s own cgroup tests (and
+/// `oci_runtime_core::systemd_cgroup`'s own unit tests) already use: a
+/// real, self-cleaning D-Bus round trip rather than just checking a
+/// socket path exists.
+fn systemd_user_session_available() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-system-running"])
+        .output()
+        .is_ok_and(|out| !out.stdout.is_empty())
 }
 
 #[test]
