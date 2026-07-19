@@ -332,13 +332,43 @@ fn a_failing_run_aborts_the_build_and_leaves_nothing_tagged() {
     );
 }
 
+/// A real, end-to-end multi-stage build: the target stage's own `FROM
+/// builder` inherits `builder`'s own already-committed layer (from a
+/// real `RUN` step) and its own config (`ENV FOO=bar`), then adds its
+/// own `ENV BAZ=qux` on top -- no re-pulling, no re-running anything
+/// from `builder`, and the built image's own layer list has exactly
+/// one layer beyond the base (`builder`'s own `RUN`, not a re-run of
+/// it), confirmed both by inspecting the manifest and by actually
+/// running the final image.
 #[test]
-fn rejects_a_multi_stage_dockerfile_with_a_clear_error() {
+fn multi_stage_from_an_earlier_stage_inherits_its_layers_and_config() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
     let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/multi-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+    let base_record = store
+        .resolve_image("docker.io/ociman-test/multi-base:latest")
+        .unwrap()
+        .unwrap();
+    let base_manifest = store.image_manifest(&base_record).unwrap();
+
     let context_dir = tempfile::tempdir().unwrap();
     write_containerfile(
         context_dir.path(),
-        "FROM busybox AS builder\nFROM busybox\n",
+        "FROM ociman-test/multi-base:latest AS builder\n\
+         ENV FOO=bar\n\
+         RUN echo hello > /marker.txt\n\
+         FROM builder\n\
+         ENV BAZ=qux\n",
     );
 
     let build = ociman(
@@ -347,15 +377,108 @@ fn rejects_a_multi_stage_dockerfile_with_a_clear_error() {
             "build",
             context_dir.path().to_str().unwrap(),
             "-t",
-            "x:latest",
+            "ociman-test/multi-result:latest",
         ],
     );
-    assert!(!build.status.success());
-    let stderr = String::from_utf8_lossy(&build.stderr);
     assert!(
-        stderr.contains("multi-stage Dockerfiles are not yet supported"),
-        "{stderr}"
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
     );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/multi-result:latest")
+        .unwrap()
+        .unwrap();
+    let manifest = store.image_manifest(&record).unwrap();
+    // `builder`'s own one real RUN layer, on top of the base image's
+    // own -- never re-run, never re-committed a second time.
+    assert_eq!(manifest.layers.len(), base_manifest.layers.len() + 1);
+
+    let config = store.image_config(&record).unwrap();
+    let cc = config.config.unwrap();
+    assert!(cc.env.contains(&"FOO=bar".to_string()));
+    assert!(cc.env.contains(&"BAZ=qux".to_string()));
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/multi-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /marker.txt && echo FOO=$FOO BAZ=$BAZ",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "hello\nFOO=bar BAZ=qux\n"
+    );
+}
+
+/// A stage nothing later depends on (neither as a `FROM` base nor,
+/// once supported, a `COPY --from=`) is pruned by `stages_needed_for`
+/// and never built at all -- proven here by giving the unrelated
+/// stage a `FROM` reference to an image that doesn't exist anywhere
+/// (not seeded, not a real registry reference this test could ever
+/// pull): if it were built, the whole command would fail; since it
+/// isn't, the build succeeds using only the target stage's own real
+/// base.
+#[test]
+fn an_unreferenced_stage_is_pruned_and_never_built() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/prune-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM this-image-does-not-exist-anywhere:latest AS unrelated\n\
+         LABEL unused=true\n\
+         FROM ociman-test/prune-base:latest\n\
+         LABEL used=true\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/prune-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/prune-result:latest")
+        .unwrap()
+        .unwrap();
+    let config = store.image_config(&record).unwrap();
+    let labels = config.config.unwrap().labels;
+    assert_eq!(labels.get("used").map(String::as_str), Some("true"));
+    assert!(!labels.contains_key("unused"));
 }
 
 #[test]

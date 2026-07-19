@@ -7,12 +7,21 @@
 //!
 //! # Deliberately narrow first scope
 //!
-//! * **Single-stage builds only.** A multi-stage Dockerfile (more than
-//!   one `FROM`) is rejected with a clear error — `oci-dockerfile`'s
-//!   own `resolve_dependencies`/`stages_needed_for` (0043) already
-//!   compute the dependency-ordered build plan a multi-stage build
-//!   would need, but nothing here drives that plan yet (a later
-//!   increment).
+//! * **Multi-stage builds work when a later stage's own `FROM`
+//!   references an earlier stage by name** (`oci_dockerfile::
+//!   resolve_dependencies`/`stages_needed_for`, 0043, compute exactly
+//!   which stages need building, in dependency order, for the target —
+//!   always the *last* stage in the file, matching real `docker
+//!   build`'s own default with no `--target`; unreferenced stages are
+//!   pruned and never built at all). Each stage's own final `ImageConfig`
+//!   and layer list are kept in memory for the rest of the build, so a
+//!   later stage referencing an earlier one as its base starts from
+//!   that stage's own already-committed layers/config — no re-pulling,
+//!   no re-running anything. **`COPY --from=<stage-or-image>` is not
+//!   supported yet** (`resolve_dependencies` deliberately doesn't track
+//!   it as a dependency either, see its own doc comment) — a later
+//!   increment, since it needs its own extension to the dependency
+//!   graph, not just this one's per-stage build loop.
 //! * **`RUN` is supported.** A `RUN` step materializes the base
 //!   image's own layers into a real, persistent scratch rootfs
 //!   (created once per build, reused cumulatively across every `RUN`/
@@ -101,73 +110,67 @@ pub fn cmd_build(
     let (meta_args, stages) =
         oci_dockerfile::group_stages(instructions).map_err(|e| anyhow::anyhow!(e))?;
     anyhow::ensure!(
-        stages.len() == 1,
-        "ociman build: multi-stage Dockerfiles are not yet supported ({} `FROM` stages found in \
-         {}); only a single stage is currently supported",
-        stages.len(),
+        !stages.is_empty(),
+        "ociman build: {} contains no `FROM` instruction",
         dockerfile_path.display()
     );
     let global_args =
         oci_dockerfile::expand_meta_args(&meta_args).map_err(|e| anyhow::anyhow!(e))?;
-    let stage =
-        oci_dockerfile::expand_stage(&global_args, &stages[0]).map_err(|e| anyhow::anyhow!(e))?;
 
-    anyhow::ensure!(
-        !stage.base_name.eq_ignore_ascii_case("scratch"),
-        "ociman build: `FROM scratch` is not yet supported (no base image to extend)"
-    );
+    // The target is always the *last* stage in the file, matching real
+    // `docker build`'s own default when no `--target` is given
+    // (`--target` itself doesn't exist as a flag yet). Stages that
+    // don't actually contribute to it (an unrelated stage, or one only
+    // ever referenced via a not-yet-supported `COPY --from=`) are
+    // pruned by `stages_needed_for` and never built at all.
+    let deps = oci_dockerfile::resolve_dependencies(&stages);
+    let target = stages.len() - 1;
+    let build_order = oci_dockerfile::stages_needed_for(&deps, target);
 
     let store = crate::open_store()?;
-    let base_reference = Reference::parse(&stage.base_name)
-        .with_context(|| format!("parsing base image reference {:?}", stage.base_name))?;
-    let base_record = crate::resolve_or_pull(&store, &base_reference)?;
-    let base_manifest = store
-        .image_manifest(&base_record)
-        .with_context(|| format!("reading manifest for {base_reference}"))?;
-    let mut config = store
-        .image_config(&base_record)
-        .with_context(|| format!("reading config for {base_reference}"))?;
-    let mut layers = base_manifest.layers.clone();
+    let mut built: std::collections::HashMap<usize, BuiltStage> = std::collections::HashMap::new();
+    for &stage_index in &build_order {
+        let stage = oci_dockerfile::expand_stage(&global_args, &stages[stage_index])
+            .map_err(|e| anyhow::anyhow!(e))?;
 
-    // A scratch rootfs is only materialized if this stage actually
-    // touches the filesystem (`RUN`/`COPY`) -- every metadata-only
-    // instruction 0050 already supported never does, so paying for a
-    // tempdir plus a full base-image layer extraction for those
-    // Containerfiles would be pure waste.
-    let needs_rootfs = stage
-        .instructions
-        .iter()
-        .any(|instruction| matches!(instruction, Instruction::Run(_) | Instruction::Copy { .. }));
-    let build_dir = if needs_rootfs {
-        let dir = tempfile::tempdir().context("creating build scratch directory")?;
-        let rootfs_dir = dir.path().join("rootfs");
-        std::fs::create_dir_all(&rootfs_dir)
-            .with_context(|| format!("creating {}", rootfs_dir.display()))?;
-        for layer in &base_manifest.layers {
-            let compression = crate::compression_for_media_type(&layer.media_type)
-                .with_context(|| format!("layer {}", layer.digest))?;
-            let blob = store
-                .open_blob(&layer.digest)
-                .with_context(|| format!("opening layer blob {}", layer.digest))?;
-            oci_layer::apply(blob, compression, &rootfs_dir)
-                .with_context(|| format!("applying base layer {}", layer.digest))?;
-        }
-        Some(dir)
-    } else {
-        None
-    };
-    let rootfs_dir = build_dir.as_ref().map(|dir| dir.path().join("rootfs"));
+        let (base_config, base_layers) = match deps[stage_index] {
+            // `FROM <earlier-stage-name>`: start from that stage's own
+            // already-built config/layers directly -- no store lookup,
+            // no re-pulling, no re-running anything (`stages_needed_
+            // for`'s own ascending order guarantees it was already
+            // built earlier in this same loop).
+            Some(earlier_index) => {
+                let earlier = built.get(&earlier_index).expect(
+                    "stages_needed_for always orders a dependency before its own dependent",
+                );
+                (earlier.config.clone(), earlier.layers.clone())
+            }
+            None => {
+                anyhow::ensure!(
+                    !stage.base_name.eq_ignore_ascii_case("scratch"),
+                    "ociman build: `FROM scratch` is not yet supported (no base image to extend)"
+                );
+                let base_reference = Reference::parse(&stage.base_name).with_context(|| {
+                    format!("parsing base image reference {:?}", stage.base_name)
+                })?;
+                let base_record = crate::resolve_or_pull(&store, &base_reference)?;
+                let base_manifest = store
+                    .image_manifest(&base_record)
+                    .with_context(|| format!("reading manifest for {base_reference}"))?;
+                let base_config = store
+                    .image_config(&base_record)
+                    .with_context(|| format!("reading config for {base_reference}"))?;
+                (base_config, base_manifest.layers.clone())
+            }
+        };
 
-    for instruction in &stage.instructions {
-        apply_instruction(
-            instruction,
-            &mut config,
-            &mut layers,
-            &store,
-            rootfs_dir.as_deref(),
-            context,
-        )?;
+        let built_stage = build_stage(&store, context, &stage, base_config, base_layers)?;
+        built.insert(stage_index, built_stage);
     }
+
+    let BuiltStage { config, layers } = built
+        .remove(&target)
+        .expect("the target stage is always included in its own stages_needed_for result");
 
     let config_bytes = serde_json::to_vec(&config).context("serializing image config")?;
     let config_ingested = store
@@ -210,6 +213,72 @@ pub fn cmd_build(
         println!("tagged: {tag_reference}");
     }
     Ok(())
+}
+
+/// One stage's own final result: everything a *later* stage's own
+/// `FROM <this-stage's-name>` needs to start from (its own `config`
+/// and layer list — already-committed layers, so a dependent stage
+/// can extract them the exact same way it would extract any external
+/// image's own layers), and everything [`cmd_build`] itself needs
+/// once this happens to be the target stage.
+struct BuiltStage {
+    config: ImageConfig,
+    layers: Vec<Descriptor>,
+}
+
+/// Build one already-`$VAR`-expanded [`oci_dockerfile::Stage`] on top
+/// of `base_config`/`base_layers` (either an external image's own, or
+/// an earlier stage's own already-built result — [`cmd_build`] decides
+/// which). Materializes a scratch rootfs only if this stage actually
+/// touches the filesystem (`RUN`/`COPY`) — a stage with neither never
+/// pays for a tempdir or a base-layer extraction, and its own returned
+/// layer list stays byte-identical to `base_layers`.
+fn build_stage(
+    store: &oci_store::Store,
+    context: &Path,
+    stage: &oci_dockerfile::Stage,
+    base_config: ImageConfig,
+    base_layers: Vec<Descriptor>,
+) -> anyhow::Result<BuiltStage> {
+    let mut config = base_config;
+    let mut layers = base_layers;
+
+    let needs_rootfs = stage
+        .instructions
+        .iter()
+        .any(|instruction| matches!(instruction, Instruction::Run(_) | Instruction::Copy { .. }));
+    let build_dir = if needs_rootfs {
+        let dir = tempfile::tempdir().context("creating build scratch directory")?;
+        let rootfs_dir = dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs_dir)
+            .with_context(|| format!("creating {}", rootfs_dir.display()))?;
+        for layer in &layers {
+            let compression = crate::compression_for_media_type(&layer.media_type)
+                .with_context(|| format!("layer {}", layer.digest))?;
+            let blob = store
+                .open_blob(&layer.digest)
+                .with_context(|| format!("opening layer blob {}", layer.digest))?;
+            oci_layer::apply(blob, compression, &rootfs_dir)
+                .with_context(|| format!("applying base layer {}", layer.digest))?;
+        }
+        Some(dir)
+    } else {
+        None
+    };
+    let rootfs_dir = build_dir.as_ref().map(|dir| dir.path().join("rootfs"));
+
+    for instruction in &stage.instructions {
+        apply_instruction(
+            instruction,
+            &mut config,
+            &mut layers,
+            store,
+            rootfs_dir.as_deref(),
+            context,
+        )?;
+    }
+
+    Ok(BuiltStage { config, layers })
 }
 
 /// Real `podman build`'s own default preference when `-f`/`--file`
