@@ -503,6 +503,87 @@ fn run_env_flag_overrides_an_existing_variable_and_adds_a_new_one() {
     );
 }
 
+/// `--hostname` really does set the container's own UTS hostname,
+/// matching real `docker run --hostname`/`podman run --hostname`
+/// exactly -- checked the most direct way available: printing the
+/// real kernel-reported hostname from inside the running container.
+#[test]
+fn run_hostname_flag_sets_the_containers_own_uts_hostname() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/hostname:latest",
+        &busybox,
+        &["sh", "hostname"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--hostname", "my-custom-host"])
+        .args(["ociman-test/hostname:latest"])
+        .args(["/bin/hostname"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "my-custom-host\n");
+}
+
+/// With no `--hostname` given, the container's own hostname defaults
+/// to its own generated id -- matching real `podman`'s own documented
+/// default (`container-libs`'s own vendored `pkg/specgen/specgen.go`:
+/// "will be set to the container ID").
+#[test]
+fn run_without_hostname_flag_defaults_to_the_containers_own_id() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/hostname-default:latest",
+        &busybox,
+        &["sh", "hostname"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--name", "hostname-default-test"])
+        .args(["ociman-test/hostname-default:latest"])
+        .args(["/bin/hostname"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hostname = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // A real, generated 12-hex-char container id -- not the `--name`
+    // given above, which is a separate, human-chosen identifier with
+    // no bearing on the UTS hostname unless `--hostname` is also
+    // given.
+    assert_eq!(hostname.len(), 12, "got {hostname:?}");
+    assert!(
+        hostname.bytes().all(|b| b.is_ascii_hexdigit()),
+        "got {hostname:?}"
+    );
+}
+
 #[test]
 fn run_uses_the_images_default_cmd_and_env() {
     let Some(busybox) = busybox_path() else {

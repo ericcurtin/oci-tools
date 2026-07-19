@@ -66,7 +66,21 @@ struct Cli {
 
 /// Subcommands shipped so far. The rest of the podman-style surface
 /// arrives with later milestones.
+///
+/// `large_enum_variant` allowed deliberately: `Run`'s own many CLI
+/// flags (17 fields and counting) make it much larger than the other
+/// variants, but unlike, say, `oci_runtime_core::launch::RootfsAction`
+/// (which really is constructed many times in a hot per-mount-
+/// operation loop, and boxes its own large field for exactly that
+/// reason), this whole enum is parsed into *once* per process
+/// invocation and immediately destructured in the one `match` below —
+/// there is no hot loop or long-lived collection of `Command` values
+/// anywhere for the "wasted space in smaller variants" concern this
+/// lint exists for to actually matter, and no single field is large
+/// enough that boxing just one of them would meaningfully help
+/// anyway.
 #[derive(Debug, clap::Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Pull an image from a registry into local storage.
     Pull {
@@ -312,6 +326,20 @@ enum Command {
         /// comment for why that distinction is real, not cosmetic).
         #[arg(short, long = "env")]
         env: Vec<String>,
+        /// Set the container's own UTS hostname, matching real
+        /// `docker run --hostname`/`podman run --hostname` exactly.
+        /// Defaults to the container's own generated id (real
+        /// `podman`'s own documented default too — checked directly
+        /// against `container-libs`'s own vendored `pkg/specgen/
+        /// specgen.go`: "will be set to the container ID" when unset
+        /// and the UTS namespace is private, which it always is here).
+        /// No format validation — passed straight through to the
+        /// kernel's own `sethostname(2)`, which rejects a genuinely
+        /// invalid value itself, same as every other pass-through flag
+        /// this project's own CLI already has (`--cpuset-cpus`/
+        /// `--cpuset-mems`).
+        #[arg(long)]
+        hostname: Option<String>,
     },
     /// List containers.
     Ps {
@@ -435,6 +463,7 @@ fn main() -> std::process::ExitCode {
                 privileged,
                 read_only,
                 env,
+                hostname,
             }) => cmd_run(
                 &image,
                 &args,
@@ -452,6 +481,7 @@ fn main() -> std::process::ExitCode {
                 privileged,
                 read_only,
                 &env,
+                hostname.as_deref(),
             ),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
@@ -609,6 +639,7 @@ fn cmd_run(
     privileged: bool,
     read_only: bool,
     env: &[String],
+    hostname: Option<&str>,
 ) -> anyhow::Result<()> {
     let seccomp = resolve_seccomp(security_opts, privileged)?;
     let base_capabilities = if privileged {
@@ -700,6 +731,7 @@ fn cmd_run(
             capabilities,
             read_only,
             env,
+            hostname,
         )?;
         if let Some(process) = &spec.process {
             state
@@ -1156,6 +1188,7 @@ fn synthesize_spec(
     capabilities: Vec<String>,
     read_only: bool,
     env: &[String],
+    hostname: Option<&str>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -1218,7 +1251,12 @@ fn synthesize_spec(
         linux_caps.permitted = capabilities;
     }
 
-    spec.hostname = Some(id.to_string());
+    // Defaults to the container's own generated id, matching real
+    // `podman`'s own documented default ("will be set to the
+    // container ID" when the UTS namespace is private, which it
+    // always is here) — `--hostname` overrides it explicitly, same as
+    // real `docker run --hostname`/`podman run --hostname`.
+    spec.hostname = Some(hostname.unwrap_or(id).to_string());
 
     let linux = spec
         .linux
@@ -1588,9 +1626,11 @@ fn resolve_user(rootfs: &Path, user: &str) -> anyhow::Result<(u32, u32)> {
     Ok((uid, gid))
 }
 
-/// A short, `docker`-style hex container ID (cosmetic only right now:
-/// used as the container's hostname — there is no persistent container
-/// record to key on it yet, see this binary's own module doc comment).
+/// A short, `docker`-style hex container ID — this project's own
+/// persistent container record's real key (`create_container_record`
+/// uses this directly as the id it creates the record under), and
+/// also this container's own default UTS hostname unless `--hostname`
+/// overrides it (`synthesize_spec`'s own doc comment).
 fn short_id() -> String {
     let seed = format!("{:?}-{}", std::time::SystemTime::now(), std::process::id());
     let digest = oci_spec_types::digest::sha256(seed.as_bytes());
