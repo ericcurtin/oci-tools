@@ -567,6 +567,98 @@ fn run_memory_swap_accepts_negative_one_via_the_real_cli_as_unlimited() {
     assert_eq!(swap_max, "infinity");
 }
 
+/// `--cpuset-cpus`/`--cpuset-mems` correctly set the real systemd
+/// scope's own `AllowedCPUs`/`AllowedMemoryNodes` properties -- this
+/// test deliberately only checks *that* (matching the same technique
+/// `--cpus`'s own test above already uses for a rate-limit property),
+/// not that CPU pinning is actually enforced: found by hand, and
+/// documented honestly in `oci_runtime_core::systemd_cgroup`'s own doc
+/// comment and `docs/design/0056`, real rootless `systemd --user`
+/// does not reliably delegate the `cpuset` controller down to this
+/// project's own scopes the way it does for `--memory`/`--cpus`, so a
+/// test asserting real kernel-level enforcement here would be
+/// asserting something not actually true on a typical host.
+#[test]
+fn run_cpuset_flags_set_the_real_systemd_scopes_own_allowed_cpus_property() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cpuset:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "--cpuset-cpus",
+            "0-1",
+            "--cpuset-mems",
+            "0",
+            "ociman-test/cpuset:latest",
+        ])
+        .args(["/bin/sh", "-c", "sleep 10"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run");
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    assert!(!container_id.is_empty(), "container never appeared in `ps`");
+    let status = wait_for_running(storage_dir.path(), &container_id, Duration::from_secs(20));
+    assert_eq!(status, "running", "container never reached `running`");
+    let scope_name = format!("ociman-{container_id}.scope");
+
+    let show_cpus = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            &scope_name,
+            "-p",
+            "AllowedCPUs",
+            "--value",
+        ])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let allowed_cpus = String::from_utf8_lossy(&show_cpus.stdout)
+        .trim()
+        .to_string();
+    let show_mems = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            &scope_name,
+            "-p",
+            "AllowedMemoryNodes",
+            "--value",
+        ])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let allowed_mems = String::from_utf8_lossy(&show_mems.stdout)
+        .trim()
+        .to_string();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(allowed_cpus, "0-1");
+    assert_eq!(allowed_mems, "0");
+}
+
 /// Same real-CLI-not-just-a-unit-test concern as the `--memory-swap
 /// -1` test above, for `--pids-limit -1` specifically (real `docker
 /// run --pids-limit -1`/`podman run --pids-limit -1`'s own "no limit"

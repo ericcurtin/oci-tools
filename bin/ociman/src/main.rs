@@ -180,6 +180,33 @@ enum Command {
         /// closed.
         #[arg(long = "pids-limit", allow_hyphen_values = true)]
         pids_limit: Option<i64>,
+        /// Which CPUs the container's own cgroup may run on
+        /// (`cpuset.cpus`-style range list, e.g. `0-2` or `0,2`),
+        /// matching real `docker run --cpuset-cpus`/`podman run
+        /// --cpuset-cpus`. No syntax validation is done here — same as
+        /// real `docker`, which passes this straight through to the
+        /// runtime spec and lets the kernel reject a malformed value —
+        /// an unparseable string is silently skipped rather than
+        /// applied (see `oci_runtime_core::systemd_cgroup`'s own
+        /// `AllowedCPUs` translation).
+        ///
+        /// **Known limitation, found by hand, not assumed**: on a
+        /// typical rootless host, real `systemd --user` does not
+        /// reliably delegate the `cpuset` controller down to this
+        /// container's own scope the way it does for `--memory`/
+        /// `--cpus` (`man systemd.resource-control` itself warns
+        /// `AllowedCPUs=` "may be limited by parent units") — the
+        /// property is still set correctly, but real kernel-level CPU
+        /// pinning may not actually take effect. See `docs/design/0056`.
+        #[arg(long = "cpuset-cpus")]
+        cpuset_cpus: Option<String>,
+        /// Which NUMA memory nodes the container's own cgroup may use
+        /// (`cpuset.mems`-style range list), matching real `docker run
+        /// --cpuset-mems`/`podman run --cpuset-mems`. Same "no syntax
+        /// validation, kernel/translation-layer rejects a bad value",
+        /// and the same rootless delegation caveat, as `--cpuset-cpus`.
+        #[arg(long = "cpuset-mems")]
+        cpuset_mems: Option<String>,
     },
     /// List containers.
     Ps {
@@ -277,6 +304,8 @@ fn main() -> std::process::ExitCode {
                 memory_swap,
                 cpus,
                 pids_limit,
+                cpuset_cpus,
+                cpuset_mems,
             }) => cmd_run(
                 &image,
                 &args,
@@ -286,6 +315,8 @@ fn main() -> std::process::ExitCode {
                 memory_swap.as_deref(),
                 cpus,
                 pids_limit,
+                cpuset_cpus.as_deref(),
+                cpuset_mems.as_deref(),
             ),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
@@ -435,6 +466,8 @@ fn cmd_run(
     memory_swap: Option<&str>,
     cpus: Option<f64>,
     pids_limit: Option<i64>,
+    cpuset_cpus: Option<&str>,
+    cpuset_mems: Option<&str>,
 ) -> anyhow::Result<()> {
     let memory_limit_bytes = memory.map(parse_memory_limit).transpose()?;
     let memory_swap_bytes = memory_swap.map(parse_memory_swap_limit).transpose()?;
@@ -510,6 +543,8 @@ fn cmd_run(
             memory_swap_bytes,
             cpus,
             pids_limit,
+            cpuset_cpus,
+            cpuset_mems,
         )?;
         if let Some(process) = &spec.process {
             state
@@ -960,6 +995,8 @@ fn synthesize_spec(
     memory_swap_bytes: Option<i64>,
     cpus: Option<f64>,
     pids_limit: Option<i64>,
+    cpuset_cpus: Option<&str>,
+    cpuset_mems: Option<&str>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -1011,7 +1048,14 @@ fn synthesize_spec(
         .as_mut()
         .expect("Spec::example always sets linux");
 
-    let resources = resources_from_cli(memory_limit_bytes, memory_swap_bytes, cpus, pids_limit);
+    let resources = resources_from_cli(
+        memory_limit_bytes,
+        memory_swap_bytes,
+        cpus,
+        pids_limit,
+        cpuset_cpus,
+        cpuset_mems,
+    );
     if let Some(resources) = resources {
         linux.resources = Some(resources);
     }
@@ -1032,16 +1076,24 @@ fn synthesize_spec(
 }
 
 /// Build a `LinuxResources` from `ociman run`'s own `--memory`/
-/// `--memory-swap`/`--cpus`/`--pids-limit` flags, `None` if none of
-/// the four were given at all (leaving `spec.linux.resources`
-/// untouched, exactly as before any of these flags existed).
+/// `--memory-swap`/`--cpus`/`--pids-limit`/`--cpuset-cpus`/
+/// `--cpuset-mems` flags, `None` if none of the six were given at all
+/// (leaving `spec.linux.resources` untouched, exactly as before any of
+/// these flags existed).
 fn resources_from_cli(
     memory_limit_bytes: Option<i64>,
     memory_swap_bytes: Option<i64>,
     cpus: Option<f64>,
     pids_limit: Option<i64>,
+    cpuset_cpus: Option<&str>,
+    cpuset_mems: Option<&str>,
 ) -> Option<oci_spec_types::runtime::LinuxResources> {
-    if memory_limit_bytes.is_none() && cpus.is_none() && pids_limit.is_none() {
+    if memory_limit_bytes.is_none()
+        && cpus.is_none()
+        && pids_limit.is_none()
+        && cpuset_cpus.is_none()
+        && cpuset_mems.is_none()
+    {
         return None;
     }
     let memory = memory_limit_bytes.map(|limit| oci_spec_types::runtime::LinuxMemory {
@@ -1067,11 +1119,22 @@ fn resources_from_cli(
     // (`daemon/daemon_unix.go`: `quota := NanoCPUs * period / 1e9`,
     // with `period` always `100 * time.Millisecond`).
     const CPU_PERIOD_USEC: u64 = 100_000;
-    let cpu = cpus.map(|cpus| oci_spec_types::runtime::LinuxCpu {
-        quota: Some((cpus * CPU_PERIOD_USEC as f64).round() as i64),
-        period: Some(CPU_PERIOD_USEC),
-        ..Default::default()
-    });
+    // `LinuxCpu` is built whenever *any* of `--cpus`/`--cpuset-cpus`/
+    // `--cpuset-mems` is given, not just `--cpus` -- a caller who only
+    // wants to pin a container to specific CPUs/memory nodes, with no
+    // quota at all, still needs a real `LinuxCpu` to carry `cpus`/
+    // `mems` into the spec.
+    let cpu = if cpus.is_some() || cpuset_cpus.is_some() || cpuset_mems.is_some() {
+        Some(oci_spec_types::runtime::LinuxCpu {
+            quota: cpus.map(|cpus| (cpus * CPU_PERIOD_USEC as f64).round() as i64),
+            period: cpus.map(|_| CPU_PERIOD_USEC),
+            cpus: cpuset_cpus.unwrap_or_default().to_string(),
+            mems: cpuset_mems.unwrap_or_default().to_string(),
+            ..Default::default()
+        })
+    } else {
+        None
+    };
     let pids = pids_limit.map(|limit| oci_spec_types::runtime::LinuxPids {
         // `0` or negative means unlimited, matching real docker's own
         // convention (`daemon/daemon_unix.go`'s `getPidsLimit`) rather
@@ -1294,12 +1357,12 @@ mod tests {
 
     #[test]
     fn resources_from_cli_is_none_when_nothing_was_given() {
-        assert!(resources_from_cli(None, None, None, None).is_none());
+        assert!(resources_from_cli(None, None, None, None, None, None).is_none());
     }
 
     #[test]
     fn resources_from_cli_translates_cpus_to_a_quota_over_a_100ms_period() {
-        let resources = resources_from_cli(None, None, Some(1.5), None).unwrap();
+        let resources = resources_from_cli(None, None, Some(1.5), None, None, None).unwrap();
         let cpu = resources.cpu.unwrap();
         assert_eq!(cpu.quota, Some(150_000));
         assert_eq!(cpu.period, Some(100_000));
@@ -1308,7 +1371,7 @@ mod tests {
     #[test]
     fn resources_from_cli_pids_limit_zero_or_negative_means_unlimited() {
         assert_eq!(
-            resources_from_cli(None, None, None, Some(0))
+            resources_from_cli(None, None, None, Some(0), None, None)
                 .unwrap()
                 .pids
                 .unwrap()
@@ -1316,7 +1379,7 @@ mod tests {
             Some(-1)
         );
         assert_eq!(
-            resources_from_cli(None, None, None, Some(-5))
+            resources_from_cli(None, None, None, Some(-5), None, None)
                 .unwrap()
                 .pids
                 .unwrap()
@@ -1324,7 +1387,7 @@ mod tests {
             Some(-1)
         );
         assert_eq!(
-            resources_from_cli(None, None, None, Some(42))
+            resources_from_cli(None, None, None, Some(42), None, None)
                 .unwrap()
                 .pids
                 .unwrap()
@@ -1335,7 +1398,8 @@ mod tests {
 
     #[test]
     fn resources_from_cli_combines_all_four_independently() {
-        let resources = resources_from_cli(Some(1024), None, Some(0.5), Some(10)).unwrap();
+        let resources =
+            resources_from_cli(Some(1024), None, Some(0.5), Some(10), None, None).unwrap();
         assert_eq!(resources.memory.unwrap().limit, Some(1024));
         assert_eq!(resources.cpu.unwrap().quota, Some(50_000));
         assert_eq!(resources.pids.unwrap().limit, Some(10));
@@ -1343,20 +1407,53 @@ mod tests {
 
     #[test]
     fn resources_from_cli_defaults_swap_to_twice_memory_when_unset() {
-        let resources = resources_from_cli(Some(1024), None, None, None).unwrap();
+        let resources = resources_from_cli(Some(1024), None, None, None, None, None).unwrap();
         assert_eq!(resources.memory.unwrap().swap, Some(2048));
     }
 
     #[test]
     fn resources_from_cli_uses_an_explicit_memory_swap_value_untouched() {
-        let resources = resources_from_cli(Some(1024), Some(1500), None, None).unwrap();
+        let resources = resources_from_cli(Some(1024), Some(1500), None, None, None, None).unwrap();
         assert_eq!(resources.memory.unwrap().swap, Some(1500));
     }
 
     #[test]
     fn resources_from_cli_passes_through_unlimited_memory_swap() {
-        let resources = resources_from_cli(Some(1024), Some(-1), None, None).unwrap();
+        let resources = resources_from_cli(Some(1024), Some(-1), None, None, None, None).unwrap();
         assert_eq!(resources.memory.unwrap().swap, Some(-1));
+    }
+
+    #[test]
+    fn resources_from_cli_carries_cpuset_cpus_and_mems_with_no_quota_at_all() {
+        // `--cpuset-cpus`/`--cpuset-mems` alone, with no `--cpus`, must
+        // still produce a real `LinuxCpu` carrying just the cpuset
+        // fields -- pinning a container to specific CPUs/memory nodes
+        // doesn't require a rate quota too.
+        let resources = resources_from_cli(None, None, None, None, Some("0-1"), Some("0")).unwrap();
+        let cpu = resources.cpu.unwrap();
+        assert_eq!(cpu.cpus, "0-1");
+        assert_eq!(cpu.mems, "0");
+        assert_eq!(cpu.quota, None);
+        assert_eq!(cpu.period, None);
+    }
+
+    #[test]
+    fn resources_from_cli_combines_cpus_quota_with_cpuset() {
+        let resources = resources_from_cli(None, None, Some(1.5), None, Some("0-3"), None).unwrap();
+        let cpu = resources.cpu.unwrap();
+        assert_eq!(cpu.quota, Some(150_000));
+        assert_eq!(cpu.cpus, "0-3");
+        assert_eq!(cpu.mems, "");
+    }
+
+    #[test]
+    fn resources_from_cli_is_some_when_only_a_cpuset_flag_is_given() {
+        // Confirms the early "nothing was given at all" check itself
+        // considers `--cpuset-cpus`/`--cpuset-mems`, not just the
+        // four flags that existed before this pair -- giving only one
+        // of them must still produce `Some`, not `None`.
+        assert!(resources_from_cli(None, None, None, None, Some("0"), None).is_some());
+        assert!(resources_from_cli(None, None, None, None, None, Some("0")).is_some());
     }
 
     #[test]

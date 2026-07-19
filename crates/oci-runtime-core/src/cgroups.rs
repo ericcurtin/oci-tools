@@ -112,6 +112,24 @@ fn plan_cpu(cpu: &oci_spec_types::runtime::LinuxCpu, writes: &mut Vec<CgroupWrit
     if let Some(burst) = cpu.burst {
         writes.push(("cpu.max.burst", burst.to_string()));
     }
+    // `cpuset.cpus`/`cpuset.mems` take the same range-list string
+    // (`"0-3,5"`) the runtime-spec's own `cpus`/`mems` fields already
+    // use verbatim, no numeric conversion needed — unlike every other
+    // write in this function. Matches real crun's own
+    // `write_cpuset_resources` (`~/git/crun/src/libcrun/
+    // cgroup-resources.c`), which writes both files directly from the
+    // spec's own strings with no reformatting either. Requires the
+    // `cpuset` controller to already be enabled in this cgroup's own
+    // `cgroup.subtree_control` — this project doesn't enable
+    // additional controllers beyond whatever's already active, a real,
+    // pre-existing scope limit shared with every other write this
+    // function makes (see this module's own doc comment).
+    if !cpu.cpus.is_empty() {
+        writes.push(("cpuset.cpus", cpu.cpus.clone()));
+    }
+    if !cpu.mems.is_empty() {
+        writes.push(("cpuset.mems", cpu.mems.clone()));
+    }
 }
 
 /// `0` -> unset (no write), `-1` -> `"max"`, else the decimal value.
@@ -163,6 +181,56 @@ pub(crate) fn convert_memory_swap_to_v2(memory_swap: i64, memory: i64) -> io::Re
         ));
     }
     Ok(memory_swap - memory)
+}
+
+/// Parse a `cpuset.cpus`/`cpuset.mems`-style range-list string (e.g.
+/// `"0-3,5,7-9"`) into a little-endian bitmask byte array: bit `i`
+/// lives in byte `i / 8`, at position `1 << (i % 8)` within it, bytes
+/// in increasing index order. Ported directly from real `crun`'s own
+/// `cpuset_string_to_bitmask` (`~/git/crun/src/libcrun/utils.c`), not
+/// guessed — real `crun` needs exactly this same conversion for the
+/// identical reason this function exists: `systemd`'s own `AllowedCPUs`/
+/// `AllowedMemoryNodes` D-Bus properties (unlike every other resource
+/// property this project's own systemd driver sets) take a byte-array
+/// bitmask, not the human-readable range-list string cgroupfs itself
+/// accepts verbatim (see `cgroups::plan_cpu`, which passes the same
+/// input straight through with no conversion at all, needing none).
+///
+/// `pub(crate)`, not private: `systemd_cgroup`'s own resource-property
+/// translation (`AllowedCPUs`/`AllowedMemoryNodes`) is the only caller.
+pub(crate) fn cpuset_string_to_bitmask(spec: &str) -> Result<Vec<u8>, String> {
+    let mut mask: Vec<u8> = Vec::new();
+    for range in spec.split(',') {
+        let range = range.trim();
+        let (start, end) = match range.split_once('-') {
+            Some((start, end)) => (
+                start
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("cannot parse input `{spec}`"))?,
+                end.trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("cannot parse input `{spec}`"))?,
+            ),
+            None => {
+                let value = range
+                    .parse::<u32>()
+                    .map_err(|_| format!("cannot parse input `{spec}`"))?;
+                (value, value)
+            }
+        };
+        if end < start || end > (1 << 20) {
+            return Err(format!("cannot parse input `{spec}`"));
+        }
+        let needed_bytes = (end / 8) as usize + 1;
+        if mask.len() < needed_bytes {
+            mask.resize(needed_bytes, 0);
+        }
+        for bit in start..=end {
+            mask[(bit / 8) as usize] |= 1 << (bit % 8);
+        }
+    }
+    Ok(mask)
 }
 
 /// Convert cgroup-v1-style CPU shares (~2-262144, default 1024) to
@@ -384,6 +452,43 @@ mod tests {
     }
 
     #[test]
+    fn cpuset_string_to_bitmask_sets_single_bits() {
+        // CPUs 0 and 2 -> bits 0 and 2 of byte 0 -> 0b0000_0101 = 5.
+        assert_eq!(cpuset_string_to_bitmask("0,2").unwrap(), vec![0b0000_0101]);
+    }
+
+    #[test]
+    fn cpuset_string_to_bitmask_handles_a_range() {
+        // 0-3 -> the low 4 bits of byte 0 set -> 0b0000_1111 = 15.
+        assert_eq!(cpuset_string_to_bitmask("0-3").unwrap(), vec![0b0000_1111]);
+    }
+
+    #[test]
+    fn cpuset_string_to_bitmask_spans_multiple_bytes() {
+        // 0-1 (byte 0) and 8-9 (byte 1).
+        assert_eq!(
+            cpuset_string_to_bitmask("0-1,8-9").unwrap(),
+            vec![0b0000_0011, 0b0000_0011]
+        );
+    }
+
+    #[test]
+    fn cpuset_string_to_bitmask_combines_ranges_and_singles() {
+        // Matches the real fixture value this crate's own
+        // `matches_real_runc_fixture_resources` test already uses:
+        // "0-1" -> bits 0 and 1 set.
+        assert_eq!(cpuset_string_to_bitmask("0-1").unwrap(), vec![0b0000_0011]);
+    }
+
+    #[test]
+    fn cpuset_string_to_bitmask_rejects_garbage() {
+        assert!(cpuset_string_to_bitmask("").is_err());
+        assert!(cpuset_string_to_bitmask("not-a-number").is_err());
+        assert!(cpuset_string_to_bitmask("3-1").is_err()); // decreasing range
+        assert!(cpuset_string_to_bitmask("-1").is_err()); // no negative CPUs
+    }
+
+    #[test]
     fn cpu_shares_default_1024_converts_to_weight_100() {
         assert_eq!(convert_cpu_shares_to_weight(1024), 100);
     }
@@ -467,6 +572,42 @@ mod tests {
     }
 
     #[test]
+    fn cpuset_cpus_and_mems_are_written_verbatim_with_no_numeric_conversion() {
+        let resources = LinuxResources {
+            cpu: Some(LinuxCpu {
+                cpus: "0-3,5".to_string(),
+                mems: "0-1".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_resources(&resources),
+            vec![
+                ("cpuset.cpus", "0-3,5".to_string()),
+                ("cpuset.mems", "0-1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn cpuset_cpus_and_mems_absent_when_unset() {
+        let resources = LinuxResources {
+            cpu: Some(LinuxCpu {
+                quota: Some(50_000),
+                period: Some(100_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            plan_resources(&resources)
+                .iter()
+                .all(|(name, _)| *name != "cpuset.cpus" && *name != "cpuset.mems")
+        );
+    }
+
+    #[test]
     fn pids_limit_writes_pids_max() {
         let resources = LinuxResources {
             pids: Some(LinuxPids { limit: Some(100) }),
@@ -515,6 +656,7 @@ mod tests {
                 ("memory.low", "52428800".to_string()),
                 ("cpu.weight", convert_cpu_shares_to_weight(512).to_string()),
                 ("cpu.max", "50000 100000".to_string()),
+                ("cpuset.cpus", "0-1".to_string()),
                 ("pids.max", "100".to_string()),
             ]
         );

@@ -65,7 +65,9 @@ use zbus::MatchRule;
 use zbus::blocking::{Connection, MessageIterator};
 use zbus::zvariant::{OwnedObjectPath, Value};
 
-use crate::cgroups::{convert_cpu_shares_to_weight, convert_memory_swap_to_v2};
+use crate::cgroups::{
+    convert_cpu_shares_to_weight, convert_memory_swap_to_v2, cpuset_string_to_bitmask,
+};
 
 const SYSTEMD_BUS_NAME: &str = "org.freedesktop.systemd1";
 const SYSTEMD_OBJECT_PATH: &str = "/org/freedesktop/systemd1";
@@ -311,6 +313,56 @@ fn resource_properties(resources: &LinuxResources) -> Vec<(&'static str, Value<'
             properties.push(("CPUQuotaPerSecUSec", Value::from(quota_per_sec)));
             properties.push(("CPUQuotaPeriodUSec", Value::from(period)));
         }
+        // `AllowedCPUs`/`AllowedMemoryNodes` are the only two
+        // properties in this whole function that aren't a plain
+        // integer: real `systemd`'s own D-Bus signature for both is
+        // `ay` (a byte-array bitmask), not the human-readable
+        // range-list string `cgroupfs`'s own `cpuset.cpus`/
+        // `cpuset.mems` accept verbatim (see `cgroups::plan_cpu`,
+        // which needs no such conversion at all) — matches real
+        // `crun`'s own `append_resources`, checked directly. A string
+        // that fails to parse is tolerated (skipped, not a hard
+        // error) rather than failing the whole container launch over
+        // one malformed resource property, the same stance this
+        // function already takes for an invalid combined `--memory`/
+        // `--memory-swap` pair just above.
+        //
+        // A real, honestly-documented limitation, found by hand
+        // against a real rootless `systemd --user` session before
+        // shipping this (not assumed to work just because the other
+        // properties in this function do): setting `AllowedCPUs`/
+        // `AllowedMemoryNodes` is accepted and correctly stored by
+        // systemd (`systemctl --user show <scope> -p AllowedCPUs`
+        // reports the right value back), but — unlike every other
+        // property here — it does *not* reliably cause systemd to
+        // enable the `cpuset` controller down through the cgroup
+        // hierarchy leading to the scope the way setting `MemoryMax`/
+        // `CPUQuota*` reliably enables `memory`/`cpu` (confirmed
+        // directly: `EffectiveCPUs` stays empty and the scope's own
+        // real `cpuset.cpus` cgroupfs file never even gets created,
+        // while the equivalent `memory.max`/`cpu.max` files for
+        // `--memory`/`--cpus` do). `man systemd.resource-control`
+        // itself warns `AllowedCPUs=` "doesn't guarantee ... it may be
+        // limited by parent units" — this project's own rootless
+        // `app.slice`/`user@.service` hierarchy is exactly such a
+        // limiting parent, and delegating `cpuset` further down to an
+        // unprivileged `--user` scope isn't something this project
+        // does (or, as far as could be determined, can straightforwardly
+        // do) yet. The property is still set (so a well-configured host
+        // that *does* delegate `cpuset` benefits from it, and the value
+        // is genuinely correct), but real enforcement on a typical
+        // rootless host is not currently guaranteed — see `docs/design/
+        // 0056`'s own "what's still not here".
+        if !cpu.cpus.is_empty()
+            && let Ok(bitmask) = cpuset_string_to_bitmask(&cpu.cpus)
+        {
+            properties.push(("AllowedCPUs", Value::from(bitmask)));
+        }
+        if !cpu.mems.is_empty()
+            && let Ok(bitmask) = cpuset_string_to_bitmask(&cpu.mems)
+        {
+            properties.push(("AllowedMemoryNodes", Value::from(bitmask)));
+        }
     }
     if let Some(pids) = &resources.pids
         && let Some(limit) = pids.limit
@@ -474,6 +526,47 @@ mod tests {
             Value::from(0u64),
             "swap == memory limit must translate to a swap-only limit of exactly 0"
         );
+    }
+
+    #[test]
+    fn resource_properties_translates_cpuset_cpus_and_mems_into_bitmasks() {
+        let resources = LinuxResources {
+            cpu: Some(oci_spec_types::runtime::LinuxCpu {
+                cpus: "0-1".to_string(),
+                mems: "0".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let properties = resource_properties(&resources);
+        let values: std::collections::HashMap<&str, &Value> = properties
+            .iter()
+            .map(|(name, value)| (*name, value))
+            .collect();
+        // "0-1" -> bits 0 and 1 set -> byte 0b0000_0011 = 3, matching
+        // `cgroups::cpuset_string_to_bitmask`'s own dedicated tests.
+        assert_eq!(*values["AllowedCPUs"], Value::from(vec![0b0000_0011u8]));
+        assert_eq!(
+            *values["AllowedMemoryNodes"],
+            Value::from(vec![0b0000_0001u8])
+        );
+    }
+
+    #[test]
+    fn resource_properties_tolerates_an_unparseable_cpuset_string() {
+        // A malformed `--cpuset-cpus` value is skipped, not a hard
+        // error that would fail the whole container launch over one
+        // resource property -- matches this same function's own
+        // established tolerance for an unconvertible memory+swap pair.
+        let resources = LinuxResources {
+            cpu: Some(oci_spec_types::runtime::LinuxCpu {
+                cpus: "not-a-cpu-list".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let properties = resource_properties(&resources);
+        assert!(properties.iter().all(|(name, _)| *name != "AllowedCPUs"));
     }
 
     #[test]
