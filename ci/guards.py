@@ -58,6 +58,7 @@ CAPABILITY_GROUPS: dict[str, list[str]] = {
     "low-level unix syscalls": ["rustix", "nix"],
     "seccomp-bpf filtering": ["seccompiler", "libseccomp", "libseccomp-sys", "syscallz"],
     "gzip decompression": ["flate2", "libflate", "zune-inflate"],
+    "zstd decompression": ["ruzstd", "zstd", "zstd-safe"],
 }
 
 

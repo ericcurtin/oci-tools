@@ -33,7 +33,10 @@ use oci_spec_types::image::{
 };
 use oci_store::{ImageRecord, Store};
 
-use oci_tools_tests::{bin_path, busybox_path, seed_image, seed_image_with_files};
+use oci_tools_tests::{
+    LayerCompression, bin_path, busybox_path, seed_image, seed_image_with_files,
+    seed_image_with_files_and_compression,
+};
 
 fn ociman_run(storage_root: &Path, image: &str, args: &[&str]) -> std::process::Output {
     Command::new(bin_path("ociman"))
@@ -262,6 +265,45 @@ fn run_rejects_a_named_non_root_user() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("cannot map"), "got stderr: {stderr:?}");
+}
+
+/// Real registries increasingly serve `tar+zstd` layers, not just
+/// `tar+gzip` (see `docs/design/0029`) — this proves `ociman run`
+/// actually extracts one and runs the resulting container, not just
+/// that `oci-layer`'s own unit tests can decompress one in isolation.
+#[test]
+fn run_extracts_a_zstd_compressed_layer() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image_with_files_and_compression(
+        &store,
+        "ociman-test/zstd-layer:latest",
+        &busybox,
+        &["sh"],
+        &[],
+        LayerCompression::Zstd,
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo zstd-layer-worked".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+
+    let out = ociman_run(storage_dir.path(), "ociman-test/zstd-layer:latest", &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("zstd-layer-worked"), "got: {stdout:?}");
 }
 
 /// The bug this whole increment's real-image-first testing approach was

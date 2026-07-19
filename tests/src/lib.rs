@@ -21,7 +21,7 @@ use oci_spec_types::Reference;
 use oci_spec_types::digest::sha256;
 use oci_spec_types::image::{
     ContainerConfig, Descriptor, ImageConfig, ImageManifest, MEDIA_TYPE_IMAGE_CONFIG,
-    MEDIA_TYPE_IMAGE_LAYER_GZIP, MEDIA_TYPE_IMAGE_MANIFEST, RootFs,
+    MEDIA_TYPE_IMAGE_LAYER_GZIP, MEDIA_TYPE_IMAGE_LAYER_ZSTD, MEDIA_TYPE_IMAGE_MANIFEST, RootFs,
 };
 use oci_store::{ImageRecord, Store};
 
@@ -119,6 +119,41 @@ pub fn seed_image_with_files(
     extra_files: &[(&str, &[u8])],
     container_config: ContainerConfig,
 ) {
+    seed_image_with_files_and_compression(
+        store,
+        reference,
+        busybox,
+        applets,
+        extra_files,
+        LayerCompression::Gzip,
+        container_config,
+    );
+}
+
+/// Which compression [`seed_image_with_files_and_compression`] applies
+/// to its one synthetic layer, and correspondingly which media type it
+/// declares in the manifest — real registries serve either, and
+/// `ociman`'s own `compression_for_media_type` has to handle both (see
+/// `tests/tests/ociman_run.rs`'s zstd test).
+#[derive(Debug, Clone, Copy)]
+pub enum LayerCompression {
+    /// `tar+gzip` (the overwhelmingly common real-world case).
+    Gzip,
+    /// `tar+zstd`.
+    Zstd,
+}
+
+/// [`seed_image_with_files`], plus an explicit `compression` choice
+/// instead of always gzip.
+pub fn seed_image_with_files_and_compression(
+    store: &Store,
+    reference: &str,
+    busybox: &Path,
+    applets: &[&str],
+    extra_files: &[(&str, &[u8])],
+    compression: LayerCompression,
+    container_config: ContainerConfig,
+) {
     let mut builder = tar::Builder::new(Vec::new());
     let busybox_bytes = std::fs::read(busybox).unwrap();
     let mut header = tar::Header::new_gnu();
@@ -149,11 +184,24 @@ pub fn seed_image_with_files(
     let tar_bytes = builder.into_inner().unwrap();
     let diff_id = sha256(&tar_bytes);
 
-    // gzip it, exactly like a real registry blob would be.
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(&tar_bytes).unwrap();
-    let gzipped = encoder.finish().unwrap();
-    let layer = store.ingest(gzipped.as_slice()).unwrap();
+    // Compressed exactly like a real registry blob would be, gzip or
+    // zstd depending on what the caller asked for.
+    let (compressed, media_type) = match compression {
+        LayerCompression::Gzip => {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&tar_bytes).unwrap();
+            (encoder.finish().unwrap(), MEDIA_TYPE_IMAGE_LAYER_GZIP)
+        }
+        LayerCompression::Zstd => {
+            let compressed = ruzstd::encoding::compress_to_vec(
+                tar_bytes.as_slice(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            );
+            (compressed, MEDIA_TYPE_IMAGE_LAYER_ZSTD)
+        }
+    };
+    let layer = store.ingest(compressed.as_slice()).unwrap();
 
     let image_config = ImageConfig {
         architecture: Some(std::env::consts::ARCH.to_string()),
@@ -183,7 +231,7 @@ pub fn seed_image_with_files(
             platform: None,
         },
         layers: vec![Descriptor {
-            media_type: MEDIA_TYPE_IMAGE_LAYER_GZIP.to_string(),
+            media_type: media_type.to_string(),
             digest: layer.digest,
             size: layer.size,
             urls: vec![],

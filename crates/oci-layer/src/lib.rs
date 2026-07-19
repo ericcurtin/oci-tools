@@ -48,10 +48,19 @@
 //! gap, not silently "close enough" — flagged here for exactly that
 //! reason.
 //!
+//! # `zstd` layers
+//!
+//! Decompressed via `ruzstd` (pure Rust, MIT, no libzstd dependency —
+//! matches this project's own gzip choice, `flate2`'s Rust backend,
+//! for the same reason). `ruzstd::decoding::StreamingDecoder` expects
+//! its input to be a *single* zstd frame; the format itself allows an
+//! archive to concatenate several, which this crate doesn't handle
+//! (real registries' own zstd layer blobs are, in every real image
+//! this project has pulled so far, a single frame — the overwhelmingly
+//! common shape most encoders produce by default).
+//!
 //! # What isn't handled yet
 //!
-//! * `zstd`-compressed layers (`Compression::Zstd` is accepted by the
-//!   API but not yet implemented — see [`apply`]'s own error for it).
 //! * Device nodes (`mknod`) and FIFOs: skipped rather than attempted,
 //!   since creating a real device node needs `CAP_MKNOD`, which a
 //!   rootless caller never has on the host (this is a real, standing
@@ -71,7 +80,9 @@ pub enum Compression {
     /// `tar+gzip` — the overwhelmingly common real-world case
     /// (`application/vnd.oci.image.layer.v1.tar+gzip`).
     Gzip,
-    /// `tar+zstd` — accepted by the API, not implemented yet.
+    /// `tar+zstd`
+    /// (`application/vnd.oci.image.layer.v1.tar+zstd`) — see this
+    /// module's own doc comment for the single-frame scope limit.
     Zstd,
 }
 
@@ -87,9 +98,12 @@ pub enum LayerError {
     /// corrupt layer would use to write outside the intended rootfs.
     #[error("layer entry path {0:?} escapes the extraction root")]
     PathEscapesRoot(PathBuf),
-    /// [`Compression::Zstd`] was requested; not implemented yet.
-    #[error("zstd-compressed layers are not supported yet")]
-    ZstdNotSupported,
+    /// The zstd frame header itself was malformed (not a tar/gzip
+    /// concern — `ruzstd` validates this eagerly, at construction,
+    /// rather than lazily on the first read the way `flate2`'s own
+    /// gzip decoder does).
+    #[error("invalid zstd stream: {0}")]
+    InvalidZstd(String),
 }
 
 type Result<T> = std::result::Result<T, LayerError>;
@@ -104,7 +118,11 @@ pub fn apply(reader: impl Read, compression: Compression, dest: &Path) -> Result
     match compression {
         Compression::None => apply_tar(reader, dest),
         Compression::Gzip => apply_tar(flate2::read::GzDecoder::new(reader), dest),
-        Compression::Zstd => Err(LayerError::ZstdNotSupported),
+        Compression::Zstd => {
+            let decoder = ruzstd::decoding::StreamingDecoder::new(reader)
+                .map_err(|e| LayerError::InvalidZstd(e.to_string()))?;
+            apply_tar(decoder, dest)
+        }
     }
 }
 
@@ -581,9 +599,30 @@ mod tests {
     }
 
     #[test]
-    fn zstd_is_a_clear_not_yet_error() {
+    fn zstd_compressed_layer_extracts_the_same_as_uncompressed() {
         let dir = tempfile::tempdir().unwrap();
-        let err = apply(io::empty(), Compression::Zstd, dir.path()).unwrap_err();
-        assert!(matches!(err, LayerError::ZstdNotSupported));
+        let data = build_tar(&[Entry::File("z.txt", b"zstd-compressed")]);
+        let zstd_bytes = ruzstd::encoding::compress_to_vec(
+            data.as_slice(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+
+        apply(zstd_bytes.as_slice(), Compression::Zstd, dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("z.txt")).unwrap(),
+            b"zstd-compressed"
+        );
+    }
+
+    #[test]
+    fn a_malformed_zstd_stream_is_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = apply(
+            b"this is not a zstd frame at all".as_slice(),
+            Compression::Zstd,
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, LayerError::InvalidZstd(_)), "{err:?}");
     }
 }
