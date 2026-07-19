@@ -28,30 +28,33 @@
 //!   instructions' own argument text (e.g. `RUN echo $FOO`) is *not
 //!   yet applied* — every [`Instruction`] `parse` produces carries its
 //!   arguments exactly as written. The expansion engine itself
-//!   ([`expand`], in [`shell_expand`]) is implemented and thoroughly
-//!   tested on its own, deliberately *not yet wired into*
-//!   `Instruction` dispatch — see its own module doc comment for
-//!   exactly why (it needs to know each instruction's own accumulated
-//!   `ARG`/`ENV` environment, which only makes sense once
-//!   instructions are grouped into build stages, the next bullet
-//!   below).
+//!   ([`expand`], in [`shell_expand`]) and stage grouping
+//!   ([`group_stages`], in [`stage`] — grouping the flat instruction
+//!   list `parse` produces by `FROM` boundaries, the prerequisite for
+//!   knowing each instruction's own accumulated environment) are both
+//!   implemented and thoroughly tested on their own; actually applying
+//!   `expand` to each stage's own instructions, in order, threading
+//!   the accumulated environment through, is the natural next
+//!   increment that combines them.
 //! - `ONBUILD`, `HEALTHCHECK`, heredocs (`<<EOF ... EOF`), and every
 //!   BuildKit-only flag (`RUN --mount=`, `COPY --link`/`--parents`/
 //!   `--exclude=`, `ADD --link`/`--keep-git-dir`/`--checksum=`/
 //!   `--unpack`) — a Containerfile using any of these fails to parse
 //!   with a clear error, rather than being silently misparsed.
-//! - The build graph (stage DAG, dependency-ordered execution, target
-//!   selection) and build cache this crate's own module doc has
-//!   always planned — `parse` only gets as far as a flat instruction
-//!   list; grouping instructions into stages by their own `FROM`
-//!   boundaries is the next increment.
+//! - Dependency-ordered execution and target-stage selection (`FROM
+//!   builder` referencing an earlier stage by name isn't resolved to
+//!   an actual dependency edge yet — [`find_stage`] exists as the
+//!   building block for that, but nothing calls it that way yet) and
+//!   the build cache this crate's own module doc has always planned.
 
 mod instruction;
 mod lexer;
 mod shell_expand;
+mod stage;
 
 pub use instruction::{AddFlags, CopyFlags, Instruction, ShellOrExec};
 pub use shell_expand::expand;
+pub use stage::{Stage, find_stage, group_stages};
 
 /// Parse a whole Dockerfile/Containerfile's contents into an ordered
 /// list of [`Instruction`]s.
