@@ -119,10 +119,47 @@ enum Command {
     Exec {
         /// The container's ID.
         id: String,
+        /// UID (format: `<uid>[:<gid>]`) — numeric only, matching real
+        /// `runc exec --user`; overriding to a *named* user needs
+        /// `/etc/passwd` resolution inside the rootfs, which is a
+        /// higher-level-tool concern (`ociman exec --user` supports
+        /// it) rather than this low-level runtime's own.
+        #[arg(short, long)]
+        user: Option<String>,
+        /// Current working directory inside the container.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Additional `KEY=value` environment variables, appended to
+        /// (not replacing) the container's own process environment.
+        /// Repeatable.
+        #[arg(short, long = "env")]
+        env: Vec<String>,
         /// Command and arguments to run inside the container.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
     },
+}
+
+/// Parse a `runc exec --user`-style `<uid>[:<gid>]` string: `uid` is
+/// required and numeric; `gid`, if given, is also numeric — no named-
+/// user/group resolution here (that's `ociman exec --user`'s job, via
+/// the container's own `/etc/passwd`/`/etc/group`, not this low-level
+/// runtime's).
+fn parse_numeric_user(s: &str) -> anyhow::Result<(u32, Option<u32>)> {
+    let (uid_str, gid_str) = s.split_once(':').unwrap_or((s, ""));
+    let uid: u32 = uid_str
+        .parse()
+        .with_context(|| format!("--user: {uid_str:?} is not a valid numeric uid"))?;
+    let gid = if gid_str.is_empty() {
+        None
+    } else {
+        Some(
+            gid_str
+                .parse()
+                .with_context(|| format!("--user: {gid_str:?} is not a valid numeric gid"))?,
+        )
+    };
+    Ok((uid, gid))
 }
 
 /// Filename of the OCI runtime-spec bundle configuration, per the spec.
@@ -153,7 +190,13 @@ fn main() -> std::process::ExitCode {
             Some(Command::Start { id }) => cmd_start(&root, &id),
             Some(Command::Kill { id, signal }) => cmd_kill(&root, &id, signal.as_deref()),
             Some(Command::Delete { id, force }) => cmd_delete(&root, &id, force),
-            Some(Command::Exec { id, args }) => cmd_exec(&root, &id, &args),
+            Some(Command::Exec {
+                id,
+                user,
+                cwd,
+                env,
+                args,
+            }) => cmd_exec(&root, &id, user.as_deref(), cwd.as_deref(), &env, &args),
         }
     })
 }
@@ -405,7 +448,14 @@ fn remove_cgroup_directory_if_any(bundle_path: &str) {
     }
 }
 
-fn cmd_exec(root: &Path, id: &str, args: &[String]) -> anyhow::Result<()> {
+fn cmd_exec(
+    root: &Path,
+    id: &str,
+    user: Option<&str>,
+    cwd: Option<&str>,
+    extra_env: &[String],
+    args: &[String],
+) -> anyhow::Result<()> {
     let store = StateStore::open(root)
         .with_context(|| format!("opening container state root {}", root.display()))?;
     let state = store.load(id)?;
@@ -417,12 +467,11 @@ fn cmd_exec(root: &Path, id: &str, args: &[String]) -> anyhow::Result<()> {
         .pid
         .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
 
-    // The exec'd process joins the *same* namespaces, user/capability
-    // set, working directory, and environment the container's own init
-    // process was given at `create`/`run` time — read back from its own
-    // bundle rather than re-specified on this command line, matching
-    // real `runc exec`'s default (no `--user`/`--cwd`/`--env` override
-    // support yet).
+    // The exec'd process joins the *same* namespaces and capability
+    // set the container's own init process was given at `create`/`run`
+    // time, read back from its own bundle — user/cwd/env default the
+    // same way, but `--user`/`--cwd`/`--env` (matching real `runc
+    // exec`'s own flags) can override them per invocation.
     let bundle = oci_runtime_core::Bundle::load(Path::new(&state.bundle))
         .with_context(|| format!("loading bundle from {}", state.bundle))?;
     let process_spec = bundle
@@ -439,13 +488,29 @@ fn cmd_exec(root: &Path, id: &str, args: &[String]) -> anyhow::Result<()> {
         .map(|ns| ns.kind)
         .collect();
 
+    let mut effective_user = process_spec.user.clone();
+    if let Some(user) = user {
+        let (uid, gid) = parse_numeric_user(user)?;
+        effective_user.uid = uid;
+        // Matches real `runc exec`: `--user 1000` alone only overrides
+        // the uid, leaving the container's own default gid in place;
+        // `--user 1000:1000` overrides both.
+        if let Some(gid) = gid {
+            effective_user.gid = gid;
+        }
+    }
+    let mut effective_env = process_spec.env.clone();
+    effective_env.extend(extra_env.iter().cloned());
+
     let request = oci_runtime_core::exec::ExecRequest {
         namespaces,
-        user: process_spec.user.clone(),
+        user: effective_user,
         capabilities: process_spec.capabilities.clone(),
         no_new_privileges: process_spec.no_new_privileges,
-        cwd: process_spec.cwd.clone(),
-        env: process_spec.env.clone(),
+        cwd: cwd
+            .map(str::to_string)
+            .unwrap_or_else(|| process_spec.cwd.clone()),
+        env: effective_env,
         args: args.to_vec(),
     };
 

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use oci_spec_types::image::ContainerConfig;
 use oci_store::Store;
 
-use oci_tools_tests::{bin_path, busybox_path, seed_image};
+use oci_tools_tests::{bin_path, busybox_path, seed_image, seed_image_with_files};
 
 fn ociman(storage_root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin_path("ociman"))
@@ -48,6 +48,21 @@ fn ociman_run_detached(
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to spawn ociman run")
+}
+
+/// Find the (only) container's id via `ps -a -q`, polling briefly
+/// since it may not have been persisted yet the instant `run` was
+/// spawned.
+fn only_container_id(storage_root: &Path, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = ociman(storage_root, &["ps", "-a", "-q"]);
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !id.is_empty() || Instant::now() >= deadline {
+            return id;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Poll `ociman ps -a --json`'s single-container status field until it
@@ -199,4 +214,131 @@ fn exec_refuses_a_container_that_has_already_stopped() {
         !exec.status.success(),
         "exec should refuse an already-stopped container"
     );
+}
+
+#[test]
+fn exec_cwd_and_env_flags_override_the_defaults() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/exec-cwd-env:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            env: vec!["PATH=/bin".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/exec-cwd-env:latest",
+        &["/bin/sh", "-c", "sleep 5"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(5));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(5)),
+        "running"
+    );
+
+    let exec = ociman(
+        storage_dir.path(),
+        &[
+            "exec",
+            "--cwd",
+            "/bin",
+            "--env",
+            "EXEC_TEST_VAR=exec-test-value",
+            &id,
+            "/bin/sh",
+            "-c",
+            "pwd; echo \"$EXEC_TEST_VAR\"; echo \"got:$PATH\"",
+        ],
+    );
+    assert!(
+        exec.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&exec.stdout).into_owned();
+    assert_eq!(
+        stdout.lines().next(),
+        Some("/bin"),
+        "--cwd should override the default cwd (\"/\"): got {stdout:?}"
+    );
+    assert!(stdout.contains("exec-test-value"), "got: {stdout:?}");
+    assert!(
+        stdout.contains("got:/bin"),
+        "the container's own base PATH should still be set (appended to, not replaced): {stdout:?}"
+    );
+
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "--force", &id]);
+}
+
+#[test]
+fn exec_user_flag_resolves_a_named_user_via_the_containers_own_etc_passwd() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image_with_files(
+        &store,
+        "ociman-test/exec-named-user:latest",
+        &busybox,
+        &["sh", "id"],
+        &[(
+            "etc/passwd",
+            b"root:x:0:0:root:/root:/bin/sh\napp:x:1000:1000:App:/home/app:/bin/sh\n".as_slice(),
+        )],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/exec-named-user:latest",
+        &["/bin/sh", "-c", "sleep 5"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(5));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(5)),
+        "running"
+    );
+
+    // "root" is the one name that can fully succeed today (it
+    // resolves to uid 0, the only container uid this rootless runtime
+    // can map) — see docs/design/0024.
+    let exec = ociman(
+        storage_dir.path(),
+        &["exec", "--user", "root", &id, "/bin/sh", "-c", "true"],
+    );
+    assert!(
+        exec.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+
+    // A named user that resolves fine (via the same /etc/passwd) but
+    // to a non-root uid still hits the same "can't map it" wall a
+    // numeric one would.
+    let exec_nonroot = ociman(
+        storage_dir.path(),
+        &["exec", "--user", "app", &id, "/bin/sh", "-c", "true"],
+    );
+    assert!(
+        !exec_nonroot.status.success(),
+        "a named user resolving to a non-root uid should still be rejected"
+    );
+
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "--force", &id]);
 }

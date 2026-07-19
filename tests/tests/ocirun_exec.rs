@@ -115,6 +115,207 @@ fn exec_propagates_its_own_exit_code() {
 }
 
 #[test]
+fn exec_cwd_flag_overrides_the_default_working_directory() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+    std::fs::create_dir(bundle_dir.path().join("rootfs/tmp-cwd-test")).unwrap();
+
+    ocirun_create(root_dir.path(), bundle_dir.path(), "exec-cwd-test");
+    let start = ocirun(root_dir.path(), &["start", "exec-cwd-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-cwd-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let exec = ocirun(
+        root_dir.path(),
+        &[
+            "exec",
+            "--cwd",
+            "/tmp-cwd-test",
+            "exec-cwd-test",
+            "/bin/sh",
+            "-c",
+            "pwd",
+        ],
+    );
+    assert!(
+        exec.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&exec.stdout).trim(),
+        "/tmp-cwd-test"
+    );
+
+    ocirun(root_dir.path(), &["delete", "--force", "exec-cwd-test"]);
+}
+
+#[test]
+fn exec_env_flag_appends_to_the_base_environment() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    ocirun_create(root_dir.path(), bundle_dir.path(), "exec-env-test");
+    let start = ocirun(root_dir.path(), &["start", "exec-env-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-env-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let exec = ocirun(
+        root_dir.path(),
+        &[
+            "exec",
+            "--env",
+            "EXEC_TEST_VAR=exec-test-value",
+            "exec-env-test",
+            "/bin/sh",
+            "-c",
+            "echo \"$EXEC_TEST_VAR\"; echo \"got:$PATH\"",
+        ],
+    );
+    assert!(
+        exec.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&exec.stdout).into_owned();
+    assert!(
+        stdout.contains("exec-test-value"),
+        "the --env var should be set: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("got:/usr/local/sbin"),
+        "the container's own base PATH should still be set (appended to, not replaced): {stdout:?}"
+    );
+
+    ocirun(root_dir.path(), &["delete", "--force", "exec-env-test"]);
+}
+
+#[test]
+fn exec_user_flag_to_root_succeeds() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    ocirun_create(root_dir.path(), bundle_dir.path(), "exec-user-root-test");
+    let start = ocirun(root_dir.path(), &["start", "exec-user-root-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-user-root-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let exec = ocirun(
+        root_dir.path(),
+        &[
+            "exec",
+            "--user",
+            "0:0",
+            "exec-user-root-test",
+            "/bin/sh",
+            "-c",
+            "true",
+        ],
+    );
+    assert!(
+        exec.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+
+    ocirun(
+        root_dir.path(),
+        &["delete", "--force", "exec-user-root-test"],
+    );
+}
+
+#[test]
+fn exec_user_flag_to_a_non_root_uid_is_rejected() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    ocirun_create(root_dir.path(), bundle_dir.path(), "exec-user-nonroot-test");
+    let start = ocirun(root_dir.path(), &["start", "exec-user-nonroot-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-user-nonroot-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let exec = ocirun(
+        root_dir.path(),
+        &[
+            "exec",
+            "--user",
+            "1000",
+            "exec-user-nonroot-test",
+            "/bin/sh",
+            "-c",
+            "true",
+        ],
+    );
+    assert!(
+        !exec.status.success(),
+        "a non-root --user should be rejected: this rootless runtime only maps uid 0"
+    );
+
+    // The container itself must be unaffected by the rejected exec.
+    assert_eq!(
+        oci_tools_tests::state_status(root_dir.path(), "exec-user-nonroot-test"),
+        "running"
+    );
+
+    ocirun(
+        root_dir.path(),
+        &["delete", "--force", "exec-user-nonroot-test"],
+    );
+}
+
+#[test]
 fn exec_refuses_a_container_that_is_not_running() {
     let Some(busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");

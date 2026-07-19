@@ -114,6 +114,21 @@ enum Command {
     Exec {
         /// The container's ID.
         id: String,
+        /// Username or UID, and optionally groupname or GID
+        /// (`<user>[:<group>]`), resolved against the container's own
+        /// `/etc/passwd`/`/etc/group` — matching real `podman exec
+        /// --user`'s own richer (name-or-number) support, unlike the
+        /// numeric-only `ocirun exec --user`.
+        #[arg(short, long)]
+        user: Option<String>,
+        /// Current working directory inside the container.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Additional `KEY=value` environment variables, appended to
+        /// (not replacing) the container's own process environment.
+        /// Repeatable.
+        #[arg(short, long = "env")]
+        env: Vec<String>,
         /// Command and arguments to run inside the container.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
@@ -146,7 +161,13 @@ fn main() -> std::process::ExitCode {
             Some(Command::Run { image, args, rm }) => cmd_run(&image, &args, rm),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
-            Some(Command::Exec { id, args }) => cmd_exec(&id, &args),
+            Some(Command::Exec {
+                id,
+                user,
+                cwd,
+                env,
+                args,
+            }) => cmd_exec(&id, user.as_deref(), cwd.as_deref(), &env, &args),
             Some(Command::Logs { id }) => cmd_logs(&id),
         }
     })
@@ -668,7 +689,13 @@ fn short_id() -> String {
     digest.hex()[..12].to_string()
 }
 
-fn cmd_exec(id: &str, args: &[String]) -> anyhow::Result<()> {
+fn cmd_exec(
+    id: &str,
+    user: Option<&str>,
+    cwd: Option<&str>,
+    extra_env: &[String],
+    args: &[String],
+) -> anyhow::Result<()> {
     let containers = open_container_store()?;
     let state = containers.load(id)?;
     let status = state.effective_status();
@@ -679,11 +706,11 @@ fn cmd_exec(id: &str, args: &[String]) -> anyhow::Result<()> {
         .pid
         .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
 
-    // The exec'd process joins the *same* namespaces, user/capability
-    // set, working directory, and environment the container's own init
-    // process was given, read back from its own bundle — matching real
-    // `podman exec`'s default (no `--user`/`--workdir`/`--env` override
-    // support yet), same as `ocirun exec` (0022).
+    // The exec'd process joins the *same* namespaces and capability
+    // set the container's own init process was given, read back from
+    // its own bundle — user/cwd/env default the same way, but
+    // `--user`/`--cwd`/`--env` (matching real `podman exec`'s own
+    // flags) can override them per invocation.
     let bundle = oci_runtime_core::Bundle::load(Path::new(&state.bundle))
         .with_context(|| format!("loading bundle from {}", state.bundle))?;
     let process_spec = bundle
@@ -700,13 +727,32 @@ fn cmd_exec(id: &str, args: &[String]) -> anyhow::Result<()> {
         .map(|ns| ns.kind)
         .collect();
 
+    let mut effective_user = process_spec.user.clone();
+    if let Some(user) = user {
+        // Resolved against the *container's own* `/etc/passwd`/
+        // `/etc/group` (the same rootfs its init process already
+        // pivoted into) — the same resolution `run` itself uses for
+        // an image's `USER` config field (0024), reused here so
+        // `--user app` works exactly as well as `--user 1000` does.
+        let rootfs = bundle
+            .rootfs_path()
+            .ok_or_else(|| anyhow::anyhow!("bundle at {} has no root", state.bundle))?;
+        let (uid, gid) = resolve_user(&rootfs, user)?;
+        effective_user.uid = uid;
+        effective_user.gid = gid;
+    }
+    let mut effective_env = process_spec.env.clone();
+    effective_env.extend(extra_env.iter().cloned());
+
     let request = oci_runtime_core::exec::ExecRequest {
         namespaces,
-        user: process_spec.user.clone(),
+        user: effective_user,
         capabilities: process_spec.capabilities.clone(),
         no_new_privileges: process_spec.no_new_privileges,
-        cwd: process_spec.cwd.clone(),
-        env: process_spec.env.clone(),
+        cwd: cwd
+            .map(str::to_string)
+            .unwrap_or_else(|| process_spec.cwd.clone()),
+        env: effective_env,
         args: args.to_vec(),
     };
 
