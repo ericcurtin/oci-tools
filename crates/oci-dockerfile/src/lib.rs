@@ -22,20 +22,18 @@
 //! sorted rather than kept in source order; and more — see
 //! [`lexer`]/[`instruction`]'s own doc comments for the specifics).
 //!
+//! `parse` -> [`group_stages`] -> [`expand_meta_args`]/[`expand_stage`]
+//! is the full pipeline so far: raw text to a flat instruction list,
+//! grouped into stages by `FROM` boundaries, then fully `$VAR`/
+//! `${VAR}`-expanded (every instruction field real BuildKit itself
+//! expands — `RUN`/`CMD`/`ENTRYPOINT`/`SHELL`'s own command-line text
+//! is deliberately never touched, see [`expand_stage`]'s own doc
+//! comment) with real per-stage environment scoping (each stage starts
+//! fresh; meta-`ARG`s declared before the first `FROM` only carry into
+//! a stage if re-declared there).
+//!
 //! **Deliberately not implemented yet**, each a separate, later
 //! increment of its own:
-//! - `ARG`/`ENV` variable substitution/interpolation within other
-//!   instructions' own argument text (e.g. `RUN echo $FOO`) is *not
-//!   yet applied* — every [`Instruction`] `parse` produces carries its
-//!   arguments exactly as written. The expansion engine itself
-//!   ([`expand`], in [`shell_expand`]) and stage grouping
-//!   ([`group_stages`], in [`stage`] — grouping the flat instruction
-//!   list `parse` produces by `FROM` boundaries, the prerequisite for
-//!   knowing each instruction's own accumulated environment) are both
-//!   implemented and thoroughly tested on their own; actually applying
-//!   `expand` to each stage's own instructions, in order, threading
-//!   the accumulated environment through, is the natural next
-//!   increment that combines them.
 //! - `ONBUILD`, `HEALTHCHECK`, heredocs (`<<EOF ... EOF`), and every
 //!   BuildKit-only flag (`RUN --mount=`, `COPY --link`/`--parents`/
 //!   `--exclude=`, `ADD --link`/`--keep-git-dir`/`--checksum=`/
@@ -46,12 +44,17 @@
 //!   an actual dependency edge yet — [`find_stage`] exists as the
 //!   building block for that, but nothing calls it that way yet) and
 //!   the build cache this crate's own module doc has always planned.
+//! - `--build-arg` (an external override for a meta-`ARG`'s own
+//!   value) has no representation at all yet — [`expand_meta_args`]
+//!   only ever sees each `ARG`'s own inline default.
 
+mod expand_stage;
 mod instruction;
 mod lexer;
 mod shell_expand;
 mod stage;
 
+pub use expand_stage::{expand_meta_args, expand_stage};
 pub use instruction::{AddFlags, CopyFlags, Instruction, ShellOrExec};
 pub use shell_expand::expand;
 pub use stage::{Stage, find_stage, group_stages};
