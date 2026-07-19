@@ -73,7 +73,7 @@ mod stage;
 pub use commit::{
     CommitLayerError, CommittedLayer, commit_layer, record_empty_history, record_layer,
 };
-pub use dependencies::{resolve_dependencies, stages_needed_for};
+pub use dependencies::{resolve_copy_from_dependencies, resolve_dependencies, stages_needed_for};
 pub use expand_stage::{expand_meta_args, expand_stage};
 pub use instruction::{AddFlags, CopyFlags, Instruction, ShellOrExec};
 pub use shell_expand::expand;

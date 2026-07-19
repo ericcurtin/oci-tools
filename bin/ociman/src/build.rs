@@ -7,21 +7,24 @@
 //!
 //! # Deliberately narrow first scope
 //!
-//! * **Multi-stage builds work when a later stage's own `FROM`
-//!   references an earlier stage by name** (`oci_dockerfile::
-//!   resolve_dependencies`/`stages_needed_for`, 0043, compute exactly
-//!   which stages need building, in dependency order, for the target —
-//!   always the *last* stage in the file, matching real `docker
-//!   build`'s own default with no `--target`; unreferenced stages are
-//!   pruned and never built at all). Each stage's own final `ImageConfig`
-//!   and layer list are kept in memory for the rest of the build, so a
-//!   later stage referencing an earlier one as its base starts from
-//!   that stage's own already-committed layers/config — no re-pulling,
-//!   no re-running anything. **`COPY --from=<stage-or-image>` is not
-//!   supported yet** (`resolve_dependencies` deliberately doesn't track
-//!   it as a dependency either, see its own doc comment) — a later
-//!   increment, since it needs its own extension to the dependency
-//!   graph, not just this one's per-stage build loop.
+//! * **Multi-stage builds work for both kinds of cross-stage
+//!   reference.** A later stage's own `FROM` can reference an earlier
+//!   stage by name (`oci_dockerfile::resolve_dependencies`), and a
+//!   `COPY --from=<stage>` can copy files out of an earlier stage's own
+//!   materialized rootfs (`oci_dockerfile::
+//!   resolve_copy_from_dependencies`, 0054) — `stages_needed_for`
+//!   (0043) combines both into the one set of stages that actually need
+//!   building, in dependency order, for the target (always the *last*
+//!   stage in the file, matching real `docker build`'s own default with
+//!   no `--target`; stages neither kind of reference ever reaches are
+//!   pruned and never built at all). Each built stage's own
+//!   `ImageConfig`, layer list, and (if it has one) rootfs directory are
+//!   kept around for the rest of the build, so a later stage can reuse
+//!   any of them directly — no re-pulling, no re-running anything.
+//!   **`COPY --from=<external-image>`** (a name that isn't any earlier
+//!   stage's own) **is still not supported** — pulling and extracting
+//!   an arbitrary other image just for a `COPY` is its own separate
+//!   future increment.
 //! * **`RUN` is supported.** A `RUN` step materializes the base
 //!   image's own layers into a real, persistent scratch rootfs
 //!   (created once per build, reused cumulatively across every `RUN`/
@@ -33,19 +36,20 @@
 //!   via `oci_dockerfile::commit_layer`/`record_layer` (0048/0049). A
 //!   nonzero exit aborts the whole build, matching real `docker
 //!   build`/`podman build`.
-//! * **`COPY` from the build context is supported, narrowly.** Exactly
-//!   one source at a time (no multiple sources yet), no glob patterns,
-//!   no `--from=<stage-or-image>` (only single-stage builds exist so
-//!   far anyway), no `--chown`/`--chmod` (this project's own rootless
-//!   single-uid-mapping design, and `oci_layer::apply`'s own
-//!   already-documented "doesn't chown" scope limit, apply equally
-//!   here) — each rejected with a clear error rather than silently
-//!   ignored. A supported `COPY` commits a real new layer exactly like
-//!   `RUN` does (via the same diff/`commit_layer`/`record_layer`
-//!   path), just from a plain recursive file copy instead of running a
-//!   command. `ADD` (which also fetches remote URLs and auto-extracts
-//!   local archives, on top of everything `COPY` does) is not
-//!   implemented at all yet — rejected with a clear error, matching
+//! * **`COPY` (from the build context, or `--from=<earlier-stage>`) is
+//!   supported, narrowly.** Exactly one source at a time (no multiple
+//!   sources yet), no glob patterns, no `--from=<external-image>`
+//!   (only an earlier stage in this same file), no `--chown`/`--chmod`
+//!   (this project's own rootless single-uid-mapping design, and
+//!   `oci_layer::apply`'s own already-documented "doesn't chown" scope
+//!   limit, apply equally here) — each rejected with a clear error
+//!   rather than silently ignored. A supported `COPY` commits a real
+//!   new layer exactly like `RUN` does (via the same diff/
+//!   `commit_layer`/`record_layer` path), just from a plain recursive
+//!   file copy instead of running a command. `ADD` (which also fetches
+//!   remote URLs and auto-extracts local archives, on top of
+//!   everything `COPY` does) is not implemented at all yet — rejected
+//!   with a clear error, matching
 //!   this project's own established convention for a deliberately
 //!   unimplemented construct (e.g. `ONBUILD`/`HEALTHCHECK` at parse
 //!   time).
@@ -121,11 +125,20 @@ pub fn cmd_build(
     // `docker build`'s own default when no `--target` is given
     // (`--target` itself doesn't exist as a flag yet). Stages that
     // don't actually contribute to it (an unrelated stage, or one only
-    // ever referenced via a not-yet-supported `COPY --from=`) are
-    // pruned by `stages_needed_for` and never built at all.
+    // referenced via a not-yet-supported `COPY --from=<external
+    // image>`) are pruned by `stages_needed_for` and never built at
+    // all.
     let deps = oci_dockerfile::resolve_dependencies(&stages);
+    let copy_from_deps = oci_dockerfile::resolve_copy_from_dependencies(&stages);
     let target = stages.len() - 1;
-    let build_order = oci_dockerfile::stages_needed_for(&deps, target);
+    let build_order = oci_dockerfile::stages_needed_for(&deps, &copy_from_deps, target);
+
+    // Every stage some *other* stage's own `COPY --from=` reads from
+    // must keep a real rootfs around, even if it has no `RUN`/`COPY`
+    // of its own -- otherwise there would be nothing on disk for that
+    // later `COPY` to read.
+    let copy_from_targets: std::collections::HashSet<usize> =
+        copy_from_deps.iter().flatten().copied().collect();
 
     let store = crate::open_store()?;
     let mut built: std::collections::HashMap<usize, BuiltStage> = std::collections::HashMap::new();
@@ -164,11 +177,24 @@ pub fn cmd_build(
             }
         };
 
-        let built_stage = build_stage(&store, context, &stage, base_config, base_layers)?;
+        let stage_ctx = StageContext {
+            stages: &stages,
+            built: &built,
+        };
+        let force_rootfs = copy_from_targets.contains(&stage_index);
+        let built_stage = build_stage(
+            &store,
+            context,
+            &stage,
+            base_config,
+            base_layers,
+            force_rootfs,
+            &stage_ctx,
+        )?;
         built.insert(stage_index, built_stage);
     }
 
-    let BuiltStage { config, layers } = built
+    let BuiltStage { config, layers, .. } = built
         .remove(&target)
         .expect("the target stage is always included in its own stages_needed_for result");
 
@@ -219,34 +245,66 @@ pub fn cmd_build(
 /// `FROM <this-stage's-name>` needs to start from (its own `config`
 /// and layer list — already-committed layers, so a dependent stage
 /// can extract them the exact same way it would extract any external
-/// image's own layers), and everything [`cmd_build`] itself needs
-/// once this happens to be the target stage.
+/// image's own layers), everything a later stage's own `COPY
+/// --from=<this-stage's-name>` needs to read from (`rootfs_dir`, kept
+/// alive by holding onto `_build_dir` for as long as this `BuiltStage`
+/// itself lives), and everything [`cmd_build`] itself needs once this
+/// happens to be the target stage.
 struct BuiltStage {
     config: ImageConfig,
     layers: Vec<Descriptor>,
+    rootfs_dir: Option<PathBuf>,
+    /// Held only for its `Drop` (cleans up the scratch directory once
+    /// nothing references this stage's own result anymore) —
+    /// `rootfs_dir` above is what every actual read goes through.
+    _build_dir: Option<tempfile::TempDir>,
+}
+
+/// Read-only view of every stage already built earlier in this same
+/// [`cmd_build`] call — what a `COPY --from=<stage>` needs to resolve
+/// its own source root.
+struct StageContext<'a> {
+    stages: &'a [oci_dockerfile::Stage],
+    built: &'a std::collections::HashMap<usize, BuiltStage>,
+}
+
+impl StageContext<'_> {
+    /// The rootfs directory an earlier stage named `name` was built
+    /// into, if `name` matches one (case-insensitively, matching real
+    /// `HasStage`) *and* that stage actually has a rootfs at all
+    /// (always true for a stage [`cmd_build`] itself marked as some
+    /// later `COPY --from=`'s own target — see its own `force_rootfs`
+    /// handling).
+    fn rootfs_for(&self, name: &str) -> Option<&Path> {
+        let index = oci_dockerfile::find_stage(self.stages, name)?;
+        self.built.get(&index)?.rootfs_dir.as_deref()
+    }
 }
 
 /// Build one already-`$VAR`-expanded [`oci_dockerfile::Stage`] on top
 /// of `base_config`/`base_layers` (either an external image's own, or
 /// an earlier stage's own already-built result — [`cmd_build`] decides
-/// which). Materializes a scratch rootfs only if this stage actually
-/// touches the filesystem (`RUN`/`COPY`) — a stage with neither never
-/// pays for a tempdir or a base-layer extraction, and its own returned
-/// layer list stays byte-identical to `base_layers`.
+/// which). Materializes a scratch rootfs if this stage actually
+/// touches the filesystem (`RUN`/`COPY`) *or* `force_rootfs` is set
+/// (some later stage's own `COPY --from=` reads from this one) —
+/// otherwise never pays for a tempdir or a base-layer extraction, and
+/// its own returned layer list stays byte-identical to `base_layers`.
 fn build_stage(
     store: &oci_store::Store,
     context: &Path,
     stage: &oci_dockerfile::Stage,
     base_config: ImageConfig,
     base_layers: Vec<Descriptor>,
+    force_rootfs: bool,
+    stage_ctx: &StageContext<'_>,
 ) -> anyhow::Result<BuiltStage> {
     let mut config = base_config;
     let mut layers = base_layers;
 
-    let needs_rootfs = stage
-        .instructions
-        .iter()
-        .any(|instruction| matches!(instruction, Instruction::Run(_) | Instruction::Copy { .. }));
+    let needs_rootfs = force_rootfs
+        || stage.instructions.iter().any(|instruction| {
+            matches!(instruction, Instruction::Run(_) | Instruction::Copy { .. })
+        });
     let build_dir = if needs_rootfs {
         let dir = tempfile::tempdir().context("creating build scratch directory")?;
         let rootfs_dir = dir.path().join("rootfs");
@@ -275,10 +333,16 @@ fn build_stage(
             store,
             rootfs_dir.as_deref(),
             context,
+            stage_ctx,
         )?;
     }
 
-    Ok(BuiltStage { config, layers })
+    Ok(BuiltStage {
+        config,
+        layers,
+        rootfs_dir,
+        _build_dir: build_dir,
+    })
 }
 
 /// Real `podman build`'s own default preference when `-f`/`--file`
@@ -311,6 +375,7 @@ fn resolve_dockerfile_path(context: &Path, dockerfile: Option<&Path>) -> anyhow:
 /// for exactly which instructions are supported. `rootfs` is `Some`
 /// whenever the stage contains at least one `RUN`/`COPY` (see
 /// [`cmd_build`]); those are the only arms that ever need it.
+#[allow(clippy::too_many_arguments)]
 fn apply_instruction(
     instruction: &Instruction,
     config: &mut ImageConfig,
@@ -318,6 +383,7 @@ fn apply_instruction(
     store: &oci_store::Store,
     rootfs: Option<&Path>,
     context: &Path,
+    stage_ctx: &StageContext<'_>,
 ) -> anyhow::Result<()> {
     match instruction {
         Instruction::Run(shell_or_exec) => {
@@ -334,7 +400,9 @@ fn apply_instruction(
             let rootfs = rootfs.expect(
                 "cmd_build always prepares a rootfs when the stage contains a COPY instruction",
             );
-            copy_instruction(flags, sources, dest, config, layers, store, context, rootfs)?;
+            copy_instruction(
+                flags, sources, dest, config, layers, store, context, rootfs, stage_ctx,
+            )?;
         }
         Instruction::Add { .. } => anyhow::bail!(
             "ociman build: ADD is not yet supported (COPY from the build context is; see this \
@@ -546,12 +614,8 @@ fn copy_instruction(
     store: &oci_store::Store,
     context: &Path,
     rootfs: &Path,
+    stage_ctx: &StageContext<'_>,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        flags.from.is_none(),
-        "ociman build: COPY --from is not yet supported (only copying from the build context \
-         is supported; only single-stage builds exist so far anyway)"
-    );
     anyhow::ensure!(
         flags.chown.is_none(),
         "ociman build: COPY --chown is not yet supported"
@@ -569,18 +633,31 @@ fn copy_instruction(
         !source.contains(['*', '?', '[']),
         "ociman build: COPY wildcard patterns are not yet supported ({source:?})"
     );
-    let command_text = format!("COPY {source} {dest}");
+    let command_text = match &flags.from {
+        Some(from) => format!("COPY --from={from} {source} {dest}"),
+        None => format!("COPY {source} {dest}"),
+    };
 
     // Real Docker/BuildKit rule, checked directly (`parser.go`'s own
-    // `parseCopy`): a source path is always relative to the build
-    // context, even one written with a leading `/` -- `COPY /foo
-    // /bar` copies `<context>/foo`, never a host-absolute `/foo`.
-    let source_path = safe_join(context, source.trim_start_matches('/'))
+    // `parseCopy`): a source path is always relative to its own root
+    // (the build context, or an earlier stage's own rootfs for
+    // `--from=<stage>`), even one written with a leading `/` -- `COPY
+    // /foo /bar` copies `<root>/foo`, never a host-absolute `/foo`.
+    let source_root: &Path = match &flags.from {
+        None => context,
+        Some(from) => stage_ctx.rootfs_for(from).ok_or_else(|| {
+            anyhow::anyhow!(
+                "ociman build: COPY --from={from:?} does not match any earlier stage in this \
+                 Containerfile (copying from an external image is not yet supported)"
+            )
+        })?,
+    };
+    let source_path = safe_join(source_root, source.trim_start_matches('/'))
         .with_context(|| format!("resolving COPY source {source:?}"))?;
     anyhow::ensure!(
         source_path.exists(),
-        "COPY source {source:?} does not exist in the build context ({})",
-        context.display()
+        "COPY source {source:?} does not exist in {}",
+        source_root.display()
     );
 
     // A relative destination is resolved against the working

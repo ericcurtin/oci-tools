@@ -914,3 +914,193 @@ fn copy_rejects_a_missing_source() {
         "a failed build must not leave a partial image tagged"
     );
 }
+
+/// The classic multi-stage pattern: build an artifact in one stage,
+/// then `COPY --from=<that stage>` just the artifact into a fresh
+/// final stage. The final image's own manifest must have exactly one
+/// new layer beyond its own (fresh) base -- `builder`'s own separate
+/// `RUN` layer never becomes part of the final image at all, and
+/// `builder`'s other files (its own base image content aside) never
+/// leak into the final rootfs either.
+#[test]
+fn copy_from_an_earlier_stage_copies_a_real_file_and_discards_the_rest_of_that_stage() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copyfrom-base:latest",
+        &busybox,
+        &["sh", "cat", "ls"],
+        ContainerConfig::default(),
+    );
+    let base_record = store
+        .resolve_image("docker.io/ociman-test/copyfrom-base:latest")
+        .unwrap()
+        .unwrap();
+    let base_manifest = store.image_manifest(&base_record).unwrap();
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copyfrom-base:latest AS builder\n\
+         RUN echo built-artifact > /app.bin\n\
+         FROM ociman-test/copyfrom-base:latest\n\
+         COPY --from=builder /app.bin /usr/local/bin/app.bin\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/copyfrom-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/copyfrom-result:latest")
+        .unwrap()
+        .unwrap();
+    let manifest = store.image_manifest(&record).unwrap();
+    // Exactly one new layer (the COPY) beyond the (fresh, unmodified)
+    // base -- `builder`'s own RUN layer is never part of this image.
+    assert_eq!(manifest.layers.len(), base_manifest.layers.len() + 1);
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/copyfrom-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /usr/local/bin/app.bin && (test -f /app.bin && echo LEAKED || echo CLEAN)",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "built-artifact\nCLEAN\n"
+    );
+}
+
+#[test]
+fn copy_from_rejects_a_name_that_is_not_any_earlier_stage() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copyfrom-reject-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copyfrom-reject-base:latest\n\
+         COPY --from=docker.io/library/alpine:latest /etc/os-release /os-release\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/should-fail:latest",
+        ],
+    );
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("does not match any earlier stage"),
+        "{stderr}"
+    );
+}
+
+/// A stage referenced only via `COPY --from=` (not `FROM`) is still
+/// built (it must be, for the `COPY` to have anything to read), but a
+/// *third* stage nothing at all references is still pruned exactly
+/// like the `FROM`-only pruning test above -- both kinds of cross-
+/// stage reference feed the very same `stages_needed_for` pruning.
+#[test]
+fn an_unreferenced_stage_is_pruned_even_when_another_stage_is_used_only_via_copy_from() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copyfrom-prune-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copyfrom-prune-base:latest AS builder\n\
+         RUN echo hi > /out.txt\n\
+         FROM this-image-does-not-exist-anywhere:latest AS unrelated\n\
+         FROM ociman-test/copyfrom-prune-base:latest\n\
+         COPY --from=builder /out.txt /out.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/copyfrom-prune-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/copyfrom-prune-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /out.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "hi\n");
+}
