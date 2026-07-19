@@ -29,6 +29,11 @@ rustix = { version = "1.1", features = ["thread", "system", "process"] }
 # Pure-Rust zstd decompressor (OCI image layers increasingly use
 # `tar+zstd` rather than `tar+gzip`) -- avoids linking libzstd.
 ruzstd = "0.8"
+# Pure-Rust D-Bus client (the systemd cgroup driver talks to systemd
+# itself over D-Bus, real crun/podman's own default on systemd-based
+# distros) -- avoids linking libdbus.
+zbus = "5"
+zvariant = "5"
 # Pure-Rust seccomp-BPF filter compiler (used in production by AWS
 # Firecracker) -- avoids both hand-rolled BPF instruction encoding and a
 # libseccomp C dependency.

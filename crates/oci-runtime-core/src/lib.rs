@@ -89,6 +89,7 @@ pub mod rootfs;
 pub mod seccomp;
 pub mod signal;
 pub mod state;
+pub mod systemd_cgroup;
 mod time;
 pub mod validate;
 

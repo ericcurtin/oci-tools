@@ -20,6 +20,8 @@ serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zbus.workspace = true
+zvariant.workspace = true
 
 [lints]
 workspace = true

@@ -59,6 +59,7 @@ CAPABILITY_GROUPS: dict[str, list[str]] = {
     "seccomp-bpf filtering": ["seccompiler", "libseccomp", "libseccomp-sys", "syscallz"],
     "gzip decompression": ["flate2", "libflate", "zune-inflate"],
     "zstd decompression": ["ruzstd", "zstd", "zstd-safe"],
+    "D-Bus client": ["zbus", "dbus", "dbus-tokio"],
 }
 
 
