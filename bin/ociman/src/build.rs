@@ -69,11 +69,13 @@
 //!   comment has the exact scope, checked directly against the
 //!   currently-vendored `~/git/moby`'s own archive-detection code) is
 //!   unpacked into the destination directory (created along with any
-//!   missing parents) instead of being copied as one file. A remote
-//!   URL source (`http://`/`https://`) is rejected with a clear error
-//!   — not yet supported, a separate future increment (this project
-//!   has no sanctioned general-purpose HTTP client for build-time use
-//!   outside `oci-registry`'s own registry-protocol-specific one).
+//!   missing parents) instead of being copied as one file. **A remote
+//!   URL source (`http://`/`https://`) is supported too**, fetched via
+//!   [`oci_dockerfile::download`] and never auto-extracted even if it
+//!   looks like an archive (matching real BuildKit's own
+//!   `noDecompress` for exactly this source kind) — see
+//!   `add_instruction`'s own doc comment for the exact, checked-
+//!   directly filename-determination and file-mode rules.
 //! * **`FROM scratch` is rejected too** (no base image to extend —
 //!   producing a genuinely empty rootfs is its own future increment).
 //! * **`--build-arg KEY=value` (or bare `--build-arg KEY`, pulling
@@ -880,11 +882,27 @@ fn copy_instruction(
 /// [`oci_layer::detect_archive`]'s own doc comment has the exact,
 /// checked-against-the-real-source scope) is unpacked into `dest`
 /// instead of being copied as one file, matching real `docker`'s own
-/// documented `ADD` behavior. Remote URL sources
-/// (`http://`/`https://`) are not yet supported — a real, separate
-/// increment (this project has no sanctioned HTTP client for build-time
-/// use yet outside `oci-registry`'s own registry-protocol-specific
-/// one; see `ci/guards.py`'s "one crate per capability" list).
+/// documented `ADD` behavior. A remote URL source (`http://`/
+/// `https://`) is fetched in full via [`oci_dockerfile::download`] and
+/// never auto-extracted even if it looks like an archive — checked
+/// directly against real BuildKit's own `noDecompress = true` for
+/// exactly this source kind (`copy.go`'s own `performCopy`) — and
+/// placed at `dest` directly if `dest` is an explicit, non-`/`-ending
+/// file name, or under a file name the URL/response itself suggests
+/// (see [`oci_dockerfile::download`]'s own doc comment) if `dest` is a
+/// directory, matching real BuildKit's own `getFilenameForDownload`
+/// (erroring with a clear message if `dest` is directory-like and no
+/// file name could be derived, same as the real source's own
+/// `"cannot determine filename for source"`). Written with mode
+/// `0o600`, matching real BuildKit's own temp-file mode for exactly
+/// this source kind (`downloadSource`'s own `os.OpenFile(...,
+/// 0o600)`), which — unlike a locally-copied file — has no "original"
+/// permission bits of its own to preserve. One deliberate
+/// simplification, not present in the real source: the downloaded
+/// file's mtime is never set from the response's own `Last-Modified`
+/// header (real BuildKit does); this project just leaves it at the
+/// time the file was written, a cosmetic difference with no effect on
+/// the built image's own content or correctness.
 #[allow(clippy::too_many_arguments)]
 fn add_instruction(
     flags: &AddFlags,
@@ -908,21 +926,26 @@ fn add_instruction(
         !sources.is_empty(),
         "ociman build: ADD requires at least one source"
     );
-    for source in sources {
-        anyhow::ensure!(
-            !source.starts_with("http://") && !source.starts_with("https://"),
-            "ociman build: ADD from a remote URL is not yet supported ({source:?})"
-        );
-    }
     let command_text = format!("ADD {} {dest}", sources.join(" "));
 
-    let sources = resolve_sources(context, sources, "ADD")?;
+    // Remote URL sources never participate in glob expansion (and
+    // `contains_wildcards` would misfire on a URL's own `?query=`
+    // otherwise) and are never checked against the build context --
+    // resolved separately from local sources, then recombined only
+    // for the shared "more than one source" destination rule below.
+    let local_sources: Vec<String> = sources
+        .iter()
+        .filter(|s| !is_remote_url(s))
+        .cloned()
+        .collect();
+    let url_sources: Vec<&String> = sources.iter().filter(|s| is_remote_url(s)).collect();
+    let local_sources = resolve_sources(context, &local_sources, "ADD")?;
     // Same real Docker/BuildKit rule as `copy_instruction` -- see its
     // own doc comment for the exact source checked directly (against
     // the *expanded* source count, not the number of source arguments
     // as literally written).
     anyhow::ensure!(
-        sources.len() == 1 || dest.ends_with('/'),
+        local_sources.len() + url_sources.len() == 1 || dest.ends_with('/'),
         "ociman build: when using ADD with more than one source file, the destination must be \
          a directory and end with a / ({dest:?})"
     );
@@ -934,7 +957,28 @@ fn add_instruction(
 
     let before = oci_layer::Snapshot::capture(rootfs)
         .with_context(|| format!("capturing rootfs state before {command_text}"))?;
-    for source in &sources {
+    for url in &url_sources {
+        let downloaded =
+            oci_dockerfile::download(url).with_context(|| format!("ADD: downloading {url:?}"))?;
+        let target = if dest.ends_with('/') || dest_path.is_dir() {
+            let file_name = downloaded.suggested_file_name.with_context(|| {
+                format!(
+                    "ociman build: ADD: cannot determine a file name for source {url:?} -- \
+                     destination {dest:?} needs an explicit file name"
+                )
+            })?;
+            dest_path.join(file_name)
+        } else {
+            dest_path.clone()
+        };
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        write_new_file(&target, &downloaded.bytes, 0o600)
+            .with_context(|| format!("writing downloaded {url:?} to {}", target.display()))?;
+    }
+    for source in &local_sources {
         // `ADD` has no `--from` at all (see `AddFlags`'s own doc
         // comment) -- always relative to the build context, unlike
         // `COPY`, which can also reach into an earlier stage's own
@@ -1167,6 +1211,31 @@ fn safe_join(base: &Path, relative: &str) -> anyhow::Result<PathBuf> {
         }
     }
     Ok(out)
+}
+
+/// A real `ADD` remote URL source, matching real BuildKit's own check
+/// (`instructions.go`'s own `IsURL`).
+fn is_remote_url(source: &str) -> bool {
+    source.starts_with("http://") || source.starts_with("https://")
+}
+
+/// Write `bytes` to a brand-new file at `target` with `mode` (subject
+/// to the calling process's own umask, same as any `open()` call --
+/// matching real BuildKit's own `os.OpenFile(..., 0o600)` for exactly
+/// this source kind, which is equally umask-subject).
+fn write_new_file(target: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(target)
+        .with_context(|| format!("creating {}", target.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", target.display()))?;
+    Ok(())
 }
 
 /// Recursively copy `src` to `dest`: a directory is created and its

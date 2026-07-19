@@ -1311,10 +1311,37 @@ fn add_copies_a_non_archive_source_like_copy() {
     );
 }
 
-/// `ADD` from a remote URL is a real, clear, surfaced error -- not
-/// yet supported, not silently treated as a local path.
+/// A tiny, single-response HTTP/1.1 mock -- the same real-loopback-
+/// socket pattern `oci-registry`'s own `client.rs` test module
+/// established, reused here rather than a fake transport.
+fn serve_one_response(response: &'static str) -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        loop {
+            let mut header_line = String::new();
+            reader.read_line(&mut header_line).unwrap();
+            if header_line.trim().is_empty() {
+                break;
+            }
+        }
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    addr
+}
+
+/// `ADD` from a remote URL fetches the real content over a real
+/// socket and places it at an explicit, non-`/`-ending destination
+/// verbatim -- never auto-extracted even though this body is a real
+/// gzip stream, matching real BuildKit's own `noDecompress` for
+/// exactly this source kind (see `add_instruction`'s own doc comment).
 #[test]
-fn add_rejects_a_remote_url_source() {
+fn add_from_remote_url_places_the_downloaded_file_at_an_explicit_destination() {
     let Some(busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");
         return;
@@ -1325,15 +1352,21 @@ fn add_rejects_a_remote_url_source() {
         &store,
         "ociman-test/add-url-base:latest",
         &busybox,
-        &["sh"],
+        &["sh", "cat", "wc"],
         ContainerConfig::default(),
+    );
+
+    let addr = serve_one_response(
+        "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nhello world!",
     );
 
     let context_dir = tempfile::tempdir().unwrap();
     write_containerfile(
         context_dir.path(),
-        "FROM ociman-test/add-url-base:latest\n\
-         ADD https://example.com/file.txt /file.txt\n",
+        &format!(
+            "FROM ociman-test/add-url-base:latest\n\
+             ADD http://{addr}/greeting.txt /downloaded.txt\n"
+        ),
     );
 
     let build = ociman(
@@ -1345,12 +1378,143 @@ fn add_rejects_a_remote_url_source() {
             "ociman-test/add-url-result:latest",
         ],
     );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/add-url-result:latest",
+            "--",
+            "/bin/cat",
+            "/downloaded.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "hello world!");
+}
+
+/// `ADD` from a remote URL into a directory destination derives the
+/// file name from the URL's own path, matching real BuildKit's own
+/// `getFilenameForDownload`.
+#[test]
+fn add_from_remote_url_into_a_directory_derives_the_filename_from_the_url_path() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-url-dir-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let addr =
+        serve_one_response("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc");
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!(
+            "FROM ociman-test/add-url-dir-base:latest\n\
+             ADD http://{addr}/data/report.txt /app/\n"
+        ),
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/add-url-dir-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/add-url-dir-result:latest",
+            "--",
+            "/bin/cat",
+            "/app/report.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "abc");
+}
+
+/// A directory destination with a URL that gives no derivable file
+/// name at all (no path segment, no `Content-Disposition`) is a real,
+/// clear, surfaced error -- matching real BuildKit's own `"cannot
+/// determine filename for source"`.
+#[test]
+fn add_from_remote_url_with_no_derivable_filename_into_a_directory_is_an_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-url-noname-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let addr =
+        serve_one_response("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc");
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!(
+            "FROM ociman-test/add-url-noname-base:latest\n\
+             ADD http://{addr}/ /app/\n"
+        ),
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/add-url-noname-result:latest",
+        ],
+    );
     assert!(!build.status.success());
     let stderr = String::from_utf8_lossy(&build.stderr);
-    assert!(stderr.contains("remote URL"), "{stderr}");
+    assert!(stderr.contains("cannot determine a file name"), "{stderr}");
     assert!(
         store
-            .resolve_image("docker.io/ociman-test/add-url-result:latest")
+            .resolve_image("docker.io/ociman-test/add-url-noname-result:latest")
             .unwrap()
             .is_none(),
         "a failed build must not leave a partial image tagged"
