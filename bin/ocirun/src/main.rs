@@ -5,8 +5,10 @@
 //! `run` (create-and-start in one step), the separate `create`/`start`/
 //! `kill`/`delete` two-phase lifecycle, and `exec` (running an
 //! *additional* process inside an already-running container, joining
-//! its existing namespaces rather than creating new ones). Lifecycle
-//! hooks (`prestart`/`createRuntime`/`startContainer`/...) remain.
+//! its existing namespaces rather than creating new ones).
+//! `poststart`/`poststop` lifecycle hooks run for `run`; the other four
+//! hook points, and hooks for the `create`/`start`/`kill`/`delete`
+//! lifecycle, remain — see `docs/design/0026`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -368,8 +370,39 @@ fn cmd_delete(root: &Path, id: &str, force: bool) -> anyhow::Result<()> {
         }
     }
 
+    remove_cgroup_directory_if_any(&state.bundle);
     store.remove(id)?;
     Ok(())
+}
+
+/// Best-effort cleanup of the cgroup directory (if any) a `create`d
+/// container's own process was migrated into — see
+/// `oci_runtime_core::cgroups::remove`'s own doc comment for why this
+/// is necessary at all (the kernel does not do it on its own). Unlike
+/// `launch::run_reporting_pid` (which always has the bundle already
+/// loaded), `delete` only has `state.bundle`'s path on hand, so this
+/// re-reads `config.json` for the one field it actually needs. A
+/// failure (including the bundle no longer being readable at all,
+/// which can legitimately happen well after the container that used
+/// it is gone) is logged and tolerated: it must never block deleting
+/// the container's own state, which is the whole point of `delete`.
+fn remove_cgroup_directory_if_any(bundle_path: &str) {
+    let Ok(bundle) = oci_runtime_core::Bundle::load(bundle_path) else {
+        return;
+    };
+    let Ok(Some(dir)) = oci_runtime_core::cgroups::directory_for(
+        Path::new("/sys/fs/cgroup"),
+        bundle
+            .spec
+            .linux
+            .as_ref()
+            .and_then(|l| l.cgroups_path.as_deref()),
+    ) else {
+        return;
+    };
+    if let Err(e) = oci_runtime_core::cgroups::remove(&dir) {
+        tracing::warn!(cgroup = %dir.display(), error = %e, "removing cgroup directory (tolerated)");
+    }
 }
 
 fn cmd_exec(root: &Path, id: &str, args: &[String]) -> anyhow::Result<()> {

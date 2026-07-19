@@ -149,8 +149,33 @@ pub unsafe fn run_reporting_pid(
         // isn't a reason to fail the whole `run`.
         let _ = thread.join();
     }
+    remove_cgroup_directory_if_any(bundle);
     run_lifecycle_hooks(bundle, id, 0, "stopped", &Hook::Poststop);
     Ok(process::exit_code_from_wait_status(status))
+}
+
+/// Remove `bundle`'s own cgroup directory (the same one
+/// `build_child_setup` computed and the container's own process
+/// migrated into), now that it has exited and left it empty — see
+/// [`cgroups::remove`]'s own doc comment for why this is necessary at
+/// all (the kernel does not do it on its own) and tolerant of races.
+/// A bundle with no `cgroupsPath` set has nothing to remove; a failure
+/// is logged and tolerated, the same "don't fail the container over
+/// cleanup" reasoning `run_lifecycle_hooks` already applies.
+fn remove_cgroup_directory_if_any(bundle: &Bundle) {
+    let Ok(Some(dir)) = cgroups::directory_for(
+        Path::new(CGROUP_ROOT),
+        bundle
+            .spec
+            .linux
+            .as_ref()
+            .and_then(|l| l.cgroups_path.as_deref()),
+    ) else {
+        return;
+    };
+    if let Err(e) = cgroups::remove(&dir) {
+        tracing::warn!(cgroup = %dir.display(), error = %e, "removing cgroup directory (tolerated)");
+    }
 }
 
 /// Which of the two implemented hook points [`run_lifecycle_hooks`] is

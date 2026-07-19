@@ -237,6 +237,48 @@ pub fn enter(cgroup_dir: &Path) -> io::Result<()> {
     )
 }
 
+/// Remove `cgroup_dir` (the same directory [`directory_for`] computed
+/// and [`enter`] migrated into) once the container's process has
+/// exited and left it empty.
+///
+/// Unlike the interface files `apply` writes, an empty cgroup does
+/// *not* get cleaned up by the kernel on its own — removal is entirely
+/// the caller's job, confirmed against the real kernel's own docs
+/// (`~/git/linux/Documentation/admin-guide/cgroup-v2.rst`: an empty
+/// cgroup is described as "considered empty and can be removed:
+/// `rmdir $CGROUP_NAME`" — presented as something the caller still has
+/// to do, not automatic). Leaving this undone means every container
+/// run with a `cgroupsPath` set leaks one empty directory per
+/// container, forever.
+///
+/// Tolerates the directory already being gone (nothing to clean up —
+/// e.g. a caller that never actually got as far as creating one) and
+/// retries briefly on `ResourceBusy`/`DirectoryNotEmpty`: the kernel
+/// can take a moment after the last process actually exits before
+/// `rmdir` stops seeing the cgroup as populated, the same reason
+/// `ocirun delete`'s own kill-then-poll loop elsewhere in this
+/// codebase exists.
+pub fn remove(cgroup_dir: &Path) -> io::Result<()> {
+    const ATTEMPTS: u32 = 50;
+    for attempt in 0..ATTEMPTS {
+        match std::fs::remove_dir(cgroup_dir) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e)
+                if attempt + 1 < ATTEMPTS
+                    && matches!(
+                        e.kind(),
+                        io::ErrorKind::ResourceBusy | io::ErrorKind::DirectoryNotEmpty
+                    ) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the loop above always returns on its last attempt")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +569,43 @@ mod tests {
             written,
             rustix::process::getpid().as_raw_nonzero().to_string()
         );
+    }
+
+    #[test]
+    fn remove_deletes_an_existing_empty_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("container-cgroup");
+        std::fs::create_dir(&dir).unwrap();
+        remove(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn remove_tolerates_an_already_missing_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("never-existed");
+        remove(&dir).unwrap();
+    }
+
+    #[test]
+    fn remove_retries_past_a_directory_that_only_becomes_empty_later() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("container-cgroup");
+        std::fs::create_dir(&dir).unwrap();
+        let stray_file = dir.join("cgroup.procs");
+        std::fs::write(&stray_file, "").unwrap();
+
+        // Simulate the kernel taking a moment to actually empty the
+        // cgroup out from under us: remove the one thing blocking
+        // `rmdir` from a background thread, shortly after `remove`
+        // itself has already started retrying.
+        let dir_clone = dir.clone();
+        let remover = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            let _ = std::fs::remove_file(dir_clone.join("cgroup.procs"));
+        });
+        remove(&dir).unwrap();
+        remover.join().unwrap();
+        assert!(!dir.exists());
     }
 }

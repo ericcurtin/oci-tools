@@ -319,6 +319,17 @@ fn run_creates_and_enters_the_requested_cgroup() {
         "0::/",
         "got stdout: {stdout:?}"
     );
+
+    // The cgroup directory itself must be gone once `run` returns —
+    // the kernel does not remove an empty cgroup on its own (see
+    // `docs/design/0027`); leaving this unchecked would silently leak
+    // one directory per container run with a `cgroupsPath` forever.
+    let cgroup_dir = Path::new("/sys/fs/cgroup").join(target.trim_start_matches('/'));
+    assert!(
+        !cgroup_dir.exists(),
+        "cgroup directory {} should have been removed after run",
+        cgroup_dir.display()
+    );
 }
 
 #[test]
