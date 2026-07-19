@@ -6,108 +6,219 @@
 //! instruction encoding or linking libseccomp (a C library, which this
 //! project's all-Rust design avoids wherever a real alternative exists).
 //! Goes through `seccompiler`'s JSON frontend (`compile_from_json`,
-//! rebuilding one small JSON document per container via `serde_json`,
-//! never hand-formatted strings) rather than its Rust-typed
+//! rebuilding small JSON documents via `serde_json`, never
+//! hand-formatted strings) rather than its Rust-typed
 //! `SeccompFilter`/`SeccompRule` API: the syscall name -> number table
 //! (`SyscallTable`) those types need is a private implementation detail
 //! of the crate, only reachable through the JSON frontend, which
 //! resolves names internally.
 //!
-//! # A real, verified scope limit: one shared action per profile
+//! # Multi-action profiles: real, common, and not directly supported by `seccompiler`'s own API
 //!
-//! `seccompiler`'s filter model (JSON or Rust API alike) compiles to a
-//! *single* BPF program with exactly two possible outcomes:
-//! `match_action` (any listed syscall rule matched) or `mismatch_action`
-//! (nothing matched). The full OCI seccomp schema allows a *different*
-//! action per `syscalls[]` entry (e.g. one group `SCMP_ACT_ERRNO(1)`,
-//! another `SCMP_ACT_ALLOW`, with yet another `defaultAction` for
-//! everything else — exactly what a real captured `podman`-generated
-//! profile looks like, see `docs/design/0016`).
+//! `seccompiler`'s filter model (JSON or Rust API alike) compiles a
+//! *single* document to a BPF program with exactly two possible
+//! outcomes: `match_action` (any listed syscall rule matched) or
+//! `mismatch_action` (nothing matched). The full OCI seccomp schema
+//! allows a *different* action per `syscalls[]` entry — exactly what a
+//! real captured `podman`-generated profile looks like (`defaultAction:
+//! SCMP_ACT_ERRNO(38)`, one group at `SCMP_ACT_ERRNO(1)`, ~390 syscalls
+//! at `SCMP_ACT_ALLOW`, and even the same syscall name — `socket` —
+//! appearing several times with *different* actions depending on its
+//! own argument values; see this crate's own test fixture,
+//! `podman-generated-config-with-seccomp.json`).
 //!
 //! Installing several *separate*, stacked kernel filters to fake more
-//! than two actions does **not** work in general: per the kernel's own
-//! documentation (`Documentation/userspace-api/seccomp_filter.rst`,
-//! "If multiple filters exist, the return value for the evaluation of a
-//! given system call will always use the highest precedent value" —
-//! `ALLOW` is the *lowest* precedence action), a later, more-permissive
-//! rule can never override an earlier, more-restrictive one once
-//! several filters are stacked, regardless of install order. That's the
-//! opposite of the OCI spec's actual "explicit per-syscall rule
-//! overrides the default, whichever direction" semantics — a `default
-//! -> ERRNO` plus `explicit read/write/... -> ALLOW` profile (the
-//! overwhelmingly common real shape) would come out *wrong*, silently,
-//! if built that way. A single, correct BPF decision chain (what real
-//! `libseccomp` compiles) needs more than this crate's high-level API
-//! exposes.
+//! than two actions does **not** work in general (an earlier increment
+//! of this module tried and rejected exactly that — see
+//! `docs/design/0016`): per the kernel's own documentation
+//! (`Documentation/userspace-api/seccomp_filter.rst`), stacked filters'
+//! results combine by taking the *highest-precedence action across all
+//! of them*, with `ALLOW` the lowest-precedence action of all — so a
+//! `default -> ERRNO` profile with an explicit `ALLOW` override for a
+//! handful of syscalls (the overwhelmingly common real shape, and
+//! exactly the captured profile above) can never be expressed that way:
+//! `ALLOW` can never win against `ERRNO` no matter which order the
+//! filters are installed in.
 //!
-//! So: this only accepts profiles where every `syscalls[]` entry shares
-//! *one* action (matching `seccompiler`'s own two-action model exactly,
-//! with no risk of the precedence trap above) and returns a clear,
-//! loud [`io::ErrorKind::Unsupported`] error otherwise — refusing to
-//! start the container rather than silently enforcing the wrong policy.
-//! Per-syscall argument conditions (`args`) are fully supported within
-//! that scope.
+//! # This module's own approach: one BPF program, assembled from several independently-compiled pieces
+//!
+//! `seccompiler`'s own precedence problem only applies to *multiple
+//! separately-installed kernel filters* — nothing stops a *single* BPF
+//! program from returning whatever action is correct for whatever
+//! syscall matched, entirely under this module's own control. This
+//! module compiles one small, single-syscall document per syscall name
+//! (reusing `seccompiler`'s own, already-tested name resolution and
+//! argument-condition BPF encoding for each one — the genuinely
+//! error-prone part this module still doesn't reimplement), then
+//! assembles all of them into one combined program itself:
+//!
+//! * Every such single-syscall document, read directly from
+//!   `seccompiler`'s own source (`SeccompFilter::append_syscall_chain`,
+//!   `TryFrom<SeccompFilter> for BpfProgram`) rather than assumed,
+//!   always has the exact same shape: a 3-instruction architecture
+//!   check, a 1-instruction "load the syscall number" step, the
+//!   syscall's own rule chain (however many instructions that takes),
+//!   and *always exactly two* trailing `RET <mismatch_action>`
+//!   instructions — one reached if the syscall number matched but its
+//!   own argument conditions didn't (only actually reachable when there
+//!   *are* argument conditions), one reached if the syscall number
+//!   didn't match at all.
+//! * [`to_relocatable_segment`] turns one of these into something safe
+//!   to paste immediately after another: the leading 4 instructions
+//!   (architecture check + "load syscall number", both purely
+//!   redundant after the very first segment) are dropped outright —
+//!   safe because classic BPF has no backward jumps at all, so nothing
+//!   later ever jumps back into a dropped header — while the trailing
+//!   two `RET` instructions are *rewritten in place* to an
+//!   unconditional "fall through to the next instruction" no-op
+//!   (`JA 0`), **not stripped**. Rewriting rather than stripping is the
+//!   one genuinely subtle part of this design: every jump elsewhere in
+//!   the segment that targets one of these two positions was computed
+//!   as a fixed relative offset from its own position, assuming these
+//!   two instructions physically exist right there; stripping them
+//!   would shift everything that follows and silently send those jumps
+//!   to the wrong place. Rewriting them in place keeps every position —
+//!   and therefore every other jump's own already-correct offset —
+//!   byte for byte identical; only the *meaning* of reaching one of
+//!   these two positions changes, from "return this segment's own
+//!   placeholder action" to "keep going into whatever comes next".
+//! * Every segment (in the exact order its syscall name appeared in
+//!   `syscalls[]`, so a name repeated with different, order-sensitive
+//!   conditions — like the real captured profile's own `socket` case —
+//!   is tried in the same order a real profile author intended) is
+//!   concatenated, and one final, real `RET <defaultAction>`
+//!   instruction is appended after all of them.
+//!
+//! Verified against a real kernel (a scratch program, deleted after,
+//! per this project's own established discipline) before writing any
+//! of the code above: a combined program with three different actions
+//! (an `ERRNO` override for one syscall, an `ALLOW` override — the
+//! "wrong direction" case stacking can't express — for another despite
+//! a stricter `ERRNO` default, and an argument-conditioned rule mixed
+//! in alongside both) produced exactly the right result for every case,
+//! including the specific "argument conditions present but not matched"
+//! path this rewrite-in-place scheme has to get right (a first,
+//! simpler version of this module that only stripped the two trailing
+//! instructions outright — never rewrote them — passed every check
+//! *except* that one: a `kill()` call whose arguments didn't match its
+//! own rule fell all the way through into unfiltered kernel behavior
+//! rather than the intended default action, exactly the "jump target
+//! silently wrong for a case that happens to also be dead code in the
+//! simpler, no-argument-conditions case" bug this doc comment's own
+//! "rewrite, don't strip" reasoning above explains).
 
 use std::io;
 
-use oci_spec_types::runtime::LinuxSeccomp;
+use oci_spec_types::runtime::{LinuxSeccomp, LinuxSeccompArg};
+use seccompiler::sock_filter;
 use serde_json::{Value, json};
+
+/// `BPF_JMP | BPF_JA`: an unconditional "jump 0 instructions forward",
+/// i.e. fall through to whatever immediately follows — see
+/// [`to_relocatable_segment`]'s own doc comment for why this module
+/// rewrites two specific instructions in every compiled segment to
+/// this exact value.
+const BPF_JMP_JA_NOOP: sock_filter = sock_filter {
+    code: 0x05,
+    jt: 0,
+    jf: 0,
+    k: 0,
+};
 
 /// Compile `seccomp` to a BPF program and install it (via `seccomp(2)`)
 /// for the calling (single-threaded) process.
 pub fn apply(seccomp: &LinuxSeccomp) -> io::Result<()> {
-    let mismatch_action = action_json(&seccomp.default_action, seccomp.default_errno_ret)?;
+    let arch = std::env::consts::ARCH
+        .try_into()
+        .map_err(|e: seccompiler::BackendError| {
+            io::Error::new(io::ErrorKind::Unsupported, e.to_string())
+        })?;
+    let default_action = action_value(&seccomp.default_action, seccomp.default_errno_ret)?;
 
-    let mut match_action: Option<Value> = None;
-    let mut match_action_name = String::new();
-    let mut filter = Vec::with_capacity(seccomp.syscalls.len());
+    // Degenerate case (no explicit `syscalls[]` rules at all -- every
+    // syscall gets `defaultAction`): none of the combining machinery
+    // below is needed, or even possible (there's no segment to borrow
+    // an architecture-check header from). A single, ordinary
+    // `seccompiler` document with an empty `filter` array already
+    // does exactly this on its own.
+    if seccomp.syscalls.is_empty() {
+        let placeholder = if seccomp.default_action == "SCMP_ACT_ALLOW" {
+            json!("trap")
+        } else {
+            json!("allow")
+        };
+        let mismatch_action = action_json(&seccomp.default_action, seccomp.default_errno_ret)?;
+        let program = compile_document(arch, &mismatch_action, &placeholder, &[])?;
+        return seccompiler::apply_filter(&program).map_err(|e| io::Error::other(e.to_string()));
+    }
+
+    let mut combined: Vec<sock_filter> = Vec::new();
+    let mut first = true;
     for syscall in &seccomp.syscalls {
-        let action = action_json(&syscall.action, syscall.errno_ret)?;
-        match &match_action {
-            None => {
-                match_action_name = syscall.action.clone();
-                match_action = Some(action);
-            }
-            Some(shared) if *shared == action => {}
-            Some(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!(
-                        "seccomp profiles with more than one distinct action across \
-                         `syscalls` entries are not supported yet (had `{match_action_name}` \
-                         and `{}`; see oci_runtime_core::seccomp's doc comment for why)",
-                        syscall.action
-                    ),
-                ));
-            }
-        }
+        let match_action = action_json(&syscall.action, syscall.errno_ret)?;
         for name in &syscall.names {
-            let mut rule = json!({ "syscall": name });
-            if !syscall.args.is_empty() {
-                let args = syscall
-                    .args
-                    .iter()
-                    .map(|arg| {
-                        Ok(json!({
-                            "index": arg.index,
-                            "type": "qword",
-                            "op": op_json(&arg.op, arg.value_two)?,
-                            "val": arg.value,
-                        }))
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
-                rule["args"] = Value::Array(args);
-            }
-            filter.push(rule);
+            let segment = compile_single_syscall(arch, name, &match_action, &syscall.args)?;
+            combined.extend(to_relocatable_segment(segment, first));
+            first = false;
         }
     }
-    // No explicit rules at all: `match_action` is never reached (an
-    // empty `filter` array always returns `mismatch_action`), so any
-    // placeholder satisfies `seccompiler`'s schema.
-    let match_action = match_action.unwrap_or(json!("allow"));
+    combined.push(sock_filter {
+        code: 0x06, // BPF_RET | BPF_K
+        jt: 0,
+        jf: 0,
+        k: u32::from(default_action),
+    });
 
+    seccompiler::apply_filter(&combined).map_err(|e| io::Error::other(e.to_string()))
+}
+
+/// Compile a document matching exactly one syscall (`name`, with
+/// `args` conditions if any) to `match_action`, paired with an
+/// arbitrary `mismatch_action` placeholder distinct from it (the value
+/// never actually matters on its own — see [`to_relocatable_segment`],
+/// which overwrites both of a compiled program's own trailing
+/// mismatch-action `RET`s regardless of what they were).
+fn compile_single_syscall(
+    arch: seccompiler::TargetArch,
+    name: &str,
+    match_action: &Value,
+    args: &[LinuxSeccompArg],
+) -> io::Result<Vec<sock_filter>> {
+    let placeholder = if *match_action == json!("allow") {
+        json!("trap")
+    } else {
+        json!("allow")
+    };
+    let mut rule = json!({ "syscall": name });
+    if !args.is_empty() {
+        let args_json = args
+            .iter()
+            .map(|arg| {
+                Ok(json!({
+                    "index": arg.index,
+                    "type": "qword",
+                    "op": op_json(&arg.op, arg.value_two)?,
+                    "val": arg.value,
+                }))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        rule["args"] = Value::Array(args_json);
+    }
+    compile_document(arch, match_action, &placeholder, &[rule])
+}
+
+/// Build and compile a single `seccompiler` JSON document (one
+/// `mismatch_action`/`match_action`/`filter` document, matching the
+/// shape `seccompiler`'s own JSON frontend expects), returning the
+/// resulting compiled program.
+fn compile_document(
+    arch: seccompiler::TargetArch,
+    match_action: &Value,
+    mismatch_action: &Value,
+    filter: &[Value],
+) -> io::Result<Vec<sock_filter>> {
     let document = json!({
-        "container": {
+        "s": {
             "mismatch_action": mismatch_action,
             "match_action": match_action,
             "filter": filter,
@@ -115,34 +226,77 @@ pub fn apply(seccomp: &LinuxSeccomp) -> io::Result<()> {
     });
     let bytes = serde_json::to_vec(&document)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-
-    let arch = std::env::consts::ARCH
-        .try_into()
-        .map_err(|e: seccompiler::BackendError| {
-            io::Error::new(io::ErrorKind::Unsupported, e.to_string())
-        })?;
     let mut map = seccompiler::compile_from_json(bytes.as_slice(), arch)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-    let program = map
-        .remove("container")
-        .expect("compile_from_json preserves the single key this document defines");
-    seccompiler::apply_filter(&program).map_err(|e| io::Error::other(e.to_string()))
+    Ok(map
+        .remove("s")
+        .expect("compile_from_json preserves the single key this document defines"))
+}
+
+/// Turn a [`compile_single_syscall`] output into something safe to
+/// concatenate immediately after another such output (`is_first`:
+/// whether this is the very first segment in the combined program,
+/// which alone keeps its own architecture-check header) — see this
+/// module's own doc comment for the full reasoning.
+fn to_relocatable_segment(program: Vec<sock_filter>, is_first: bool) -> Vec<sock_filter> {
+    let mut segment = if is_first {
+        program
+    } else {
+        // Drop the leading architecture check (3 instructions) and the
+        // shared "load the syscall number" step (1 instruction) --
+        // purely redundant after the first segment, and safe to drop
+        // since classic BPF has no backward jumps for anything later
+        // to rely on finding them still there.
+        program[4..].to_vec()
+    };
+    let len = segment.len();
+    debug_assert!(
+        len >= 2,
+        "a compiled single-syscall document should always have at least its own two \
+         trailing mismatch-action RET instructions"
+    );
+    for slot in &mut segment[len.saturating_sub(2)..] {
+        *slot = BPF_JMP_JA_NOOP;
+    }
+    segment
 }
 
 /// Map an `SCMP_ACT_*` name (plus its `errnoRet`, when the action needs
-/// one) to `seccompiler`'s JSON action representation.
+/// one) to `seccompiler`'s JSON action representation — used for the
+/// per-syscall `match_action`s embedded in a compiled document (see
+/// [`compile_single_syscall`]).
 fn action_json(name: &str, errno_ret: Option<u32>) -> io::Result<Value> {
-    // The runtime-spec's own documented default when `errnoRet` (or
-    // `defaultErrnoRet`) is unset for an `ERRNO`/`TRACE` action.
-    const DEFAULT_ERRNO: u32 = libc::EPERM as u32;
+    Ok(match action_value(name, errno_ret)? {
+        seccompiler::SeccompAction::Allow => json!("allow"),
+        seccompiler::SeccompAction::Errno(errno) => json!({ "errno": errno }),
+        seccompiler::SeccompAction::KillThread => json!("kill_thread"),
+        seccompiler::SeccompAction::KillProcess => json!("kill_process"),
+        seccompiler::SeccompAction::Trap => json!("trap"),
+        seccompiler::SeccompAction::Log => json!("log"),
+        seccompiler::SeccompAction::Trace(trace) => json!({ "trace": trace }),
+    })
+}
+
+/// The runtime-spec's own documented default when `errnoRet` (or
+/// `defaultErrnoRet`) is unset for an `SCMP_ACT_ERRNO` action.
+fn errno_ret_or_default(errno_ret: Option<u32>) -> u32 {
+    errno_ret.unwrap_or(libc::EPERM as u32)
+}
+
+/// Map an `SCMP_ACT_*` name (plus its `errnoRet`, when the action
+/// needs one) to `seccompiler`'s own typed action — used directly for
+/// [`apply`]'s single, real final `RET <defaultAction>` instruction
+/// (via `u32::from`), and as the single source of truth
+/// [`action_json`] mirrors for every other, JSON-embedded use.
+fn action_value(name: &str, errno_ret: Option<u32>) -> io::Result<seccompiler::SeccompAction> {
     Ok(match name {
-        "SCMP_ACT_ALLOW" => json!("allow"),
-        "SCMP_ACT_ERRNO" => json!({ "errno": errno_ret.unwrap_or(DEFAULT_ERRNO) }),
-        "SCMP_ACT_KILL" | "SCMP_ACT_KILL_THREAD" => json!("kill_thread"),
-        "SCMP_ACT_KILL_PROCESS" => json!("kill_process"),
-        "SCMP_ACT_TRAP" => json!("trap"),
-        "SCMP_ACT_LOG" => json!("log"),
-        "SCMP_ACT_TRACE" => json!({ "trace": errno_ret.unwrap_or(0) }),
+        "SCMP_ACT_ALLOW" => seccompiler::SeccompAction::Allow,
+        "SCMP_ACT_ERRNO" => seccompiler::SeccompAction::Errno(errno_ret_or_default(errno_ret)),
+        "SCMP_ACT_KILL" | "SCMP_ACT_KILL_THREAD" => seccompiler::SeccompAction::KillThread,
+        "SCMP_ACT_KILL_PROCESS" => seccompiler::SeccompAction::KillProcess,
+        "SCMP_ACT_TRAP" => seccompiler::SeccompAction::Trap,
+        "SCMP_ACT_LOG" => seccompiler::SeccompAction::Log,
+        "SCMP_ACT_TRACE" => seccompiler::SeccompAction::Trace(errno_ret.unwrap_or(0)),
         // Userspace notification (a listener fd a supervisor reads from)
         // has no equivalent in seccompiler's action set and needs a
         // supervising process to actually handle notifications, which
@@ -187,6 +341,14 @@ fn op_json(name: &str, value_two: u64) -> io::Result<Value> {
 mod tests {
     use super::*;
     use oci_spec_types::runtime::LinuxSyscall;
+    use std::convert::TryInto;
+
+    /// The current build's own architecture, exactly like [`apply`]'s
+    /// own real use — this crate's seccomp support has only ever been
+    /// native-arch-only (see this module's own doc comment).
+    fn test_arch() -> seccompiler::TargetArch {
+        std::env::consts::ARCH.try_into().unwrap()
+    }
 
     fn syscall(name: &str, action: &str) -> LinuxSyscall {
         LinuxSyscall {
@@ -269,16 +431,55 @@ mod tests {
     }
 
     #[test]
-    fn apply_rejects_mixed_actions_across_syscalls() {
-        let profile = seccomp(
-            "SCMP_ACT_ALLOW",
-            vec![
-                syscall("chmod", "SCMP_ACT_ERRNO"),
-                syscall("chown", "SCMP_ACT_KILL"),
-            ],
+    fn action_value_agrees_with_action_json_for_every_action() {
+        // action_json is defined *in terms of* action_value (see its
+        // own doc comment) -- this just double-checks the u32 encoding
+        // action_value's own caller (`apply`'s final default-action
+        // RET) actually gets matches what seccompiler itself would
+        // produce for the same logical action, rather than trusting
+        // the wiring blindly.
+        assert_eq!(
+            u32::from(action_value("SCMP_ACT_ALLOW", None).unwrap()),
+            u32::from(seccompiler::SeccompAction::Allow)
         );
-        let err = apply(&profile).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(
+            u32::from(action_value("SCMP_ACT_ERRNO", Some(38)).unwrap()),
+            u32::from(seccompiler::SeccompAction::Errno(38))
+        );
+        assert_eq!(
+            u32::from(action_value("SCMP_ACT_KILL_PROCESS", None).unwrap()),
+            u32::from(seccompiler::SeccompAction::KillProcess)
+        );
+    }
+
+    #[test]
+    fn to_relocatable_segment_rewrites_exactly_the_trailing_two_mismatch_rets() {
+        // Compiled standalone, `mkdirat` (an ordinary, argument-free
+        // rule) should have length 10: 3 (arch check) + 1 (load
+        // syscall nr) + 4 (JEQ, JA, JA, RET match) + 2 (the two
+        // trailing mismatch RETs this function rewrites) -- verified
+        // directly against `seccompiler`'s own source structure in
+        // this module's own doc comment, not just assumed here.
+        let program =
+            compile_single_syscall(test_arch(), "mkdirat", &json!({"errno": 1}), &[]).unwrap();
+        assert_eq!(program.len(), 10, "{program:?}");
+
+        let first = to_relocatable_segment(program.clone(), true);
+        // Kept as the first segment: header + load_nr + everything,
+        // only the last two rewritten.
+        assert_eq!(first.len(), 10);
+        assert_eq!(first[8], BPF_JMP_JA_NOOP);
+        assert_eq!(first[9], BPF_JMP_JA_NOOP);
+        assert_ne!(
+            first[7], BPF_JMP_JA_NOOP,
+            "the real RET match_action must survive"
+        );
+
+        let later = to_relocatable_segment(program, false);
+        // Not first: header + load_nr (4 instructions) dropped too.
+        assert_eq!(later.len(), 6);
+        assert_eq!(later[4], BPF_JMP_JA_NOOP);
+        assert_eq!(later[5], BPF_JMP_JA_NOOP);
     }
 
     #[test]

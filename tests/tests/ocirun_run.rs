@@ -415,6 +415,62 @@ fn run_applies_a_seccomp_profile_with_an_argument_condition() {
 }
 
 #[test]
+fn run_applies_a_seccomp_profile_with_two_distinct_non_default_actions() {
+    // Real, multi-action profiles (a different action per `syscalls[]`
+    // entry, not just one shared action plus a default) were rejected
+    // outright before `docs/design/0036` -- see that note for why, and
+    // for the manual-scratch/real-captured-profile verification this
+    // automated test doesn't repeat (proving the *specific* "an
+    // explicit ALLOW overrides a stricter ERRNO default" case, which
+    // this test's own `defaultAction: SCMP_ACT_ALLOW` choice
+    // deliberately doesn't need, to stay reliably portable rather than
+    // needing an exhaustive allow-list for every syscall this
+    // rootless container's own busybox shell happens to make).
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(
+        dir.path(),
+        &busybox,
+        &[
+            "/bin/sh",
+            "-c",
+            "mkdir /blocked; echo mkdir_exit=$?; kill -0 $$; echo kill0_exit=$?",
+        ],
+    );
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["linux"]["seccomp"] = serde_json::json!({
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "syscalls": [
+            {"names": ["mkdirat"], "action": "SCMP_ACT_ERRNO", "errnoRet": 13},
+            {
+                "names": ["kill"],
+                "action": "SCMP_ACT_ERRNO",
+                "errnoRet": 1,
+                "args": [{"index": 1, "value": 0, "op": "SCMP_CMP_EQ"}]
+            }
+        ]
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let out = ocirun_run(dir.path(), "seccomp-multi-action-test");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Both distinct actions took effect on the *same* container, from
+    // the *same* profile -- exactly what was rejected before this
+    // increment.
+    assert_eq!(stdout.trim(), "mkdir_exit=1\nkill0_exit=1");
+}
+
+#[test]
 fn run_isolates_hostname_from_the_host() {
     let Some(busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");
