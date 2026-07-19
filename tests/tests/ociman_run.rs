@@ -222,6 +222,142 @@ fn run_rejects_the_same_capability_added_and_dropped() {
     );
 }
 
+/// `--privileged` grants every capability this build recognizes
+/// (`CapEff` becomes all 41 recognized bits set, `0x1ffffffffff` --
+/// confirmed by hand against a real running container first, the same
+/// value real `--cap-add=all` alone produces) and disables seccomp
+/// entirely (`Seccomp: 0`, `SECCOMP_MODE_DISABLED`).
+#[test]
+fn run_privileged_grants_every_capability_and_disables_seccomp() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/privileged:latest",
+        &busybox,
+        &["sh", "grep"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--privileged"])
+        .args(["ociman-test/privileged:latest"])
+        .args([
+            "/bin/sh",
+            "-c",
+            "grep -E \"^(CapEff|Seccomp):\" /proc/self/status",
+        ])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "CapEff:\t000001ffffffffff\nSeccomp:\t0"
+    );
+}
+
+/// `--cap-drop` still applies on top of `--privileged`'s own
+/// all-capabilities base, exactly like it would on top of the
+/// ordinary default -- `--privileged` isn't a special case
+/// `merge_capabilities` treats differently.
+#[test]
+fn run_privileged_still_honors_an_explicit_cap_drop() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/privileged-cap-drop:latest",
+        &busybox,
+        &["sh", "grep"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--privileged", "--cap-drop", "chown"])
+        .args(["ociman-test/privileged-cap-drop:latest"])
+        .args(["/bin/sh", "-c", "grep -E \"^CapEff:\" /proc/self/status"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // All 41 recognized capabilities except CAP_CHOWN (bit 0).
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "CapEff:\t000001fffffffffe"
+    );
+}
+
+/// An explicit `--security-opt seccomp=<path>` still wins over
+/// `--privileged`'s own "disable seccomp entirely" default -- matching
+/// real `podman`'s own `security_linux.go` check exactly (`--privileged`
+/// only forces `unconfined` when no seccomp option was explicitly
+/// given at all).
+#[test]
+fn run_privileged_still_honors_an_explicit_custom_seccomp_profile() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/privileged-custom-seccomp:latest",
+        &busybox,
+        &["sh", "mkdir"],
+        ContainerConfig::default(),
+    );
+
+    let profile_dir = tempfile::tempdir().unwrap();
+    let profile_path = profile_dir.path().join("custom-seccomp.json");
+    // Blocks `mkdirat` specifically (the real syscall `mkdir(1)` uses
+    // on every architecture this project targets) -- everything else
+    // stays allowed.
+    std::fs::write(
+        &profile_path,
+        r#"{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["mkdirat"],"action":"SCMP_ACT_ERRNO"}]}"#,
+    )
+    .unwrap();
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--privileged", "--security-opt"])
+        .arg(format!("seccomp={}", profile_path.display()))
+        .args(["ociman-test/privileged-custom-seccomp:latest"])
+        .args(["mkdir", "/testdir"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        !out.status.success(),
+        "the explicit custom profile should still block mkdir even under --privileged"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Operation not permitted"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn run_uses_the_images_default_cmd_and_env() {
     let Some(busybox) = busybox_path() else {

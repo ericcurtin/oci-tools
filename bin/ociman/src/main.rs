@@ -234,9 +234,9 @@ enum Command {
         /// explicitly supplied is a real, surfaced error (from
         /// `oci_runtime_core::seccomp::apply`'s own existing strict
         /// validation), not something to silently drop. `--privileged`
-        /// (which disables far more than just seccomp in real
-        /// `docker`/`podman` — capabilities, device access, and more,
-        /// none of which this flag touches) is not implemented.
+        /// (its own separate flag, see below) also disables seccomp,
+        /// but only when no `--security-opt seccomp=` was explicitly
+        /// given at all — an explicit choice here always wins.
         #[arg(long = "security-opt")]
         security_opt: Vec<String>,
         /// Grant additional capabilities beyond this project's own
@@ -265,6 +265,26 @@ enum Command {
         /// surfaced error, not silently resolved one way or the other.
         #[arg(long = "cap-drop", value_delimiter = ',')]
         cap_drop: Vec<String>,
+        /// Grant the container every capability this build recognizes
+        /// and disable seccomp confinement entirely, matching real
+        /// `docker run --privileged`/`podman run --privileged`'s own
+        /// two best-checked effects (`~/git/container-libs`'s own
+        /// vendored `runtime-tools/generate/generate.go`'s
+        /// `SetupPrivileged` grants every known capability;
+        /// `pkg/specgen/generate/security_linux.go` forces seccomp to
+        /// `unconfined` unless a *different* `--security-opt seccomp=`
+        /// value was explicitly given, in which case the explicit
+        /// choice wins). `--cap-add`/`--cap-drop` still apply on top
+        /// of the all-capabilities base, same as they would on top of
+        /// the ordinary default. **Narrower than real `docker`/
+        /// `podman`'s own `--privileged`**: does not mount every host
+        /// device, disable the device-cgroup restriction, or touch
+        /// SELinux/AppArmor labeling — none of which this project
+        /// implements at all yet (device access and SELinux/AppArmor
+        /// are both still-open gaps, not silently-ignored `--privileged`
+        /// specifics).
+        #[arg(long)]
+        privileged: bool,
     },
     /// List containers.
     Ps {
@@ -376,6 +396,7 @@ fn main() -> std::process::ExitCode {
                 security_opt,
                 cap_add,
                 cap_drop,
+                privileged,
             }) => cmd_run(
                 &image,
                 &args,
@@ -390,6 +411,7 @@ fn main() -> std::process::ExitCode {
                 &security_opt,
                 &cap_add,
                 &cap_drop,
+                privileged,
             ),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
@@ -544,13 +566,18 @@ fn cmd_run(
     security_opts: &[String],
     cap_add: &[String],
     cap_drop: &[String],
+    privileged: bool,
 ) -> anyhow::Result<()> {
-    let seccomp = resolve_seccomp(security_opts)?;
-    let capabilities = merge_capabilities(
-        &oci_spec_types::runtime::podman_default_capabilities(),
-        cap_add,
-        cap_drop,
-    )?;
+    let seccomp = resolve_seccomp(security_opts, privileged)?;
+    let base_capabilities = if privileged {
+        oci_runtime_core::identity::ALL_CAPABILITY_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        oci_spec_types::runtime::podman_default_capabilities()
+    };
+    let capabilities = merge_capabilities(&base_capabilities, cap_add, cap_drop)?;
     let memory_limit_bytes = memory.map(parse_memory_limit).transpose()?;
     let memory_swap_bytes = memory_swap.map(parse_memory_swap_limit).transpose()?;
     anyhow::ensure!(
@@ -1196,6 +1223,7 @@ fn synthesize_spec(
 /// are.
 fn resolve_seccomp(
     security_opts: &[String],
+    privileged: bool,
 ) -> anyhow::Result<Option<oci_spec_types::runtime::LinuxSeccomp>> {
     let mut seccomp_opt: Option<&str> = None;
     for opt in security_opts {
@@ -1208,6 +1236,14 @@ fn resolve_seccomp(
         }
     }
     match seccomp_opt {
+        // `--privileged` forces seccomp off entirely -- matching real
+        // `podman`'s own `security_linux.go` check (`s.IsPrivileged()
+        // && s.SeccompProfilePath == ""`) -- but only when no
+        // `--security-opt seccomp=` was explicitly given at all; an
+        // explicit choice (even `seccomp=unconfined` itself, matched
+        // by the arm below regardless) always wins over `--privileged`'s
+        // own default.
+        None if privileged => Ok(None),
         None => Ok(Some(
             oci_runtime_core::seccomp::filter_to_supported_syscalls(
                 &oci_runtime_core::seccomp::default_profile(),
@@ -1746,7 +1782,7 @@ mod tests {
 
     #[test]
     fn resolve_seccomp_with_no_security_opt_at_all_returns_the_bundled_default() {
-        let seccomp = resolve_seccomp(&[]).unwrap().unwrap();
+        let seccomp = resolve_seccomp(&[], false).unwrap().unwrap();
         assert_eq!(
             seccomp,
             oci_runtime_core::seccomp::filter_to_supported_syscalls(
@@ -1757,7 +1793,7 @@ mod tests {
 
     #[test]
     fn resolve_seccomp_unconfined_disables_seccomp_entirely() {
-        let seccomp = resolve_seccomp(&["seccomp=unconfined".to_string()]).unwrap();
+        let seccomp = resolve_seccomp(&["seccomp=unconfined".to_string()], false).unwrap();
         assert!(seccomp.is_none());
     }
 
@@ -1776,7 +1812,7 @@ mod tests {
         )
         .unwrap();
 
-        let seccomp = resolve_seccomp(&[format!("seccomp={}", profile_path.display())])
+        let seccomp = resolve_seccomp(&[format!("seccomp={}", profile_path.display())], false)
             .unwrap()
             .unwrap();
         assert_eq!(seccomp.default_action, "SCMP_ACT_ALLOW");
@@ -1786,24 +1822,49 @@ mod tests {
 
     #[test]
     fn resolve_seccomp_rejects_a_missing_custom_profile_file() {
-        let err = resolve_seccomp(&["seccomp=/no/such/file.json".to_string()]).unwrap_err();
+        let err = resolve_seccomp(&["seccomp=/no/such/file.json".to_string()], false).unwrap_err();
         assert!(format!("{err:#}").contains("/no/such/file.json"));
     }
 
     #[test]
     fn resolve_seccomp_rejects_an_unsupported_security_opt_key() {
-        let err = resolve_seccomp(&["apparmor=unconfined".to_string()]).unwrap_err();
+        let err = resolve_seccomp(&["apparmor=unconfined".to_string()], false).unwrap_err();
         assert!(err.to_string().contains("apparmor=unconfined"), "{err}");
     }
 
     #[test]
     fn resolve_seccomp_last_seccomp_value_wins_when_repeated() {
-        let seccomp = resolve_seccomp(&[
-            "seccomp=/no/such/file.json".to_string(),
-            "seccomp=unconfined".to_string(),
-        ])
+        let seccomp = resolve_seccomp(
+            &[
+                "seccomp=/no/such/file.json".to_string(),
+                "seccomp=unconfined".to_string(),
+            ],
+            false,
+        )
         .unwrap();
         assert!(seccomp.is_none());
+    }
+
+    #[test]
+    fn resolve_seccomp_privileged_with_no_security_opt_disables_seccomp() {
+        let seccomp = resolve_seccomp(&[], true).unwrap();
+        assert!(seccomp.is_none());
+    }
+
+    #[test]
+    fn resolve_seccomp_privileged_still_honors_an_explicit_custom_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_path = dir.path().join("custom-seccomp.json");
+        std::fs::write(
+            &profile_path,
+            r#"{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[]}"#,
+        )
+        .unwrap();
+
+        let seccomp = resolve_seccomp(&[format!("seccomp={}", profile_path.display())], true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(seccomp.default_action, "SCMP_ACT_ALLOW");
     }
 
     fn strings(names: &[&str]) -> Vec<String> {

@@ -39,7 +39,8 @@ work via both `FROM <earlier-stage>` and `COPY --from=<earlier-stage>`;
 glob `COPY`/`ADD` are not implemented yet). Milestone 3 also grew real
 `--memory-swap`/
 `--cpuset-cpus`/`--cpuset-mems`/`--security-opt seccomp=`/a real
-`podman`-default capability set/`--cap-add`/`--cap-drop` beyond its
+`podman`-default capability set/`--cap-add`/`--cap-drop`/`--privileged`
+beyond its
 own original scope.
 Milestone 5 also now has real pieces: `oci-erofs` builds
 verified-deterministic erofs images via `mkfs.erofs`, seals/verifies
@@ -58,7 +59,7 @@ milestone.
 |-----------|-------|--------|
 | 1 | workspace skeleton, `oci-cli-common`, 4-VM CI matrix | **done** |
 | 2 | `oci-spec-types`/`oci-registry`/`oci-store`; `ociman pull/images/inspect` | **done** |
-| 3 | `oci-runtime-core` + `ocirun`; `ociman run/exec/ps/logs` rootless | **done** (plus systemd cgroups, hooks, seccomp, resource limits, `--security-opt seccomp=`, a real `podman`-default capability set, `--cap-add`/`--cap-drop`, beyond the original scope) |
+| 3 | `oci-runtime-core` + `ocirun`; `ociman run/exec/ps/logs` rootless | **done** (plus systemd cgroups, hooks, seccomp, resource limits, `--security-opt seccomp=`, a real `podman`-default capability set, `--cap-add`/`--cap-drop`, `--privileged`, beyond the original scope) |
 | 4 | `oci-dockerfile`; `ociman build` (multi-stage, cache) | in progress — `RUN`/`COPY`/`ADD`/`--build-arg` work end to end and commit real layers (`ADD`'s remote-URL sources and the build cache are not yet implemented) (see `docs/design/0050`-`0060`, `0068`) |
 | 5 | erofs/mount/BLS; `ociboot install to-disk`; dracut module; QEMU boot test | in progress — `oci-erofs` builds real, verified-deterministic erofs images via `mkfs.erofs`, seals/verifies them with real fs-verity ioctls, and has a detached dm-verity fallback via `veritysetup`; `oci-bls` reads/writes the real grubenv block and Type #1 BLS entries (verified against the real uapi-group spec); `oci-mount` attaches/detaches real loop devices (see `docs/design/0061`-`0066`); scanning `/loader/entries/` as a directory, boot counting, actually mounting a verified image at boot, `ociboot`'s own subcommands, and the dracut module are not started yet |
 | 6 | upgrade/switch/rollback/status/gc; /etc merge; boot counting; layered mode | — |
