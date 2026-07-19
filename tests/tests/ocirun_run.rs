@@ -15,18 +15,10 @@
 //! — printing why, not failing — when it isn't, rather than making it a
 //! hard CI dependency.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-use oci_tools_tests::bin_path;
-
-/// Locate `busybox`, or `None` if it isn't installed.
-fn busybox_path() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join("busybox"))
-        .find(|p| p.is_file())
-}
+use oci_tools_tests::{bin_path, busybox_path, write_bundle};
 
 /// Whether a real, working `systemd --user` session is reachable —
 /// needed to test cgroup directory creation/process migration for real
@@ -49,36 +41,6 @@ fn systemd_user_scope_available() -> bool {
         .args(["--user", "--scope", "--", "true"])
         .output()
         .is_ok_and(|out| out.status.success())
-}
-
-/// Build a minimal bundle at `dir`: a busybox-based rootfs with `sh` and
-/// the given symlinked applets, and a rootless `config.json` running
-/// `args` (a `/bin/sh -c "..."` style command is the expected shape).
-fn write_bundle(dir: &Path, busybox: &Path, args: &[&str]) {
-    let rootfs = dir.join("rootfs");
-    std::fs::create_dir_all(rootfs.join("bin")).unwrap();
-    std::fs::copy(busybox, rootfs.join("bin/busybox")).unwrap();
-    for applet in ["sh", "echo", "true", "false"] {
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("busybox", rootfs.join("bin").join(applet)).unwrap();
-    }
-
-    let out = Command::new(bin_path("ocirun"))
-        .args(["spec", "--rootless", "--bundle"])
-        .arg(dir)
-        .output()
-        .expect("failed to spawn ocirun spec");
-    assert!(
-        out.status.success(),
-        "ocirun spec --rootless failed: {out:?}"
-    );
-
-    let config_path = dir.join("config.json");
-    let mut config: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
-    config["process"]["terminal"] = serde_json::json!(false);
-    config["process"]["args"] = serde_json::json!(args);
-    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
 }
 
 fn ocirun_run(dir: &Path, id: &str) -> std::process::Output {

@@ -46,6 +46,29 @@ use std::io;
 /// must keep `child_body` to async-signal-safe operations only, or fork
 /// before doing anything that could spawn a thread.
 pub unsafe fn fork_and_wait(child_body: impl FnOnce()) -> io::Result<i32> {
+    // SAFETY: forwarded from this function's own contract.
+    let pid = unsafe { fork(child_body) }?;
+    wait(pid)
+}
+
+/// Fork the calling process, same `child_body` contract as
+/// [`fork_and_wait`], but return the child's pid to the parent
+/// immediately rather than waiting for it to exit — for callers that
+/// need to do something with the pid (record it, hand it to another
+/// process via a pipe, ...) before or instead of waiting, e.g. `create`
+/// leaving the container's init process running in the background
+/// (reparented to the nearest subreaper once this process's own parent
+/// eventually exits, same as any other backgrounded Unix process — no
+/// extra double-fork/daemonization needed for that).
+///
+/// # Safety
+///
+/// Same as [`fork_and_wait`]. Additionally, since this doesn't wait,
+/// the caller becomes responsible for eventually reaping the child
+/// (via [`wait`] or otherwise) to avoid leaving a zombie, unless it
+/// intentionally exits without reaping (leaving the child to be
+/// reparented and reaped by init/a subreaper, as `create` does).
+pub unsafe fn fork(child_body: impl FnOnce()) -> io::Result<i32> {
     // SAFETY: raw `fork(2)`; the function's own safety contract (above)
     // is what callers must uphold for `child_body`.
     let pid = unsafe { libc::fork() };
@@ -60,11 +83,18 @@ pub unsafe fn fork_and_wait(child_body: impl FnOnce()) -> io::Result<i32> {
         // SAFETY: `_exit` is always sound to call.
         unsafe { libc::_exit(127) };
     }
+    Ok(pid)
+}
 
+/// `waitpid(2)` for `pid` (retrying on `EINTR`), returning the raw
+/// status. `pid` must be a child of the calling process (e.g. one
+/// [`fork`] just returned).
+pub fn wait(pid: i32) -> io::Result<i32> {
     let mut status: i32 = 0;
     loop {
-        // SAFETY: `pid` is our own just-forked child; `&mut status` is a
-        // valid pointer for the duration of the call.
+        // SAFETY: `&mut status` is a valid pointer for the duration of
+        // the call; passing a `pid` that isn't actually our own child is
+        // a logic error the kernel reports as `ECHILD`, not unsound.
         let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
         if ret >= 0 {
             break;
@@ -75,6 +105,28 @@ pub unsafe fn fork_and_wait(child_body: impl FnOnce()) -> io::Result<i32> {
         }
     }
     Ok(status)
+}
+
+/// `kill(2)`: send `signal` to `pid`. A raw syscall (not `rustix::
+/// process::kill_process`, which only accepts its own typed `Signal`
+/// enum) so any numeric signal a caller asks for — including ones with
+/// no named constant, like realtime signals — can be sent, matching
+/// what `runc kill <id> <n>` itself accepts.
+pub fn kill(pid: i32, signal: i32) -> io::Result<()> {
+    // SAFETY: plain `kill(2)` call with no pointers.
+    let ret = unsafe { libc::kill(pid, signal) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Whether a process with this PID currently exists (`kill(pid, 0)`
+/// per `kill(2)`'s own documented no-op-signal-check convention).
+pub fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 sends nothing; only checks the pid exists and is
+    // signalable.
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 /// Decode a raw `waitpid(2)` status the way a shell would: the exit code
@@ -117,6 +169,60 @@ mod tests {
     fn fork_and_wait_reports_success() {
         let status = unsafe { fork_and_wait(|| exit_with(0)) }.unwrap();
         assert_eq!(exit_code_from_wait_status(status), 0);
+    }
+
+    #[test]
+    fn fork_returns_the_childs_pid_without_waiting() {
+        let pid = unsafe { fork(|| exit_with(0)) }.unwrap();
+        assert!(pid > 0);
+        // Reap it ourselves so it doesn't linger as a zombie for the
+        // rest of this test binary's life.
+        let status = wait(pid).unwrap();
+        assert_eq!(exit_code_from_wait_status(status), 0);
+    }
+
+    #[test]
+    fn fork_then_wait_composes_to_the_same_result_as_fork_and_wait() {
+        let pid = unsafe { fork(|| exit_with(42)) }.unwrap();
+        let status = wait(pid).unwrap();
+        assert_eq!(exit_code_from_wait_status(status), 42);
+    }
+
+    #[test]
+    fn alive_is_true_for_this_process_and_false_for_a_reaped_child() {
+        assert!(alive(std::process::id() as i32));
+
+        let pid = unsafe { fork(|| exit_with(0)) }.unwrap();
+        wait(pid).unwrap();
+        assert!(!alive(pid));
+    }
+
+    #[test]
+    fn kill_with_signal_zero_matches_alive() {
+        let pid = std::process::id() as i32;
+        assert!(kill(pid, 0).is_ok());
+
+        let child = unsafe { fork(|| exit_with(0)) }.unwrap();
+        wait(child).unwrap();
+        assert!(kill(child, 0).is_err());
+    }
+
+    #[test]
+    fn kill_actually_terminates_a_child() {
+        // A long-lived child (blocks forever) that we kill instead of
+        // letting exit on its own.
+        let pid = unsafe {
+            fork(|| {
+                libc::pause();
+                exit_with(0);
+            })
+        }
+        .unwrap();
+        assert!(alive(pid));
+        kill(pid, libc::SIGKILL).unwrap();
+        let status = wait(pid).unwrap();
+        assert!(libc::WIFSIGNALED(status));
+        assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
     }
 
     #[test]

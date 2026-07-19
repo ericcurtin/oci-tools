@@ -225,7 +225,11 @@ impl StateStore {
         &self.root
     }
 
-    fn container_dir(&self, id: &str) -> PathBuf {
+    /// The directory a container's own `state.json` (and anything else
+    /// per-container, like [`crate::exec_fifo`]) lives in. Does not
+    /// validate `id` or check the container actually exists — callers
+    /// needing that should go through [`StateStore::load`] first.
+    pub fn container_dir(&self, id: &str) -> PathBuf {
         self.root.join(id)
     }
 
