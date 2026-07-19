@@ -48,9 +48,12 @@ them with real fs-verity ioctls, and has a detached dm-verity fallback
 via `veritysetup` for state filesystems without fs-verity support;
 `oci-bls` reads/writes the real GRUB environment block
 (`saved_entry`/boot-counting), verified byte-for-byte against the real
-`grub-editenv`, and reads/writes Type #1 BLS entries, verified against
-the real uapi-group specification's own worked example; `oci-mount`
-attaches/detaches real loop devices (read-only, direct-io), verified
+`grub-editenv`, reads/writes Type #1 BLS entries and scans
+`/loader/entries/` as a directory, and implements the real spec's own
+`+tries_left-tries_done` boot-counting filename convention, all
+verified against the real uapi-group specification's own text and
+worked examples; `oci-mount` attaches/detaches real loop devices
+(read-only, direct-io), verified
 against the real `losetup`. See [docs/design/](docs/design/) for
 design notes per
 milestone.
@@ -61,7 +64,7 @@ milestone.
 | 2 | `oci-spec-types`/`oci-registry`/`oci-store`; `ociman pull/images/inspect` | **done** |
 | 3 | `oci-runtime-core` + `ocirun`; `ociman run/exec/ps/logs` rootless | **done** (plus systemd cgroups, hooks, seccomp, resource limits, `--security-opt seccomp=`, a real `podman`-default capability set, `--cap-add`/`--cap-drop`, `--privileged`, beyond the original scope) |
 | 4 | `oci-dockerfile`; `ociman build` (multi-stage, cache) | in progress — `RUN`/`COPY`/`ADD`/`--build-arg` work end to end and commit real layers (`ADD`'s remote-URL sources and the build cache are not yet implemented) (see `docs/design/0050`-`0060`, `0068`) |
-| 5 | erofs/mount/BLS; `ociboot install to-disk`; dracut module; QEMU boot test | in progress — `oci-erofs` builds real, verified-deterministic erofs images via `mkfs.erofs`, seals/verifies them with real fs-verity ioctls, and has a detached dm-verity fallback via `veritysetup`; `oci-bls` reads/writes the real grubenv block and Type #1 BLS entries (verified against the real uapi-group spec); `oci-mount` attaches/detaches real loop devices (see `docs/design/0061`-`0066`); scanning `/loader/entries/` as a directory, boot counting, actually mounting a verified image at boot, `ociboot`'s own subcommands, and the dracut module are not started yet |
+| 5 | erofs/mount/BLS; `ociboot install to-disk`; dracut module; QEMU boot test | in progress — `oci-erofs` builds real, verified-deterministic erofs images via `mkfs.erofs`, seals/verifies them with real fs-verity ioctls, and has a detached dm-verity fallback via `veritysetup`; `oci-bls` reads/writes the real grubenv block and Type #1 BLS entries, scans `/loader/entries/` as a directory, and implements the real spec's own boot-counting filename convention (all verified against the real uapi-group spec/tools); `oci-mount` attaches/detaches real loop devices (see `docs/design/0061`-`0066`, `0070`); sorting scanned entries, the `boot_success` grubenv protocol, actually mounting a verified image at boot, `ociboot`'s own subcommands, and the dracut module are not started yet |
 | 6 | upgrade/switch/rollback/status/gc; /etc merge; boot counting; layered mode | — |
 | 7 | `ocicri` (critest subset), `ocibox` | — |
 | 8 | packaging (rpm/deb), docs polish, release workflow | — |
