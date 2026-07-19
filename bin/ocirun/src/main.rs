@@ -167,6 +167,26 @@ enum Command {
     /// details) as parsable JSON — see the `features` module's own
     /// doc comment for exactly what's reported and why.
     Features,
+    /// List the real processes running inside a container: every pid
+    /// in its own cgroup (and any nested sub-cgroups), matching real
+    /// `runc ps` exactly (`~/git/runc/ps.go`) — a table (the real host
+    /// `ps` binary's own output, filtered to just this container's
+    /// pids) by default, or a bare JSON array of pids with `--format
+    /// json`. Any extra arguments are passed straight through to the
+    /// real host `ps` binary itself (default: `-ef`), so
+    /// `ocirun ps <id> -aux` works exactly like `runc ps <id> -aux`
+    /// does.
+    Ps {
+        /// The container's ID.
+        id: String,
+        /// "table" (default) or "json".
+        #[arg(short, long, default_value = "table")]
+        format: String,
+        /// Arguments passed straight through to the real host `ps`
+        /// binary (default: `-ef`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        ps_args: Vec<String>,
+    },
 }
 
 /// Parse a `runc exec --user`-style `<uid>[:<gid>]` string: `uid` is
@@ -232,6 +252,11 @@ fn main() -> std::process::ExitCode {
                 args,
             }) => cmd_exec(&root, &id, user.as_deref(), cwd.as_deref(), &env, &args),
             Some(Command::Features) => oci_cli_common::output::print_json(&features::features()),
+            Some(Command::Ps {
+                id,
+                format,
+                ps_args,
+            }) => cmd_ps(&root, &id, &format, &ps_args),
         }
     })
 }
@@ -579,6 +604,97 @@ fn remove_cgroup_directory_if_any(bundle_path: &str) {
     if let Err(e) = oci_runtime_core::cgroups::remove(&dir) {
         tracing::warn!(cgroup = %dir.display(), error = %e, "removing cgroup directory (tolerated)");
     }
+}
+
+/// List the real processes running inside a container — matches real
+/// `runc ps` exactly (`~/git/runc/ps.go`): get every pid from the
+/// container's own cgroup (see
+/// `oci_runtime_core::cgroups::all_pids`), then either print them as a
+/// bare JSON array (`--format json`) or run the real host `ps` binary
+/// and filter its output to just those pids (`--format table`, the
+/// default). A container with no `cgroupsPath` at all (this project's
+/// own bundles routinely have none — cgroup management is opt-in, see
+/// `docs/design/0015`) simply has no pids to report, not an error.
+fn cmd_ps(root: &Path, id: &str, format: &str, ps_args: &[String]) -> anyhow::Result<()> {
+    let store = StateStore::open(root)
+        .with_context(|| format!("opening container state root {}", root.display()))?;
+    let state = store.load(id)?;
+
+    let bundle = oci_runtime_core::Bundle::load(&state.bundle)
+        .with_context(|| format!("loading bundle from {}", state.bundle))?;
+    let cgroup_dir = oci_runtime_core::cgroups::directory_for(
+        Path::new("/sys/fs/cgroup"),
+        bundle
+            .spec
+            .linux
+            .as_ref()
+            .and_then(|l| l.cgroups_path.as_deref()),
+    )?;
+    let pids = match &cgroup_dir {
+        Some(dir) => oci_runtime_core::cgroups::all_pids(dir)
+            .with_context(|| format!("listing processes in {}", dir.display()))?,
+        None => Vec::new(),
+    };
+
+    match format {
+        "json" => oci_cli_common::output::print_json(&pids),
+        "table" => print_ps_table(&pids, ps_args),
+        other => anyhow::bail!("invalid format option: {other:?} (want \"table\" or \"json\")"),
+    }
+}
+
+/// Run the real host `ps` binary (`ps_args`, or `-ef` if empty) and
+/// print only its header line plus every line whose own `PID` column
+/// is one of `pids` — matches real `runc ps`'s own table-format
+/// filtering logic exactly (`~/git/runc/ps.go`'s `getPidIndex` plus
+/// its own per-line loop), including erroring out (rather than
+/// silently skipping) on a line whose `PID` column doesn't parse: a
+/// real `ps` binary's output is well-formed by construction, so a
+/// parse failure here means the column index itself was wrong, a real
+/// bug worth surfacing rather than hiding.
+fn print_ps_table(pids: &[i32], ps_args: &[String]) -> anyhow::Result<()> {
+    let args: Vec<&str> = if ps_args.is_empty() {
+        vec!["-ef"]
+    } else {
+        ps_args.iter().map(String::as_str).collect()
+    };
+    let output = std::process::Command::new("ps")
+        .args(&args)
+        .output()
+        .context("spawning ps")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "ps exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let Some(header) = lines.next() else {
+        return Ok(());
+    };
+    let pid_index = header
+        .split_whitespace()
+        .position(|field| field == "PID")
+        .context("couldn't find PID field in ps output")?;
+    println!("{header}");
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let pid_field = fields
+            .get(pid_index)
+            .with_context(|| format!("ps output line has no PID field: {line:?}"))?;
+        let pid: i32 = pid_field
+            .parse()
+            .with_context(|| format!("unable to parse pid {pid_field:?}"))?;
+        if pids.contains(&pid) {
+            println!("{line}");
+        }
+    }
+    Ok(())
 }
 
 fn cmd_exec(

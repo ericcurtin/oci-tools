@@ -358,6 +358,61 @@ pub fn remove(cgroup_dir: &Path) -> io::Result<()> {
     unreachable!("the loop above always returns on its last attempt")
 }
 
+/// Every real pid currently in `cgroup_dir`'s own `cgroup.procs`, plus
+/// every pid in any (recursively nested) sub-cgroup underneath it —
+/// matches real runc/crun's own `cgroups.GetAllPids` exactly (ported
+/// from `~/git/runc/vendor/.../opencontainers/cgroups/getallpids.go`:
+/// a plain recursive directory walk, reading `cgroup.procs` from every
+/// directory found, no dedup/sort). oci-tools itself never creates
+/// nested cgroups under a container's own directory, but a process
+/// running *inside* the container is free to (e.g. a nested container
+/// runtime, or `systemd --user` running as the container's init) — so
+/// this matches upstream's own generality rather than assuming a flat
+/// hierarchy. `cgroup_dir` not existing at all is tolerated as "no
+/// processes" (an empty `Vec`), not an error: matches real runc's own
+/// `ignoreCgroupError`, which treats a missing cgroup as "the
+/// container has already stopped and its cgroup is gone" rather than
+/// a real failure — see `ocirun ps`'s own doc comment.
+pub fn all_pids(cgroup_dir: &Path) -> io::Result<Vec<i32>> {
+    let mut pids = Vec::new();
+    match read_procs_file(cgroup_dir) {
+        Ok(mut own) => pids.append(&mut own),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(pids),
+        Err(e) => return Err(e),
+    }
+    let entries = match std::fs::read_dir(cgroup_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(pids),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            pids.append(&mut all_pids(&entry.path())?);
+        }
+    }
+    Ok(pids)
+}
+
+/// Read and parse one directory's own `cgroup.procs` file: one decimal
+/// pid per line. A completely empty file (the common case: an idle or
+/// just-created cgroup) parses to an empty `Vec`, not an error.
+fn read_procs_file(cgroup_dir: &Path) -> io::Result<Vec<i32>> {
+    let content = std::fs::read_to_string(cgroup_dir.join("cgroup.procs"))?;
+    content
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.trim().parse::<i32>().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("parsing pid {line:?} from cgroup.procs: {e}"),
+                )
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,5 +815,49 @@ mod tests {
         remove(&dir).unwrap();
         remover.join().unwrap();
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn all_pids_reads_a_flat_cgroups_own_procs_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), "123\n456\n789\n").unwrap();
+        assert_eq!(all_pids(dir.path()).unwrap(), vec![123, 456, 789]);
+    }
+
+    #[test]
+    fn all_pids_tolerates_an_empty_procs_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), "").unwrap();
+        assert_eq!(all_pids(dir.path()).unwrap(), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn all_pids_recurses_into_nested_sub_cgroups() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), "1\n").unwrap();
+        let child = dir.path().join("nested");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("cgroup.procs"), "2\n3\n").unwrap();
+        let grandchild = child.join("deeper");
+        std::fs::create_dir(&grandchild).unwrap();
+        std::fs::write(grandchild.join("cgroup.procs"), "4\n").unwrap();
+
+        let mut pids = all_pids(dir.path()).unwrap();
+        pids.sort_unstable();
+        assert_eq!(pids, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn all_pids_tolerates_a_missing_cgroup_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("already-gone");
+        assert_eq!(all_pids(&dir).unwrap(), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn all_pids_reports_a_real_error_for_unparseable_content() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), "not-a-pid\n").unwrap();
+        assert!(all_pids(dir.path()).is_err());
     }
 }
