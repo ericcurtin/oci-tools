@@ -13,10 +13,15 @@ publish = false
 anyhow.workspace = true
 clap.workspace = true
 oci-cli-common.workspace = true
+oci-layer.workspace = true
 oci-registry.workspace = true
+oci-runtime-core.workspace = true
 oci-spec-types.workspace = true
 oci-store.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 tracing.workspace = true
 
 [lints]

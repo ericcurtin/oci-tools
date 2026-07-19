@@ -1,0 +1,26 @@
+{
+    "config": {
+        "Cmd": [
+            "sh"
+        ],
+        "Env": [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ]
+    },
+    "created": "2026-05-13T02:21:49Z",
+    "history": [
+        {
+            "created": "2026-05-13T02:21:49Z",
+            "created_by": "BusyBox 1.38.0 (glibc), Debian 13"
+        }
+    ],
+    "rootfs": {
+        "type": "layers",
+        "diff_ids": [
+            "sha256:66cb17eae60e0bf660a4cf7c5fada7a748febe4c92dd972f1735af7a7c7c740d"
+        ]
+    },
+    "architecture": "arm64",
+    "os": "linux",
+    "variant": "v8"
+}

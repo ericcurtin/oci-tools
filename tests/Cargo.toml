@@ -13,8 +13,12 @@ publish = false
 serde_json.workspace = true
 
 [dev-dependencies]
+flate2.workspace = true
 oci-runtime-core.workspace = true
+oci-spec-types.workspace = true
+oci-store.workspace = true
 rustix.workspace = true
+tar.workspace = true
 tempfile.workspace = true
 
 [lints]

@@ -40,6 +40,11 @@ pub const MEDIA_TYPE_DOCKER_MANIFEST_LIST: &str =
 /// `application/vnd.docker.container.image.v1+json` — the legacy Docker
 /// image config media type.
 pub const MEDIA_TYPE_DOCKER_CONFIG: &str = "application/vnd.docker.container.image.v1+json";
+/// `application/vnd.docker.image.rootfs.diff.tar.gzip` — the legacy
+/// Docker gzip-compressed layer media type (the layer-level analog of
+/// [`MEDIA_TYPE_DOCKER_MANIFEST_V2`]; still common, since many
+/// registries serve Docker-v2 manifests by default).
+pub const MEDIA_TYPE_DOCKER_LAYER_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
 
 /// A content descriptor: identifies content by digest, media type, and size.
 /// The unit that every manifest/index/config reference is built from.
@@ -264,7 +269,20 @@ pub struct ImageConfig {
 
 /// Runtime defaults baked into an image (the `Config` object inside
 /// [`ImageConfig`]): entrypoint, cmd, env, working dir, exposed ports, etc.
+///
+/// **Every field here is `PascalCase` on the wire** (`Cmd`, `Entrypoint`,
+/// `WorkingDir`, ...), unlike every other struct in this module — a real,
+/// deliberate quirk of the image-spec (inherited from Docker's own
+/// original Go struct field names, serialized with no `json` tag
+/// override), not a typo to "fix" into `camelCase`. Verified against a
+/// real pulled image's own config blob (`docker.io/library/busybox`, its
+/// `"config"` object is exactly `{"Cmd": ["sh"], "Env": [...]}`) after
+/// `ociman run` silently produced an empty command for every real image
+/// — this struct had no `rename_all` at all before, so every field
+/// always deserialized to its default regardless of what a real image's
+/// config actually said.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct ContainerConfig {
     /// `NAME=value` environment variables to set by default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -380,6 +398,30 @@ mod tests {
         };
         assert_eq!(m.layers.len(), 1);
         assert_eq!(m.config.size, 0);
+    }
+
+    #[test]
+    fn parses_real_busybox_image_config_including_pascal_case_container_config() {
+        // Captured verbatim from `docker.io/library/busybox`'s real
+        // config blob (`skopeo`/`podman pull`, then `podman inspect`'s
+        // own digest matched this exact blob) — not hand-written.
+        // `config.Cmd`/`config.Env` are `PascalCase` in the raw JSON,
+        // exactly the quirk `ContainerConfig`'s own doc comment
+        // describes; before it had a `rename_all`, this parsed as an
+        // entirely empty `ContainerConfig` regardless of what the real
+        // image said, which `ociman run` (0020) caught by actually
+        // running a real image, not by inspecting this JSON by eye.
+        let raw = include_str!("../tests/fixtures/busybox-image-config.json");
+        let config: ImageConfig = serde_json::from_str(raw).unwrap();
+        let container_config = config.config.expect("busybox sets a config object");
+        assert_eq!(container_config.cmd, Some(vec!["sh".to_string()]));
+        assert_eq!(
+            container_config.env,
+            vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()]
+        );
+        assert_eq!(container_config.entrypoint, None);
+        assert_eq!(config.architecture.as_deref(), Some("arm64"));
+        assert_eq!(config.rootfs.diff_ids.len(), 1);
     }
 
     #[test]
