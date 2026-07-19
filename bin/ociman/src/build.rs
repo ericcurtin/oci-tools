@@ -56,24 +56,36 @@
 //!   with more than one source the destination must be a directory
 //!   and end with a `/`. `--from` reaches either an earlier stage in
 //!   this same file or a real external image reference (see above);
-//!   no `--chown`/`--chmod` (this project's own rootless
-//!   single-uid-mapping design, and `oci_layer::apply`'s own
-//!   already-documented "doesn't chown" scope limit, apply equally
-//!   here) — each rejected with a clear error rather than silently
+//!   **`--chmod=<octal-mode>` is supported** (applied recursively, to
+//!   the exact same literal mode, to every copied file and directory
+//!   — checked directly against real `docker build`'s own observed
+//!   behavior; a symbolic mode like `u+rwx` isn't yet, see
+//!   `chmod_mode`'s own doc comment); `--chown` still isn't (this
+//!   project's own rootless single-uid-mapping design, and
+//!   `oci_layer::apply`'s own already-documented "doesn't chown"
+//!   scope limit) — rejected with a clear error rather than silently
 //!   ignored. A supported `COPY` commits one real
 //!   new layer per instruction line exactly like `RUN` does (via the
 //!   same diff/`commit_layer`/`record_layer` path), just from a plain
 //!   recursive file copy instead of running a command.
 //! * **`ADD` is supported for local sources.** Same scope limits as
 //!   `COPY` above (one or more explicit sources, glob patterns
-//!   included, no `--chown`/`--chmod`), plus real docker's own
+//!   included, `--chmod` but not `--chown`), plus real docker's own
 //!   documented archive-auto-extraction: a
 //!   non-directory local source that's a real tar archive (plain,
 //!   gzip, or zstd-compressed — `oci_layer::detect_archive`'s own doc
 //!   comment has the exact scope, checked directly against the
 //!   currently-vendored `~/git/moby`'s own archive-detection code) is
 //!   unpacked into the destination directory (created along with any
-//!   missing parents) instead of being copied as one file. **A remote
+//!   missing parents) instead of being copied as one file — `--chmod`
+//!   is deliberately *not* applied to an archive's own extracted
+//!   contents (checked directly against a real Docker daemon on this
+//!   host: `ADD --chmod=0741 some.tar.gz /dest` leaves every extracted
+//!   entry's own individual mode exactly as the archive itself
+//!   specified, and `/dest` at the ordinary default directory mode —
+//!   flattening a real archive's own varied, meaningful per-entry
+//!   permissions to one single mode would be actively destructive, not
+//!   a real feature). **A remote
 //!   URL source (`http://`/`https://`) is supported too**, fetched via
 //!   [`oci_dockerfile::download`] and never auto-extracted even if it
 //!   looks like an archive (matching real BuildKit's own
@@ -781,10 +793,7 @@ fn copy_instruction(
         flags.chown.is_none(),
         "ociman build: COPY --chown is not yet supported"
     );
-    anyhow::ensure!(
-        flags.chmod.is_none(),
-        "ociman build: COPY --chmod is not yet supported"
-    );
+    let chmod = flags.chmod.as_deref().map(chmod_mode).transpose()?;
     anyhow::ensure!(
         !sources.is_empty(),
         "ociman build: COPY requires at least one source"
@@ -884,7 +893,7 @@ fn copy_instruction(
             dest_path.clone()
         };
 
-        copy_path_recursive(&source_path, &target).with_context(|| {
+        copy_path_recursive(&source_path, &target, chmod).with_context(|| {
             format!("copying {} to {}", source_path.display(), target.display())
         })?;
     }
@@ -937,10 +946,7 @@ fn add_instruction(
         flags.chown.is_none(),
         "ociman build: ADD --chown is not yet supported"
     );
-    anyhow::ensure!(
-        flags.chmod.is_none(),
-        "ociman build: ADD --chmod is not yet supported"
-    );
+    let chmod = flags.chmod.as_deref().map(chmod_mode).transpose()?;
     anyhow::ensure!(
         !sources.is_empty(),
         "ociman build: ADD requires at least one source"
@@ -994,7 +1000,7 @@ fn add_instruction(
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        write_new_file(&target, &downloaded.bytes, 0o600)
+        write_new_file(&target, &downloaded.bytes, chmod.unwrap_or(0o600))
             .with_context(|| format!("writing downloaded {url:?} to {}", target.display()))?;
     }
     for source in &local_sources {
@@ -1063,7 +1069,7 @@ fn add_instruction(
             } else {
                 dest_path.clone()
             };
-            copy_path_recursive(&source_path, &target).with_context(|| {
+            copy_path_recursive(&source_path, &target, chmod).with_context(|| {
                 format!("copying {} to {}", source_path.display(), target.display())
             })?;
         }
@@ -1267,16 +1273,36 @@ fn write_new_file(target: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> 
 /// source's own permission bits (matching `oci_layer::apply`'s own
 /// documented "keeps permission bits, doesn't chown" stance —
 /// consistent scope limit on both the read and write side of this
-/// project's own layer handling).
-fn copy_path_recursive(src: &Path, dest: &Path) -> anyhow::Result<()> {
+/// project's own layer handling) unless `chmod` overrides it.
+///
+/// `chmod`, when given, is applied to *every* copied file and
+/// directory, at any depth, to the exact same literal mode — checked
+/// directly against real `docker build`'s own observed behavior (a
+/// real `COPY --chmod=0741 somedir /dest` against a real Docker
+/// daemon on this host: every file *and* the directory itself,
+/// recursively, come back `0741`, not just the top-level entry) —
+/// never applied to a symlink itself (real Docker's own `COPY`/`ADD`
+/// dereferences a symlink source entirely, copying the *target*
+/// file's content under the destination name; this project's own
+/// `copy_path_recursive` deliberately preserves it as a real symlink
+/// instead, an already-established, different design choice — see
+/// this function's own symlink branch below — so there is no
+/// sensible "the symlink's own mode" for `chmod` to apply to in the
+/// first place, and `chmod(2)` on a symlink path affects whatever it
+/// points at, not the link, which would be a confusing, unintended
+/// side effect here).
+fn copy_path_recursive(src: &Path, dest: &Path, chmod: Option<u32>) -> anyhow::Result<()> {
     let metadata = std::fs::symlink_metadata(src)
         .with_context(|| format!("reading metadata for {}", src.display()))?;
     if metadata.is_dir() {
         std::fs::create_dir_all(dest)
             .with_context(|| format!("creating directory {}", dest.display()))?;
+        if let Some(mode) = chmod {
+            set_mode(dest, mode)?;
+        }
         for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
             let entry = entry.with_context(|| format!("reading {}", src.display()))?;
-            copy_path_recursive(&entry.path(), &dest.join(entry.file_name()))?;
+            copy_path_recursive(&entry.path(), &dest.join(entry.file_name()), chmod)?;
         }
     } else if metadata.file_type().is_symlink() {
         let link_target = std::fs::read_link(src)
@@ -1296,8 +1322,36 @@ fn copy_path_recursive(src: &Path, dest: &Path) -> anyhow::Result<()> {
         }
         std::fs::copy(src, dest)
             .with_context(|| format!("copying {} to {}", src.display(), dest.display()))?;
+        if let Some(mode) = chmod {
+            set_mode(dest, mode)?;
+        }
     }
     Ok(())
+}
+
+/// Parse a `--chmod` value: an octal permission mode string (e.g.
+/// `"0741"`, `"755"`), `0..=0o7777` — real BuildKit also accepts a
+/// symbolic form (`u+rwx,g-w`, via its own `mode.Parse`), deliberately
+/// not supported here yet: every Containerfile this project's own
+/// milestone needs to build in practice only ever uses the plain
+/// numeric form.
+fn chmod_mode(value: &str) -> anyhow::Result<u32> {
+    let mode = u32::from_str_radix(value, 8)
+        .with_context(|| format!("ociman build: invalid --chmod mode {value:?} (expected an octal number, e.g. 0755; a symbolic mode like u+rwx is not yet supported)"))?;
+    anyhow::ensure!(
+        mode <= 0o7777,
+        "ociman build: --chmod mode {value:?} is out of range (must be between 0 and 07777)"
+    );
+    Ok(mode)
+}
+
+/// Set `path`'s own permission bits to exactly `mode` (not modulated
+/// by the calling process's own umask — unlike creating a *new* file,
+/// `chmod(2)` on an existing path is never umask-subject).
+fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("chmod {mode:o} {}", path.display()))
 }
 
 /// `docker`/`podman build`'s own shell-form wrapping: a shell-form
@@ -1365,6 +1419,25 @@ fn normalize_absolute_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chmod_mode_parses_a_real_octal_string() {
+        assert_eq!(chmod_mode("0741").unwrap(), 0o741);
+        assert_eq!(chmod_mode("755").unwrap(), 0o755);
+        assert_eq!(chmod_mode("0").unwrap(), 0);
+        assert_eq!(chmod_mode("7777").unwrap(), 0o7777);
+    }
+
+    #[test]
+    fn chmod_mode_rejects_out_of_range_and_non_octal_values() {
+        assert!(chmod_mode("10000").is_err());
+        assert!(chmod_mode("999").is_err(), "9 is not a valid octal digit");
+        assert!(
+            chmod_mode("u+rwx").is_err(),
+            "symbolic mode not supported yet"
+        );
+        assert!(chmod_mode("").is_err());
+    }
 
     #[test]
     fn parse_build_args_uses_key_equals_value_verbatim() {

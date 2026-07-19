@@ -1172,7 +1172,7 @@ fn copy_rejects_unsupported_flags_and_bad_glob_patterns() {
 
     let cases = [
         ("COPY --chown=1000:1000 a.txt /a.txt\n", "--chown"),
-        ("COPY --chmod=755 a.txt /a.txt\n", "--chmod"),
+        ("COPY --chmod=not-octal a.txt /a.txt\n", "--chmod"),
         ("COPY --from=builder a.txt /a.txt\n", "--from"),
         (
             "COPY a.txt b.txt /a.txt\n",
@@ -1255,6 +1255,140 @@ fn copy_rejects_a_missing_source() {
             .is_none(),
         "a failed build must not leave a partial image tagged"
     );
+}
+
+/// `COPY --chmod=<octal>` applies the exact same literal mode,
+/// recursively, to every copied file *and* directory -- checked
+/// directly against a real Docker daemon's own observed behavior (see
+/// `docs/design/0079`): a directory source's own top-level directory,
+/// every subdirectory, and every file inside all come back the exact
+/// same mode, not just the top-level entry.
+#[test]
+fn copy_chmod_applies_the_same_octal_mode_recursively_to_every_copied_entry() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/chmod-copy-base:latest",
+        &busybox,
+        &["sh", "stat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(context_dir.path().join("dir/sub")).unwrap();
+    std::fs::write(context_dir.path().join("dir/top.txt"), "top").unwrap();
+    std::fs::write(context_dir.path().join("dir/sub/nested.txt"), "nested").unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/chmod-copy-base:latest\nCOPY --chmod=0741 dir /copied\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/chmod-copy-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/chmod-copy-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "stat -c '%a' /copied /copied/top.txt /copied/sub /copied/sub/nested.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "741\n741\n741\n741\n");
+}
+
+/// `--chmod` is deliberately *not* applied when a local `ADD` source
+/// is auto-extracted as a real archive -- checked directly against a
+/// real Docker daemon's own observed behavior (see
+/// `docs/design/0079`): flattening a real archive's own varied,
+/// individually-meaningful per-entry permissions to one single mode
+/// would be destructive, not a real feature.
+#[test]
+fn add_chmod_does_not_apply_to_auto_extracted_archive_contents() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/chmod-archive-base:latest",
+        &busybox,
+        &["sh", "stat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    let archive_path = context_dir.path().join("payload.tar.gz");
+    write_gzip_tar(&archive_path, &[("inside.txt", b"archived content")]);
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/chmod-archive-base:latest\n\
+         ADD --chmod=0741 payload.tar.gz /extracted\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/chmod-archive-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/chmod-archive-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "stat -c '%a' /extracted/inside.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    // The tar entry's own mode (0644, set by `write_gzip_tar`), not
+    // 0741 -- proves --chmod was correctly *not* applied here.
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "644\n");
 }
 
 fn write_gzip_tar(path: &Path, files: &[(&str, &[u8])]) {
@@ -1511,6 +1645,72 @@ fn add_from_remote_url_places_the_downloaded_file_at_an_explicit_destination() {
         String::from_utf8_lossy(&run.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&run.stdout), "hello world!");
+}
+
+/// `--chmod` overrides the default `0o600` mode for a downloaded `ADD`
+/// URL source too -- checked directly against a real Docker daemon's
+/// own observed behavior (see `docs/design/0079`).
+#[test]
+fn add_chmod_overrides_the_default_mode_for_a_downloaded_url_source() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/chmod-url-base:latest",
+        &busybox,
+        &["sh", "stat"],
+        ContainerConfig::default(),
+    );
+
+    let addr =
+        serve_one_response("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc");
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!(
+            "FROM ociman-test/chmod-url-base:latest\n\
+             ADD --chmod=0741 http://{addr}/greeting.txt /downloaded.txt\n"
+        ),
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/chmod-url-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/chmod-url-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "stat -c '%a' /downloaded.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "741\n");
 }
 
 /// `ADD` from a remote URL into a directory destination derives the
