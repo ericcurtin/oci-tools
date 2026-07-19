@@ -63,10 +63,10 @@ reasoning `rm --force` already relies on.
 `spawn()`+detached-stdio+poll approach `ociman_exec.rs`/`ociman_logs.rs`
 established for a genuinely concurrent "still running" scenario):
 
-* A container that installs a `TERM` trap and exits gracefully — `stop`
-  returns well within its generous grace window (proving the graceful
-  signal alone worked, not an escalation), and the container's own
-  persisted exit code is the trap's `exit 0`, not a `KILL`-derived one.
+* A container that installs a `TERM` trap and exits gracefully — the
+  container's own persisted exit code is the trap's `exit 0`, not a
+  `KILL`-derived one (`137`), proving the graceful signal alone worked
+  rather than `stop` having to escalate.
 * A plain `sleep 30` (a pid-namespace's own init, which — per 0017's
   own real-kernel finding — ignores an unhandled-default-action `TERM`
   outright) with a deliberately short `--time`: `stop` correctly
@@ -90,12 +90,31 @@ just recalled from general shell-scripting folklore) that replacing the
 single long `sleep 30` with a short-sleep loop (`while true; do sleep
 0.2; done`) bounds the same deferral to a fraction of a second instead:
 the fixed version reacts to `TERM` in ~3ms in a real, manually-verified
-`ocirun create`/`start`/`kill` sequence, and consistently passes across
-repeated local runs. Not a pid-namespace-specific kernel restriction
-(0017's own finding is about *unhandled* signals specifically; this
-one had a real handler installed throughout) — a general, well-known
-shell behavior this test's own container command had to account for,
-same as any real container entrypoint script would.
+`ocirun create`/`start`/`kill` sequence. Not a pid-namespace-specific
+kernel restriction (0017's own finding is about *unhandled* signals
+specifically; this one had a real handler installed throughout) — a
+general, well-known shell behavior this test's own container command
+had to account for, same as any real container entrypoint script would.
+
+That short-sleep-loop fix alone still wasn't quite enough, though: the
+*next* VM CI run failed the exact same way again, non-deterministically
+— reproduced by booting the actual CI VM by hand (not just this
+project's own host) and running the test repeatedly; a raw `unshare
+--pid --fork` reproduction of "does a pending trap fire between short
+sleeps" turned out not to be a faithful stand-in for `ocirun`'s own
+careful pid-namespace relay-fork handling either (its own `$!` refers
+to an outer, non-namespaced wrapper process, not the namespace's real
+pid 1), so it couldn't be trusted to explain the discrepancy on its
+own. Running the *actual* built `ociman`/`ocirun` binaries repeatedly
+inside a real VM showed the same test passing five times in a row
+right after failing once — genuine OS-scheduling-jitter flakiness under
+host load, not a deterministic bug, and not something any fixed sleep
+granularity can fully rule out. The real fix was to stop asserting on
+wall-clock timing at all (an earlier version asserted `stop` returned
+"quickly"): the exit-code assertion above is the deterministic,
+meaningful check (`0` only ever comes from the trap, `137` only ever
+from `KILL`), so it alone is what actually matters, and doesn't care
+how many milliseconds getting there took.
 
 ## Performance
 

@@ -610,6 +610,7 @@ dependencies = [
  "oci-runtime-core",
  "oci-spec-types",
  "oci-store",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

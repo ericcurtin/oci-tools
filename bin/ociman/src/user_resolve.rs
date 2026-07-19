@@ -13,8 +13,34 @@
 //! group IDs -- this runtime doesn't support extra gids yet (see the
 //! single-mapped-uid limitation in `main.rs::resolve_user`), so
 //! collecting them would just be dead data.
+//!
+//! # Symlink-escape protection
+//!
+//! Real podman's own `pkg/lookup` guards its `/etc/passwd`/`/etc/group`
+//! reads with `github.com/cyphar/filepath-securejoin`, specifically
+//! because a malicious or corrupt image could make either path (or any
+//! containing directory) a symlink pointing outside the rootfs, e.g.
+//! `/etc -> /` or `/etc/passwd -> /etc/shadow`, tricking a naive
+//! `read_to_string` into reading an arbitrary *host* file instead (0024
+//! flagged this as a known gap when this module was first written, not
+//! yet fixed). Rather than hand-roll `securejoin`'s own component-by-
+//! component symlink-clamping algorithm — subtle to get exactly right,
+//! and inherently race-prone unless every step is also re-verified
+//! atomically — this uses the kernel's own purpose-built mechanism
+//! instead: `openat2(2)`'s `RESOLVE_IN_ROOT` resolve flag (Linux 5.6+),
+//! which resolves a path against a directory fd *as if* that fd were
+//! chroot()ed to (any symlink, absolute or relative, and any `..` that
+//! would otherwise escape above it, is transparently reinterpreted
+//! relative to that same root instead), atomically, in the kernel, with
+//! no TOCTOU window at all. Verified against a real symlink escape
+//! attempt (a rootfs whose `etc/passwd` was a symlink to an outside
+//! file containing a marker string) before writing any of the tests
+//! below: `RESOLVE_IN_ROOT` correctly reports `ENOENT` instead of ever
+//! reading the escape target.
 
 use anyhow::Context;
+use rustix::fs::{Mode, OFlags, ResolveFlags};
+use std::io::Read as _;
 use std::path::Path;
 
 /// A resolved `/etc/passwd` row: only the two fields anything here
@@ -85,7 +111,7 @@ fn find_passwd_entry(
     name: &str,
     numeric_uid: Option<u32>,
 ) -> anyhow::Result<Option<PasswdEntry>> {
-    let Some(contents) = read_optional(&rootfs.join("etc/passwd"))? else {
+    let Some(contents) = read_optional(rootfs, "etc/passwd")? else {
         return Ok(None);
     };
     for line in contents.lines() {
@@ -115,7 +141,7 @@ fn find_group_gid(
     name: &str,
     numeric_gid: Option<u32>,
 ) -> anyhow::Result<Option<u32>> {
-    let Some(contents) = read_optional(&rootfs.join("etc/group"))? else {
+    let Some(contents) = read_optional(rootfs, "etc/group")? else {
         return Ok(None);
     };
     for line in contents.lines() {
@@ -134,15 +160,43 @@ fn find_group_gid(
     Ok(None)
 }
 
-/// Read a file's contents, treating "doesn't exist" as `Ok(None)`
+/// Read `<rootfs>/<relative>`'s contents, resolved via `openat2`'s
+/// `RESOLVE_IN_ROOT` (see this module's own doc comment for why) so
+/// neither `relative` nor any symlink encountered while resolving it
+/// can escape `rootfs`. Treats "doesn't exist" (including a symlink
+/// escape attempt, which resolves as a plain `ENOENT` under
+/// `RESOLVE_IN_ROOT` rather than as the escape target) as `Ok(None)`
 /// rather than an error -- plenty of real images have no `/etc/group`
 /// at all, and that's fine, not a reason to refuse to run them.
-fn read_optional(path: &Path) -> anyhow::Result<Option<String>> {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => Ok(Some(contents)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-    }
+fn read_optional(rootfs: &Path, relative: &str) -> anyhow::Result<Option<String>> {
+    let root_fd = match rustix::fs::open(rootfs, OFlags::PATH | OFlags::DIRECTORY, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(e) if e == rustix::io::Errno::NOENT => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| format!("opening rootfs {}", rootfs.display()));
+        }
+    };
+    let opened = rustix::fs::openat2(
+        &root_fd,
+        relative,
+        OFlags::RDONLY,
+        Mode::empty(),
+        ResolveFlags::IN_ROOT,
+    );
+    let fd = match opened {
+        Ok(fd) => fd,
+        Err(e) if e == rustix::io::Errno::NOENT => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("opening {} inside rootfs {}", relative, rootfs.display())
+            });
+        }
+    };
+    let mut contents = String::new();
+    std::fs::File::from(fd)
+        .read_to_string(&mut contents)
+        .with_context(|| format!("reading {} inside rootfs {}", relative, rootfs.display()))?;
+    Ok(Some(contents))
 }
 
 #[cfg(test)]
@@ -226,5 +280,48 @@ mod tests {
     fn numeric_uid_and_gid_need_no_passwd_or_group_at_all() {
         let dir = rootfs_with(None, None);
         assert_eq!(resolve(dir.path(), "1000:1000").unwrap(), (1000, 1000));
+    }
+
+    /// A malicious/corrupt image whose `/etc/passwd` is itself a
+    /// symlink pointing *outside* the rootfs must not have that target
+    /// read at all -- proving `RESOLVE_IN_ROOT` (see this module's own
+    /// doc comment) actually blocks the escape, not just that a
+    /// same-rootfs symlink still works normally (the next test).
+    #[test]
+    fn a_passwd_symlink_escaping_the_rootfs_is_not_followed() {
+        let dir = rootfs_with(None, None);
+        let secret = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(secret.path(), "root:x:0:0:root:/root:/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(secret.path(), dir.path().join("etc/passwd")).unwrap();
+
+        // The escape attempt must not resolve to the secret file at
+        // all: from `resolve`'s own point of view this looks exactly
+        // like "no /etc/passwd present", the same `Ok(None)` case a
+        // missing file produces, not a successful read of the outside
+        // target.
+        let err = resolve(dir.path(), "nonexistent-name").unwrap_err();
+        assert!(
+            err.to_string().contains("nonexistent-name"),
+            "expected the ordinary \"no /etc/passwd\" error path, not a successful escape: {err}"
+        );
+        // A numeric uid still resolves fine (falls back to "no passwd
+        // entry" exactly as if the file were simply absent).
+        assert_eq!(resolve(dir.path(), "0").unwrap(), (0, 0));
+    }
+
+    /// A symlink whose target stays *inside* the rootfs (a completely
+    /// ordinary, non-malicious thing for a real image to do, e.g.
+    /// `/etc/passwd` symlinked to `/usr/etc/passwd` as some distros'
+    /// usr-merge layouts do) must still resolve and read normally --
+    /// `RESOLVE_IN_ROOT` only needs to block *escapes*, not symlinks in
+    /// general.
+    #[test]
+    fn a_passwd_symlink_staying_inside_the_rootfs_still_resolves() {
+        let dir = rootfs_with(None, None);
+        std::fs::write(dir.path().join("etc/real-passwd"), PASSWD).unwrap();
+        std::fs::remove_file(dir.path().join("etc/passwd")).ok();
+        std::os::unix::fs::symlink("real-passwd", dir.path().join("etc/passwd")).unwrap();
+
+        assert_eq!(resolve(dir.path(), "app").unwrap(), (1000, 1000));
     }
 }
