@@ -11,7 +11,7 @@ use std::process::Command;
 use oci_spec_types::image::ContainerConfig;
 use oci_store::Store;
 
-use oci_tools_tests::{bin_path, busybox_path, seed_image};
+use oci_tools_tests::{bin_path, busybox_path, seed_image, seed_image_with_files};
 
 fn ociman(storage_root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin_path("ociman"))
@@ -1525,7 +1525,7 @@ fn copy_from_rejects_a_name_that_is_not_any_earlier_stage() {
     write_containerfile(
         context_dir.path(),
         "FROM ociman-test/copyfrom-reject-base:latest\n\
-         COPY --from=docker.io/library/alpine:latest /etc/os-release /os-release\n",
+         COPY --from=Invalid_Reference_UPPERCASE!! /a.txt /b.txt\n",
     );
 
     let build = ociman(
@@ -1539,9 +1539,95 @@ fn copy_from_rejects_a_name_that_is_not_any_earlier_stage() {
     );
     assert!(!build.status.success());
     let stderr = String::from_utf8_lossy(&build.stderr);
+    // Neither an earlier stage name nor a valid image reference --
+    // `COPY --from=<external-image>` (see `copy_from_an_external_
+    // image_pulls_and_copies_a_real_file` below) is genuinely
+    // supported now, so a name that isn't a stage is only rejected
+    // once it *also* fails to parse as a real image reference.
     assert!(
-        stderr.contains("does not match any earlier stage"),
+        stderr.contains("is neither an earlier stage")
+            && stderr.contains("nor a valid image reference"),
         "{stderr}"
+    );
+}
+
+/// `COPY --from=<external-image>` (a name that isn't any earlier
+/// stage) pulls that image for real and copies from its own rootfs --
+/// matching real BuildKit's own support for exactly this (`dispatchCopy`
+/// resolves `--from` as a stage name first and otherwise falls through
+/// to an ordinary image pull). Exercised entirely offline: the
+/// "external" image is seeded into the same isolated test store ahead
+/// of time (`seed_image_with_files`), so `resolve_or_pull` finds it
+/// already present and never touches the network -- the same
+/// established pattern every other test in this file already uses for
+/// `FROM`.
+#[test]
+fn copy_from_an_external_image_pulls_and_copies_a_real_file() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copyfrom-external-consumer:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+    seed_image_with_files(
+        &store,
+        "ociman-test/copyfrom-external-source:latest",
+        &busybox,
+        &["sh"],
+        &[("etc/distinctive-marker.txt", b"from the external image\n")],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copyfrom-external-consumer:latest\n\
+         COPY --from=ociman-test/copyfrom-external-source:latest \
+         /etc/distinctive-marker.txt /marker.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/copyfrom-external-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/copyfrom-external-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /marker.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "from the external image\n"
     );
 }
 

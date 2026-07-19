@@ -22,9 +22,12 @@
 //!   kept around for the rest of the build, so a later stage can reuse
 //!   any of them directly — no re-pulling, no re-running anything.
 //!   **`COPY --from=<external-image>`** (a name that isn't any earlier
-//!   stage's own) **is still not supported** — pulling and extracting
-//!   an arbitrary other image just for a `COPY` is its own separate
-//!   future increment.
+//!   stage's own) **is supported too**: `--from` is resolved as a
+//!   stage name first and, if that fails, as a real image reference —
+//!   pulled (or reused, if already present locally) and extracted into
+//!   its own scratch rootfs just for that one `COPY`
+//!   (`external_image_source_root`), matching real BuildKit's own
+//!   `dispatchCopy` exactly.
 //! * **`RUN` is supported.** A `RUN` step materializes the base
 //!   image's own layers into a real, persistent scratch rootfs
 //!   (created once per build, reused cumulatively across every `RUN`/
@@ -47,12 +50,13 @@
 //!   source arguments as literally written) — real Docker's own rule,
 //!   checked directly (`copy.go`'s own `createCopyInstruction`):
 //!   with more than one source the destination must be a directory
-//!   and end with a `/`. No `--from=<external-image>` (only an
-//!   earlier stage in this same file), no `--chown`/`--chmod` (this
-//!   project's own rootless single-uid-mapping design, and
-//!   `oci_layer::apply`'s own already-documented "doesn't chown" scope
-//!   limit, apply equally here) — each rejected with a clear error
-//!   rather than silently ignored. A supported `COPY` commits one real
+//!   and end with a `/`. `--from` reaches either an earlier stage in
+//!   this same file or a real external image reference (see above);
+//!   no `--chown`/`--chmod` (this project's own rootless
+//!   single-uid-mapping design, and `oci_layer::apply`'s own
+//!   already-documented "doesn't chown" scope limit, apply equally
+//!   here) — each rejected with a clear error rather than silently
+//!   ignored. A supported `COPY` commits one real
 //!   new layer per instruction line exactly like `RUN` does (via the
 //!   same diff/`commit_layer`/`record_layer` path), just from a plain
 //!   recursive file copy instead of running a command.
@@ -737,9 +741,9 @@ fn run_step_spec(
 /// into `rootfs`, commit the result as a real new layer exactly like
 /// [`run_instruction`] does (same diff/`commit_layer`/`record_layer`
 /// path), and record it into `config`/`layers`. See this module's own
-/// doc comment for exactly what's supported (`--from=<earlier-stage>`,
-/// multiple explicit sources, glob patterns) and what's still rejected
-/// (`--chown`/`--chmod`, `--from=<external-image>`) and why.
+/// doc comment for exactly what's supported (`--from=<earlier-stage>`
+/// or `--from=<external-image>`, multiple explicit sources, glob
+/// patterns) and what's still rejected (`--chown`/`--chmod`) and why.
 #[allow(clippy::too_many_arguments)]
 fn copy_instruction(
     flags: &CopyFlags,
@@ -771,17 +775,30 @@ fn copy_instruction(
 
     // Real Docker/BuildKit rule, checked directly (`parser.go`'s own
     // `parseCopy`): a source path is always relative to its own root
-    // (the build context, or an earlier stage's own rootfs for
-    // `--from=<stage>`), even one written with a leading `/` -- `COPY
+    // (the build context, an earlier stage's own rootfs for
+    // `--from=<stage>`, or a pulled external image's own rootfs for
+    // `--from=<external-image>` — see `external_image_source_root`'s
+    // own doc comment), even one written with a leading `/` -- `COPY
     // /foo /bar` copies `<root>/foo`, never a host-absolute `/foo`.
+    //
+    // `_external_image_tempdir` is held only for its own `Drop` (the
+    // scratch directory it points `source_root` at must outlive every
+    // use of `source_root` below, but is cleaned up automatically once
+    // this function returns) -- the same pattern `BuiltStage`'s own
+    // `_build_dir` already established for the analogous per-stage
+    // case.
+    let mut _external_image_tempdir: Option<tempfile::TempDir> = None;
     let source_root: &Path = match &flags.from {
         None => context,
-        Some(from) => stage_ctx.rootfs_for(from).ok_or_else(|| {
-            anyhow::anyhow!(
-                "ociman build: COPY --from={from:?} does not match any earlier stage in this \
-                 Containerfile (copying from an external image is not yet supported)"
-            )
-        })?,
+        Some(from) => match stage_ctx.rootfs_for(from) {
+            Some(rootfs) => rootfs,
+            None => {
+                let dir = external_image_source_root(store, from)
+                    .with_context(|| format!("ociman build: COPY --from={from:?}"))?;
+                _external_image_tempdir = Some(dir);
+                _external_image_tempdir.as_ref().unwrap().path()
+            }
+        },
     };
     let sources = resolve_sources(source_root, sources, "COPY")?;
     // Real Docker/BuildKit rule, checked directly (`copy.go`'s own
@@ -997,7 +1014,51 @@ fn add_instruction(
     Ok(())
 }
 
-/// Join `relative` onto `base`, rejecting any `..` component that
+/// Resolve a `COPY --from=<name>` whose `name` doesn't match any
+/// earlier stage in this same Containerfile: parse it as a real image
+/// reference, pull it (or reuse an already-pulled copy — the same
+/// `resolve_or_pull` `cmd_build`'s own `FROM <image>` handling already
+/// uses), and extract every one of its own layers into a fresh
+/// scratch directory — matching real BuildKit's own `COPY
+/// --from=<external-image>` (an ordinary image reference is exactly
+/// what a real Containerfile's own `--from` accepts beyond a stage
+/// name; checked directly against `~/git/moby/daemon/builder/
+/// dockerfile/dispatchers.go`'s own `dispatchCopy`, which resolves
+/// `--from` as a stage name first and otherwise falls through to
+/// `getImageMount`, an ordinary image pull).
+///
+/// The returned [`tempfile::TempDir`] must be kept alive by the caller
+/// (bound to a real variable, not a temporary) for as long as its own
+/// path is still being read from — dropping it deletes the scratch
+/// directory.
+fn external_image_source_root(
+    store: &oci_store::Store,
+    from: &str,
+) -> anyhow::Result<tempfile::TempDir> {
+    let reference = Reference::parse(from).with_context(|| {
+        format!(
+            "{from:?} is neither an earlier stage in this Containerfile nor a valid image \
+             reference"
+        )
+    })?;
+    let record = crate::resolve_or_pull(store, &reference)?;
+    let manifest = store
+        .image_manifest(&record)
+        .with_context(|| format!("reading manifest for {reference}"))?;
+    let dir = tempfile::tempdir()
+        .context("creating a scratch directory for an external COPY --from= image")?;
+    for layer in &manifest.layers {
+        let compression = crate::compression_for_media_type(&layer.media_type)
+            .with_context(|| format!("layer {}", layer.digest))?;
+        let blob = store
+            .open_blob(&layer.digest)
+            .with_context(|| format!("opening layer blob {}", layer.digest))?;
+        oci_layer::apply(blob, compression, dir.path())
+            .with_context(|| format!("applying layer {}", layer.digest))?;
+    }
+    Ok(dir)
+}
+
 /// Resolve `sources` (each either a literal path, or — per real
 /// BuildKit's own `containsWildcards` check, [`oci_dockerfile::
 /// contains_wildcards`] — a glob pattern) against `source_root` into a
