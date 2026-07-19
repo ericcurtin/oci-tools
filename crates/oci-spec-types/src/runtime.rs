@@ -93,23 +93,26 @@ pub struct Hook {
 /// (`~/go/pkg/mod/github.com/opencontainers/runtime-spec@.../specs-go/
 /// config.go`), not re-derived from the spec doc alone.
 ///
-/// Only [`Self::poststart`]/[`Self::poststop`] are actually executed by
-/// `oci_runtime_core::hooks` yet — see `docs/design/0026` for why the
-/// other four (`prestart`/`createRuntime`/`createContainer`/
-/// `startContainer`) aren't: they need either pivot_root-relative
-/// timing or execution inside the container's own namespaces, neither
-/// of which this increment's scope covers. All six are still parsed
-/// (and round-trip through `Spec`'s own `Serialize`/`Deserialize`)
-/// regardless, so a bundle that sets them doesn't silently lose them
-/// from `config.json` even though the unimplemented four are ignored
-/// at run time.
+/// [`Self::prestart`]/[`Self::create_runtime`]/[`Self::poststart`]/
+/// [`Self::poststop`] are executed by `oci_runtime_core::hooks` (see
+/// `docs/design/0026`/`0035`); [`Self::create_container`]/
+/// [`Self::start_container`] still aren't — they need execution inside
+/// the container's own namespaces (a different mechanism from the
+/// "runtime namespace" hooks, which just need a synchronization point
+/// in the process that already forks the container, not namespace
+/// entry of any kind). All six are still parsed (and round-trip
+/// through `Spec`'s own `Serialize`/`Deserialize`) regardless, so a
+/// bundle that sets them doesn't silently lose them from `config.json`
+/// even though the two unimplemented ones are ignored at run time.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Hooks {
     /// Deprecated in favor of [`Self::create_runtime`]; same timing.
+    /// Executed first, before [`Self::create_runtime`] — see
+    /// `docs/design/0035`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prestart: Vec<Hook>,
     /// Runtime-namespace hooks run after the container's own namespaces
-    /// exist but before `pivot_root`. Not executed yet.
+    /// exist but before `pivot_root`, right after [`Self::prestart`].
     #[serde(
         rename = "createRuntime",
         default,

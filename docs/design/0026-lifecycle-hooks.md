@@ -1,6 +1,8 @@
 # Design note 0026: lifecycle hooks (`poststart`/`poststop`)
 
-Status: implemented (two of the six real hook points; see below)
+Status: implemented (two of the six real hook points at the time this
+note was written; `prestart`/`createRuntime` added by 0035 — see below
+for what's still true)
 Scope: `oci_spec_types::runtime::{Hook, Hooks}`, new
 `oci_runtime_core::hooks` module, wired into `launch::run_reporting_pid`.
 
@@ -25,11 +27,13 @@ six *correctly* needs two things this project doesn't have yet:
   requiring a synchronization point mid-way through the rootfs setup
   plan (between "namespaces exist" and "`pivot_root` about to run"),
   which `launch::run`'s single fork-to-exec sequence has no such pause
-  in today. `createContainer`/`startContainer` need to run **inside the
-  container's own namespaces** — needing either `nsenter`-style
+  in today. **Added by 0035**: a second readiness pipe, the same shape
+  as 0034's own cgroup one, the child blocks on right at the start of
+  rootfs setup. `createContainer`/`startContainer` need to run **inside
+  the container's own namespaces** — needing either `nsenter`-style
   namespace-joining machinery around the hook's own exec, or running
   them from inside the forked child itself before it hands off to the
-  user's command.
+  user's command. Still not done, even after 0035.
 * `poststop`, per the strict spec wording, runs "after the container is
   deleted but before the delete operation returns" — for the two-phase
   `create`/`start`/`kill`/`delete` lifecycle (0017), nothing in this
@@ -179,10 +183,11 @@ run` (10.7ms) on this same session's host.
 
 ## What's still not here
 
-* `prestart`/`createRuntime`/`createContainer`/`startContainer` — see
-  the scope-decision section above for exactly why each needs more
-  machinery this project doesn't have yet (pre-`pivot_root`
-  synchronization, or container-namespace execution).
+* `prestart`/`createRuntime` — true when this note was written; added
+  by 0035. `createContainer`/`startContainer` — see the scope-decision
+  section above for exactly why they need more machinery this project
+  doesn't have yet (container-namespace execution); still not done
+  after 0035 either.
 * `poststart`/`poststop` for the `create`/`start`/`kill`/`delete`
   two-phase lifecycle (0017) — needs a persistent per-container
   reaper/shim process this project doesn't have (see the scope-decision

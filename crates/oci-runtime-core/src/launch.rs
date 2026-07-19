@@ -167,6 +167,26 @@ pub unsafe fn run_reporting_pid(
         }
     };
 
+    // Same shape as the systemd cgroup driver's own readiness pipe just
+    // above: only actually created when there's a real `prestart`/
+    // `createRuntime` hook to run, so an ordinary container (no bundle
+    // this project's own benchmark has ever used sets these) pays
+    // nothing beyond the one `Option` check both here and in
+    // `ChildSetup::mount_pivot_and_exec`.
+    let needs_pre_pivot_hooks = bundle
+        .spec
+        .hooks
+        .as_ref()
+        .is_some_and(|h| !h.prestart.is_empty() || !h.create_runtime.is_empty());
+    let hooks_ready_write = if needs_pre_pivot_hooks {
+        let (ready_read, ready_write) =
+            rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)?;
+        child_setup.hooks_ready_read = Some(ready_read);
+        Some(ready_write)
+    } else {
+        None
+    };
+
     // SAFETY: forwarded from this function's own contract. Unlike
     // `create`, this direct child's own pid *is* what gets waited on
     // below — no relay-fork subtlety here, since `ChildSetup::run`
@@ -221,6 +241,35 @@ pub unsafe fn run_reporting_pid(
     };
 
     let container_pid = read_container_pid(read_fd)?;
+
+    // The container's own process is now paused right where the real
+    // spec requires `prestart`/`createRuntime` to run (see
+    // `ChildSetup::hooks_ready_read`'s own doc comment): namespaces
+    // exist, `pivot_root` hasn't happened yet. Unlike `poststart`/
+    // `poststop` below, a failure here is **fatal** — matching real
+    // `crun`'s own `do_hooks` call sites for these two hook points,
+    // which abort container creation outright rather than merely
+    // logging and continuing (see `docs/design/0035`).
+    if let Some(write_fd) = &hooks_ready_write {
+        if let Err(e) = run_pre_pivot_hooks(bundle, id, container_pid) {
+            // The container process is still blocked on its own read of
+            // the very pipe `write_fd` is the other end of — it will
+            // never receive the "go" byte now, so it must be killed
+            // outright rather than left to hang forever.
+            let _ = process::kill(container_pid, libc::SIGKILL);
+            let _ = process::wait(direct_child_pid);
+            if let Some(thread) = log_thread {
+                let _ = thread.join();
+            }
+            remove_cgroup_directory_if_any(bundle);
+            return Err(e);
+        }
+        // Best-effort: if this write somehow fails, the child's own
+        // read still eventually unblocks on `EOF` once this function
+        // returns and drops `write_fd`.
+        let _ = rustix::io::write(write_fd, b"\0");
+    }
+
     on_pid(container_pid);
     run_lifecycle_hooks(bundle, id, container_pid, "running", &Hook::Poststart);
 
@@ -305,6 +354,46 @@ fn run_lifecycle_hooks(bundle: &Bundle, id: &str, pid: i32, status: &str, which:
     if let Err(e) = crate::hooks::run(list, &state_json, keep_going) {
         tracing::warn!(hook = name, error = %e, "lifecycle hook failed (tolerated)");
     }
+}
+
+/// Run `bundle.spec.hooks`'s `prestart` list, then its `createRuntime`
+/// list (in that order, matching real `crun`'s own `do_hooks` call
+/// sites — checked directly against
+/// `~/git/crun/src/libcrun/container.c`, not the spec prose alone),
+/// each with `keep_going: false` (a failing hook stops the rest of its
+/// own list) and status `"created"` (matching the spec: both hook
+/// points run as part of the `create` operation, before the container
+/// has ever actually started). If `prestart` fails, `createRuntime`
+/// never runs at all — same as `crun`'s own early `goto fail`.
+///
+/// Unlike [`run_lifecycle_hooks`]'s `poststart`/`poststop`, a failure
+/// here is propagated to the caller rather than merely logged: these
+/// two hook points exist specifically to let a hook reject or
+/// reconfigure the container *before* it actually starts (e.g. a CNI
+/// plugin failing to set up networking), so silently continuing would
+/// defeat their entire purpose. See `docs/design/0035`.
+fn run_pre_pivot_hooks(bundle: &Bundle, id: &str, pid: i32) -> io::Result<()> {
+    let Some(hooks) = &bundle.spec.hooks else {
+        return Ok(());
+    };
+    if hooks.prestart.is_empty() && hooks.create_runtime.is_empty() {
+        return Ok(());
+    }
+    let state = crate::hooks::HookState {
+        oci_version: &bundle.spec.version,
+        id,
+        status: "created",
+        pid,
+        bundle: bundle.path.display().to_string(),
+        annotations: bundle.spec.annotations.clone(),
+    };
+    let state_json = serde_json::to_vec(&state)
+        .map_err(|e| io::Error::other(format!("serializing hook state: {e}")))?;
+    crate::hooks::run(&hooks.prestart, &state_json, false)
+        .map_err(|e| io::Error::other(format!("prestart hook failed: {e}")))?;
+    crate::hooks::run(&hooks.create_runtime, &state_json, false)
+        .map_err(|e| io::Error::other(format!("createRuntime hook failed: {e}")))?;
+    Ok(())
 }
 
 /// Wire `child_setup`'s stdout and stderr to two ends of a fresh pipe
@@ -504,6 +593,7 @@ fn build_child_setup(bundle: &Bundle, rootfs: &Path) -> io::Result<ChildSetup> {
         stdout_log_fd: None,
         stderr_log_fd: None,
         cgroup_ready_read: None,
+        hooks_ready_read: None,
         args: process_spec.args.clone(),
         env: process_spec.env.clone(),
         cwd: process_spec.cwd.clone(),
@@ -556,6 +646,22 @@ struct ChildSetup {
     /// matters), until [`run_reporting_pid`] has finished attempting
     /// the real, D-Bus-driven migration.
     cgroup_ready_read: Option<rustix::fd::OwnedFd>,
+    /// Set only when `bundle.spec.hooks` has any `prestart`/
+    /// `createRuntime` entries: the read end of a pipe the container's
+    /// own process (the grandchild, if a PID namespace was requested;
+    /// this same process otherwise — see [`ChildSetup::run`]'s own
+    /// relay-fork note) blocks on right before doing anything else in
+    /// [`ChildSetup::mount_pivot_and_exec`] — namespaces already exist
+    /// by this point but `pivot_root` hasn't happened yet, exactly the
+    /// "runtime namespace, after namespace creation, before
+    /// `pivot_root`" timing the real spec requires for both hook
+    /// points (see `docs/design/0035`) — until [`run_reporting_pid`]
+    /// has finished running them in the *runtime's* own process (this
+    /// project has no separate persistent runtime process, so that's
+    /// simply `run_reporting_pid`'s own caller, matching real `crun`'s
+    /// `do_hooks` being called from its own main process while the
+    /// forked container process waits on a sync socket).
+    hooks_ready_read: Option<rustix::fd::OwnedFd>,
     args: Vec<String>,
     env: Vec<String>,
     cwd: String,
@@ -692,6 +798,23 @@ impl ChildSetup {
     /// image outright, and any failure along the way prints an error and
     /// exits with a matching code (see [`fail`]).
     fn mount_pivot_and_exec(&self) -> ! {
+        // First of all, before anything else here (including opening
+        // the exec fifo below): give `run_reporting_pid` a chance to
+        // run `prestart`/`createRuntime` hooks in its own (the
+        // "runtime namespace") process — see [`Self::hooks_ready_read`]'s
+        // own doc comment for exactly why this is the right point.
+        // `None` (the overwhelmingly common case: no bundle this
+        // project's own benchmark has ever used sets these hooks) costs
+        // nothing beyond the `Option` check itself.
+        if let Some(ready_read) = &self.hooks_ready_read {
+            let mut buf = [0u8; 1];
+            if let Err(e) = rustix::io::read(ready_read, &mut buf) {
+                fail(
+                    SETUP_FAILURE_EXIT_CODE,
+                    &format!("waiting for pre-pivot hooks: {e}"),
+                );
+            }
+        }
         // Must happen *before* `pivot_root` below (part of the plan
         // loop) — see `exec_fifo`'s own doc comment on why an ordinary
         // by-path open afterward would resolve against the container's

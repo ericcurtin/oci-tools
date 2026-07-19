@@ -1,9 +1,11 @@
-//! `ocirun run` lifecycle hook tests: `poststart`/`poststop`, the only
-//! two of the six real hook points this project executes yet (see
-//! `docs/design/0026`). Real hook processes run in the *runtime*
-//! namespace (the host, not the container), so a hook can write to an
-//! ordinary host-side temp file to prove it ran and with what state —
-//! no container rootfs involvement needed for the hook side of things.
+//! `ocirun run` lifecycle hook tests: `poststart`/`poststop`/
+//! `prestart`/`createRuntime`, four of the six real hook points this
+//! project executes (see `docs/design/0026`/`0035`; `createContainer`/
+//! `startContainer` still aren't). Real hook processes run in the
+//! *runtime* namespace (the host, not the container), so a hook can
+//! write to an ordinary host-side temp file to prove it ran and with
+//! what state — no container rootfs involvement needed for the hook
+//! side of things.
 
 use std::path::Path;
 use std::process::Command;
@@ -117,6 +119,119 @@ fn a_failing_poststart_hook_does_not_change_the_containers_own_exit_code() {
         result.status.code(),
         Some(42),
         "a failing poststart hook must not change the container's own exit code: {result:?}"
+    );
+}
+
+#[test]
+fn prestart_hook_receives_a_created_state_with_a_real_pid_before_the_container_runs() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(dir.path(), &busybox, &["/bin/sh", "-c", "true"]);
+    let out = dir.path().join("prestart-state.json");
+    add_dump_state_hook(dir.path(), "prestart", &out);
+
+    let result = ocirun_run(dir.path(), "hooks-prestart-test");
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&out).unwrap()).expect("hook's stdin wasn't JSON");
+    assert_eq!(state["id"], "hooks-prestart-test");
+    assert_eq!(state["status"], "created");
+    assert!(
+        state["pid"].as_i64().unwrap() > 0,
+        "expected a real pid: {state:?}"
+    );
+    assert_eq!(state["bundle"], dir.path().to_string_lossy().as_ref());
+}
+
+#[test]
+fn create_runtime_hook_receives_a_created_state_too() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(dir.path(), &busybox, &["/bin/sh", "-c", "true"]);
+    let out = dir.path().join("create-runtime-state.json");
+    add_dump_state_hook(dir.path(), "createRuntime", &out);
+
+    let result = ocirun_run(dir.path(), "hooks-create-runtime-test");
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&out).unwrap()).expect("hook's stdin wasn't JSON");
+    assert_eq!(state["id"], "hooks-create-runtime-test");
+    assert_eq!(state["status"], "created");
+}
+
+#[test]
+fn prestart_runs_before_create_runtime() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(dir.path(), &busybox, &["/bin/sh", "-c", "true"]);
+    let log = dir.path().join("order.log");
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["hooks"] = serde_json::json!({
+        "prestart": [{"path": "/bin/sh", "args": ["sh", "-c", format!("echo prestart >> {}", log.display())]}],
+        "createRuntime": [{"path": "/bin/sh", "args": ["sh", "-c", format!("echo createRuntime >> {}", log.display())]}],
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let result = ocirun_run(dir.path(), "hooks-order-test");
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let order = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        order, "prestart\ncreateRuntime\n",
+        "prestart must run, and finish, before createRuntime"
+    );
+}
+
+#[test]
+fn a_failing_prestart_hook_aborts_the_container_entirely() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(dir.path(), &busybox, &["/bin/sh", "-c", "true"]);
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    let should_not_run = dir.path().join("should-not-run");
+    config["hooks"] = serde_json::json!({
+        "prestart": [{"path": "/bin/sh", "args": ["sh", "-c", "exit 5"]}],
+        "createRuntime": [{"path": "/bin/sh", "args": ["sh", "-c", format!("touch {}", should_not_run.display())]}],
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let result = ocirun_run(dir.path(), "hooks-failing-prestart-test");
+    assert!(
+        !result.status.success(),
+        "a failing prestart hook must fail the whole `ocirun run`: {result:?}"
+    );
+    assert!(
+        !should_not_run.exists(),
+        "createRuntime must never run once prestart has already failed"
     );
 }
 
