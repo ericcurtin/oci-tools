@@ -10,8 +10,11 @@
 //!   masked paths, the rootfs pivot itself) is `create`'s job, not this
 //!   crate's — see `syscalls`' module docs.
 //!
+//! - [`loop_device`] — loop device attach/detach (read-only,
+//!   direct-io) via the kernel's own `/dev/loop-control`/`LOOP_*`
+//!   ioctls directly, no `losetup` shellout needed.
+//!
 //! Planned scope (see `docs/design/`):
-//! - loop device management (attach/detach, read-only, direct-io)
 //! - overlayfs assembly (lowerdir stacks, upper/work dirs on ext4/xfs)
 //! - mount namespaces and propagation control
 //! - idmapped mounts for rootless containers
@@ -19,10 +22,12 @@
 //! Consumers: `oci-runtime-core` (container rootfs), `ociman` (storage
 //! mounts), `ociboot`/`ociboot-init` (deployment loop mounts, /etc overlay,
 //! /var bind). Test strategy: pure logic unit-tested with fakes; privileged
-//! integration tests gated behind an environment variable.
+//! integration tests gated behind real root/`sudo` availability.
 
+pub mod loop_device;
 pub mod options;
 pub mod syscalls;
 
+pub use loop_device::{AttachOptions, attach, detach};
 pub use options::{ParsedMountOptions, parse_mount_options};
 pub use syscalls::{MountPlan, mount, pivot_root};

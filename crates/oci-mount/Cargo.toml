@@ -10,8 +10,12 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+libc.workspace = true
 oci-spec-types.workspace = true
 rustix = { workspace = true, features = ["fs", "mount"] }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

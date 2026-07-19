@@ -787,8 +787,10 @@ dependencies = [
 name = "oci-mount"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "oci-spec-types",
  "rustix",
+ "tempfile",
 ]
 
 [[package]]
