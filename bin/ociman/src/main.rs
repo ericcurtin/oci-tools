@@ -41,6 +41,10 @@ const ANNOTATION_IMAGE: &str = "io.oci-tools.image";
 /// Same idea, for the container's exit code (recorded once it's known,
 /// after the container process has actually exited).
 const ANNOTATION_EXIT_CODE: &str = "io.oci-tools.exit-code";
+/// Same idea again, for a user-chosen `--name` (see
+/// [`resolve_container_id`] for how this makes a name usable anywhere
+/// an id is, matching real `docker`/`podman`).
+const ANNOTATION_NAME: &str = "io.oci-tools.name";
 
 /// Command-line interface.
 #[derive(Debug, Parser)]
@@ -89,6 +93,18 @@ enum Command {
         /// Remove the container's storage automatically once it exits.
         #[arg(long)]
         rm: bool,
+        /// A human-chosen name, usable anywhere the generated short id
+        /// is (`ps`/`rm`/`stop`/`exec`/`logs`) — matches real `docker
+        /// run --name`/`podman run --name`. Must be unique among
+        /// existing containers (stopped ones still hold their name
+        /// until removed) and start with a letter or digit, containing
+        /// only letters, digits, `_`, `.`, or `-` afterward. If not
+        /// given, the container is only addressable by its generated
+        /// id (no auto-generated fun name like real `docker`/`podman`
+        /// assign — see `docs/design/0032`'s own "what's still not
+        /// here").
+        #[arg(long)]
+        name: Option<String>,
     },
     /// List containers.
     Ps {
@@ -103,7 +119,7 @@ enum Command {
     /// Remove a stopped container's storage. Refuses a still-running
     /// one unless `--force` (which kills it first).
     Rm {
-        /// The container's ID.
+        /// The container's ID or `--name`.
         id: String,
         /// Kill the container first if it is still running.
         #[arg(short, long)]
@@ -115,7 +131,7 @@ enum Command {
     /// `docker stop`/`podman stop`. A no-op (not an error) on an
     /// already-stopped container.
     Stop {
-        /// The container's ID.
+        /// The container's ID or `--name`.
         id: String,
         /// Seconds to wait after the initial signal before escalating
         /// to `KILL`.
@@ -128,7 +144,7 @@ enum Command {
     /// Run an additional process inside an already-running container,
     /// joining its existing namespaces.
     Exec {
-        /// The container's ID.
+        /// The container's ID or `--name`.
         id: String,
         /// Username or UID, and optionally groupname or GID
         /// (`<user>[:<group>]`), resolved against the container's own
@@ -152,7 +168,7 @@ enum Command {
     /// Print a container's captured stdout/stderr (combined, not kept
     /// separate — see `docs/design/0025`).
     Logs {
-        /// The container's ID.
+        /// The container's ID or `--name`.
         id: String,
     },
 }
@@ -174,7 +190,12 @@ fn main() -> std::process::ExitCode {
             Some(Command::Pull { reference }) => cmd_pull(&reference, cli.global.json),
             Some(Command::Images) => cmd_images(cli.global.json),
             Some(Command::Inspect { reference }) => cmd_inspect(&reference, cli.global.json),
-            Some(Command::Run { image, args, rm }) => cmd_run(&image, &args, rm),
+            Some(Command::Run {
+                image,
+                args,
+                rm,
+                name,
+            }) => cmd_run(&image, &args, rm, name.as_deref()),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
             Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, &signal),
@@ -313,7 +334,7 @@ fn cmd_inspect(reference_str: &str, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_run(image_ref: &str, args: &[String], rm: bool) -> anyhow::Result<()> {
+fn cmd_run(image_ref: &str, args: &[String], rm: bool, name: Option<&str>) -> anyhow::Result<()> {
     let reference = Reference::parse(image_ref)
         .with_context(|| format!("parsing image reference {image_ref:?}"))?;
     let store = open_store()?;
@@ -329,6 +350,13 @@ fn cmd_run(image_ref: &str, args: &[String], rm: bool) -> anyhow::Result<()> {
     let containers = open_container_store()?;
     let mut annotations = std::collections::BTreeMap::new();
     annotations.insert(ANNOTATION_IMAGE.to_string(), reference.to_string());
+    if let Some(name) = name {
+        validate_container_name(name)?;
+        if let Ok(existing) = resolve_container_id(&containers, name) {
+            anyhow::bail!("container name {name:?} is already in use by {existing:?}");
+        }
+        annotations.insert(ANNOTATION_NAME.to_string(), name.to_string());
+    }
     let (container_id, mut state) = create_container_record(&containers, &annotations)?;
     tracing::debug!(container_id, %reference, "run starting");
 
@@ -458,10 +486,69 @@ fn create_container_record(
     anyhow::bail!("failed to allocate a unique container id after several attempts")
 }
 
+/// A conservative charset check matching real `docker`/`podman`'s own
+/// `--name` convention: keeps a chosen name unambiguous from a
+/// generated short hex id and safe to interpolate into JSON/table
+/// output without any escaping surprises.
+fn validate_container_name(name: &str) -> anyhow::Result<()> {
+    let valid = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    if !valid {
+        anyhow::bail!(
+            "invalid container name {name:?}: must start with a letter or digit and contain \
+             only letters, digits, '_', '.', or '-' afterward"
+        );
+    }
+    Ok(())
+}
+
+/// Resolve `reference` (whatever a user gave any container-targeting
+/// subcommand: `ps`/`rm`/`stop`/`exec`/`logs`) to a real container id
+/// — either `reference` already *is* one, or it's a `--name` some
+/// earlier `run` assigned (see [`ANNOTATION_NAME`]), matching real
+/// `docker`/`podman`'s own "id or name, either works" convention. An id
+/// match always wins over a name match (the same precedence real tools
+/// use), so a name that happens to collide with another container's id
+/// is not ambiguous, just a reason to pick a less confusing name.
+///
+/// The error for "no such container" deliberately matches
+/// `StateStore::load`'s own `StateError::NotFound` wording exactly
+/// (`container {reference:?} does not exist`), so every existing
+/// caller/test that only ever passed a real id continues to see the
+/// same message whether the lookup failed by id or (now) by name.
+fn resolve_container_id(containers: &StateStore, reference: &str) -> anyhow::Result<String> {
+    match containers.load(reference) {
+        Ok(_) => return Ok(reference.to_string()),
+        Err(oci_runtime_core::StateError::NotFound(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let matches: Vec<String> = containers
+        .list()
+        .context("listing containers")?
+        .into_iter()
+        .filter(|state| {
+            state.annotations.get(ANNOTATION_NAME).map(String::as_str) == Some(reference)
+        })
+        .map(|state| state.id)
+        .collect();
+    match matches.as_slice() {
+        [id] => Ok(id.clone()),
+        [] => anyhow::bail!("container {reference:?} does not exist"),
+        _ => anyhow::bail!("multiple containers are named {reference:?} (this should not happen)"),
+    }
+}
+
 /// `docker ps`/`podman ps`-style view of one container record.
 #[derive(Debug, Serialize)]
 struct ContainerView {
     id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     image: String,
     command: String,
     status: String,
@@ -473,6 +560,7 @@ impl ContainerView {
     fn from_state(state: &oci_runtime_core::PersistedState) -> Self {
         ContainerView {
             id: state.id.clone(),
+            name: state.annotations.get(ANNOTATION_NAME).cloned(),
             image: state
                 .annotations
                 .get(ANNOTATION_IMAGE)
@@ -520,13 +608,18 @@ fn cmd_ps(all: bool, quiet: bool, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "{:<14} {:<40} {:<30} {:<9} CREATED",
-        "CONTAINER ID", "IMAGE", "COMMAND", "STATUS"
+        "{:<14} {:<40} {:<30} {:<9} {:<20} CREATED",
+        "CONTAINER ID", "IMAGE", "COMMAND", "STATUS", "NAMES"
     );
     for view in &views {
         println!(
-            "{:<14} {:<40} {:<30} {:<9} {}",
-            view.id, view.image, view.command, view.status, view.created
+            "{:<14} {:<40} {:<30} {:<9} {:<20} {}",
+            view.id,
+            view.image,
+            view.command,
+            view.status,
+            view.name.as_deref().unwrap_or(""),
+            view.created
         );
     }
     Ok(())
@@ -534,7 +627,8 @@ fn cmd_ps(all: bool, quiet: bool, json: bool) -> anyhow::Result<()> {
 
 fn cmd_rm(id: &str, force: bool) -> anyhow::Result<()> {
     let containers = open_container_store()?;
-    let state = containers.load(id)?;
+    let resolved = resolve_container_id(&containers, id)?;
+    let state = containers.load(&resolved)?;
     let status = state.effective_status();
 
     if !force && status != Status::Stopped {
@@ -553,7 +647,7 @@ fn cmd_rm(id: &str, force: bool) -> anyhow::Result<()> {
         }
     }
 
-    containers.remove(id)?;
+    containers.remove(&resolved)?;
     println!("{id}");
     Ok(())
 }
@@ -564,7 +658,8 @@ fn cmd_rm(id: &str, force: bool) -> anyhow::Result<()> {
 /// idempotent behavior rather than erroring on a redundant call.
 fn cmd_stop(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
     let containers = open_container_store()?;
-    let state = containers.load(id)?;
+    let resolved = resolve_container_id(&containers, id)?;
+    let state = containers.load(&resolved)?;
     if state.effective_status() == Status::Stopped {
         println!("{id}");
         return Ok(());
@@ -620,11 +715,10 @@ fn cmd_stop(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
 /// every other subcommand already uses.
 fn cmd_logs(id: &str) -> anyhow::Result<()> {
     let containers = open_container_store()?;
-    let _state = containers
-        .load(id)
+    let resolved = resolve_container_id(&containers, id)
         .with_context(|| format!("looking up container {id:?}"))?;
 
-    let log_path = containers.container_dir(id).join("container.log");
+    let log_path = containers.container_dir(&resolved).join("container.log");
     match std::fs::read(&log_path) {
         Ok(bytes) => {
             use std::io::Write as _;
@@ -761,7 +855,8 @@ fn cmd_exec(
     args: &[String],
 ) -> anyhow::Result<()> {
     let containers = open_container_store()?;
-    let state = containers.load(id)?;
+    let resolved = resolve_container_id(&containers, id)?;
+    let state = containers.load(&resolved)?;
     let status = state.effective_status();
     if status != Status::Running {
         anyhow::bail!("cannot exec in a container in the {status} state");
