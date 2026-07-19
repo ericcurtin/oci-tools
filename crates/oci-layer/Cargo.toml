@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 flate2.workspace = true
+oci-spec-types.workspace = true
 ruzstd.workspace = true
 tar.workspace = true
 thiserror.workspace = true

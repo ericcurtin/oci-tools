@@ -78,6 +78,9 @@ pub use diff::{Change, ChangeKind, Snapshot, changes};
 mod export;
 pub use export::export;
 
+mod compress;
+pub use compress::compress_for_storage;
+
 /// How a layer's tar stream is compressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
