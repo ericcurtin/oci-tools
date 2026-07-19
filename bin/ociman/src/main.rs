@@ -294,6 +294,13 @@ enum Command {
         /// specifics).
         #[arg(long)]
         privileged: bool,
+        /// Mount the container's own rootfs read-only, matching real
+        /// `docker run --read-only`/`podman run --read-only` exactly
+        /// (both default to a writable rootfs, only this flag makes it
+        /// read-only). See `synthesize_spec`'s own doc comment for why
+        /// the default is writable.
+        #[arg(long = "read-only")]
+        read_only: bool,
     },
     /// List containers.
     Ps {
@@ -408,6 +415,7 @@ fn main() -> std::process::ExitCode {
                 cap_add,
                 cap_drop,
                 privileged,
+                read_only,
             }) => cmd_run(
                 &image,
                 &args,
@@ -423,6 +431,7 @@ fn main() -> std::process::ExitCode {
                 &cap_add,
                 &cap_drop,
                 privileged,
+                read_only,
             ),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
@@ -578,6 +587,7 @@ fn cmd_run(
     cap_add: &[String],
     cap_drop: &[String],
     privileged: bool,
+    read_only: bool,
 ) -> anyhow::Result<()> {
     let seccomp = resolve_seccomp(security_opts, privileged)?;
     let base_capabilities = if privileged {
@@ -667,6 +677,7 @@ fn cmd_run(
             cpuset_mems,
             seccomp,
             capabilities,
+            read_only,
         )?;
         if let Some(process) = &spec.process {
             state
@@ -1121,29 +1132,31 @@ fn synthesize_spec(
     cpuset_mems: Option<&str>,
     seccomp: Option<oci_spec_types::runtime::LinuxSeccomp>,
     capabilities: Vec<String>,
+    read_only: bool,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
     // `Spec::example()`'s own `root.readonly` is `true` -- a reasonable
     // conservative default for a hand-written example spec, but not
     // what a real container engine actually wants: real `docker run`/
-    // `podman run` give a container a writable rootfs by default
-    // (only `--read-only`, which neither `ociman run` nor `ociman
-    // build` exposes as a flag yet, makes it read-only). Left at
-    // `true`, *no* container this engine ever started could write
-    // anywhere in its own rootfs at all -- caught by hand while
-    // building `ociman build`'s own `RUN` support (0051), which needs
-    // exactly this to do anything useful, but the same bug already
-    // affected every `ociman run` container equally, just never
-    // exercised by a test that tried to write anything. Also a pure
-    // performance win, not just a correctness fix: `oci_runtime_core::
-    // rootfs`'s own bind-then-remount-readonly step is skipped
-    // entirely when `readonly` is `false` (one fewer mount syscall
-    // pair per container start).
+    // `podman run` give a container a writable rootfs by default,
+    // only `--read-only` (now `ociman run`'s own flag, matching real
+    // `docker run --read-only`/`podman run --read-only` exactly) makes
+    // it read-only. Left unconditionally at `true`, *no* container
+    // this engine ever started could write anywhere in its own rootfs
+    // at all -- caught by hand while building `ociman build`'s own
+    // `RUN` support (0051), which needs exactly this to do anything
+    // useful, but the same bug already affected every `ociman run`
+    // container equally, just never exercised by a test that tried to
+    // write anything. Also a pure performance win when `read_only` is
+    // `false` (the common case), not just a correctness fix:
+    // `oci_runtime_core::rootfs`'s own bind-then-remount-readonly step
+    // is skipped entirely when `readonly` is `false` (one fewer mount
+    // syscall pair per container start).
     spec.root
         .as_mut()
         .expect("Spec::example always sets root")
-        .readonly = false;
+        .readonly = read_only;
 
     let container_config = config.config.clone().unwrap_or_default();
     let full_args = command_for(&container_config, args)?;

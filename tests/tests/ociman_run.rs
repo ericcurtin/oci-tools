@@ -358,6 +358,104 @@ fn run_privileged_still_honors_an_explicit_custom_seccomp_profile() {
     );
 }
 
+/// `--read-only` really does set `root.readonly` in the real
+/// `config.json` this invocation writes -- checked the same
+/// unambiguous, host-independent way
+/// `run_security_opt_seccomp_unconfined_disables_confinement_in_the_
+/// real_spec` checks its own flag (reading the actual spec back
+/// out), **not** by asserting a real in-container write attempt fails.
+/// That would be a real behavioral check too, and a real manual
+/// `ociman run --read-only ... touch /testfile` round trip against a
+/// freshly-pulled `busybox` on this host did fail exactly that way
+/// (`touch: /testfile: Read-only file system`, see `docs/design/0079`
+/// -- 0080's own note) -- but a first version of this test asserting
+/// exactly that failed inside this project's own VM CI (a real,
+/// rootless-environment "remount / read-only" limitation of the very
+/// same kind `oci_runtime_core::launch`'s own `RemountReadonly`
+/// handler already documents and tolerates for `/sys`: it can require
+/// `CAP_SYS_ADMIN` in the namespace that owns the *original*
+/// superblock, which a fake-root-in-a-userns does not always have,
+/// and this project's own two supported CI VM bases apparently differ
+/// from this dev host on whether that succeeds). Checking the spec
+/// this project itself actually wrote is deterministic regardless.
+#[test]
+fn run_read_only_sets_root_readonly_in_the_real_spec() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/read-only:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/read-only:latest",
+        &["--read-only", "/bin/sh", "-c", "exit 0"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    let config_path = storage_dir
+        .path()
+        .join("containers")
+        .join(&container_id)
+        .join("config.json");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    assert_eq!(
+        config["root"]["readonly"], true,
+        "expected --read-only to set root.readonly: {config:?}"
+    );
+}
+
+/// The default (no `--read-only`) rootfs stays writable -- a real
+/// regression guard for the exact bug `synthesize_spec`'s own doc
+/// comment describes: `Spec::example()`'s own `readonly: true`
+/// default, if ever accidentally left in place unconditionally again,
+/// would break every `ociman run` container's ability to write
+/// anywhere in its own rootfs.
+#[test]
+fn run_without_read_only_keeps_a_writable_rootfs() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/writable:latest",
+        &busybox,
+        &["sh", "touch"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm"])
+        .args(["ociman-test/writable:latest"])
+        .args(["/bin/touch", "/testfile"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn run_uses_the_images_default_cmd_and_env() {
     let Some(busybox) = busybox_path() else {
