@@ -76,7 +76,7 @@ fn run_detach_returns_immediately_and_the_container_keeps_running() {
             "ociman-test/detach-basic:latest",
             "/bin/sh",
             "-c",
-            "sleep 2",
+            "sleep 15",
         ],
     );
     let elapsed = started.elapsed();
@@ -85,8 +85,22 @@ fn run_detach_returns_immediately_and_the_container_keeps_running() {
         "stderr: {}",
         String::from_utf8_lossy(&run.stderr)
     );
+    // A generous ceiling: what actually matters here is *whether*
+    // `run -d` detached at all rather than waiting for the container's
+    // own command to finish, not exactly how many milliseconds that
+    // takes -- real OS/namespace-setup scheduling jitter, especially
+    // under a loaded or slow-emulated (TCG, no KVM) CI host, makes a
+    // tight assertion on elapsed wall-clock time flaky by nature (see
+    // `ociman_stop.rs`'s own identical fix/finding for its own
+    // grace-period assertion). The container's own command sleeps a
+    // full 15s specifically so that even a generous multi-second
+    // ceiling here still fails loudly if `run -d` genuinely blocked
+    // until the container exited instead of actually detaching; the
+    // common, uncontended case still returns in well under a second
+    // regardless of how generous this ceiling is, so raising it only
+    // helps, never slows down the common case.
     assert!(
-        elapsed < Duration::from_secs(1),
+        elapsed < Duration::from_secs(10),
         "run -d should return almost immediately, not wait for the container to exit: {elapsed:?}"
     );
     let id = String::from_utf8_lossy(&run.stdout).trim().to_string();
@@ -100,7 +114,7 @@ fn run_detach_returns_immediately_and_the_container_keeps_running() {
     );
 
     assert_eq!(
-        wait_for_status(storage_dir.path(), &id, "stopped", Duration::from_secs(10)),
+        wait_for_status(storage_dir.path(), &id, "stopped", Duration::from_secs(30)),
         "stopped"
     );
 
