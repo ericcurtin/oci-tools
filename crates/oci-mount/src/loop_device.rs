@@ -381,6 +381,19 @@ mod tests {
 
         let device = attach(&backing, &AttachOptions::default()).unwrap();
         detach(&device).unwrap();
+        // The first `detach` above can return success while the clear
+        // is only *scheduled*, not yet actually performed (see
+        // `wait_until_truly_detached`'s own doc comment) -- immediately
+        // detaching again races against that real, environment-
+        // dependent delay (`systemd-udevd` transiently opening the
+        // device to probe it, observed directly on real CI hardware)
+        // and can spuriously see the device as still genuinely
+        // attached rather than the real ENXIO this test exists to
+        // verify. Wait for the real clear to finish first.
+        assert!(
+            wait_until_truly_detached(&device),
+            "device should have become genuinely detached"
+        );
 
         let err = detach(&device).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENXIO));

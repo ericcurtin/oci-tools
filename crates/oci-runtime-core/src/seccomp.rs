@@ -185,6 +185,31 @@ pub fn apply(seccomp: &LinuxSeccomp) -> io::Result<()> {
 /// the same (default) capability set, so a single, already-resolved,
 /// flat profile is both correct and far simpler than reimplementing
 /// that resolution machinery.
+///
+/// The capture itself was taken on an aarch64 host, so `container-
+/// libs`' own `includes: {"arches": ["amd64", "x32"]}`-conditioned
+/// entries (`arch_prctl`, `modify_ldt`) correctly resolved to *nothing*
+/// at capture time and never made it into this flat file — invisible
+/// on aarch64 (where those syscalls don't exist at all, and
+/// [`filter_to_supported_syscalls`] already drops unresolvable names
+/// silently), but fatal on x86_64: glibc's own thread/TLS setup calls
+/// `arch_prctl(ARCH_SET_FS, ...)` during *every* process start,
+/// static-PIE binaries included, and a seccomp default of
+/// `SCMP_ACT_ERRNO` for it is indistinguishable from `arch_prctl`
+/// simply not existing — glibc's own reaction to that (see `sysdeps/
+/// .../dl-tls.c`) is `__libc_fatal("Fatal glibc error: Cannot allocate
+/// TLS block\n")` followed by `_exit(127)`, which — being a real exit
+/// code from a real, started process rather than an `exec` failure —
+/// is not the same failure `oci_runtime_core::launch`'s own
+/// `COMMAND_NOT_FOUND_EXIT_CODE` documents, despite the identical
+/// number: a genuinely nasty case of two unrelated bugs sharing one
+/// exit code by coincidence. Caught by this profile actually being
+/// exercised on real x86_64 CI hardware for the first time (every
+/// `ociman build` `RUN` step execs a real, statically linked `busybox`
+/// under this exact profile) — `arch_prctl`/`modify_ldt` are added
+/// back here by hand, in their real upstream's alphabetical spot,
+/// rather than by re-capturing on x86_64, since that's the only
+/// concrete gap this ever actually surfaced.
 const DEFAULT_SECCOMP_PROFILE_JSON: &str = include_str!("data/default_seccomp_profile.json");
 
 /// Parse the bundled default seccomp profile (see
