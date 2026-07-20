@@ -187,6 +187,22 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         ps_args: Vec<String>,
     },
+    /// Update a running container's real cgroup resource limits in
+    /// place — matching real `runc update`'s own `--resources`/`-r`
+    /// JSON-file mode exactly (its own many individual ad-hoc
+    /// `--memory`/`--cpu-shares`/... flags aren't supported yet, a
+    /// deliberately narrower first slice; see `docs/design/0099`).
+    Update {
+        /// The container's ID.
+        id: String,
+        /// Path to a JSON file containing the `LinuxResources` to
+        /// apply (same shape as `config.json`'s own
+        /// `linux.resources`), or `-` to read it from stdin. Any
+        /// field the JSON leaves unset is left completely alone —
+        /// this only ever changes what's actually given.
+        #[arg(short, long)]
+        resources: PathBuf,
+    },
 }
 
 /// Parse a `runc exec --user`-style `<uid>[:<gid>]` string: `uid` is
@@ -257,6 +273,7 @@ fn main() -> std::process::ExitCode {
                 format,
                 ps_args,
             }) => cmd_ps(&root, &id, &format, &ps_args),
+            Some(Command::Update { id, resources }) => cmd_update(&root, &id, &resources),
         }
     })
 }
@@ -643,6 +660,54 @@ fn cmd_ps(root: &Path, id: &str, format: &str, ps_args: &[String]) -> anyhow::Re
         }
         other => anyhow::bail!("invalid format option: {other:?} (want \"table\" or \"json\")"),
     }
+}
+
+/// Update a running container's real cgroup resource limits — matches
+/// real `runc update --resources=<file>` exactly (`~/git/runc/
+/// update.go`): `plan_resources` only ever emits a write for a field
+/// the given `LinuxResources` JSON actually sets (every field is
+/// `Option`, matching the real runtime-spec's own shape), so a
+/// deliberately narrow JSON blob (just `{"memory": {"limit": ...}}`,
+/// say) changes only that one thing and leaves every other real
+/// cgroup limit exactly as it was — no separate "merge with what's
+/// already set" logic is needed for the cgroup-writing side at all.
+/// Deliberately narrower than real runc's own full command: no
+/// individual `--memory`/`--cpu-shares`/... ad-hoc flags (JSON-file
+/// mode only), and the container's own persisted `config.json` is not
+/// rewritten to reflect the change (a later `ocirun state` still shows
+/// the limits it was *created* with) — see `docs/design/0099`.
+fn cmd_update(root: &Path, id: &str, resources_path: &Path) -> anyhow::Result<()> {
+    let store = StateStore::open(root)
+        .with_context(|| format!("opening container state root {}", root.display()))?;
+    let state = store.load(id)?;
+
+    let bundle = oci_runtime_core::Bundle::load(&state.bundle)
+        .with_context(|| format!("loading bundle from {}", state.bundle))?;
+    let cgroup_dir = oci_runtime_core::cgroups::directory_for(
+        Path::new("/sys/fs/cgroup"),
+        bundle
+            .spec
+            .linux
+            .as_ref()
+            .and_then(|l| l.cgroups_path.as_deref()),
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!("container {id:?} has no cgroup to update (no cgroupsPath set)")
+    })?;
+
+    let resources: oci_spec_types::runtime::LinuxResources = if resources_path == Path::new("-") {
+        serde_json::from_reader(std::io::stdin()).context("reading resources JSON from stdin")?
+    } else {
+        let file = std::fs::File::open(resources_path)
+            .with_context(|| format!("opening {}", resources_path.display()))?;
+        serde_json::from_reader(file)
+            .with_context(|| format!("parsing {} as JSON", resources_path.display()))?
+    };
+
+    let writes = oci_runtime_core::cgroups::plan_resources(&resources);
+    oci_runtime_core::cgroups::apply(&cgroup_dir, &writes)
+        .with_context(|| format!("applying updated resources to {}", cgroup_dir.display()))?;
+    Ok(())
 }
 
 fn cmd_exec(
