@@ -442,6 +442,14 @@ enum Command {
         #[arg(short, long, default_value_t = 250)]
         interval: u64,
     },
+    /// Rename an existing container — matching real `docker rename`/
+    /// `podman rename`.
+    Rename {
+        /// The container's ID or its current `--name`.
+        id: String,
+        /// The new name.
+        name: String,
+    },
     /// Run an additional process inside an already-running container,
     /// joining its existing namespaces.
     Exec {
@@ -560,6 +568,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, &signal),
             Some(Command::Kill { id, signal }) => cmd_kill(&id, &signal),
             Some(Command::Wait { id, interval }) => cmd_wait(&id, interval),
+            Some(Command::Rename { id, name }) => cmd_rename(&id, &name),
             Some(Command::Exec {
                 id,
                 user,
@@ -1265,6 +1274,35 @@ fn cmd_wait(id: &str, interval_ms: u64) -> anyhow::Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(interval_ms));
     }
+}
+
+/// Rename an existing container: rewrite its own [`ANNOTATION_NAME`]
+/// annotation, reusing exactly the same charset check
+/// ([`validate_container_name`]) and name-collision check `run --name`
+/// already applies — matching real `docker rename`/`podman rename`
+/// exactly (`~/git/podman/cmd/podman/containers/rename.go`: silent on
+/// success, no output at all). Renaming a container to its own
+/// current name is a harmless no-op, not a self-collision error —
+/// `run --name`'s own uniqueness check never has to consider this
+/// case (a container can't already be running under the name it's
+/// about to be created with), but `rename` can be asked for it
+/// directly.
+fn cmd_rename(id: &str, new_name: &str) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let resolved = resolve_container_id(&containers, id)?;
+    validate_container_name(new_name)?;
+    if let Ok(existing) = resolve_container_id(&containers, new_name)
+        && existing != resolved
+    {
+        anyhow::bail!("container name {new_name:?} is already in use by {existing:?}");
+    }
+
+    let mut state = containers.load(&resolved)?;
+    state
+        .annotations
+        .insert(ANNOTATION_NAME.to_string(), new_name.to_string());
+    containers.write(&state)?;
+    Ok(())
 }
 
 /// Print a container's captured output (see `docs/design/0025`):
