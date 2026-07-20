@@ -329,12 +329,36 @@ fn run_privileged_still_honors_an_explicit_custom_seccomp_profile() {
 
     let profile_dir = tempfile::tempdir().unwrap();
     let profile_path = profile_dir.path().join("custom-seccomp.json");
-    // Blocks `mkdirat` specifically (the real syscall `mkdir(1)` uses
-    // on every architecture this project targets) -- everything else
-    // stays allowed.
+    // The real syscall `mkdir(1)` uses is genuinely architecture-
+    // dependent, not just "mkdirat" everywhere: glibc's own `mkdir()`
+    // (`sysdeps/unix/sysv/linux/mkdir.c`) calls the legacy `mkdir`
+    // syscall directly when the target has one at all (`#ifdef
+    // __NR_mkdir`) -- true on x86_64, which keeps the old syscall
+    // table entry for compatibility -- and only falls back to
+    // `mkdirat(AT_FDCWD, ...)` on architectures that never had a
+    // standalone `mkdir` syscall to begin with, aarch64 among them.
+    // Naming only `mkdirat` here (this test's own earlier shape)
+    // genuinely blocks nothing at all on x86_64, letting `mkdir(1)`
+    // silently succeed under a filter that looks like it should have
+    // stopped it -- found via this exact test failing, deterministically,
+    // on real x86_64 CI hardware while passing everywhere this project
+    // had previously verified it by hand (aarch64 only, see 0069). A
+    // caller-supplied profile is deliberately used unfiltered/strict
+    // (see `resolve_seccomp`'s own doc comment) -- naming `mkdir` on an
+    // architecture where the kernel truly has no such syscall (aarch64)
+    // is a real, surfaced error there, not something to silently drop
+    // -- so which single name to block has to be chosen per
+    // architecture here, not just unioned.
+    let mkdir_syscall_name = if cfg!(target_arch = "x86_64") {
+        "mkdir"
+    } else {
+        "mkdirat"
+    };
     std::fs::write(
         &profile_path,
-        r#"{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["mkdirat"],"action":"SCMP_ACT_ERRNO"}]}"#,
+        format!(
+            r#"{{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{{"names":["{mkdir_syscall_name}"],"action":"SCMP_ACT_ERRNO"}}]}}"#
+        ),
     )
     .unwrap();
 
