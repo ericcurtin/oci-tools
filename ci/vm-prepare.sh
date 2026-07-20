@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
-# Runs INSIDE the CI guest VM, streamed over ssh stdin *before* the source
-# tree is pushed (so it must not assume anything beyond a stock cloud image;
-# in particular it installs tar, which `vm.sh push` needs).
+# Two callers, same script, because neither cares whether it's inside a VM:
+# `ci/run-in-vm.sh`, streamed over ssh stdin *before* the source tree is
+# pushed into a guest VM (so it must not assume anything beyond a stock
+# cloud image there; in particular it installs tar, which `vm.sh push`
+# needs) -- and, directly, `.github/workflows/ci.yml`'s own `native-test`
+# job, on the bare aarch64 runner `ci/native-ci.sh` builds/tests on next
+# (a real `sudo`-capable Ubuntu host already has `tar`; installing it again
+# is simply a no-op there).
 #
-# Installs the build toolchain packages for either supported base:
+# Installs the build toolchain packages for either supported guest-VM base:
 #   - CentOS Stream 10 (dnf)
 #   - Ubuntu 26.04 (apt)
-# Distro differences are data (package lists), not logic.
+# Distro differences are data (package lists), not logic. The bare aarch64
+# runner is itself always Ubuntu (whatever `ubuntu-24.04-arm` ships), so it
+# always takes the `apt-get` branch below.
 set -euxo pipefail
 
 if command -v dnf >/dev/null 2>&1; then

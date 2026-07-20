@@ -53,10 +53,18 @@ jobs:
       - name: Project guards (forbidden fs, bin deps, capability dups)
         run: python3 ci/guards.py
 
-  # Exactly 4 parallel VM jobs; each boots the target distro as a VM on a
-  # same-arch runner and builds/tests the workspace natively inside it.
-  # x86_64 runners provide KVM; GitHub's aarch64 runners have no /dev/kvm,
-  # so those cells run under TCG and get a much larger timeout.
+  # 2 parallel VM jobs (x86_64 only): each boots the target distro as a VM
+  # on a same-arch runner and builds/tests the workspace natively inside
+  # it. x86_64 runners provide KVM when the underlying host happens to
+  # expose it (falls back to TCG otherwise, see ci/setup-host.sh) --
+  # either way, real per-distro (centos-stream10/ubuntu-26.04) coverage.
+  #
+  # aarch64 coverage is `native-test` below instead, not a third and
+  # fourth cell here: GitHub's own aarch64 runners have no /dev/kvm at
+  # all, so this same harness's guest VMs would only ever boot under
+  # (slow, and — found the hard way, 2026-07-20 — occasionally flaky in
+  # ways that muddy real per-architecture bugs with unrelated timing
+  # noise) TCG there.
   vm-test:
     name: vm (${{ matrix.base }}, ${{ matrix.arch }})
     strategy:
@@ -67,18 +75,10 @@ jobs:
             arch: x86_64
             runs-on: ubuntu-24.04
             timeout: 90
-          - base: centos-stream10
-            arch: aarch64
-            runs-on: ubuntu-24.04-arm
-            timeout: 300
           - base: ubuntu-26.04
             arch: x86_64
             runs-on: ubuntu-24.04
             timeout: 90
-          - base: ubuntu-26.04
-            arch: aarch64
-            runs-on: ubuntu-24.04-arm
-            timeout: 300
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: ${{ matrix.timeout }}
     steps:
@@ -108,5 +108,43 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.base }}-${{ matrix.arch }}
+          path: artifacts/
+          if-no-files-found: error
+
+  # Real aarch64 architecture coverage, without the nested-VM harness
+  # `vm-test` uses for x86_64: builds and tests directly on GitHub's own
+  # aarch64 runner (a real CPU, no TCG emulation, no /dev/kvm dependency
+  # at all) rather than booting a second, inner guest VM this
+  # architecture's own runners can't accelerate anyway. Trades per-distro
+  # (centos-stream10/ubuntu-26.04) coverage on this architecture alone
+  # for a fast, reliable run on real hardware; `vm-test` above still
+  # covers both distros on x86_64.
+  native-test:
+    name: native (aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: ci/vm-prepare.sh
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: native-aarch64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: native-aarch64-
+
+      - name: Build, test, and stage release binaries
+        run: ci/native-ci.sh
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: binaries-native-aarch64
           path: artifacts/
           if-no-files-found: error
