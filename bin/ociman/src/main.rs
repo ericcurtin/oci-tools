@@ -16,7 +16,7 @@
 mod build;
 mod user_resolve;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use clap::Parser;
@@ -94,13 +94,13 @@ enum Command {
     Build {
         /// Build context directory.
         #[arg(default_value = ".")]
-        context: std::path::PathBuf,
+        context: PathBuf,
         /// Path to the Dockerfile/Containerfile (default: the
         /// context's own `Containerfile`, falling back to
         /// `Dockerfile`, matching real `podman build`'s own
         /// preference).
         #[arg(short = 'f', long = "file")]
-        file: Option<std::path::PathBuf>,
+        file: Option<PathBuf>,
         /// Tag the built image (`name[:tag]`) — currently required
         /// (see the `build` module's own doc comment for why).
         #[arg(short = 't', long = "tag")]
@@ -150,6 +150,12 @@ enum Command {
         /// Remove the container's storage automatically once it exits.
         #[arg(long)]
         rm: bool,
+        /// Run the container in the background and print its id,
+        /// instead of attaching to it in the foreground — matching
+        /// real `docker run -d`/`podman run -d`. Output is still
+        /// fully captured (`ociman logs`), just never shown live.
+        #[arg(short, long)]
+        detach: bool,
         /// A human-chosen name, usable anywhere the generated short id
         /// is (`ps`/`rm`/`stop`/`exec`/`logs`) — matches real `docker
         /// run --name`/`podman run --name`. Must be unique among
@@ -538,6 +544,7 @@ fn main() -> std::process::ExitCode {
                 image,
                 args,
                 rm,
+                detach,
                 name,
                 memory,
                 memory_swap,
@@ -559,6 +566,7 @@ fn main() -> std::process::ExitCode {
                 &image,
                 &args,
                 rm,
+                detach,
                 name.as_deref(),
                 memory.as_deref(),
                 memory_swap.as_deref(),
@@ -749,6 +757,7 @@ fn cmd_run(
     image_ref: &str,
     args: &[String],
     rm: bool,
+    detach: bool,
     name: Option<&str>,
     memory: Option<&str>,
     memory_swap: Option<&str>,
@@ -850,7 +859,7 @@ fn cmd_run(
     // it survives (or gets wiped by `rm`) along with the rest of the
     // container's own storage.
     let log_path = bundle_dir.join("container.log");
-    let result = (|| -> anyhow::Result<i32> {
+    let prepared = (|| -> anyhow::Result<(oci_runtime_core::Bundle, PathBuf)> {
         std::fs::create_dir_all(&rootfs_dir)
             .with_context(|| format!("creating {}", rootfs_dir.display()))?;
 
@@ -898,62 +907,11 @@ fn cmd_run(
             .with_context(|| format!("loading bundle from {}", bundle_dir.display()))?;
         let rootfs = oci_runtime_core::validate::validate(&bundle)
             .context("config.json failed validation")?;
-
-        // Records a *live* pid (and status `Running`) before blocking
-        // on the container, unlike a plain `launch::run` — this is
-        // what makes a concurrent `ociman exec`/`ps`/`rm` against this
-        // same container, issued from another invocation while this
-        // one is still foreground, actually see something real rather
-        // than the "Creating" placeholder from above (see
-        // `docs/design/0023`).
-        let record_running = |pid: i32| {
-            state.status = Status::Running;
-            state.pid = Some(pid);
-            let _ = containers.write(&state);
-        };
-
-        // Always attempt the systemd cgroup driver for `ociman`'s own
-        // containers (matching real `podman`'s own default on
-        // systemd-based distros) — falls back to no cgroup at all
-        // (logged, not fatal) if no D-Bus session is reachable, so
-        // this is a pure improvement over the previous "never any
-        // cgroup at all" behavior, never a new hard requirement. See
-        // `docs/design/0033`/`0034`. `resources` (if `--memory` set
-        // one) rides along, translated into systemd unit properties
-        // rather than dropped — see `docs/design/0037`.
-        let cgroup_setup = oci_runtime_core::launch::CgroupSetup::Systemd {
-            scope_name: format!("ociman-{container_id}.scope"),
-            description: format!("oci-tools container {container_id}"),
-            resources: bundle
-                .spec
-                .linux
-                .as_ref()
-                .and_then(|l| l.resources.clone())
-                .map(Box::new),
-        };
-
-        // SAFETY: `ociman`'s own process has not spawned any additional
-        // threads by this point (argument parsing, pulling, and layer
-        // extraction don't spawn any), so the fork `launch::
-        // run_reporting_pid` performs is sound — see its own safety
-        // note for the requirement this satisfies.
-        #[allow(unsafe_code)]
-        let exit_code = unsafe {
-            oci_runtime_core::launch::run_reporting_pid(
-                &container_id,
-                &bundle,
-                &rootfs,
-                Some(&log_path),
-                cgroup_setup,
-                record_running,
-            )
-        }
-        .context("running container")?;
-        Ok(exit_code)
+        Ok((bundle, rootfs))
     })();
 
-    let exit_code = match result {
-        Ok(code) => code,
+    let (bundle, rootfs) = match prepared {
+        Ok(v) => v,
         Err(e) => {
             // Setup failed before the container's own process ever
             // ran: don't leave a permanently-"creating" record behind,
@@ -965,16 +923,176 @@ fn cmd_run(
         }
     };
 
+    if detach {
+        // Cloned for the forked child below: the original `container_id`/
+        // `containers` are still needed afterward, in *this* process,
+        // to poll for the container's own real startup (`StateStore`
+        // itself is just a thin, cheap-to-recreate handle around a
+        // root path, not a shared, cloneable connection of any kind —
+        // re-opening it fresh in the child is simpler and just as
+        // correct as cloning would be).
+        let container_id_for_keeper = container_id.clone();
+
+        // SAFETY: `ociman`'s own process has not spawned any additional
+        // threads by this point (argument parsing, pulling, layer
+        // extraction, and spec synthesis don't spawn any), and a
+        // fresh `fork(2)` child is always single-threaded regardless
+        // of its parent — the same safety invariant
+        // `run_and_finalize`'s own `run_reporting_pid` call already
+        // requires, forwarded here since this fork happens through
+        // the exact same primitive `launch::run_reporting_pid` itself
+        // uses.
+        #[allow(unsafe_code)]
+        let keeper_pid = unsafe {
+            oci_runtime_core::process::fork(move || {
+                // Detach from the controlling terminal/session
+                // entirely, and stop this process from ever again
+                // writing to (or blocking on) the original terminal —
+                // matches real `docker run -d`'s own "no live output
+                // for a detached container" convention: `ociman
+                // logs`, not this fd, is where output is read back
+                // from (the log-tee thread `run_and_finalize`'s own
+                // `run_reporting_pid` call spawns still writes the
+                // real container output to `container.log`
+                // regardless; only its *second* copy, normally also
+                // echoed to this process's own stdout for a
+                // foreground `run`, is silenced here).
+                let _ = rustix::process::setsid();
+                let devnull = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("/dev/null");
+                if let Ok(devnull) = devnull {
+                    let _ = rustix::stdio::dup2_stdin(&devnull);
+                    let _ = rustix::stdio::dup2_stdout(&devnull);
+                    let _ = rustix::stdio::dup2_stderr(&devnull);
+                }
+                let Ok(containers) = open_container_store() else {
+                    std::process::exit(1);
+                };
+                let _ = run_and_finalize(
+                    &container_id_for_keeper,
+                    &bundle,
+                    &rootfs,
+                    &containers,
+                    state,
+                    &log_path,
+                    rm,
+                );
+                std::process::exit(0);
+            })
+        }
+        .context("detaching container")?;
+
+        wait_for_detached_container_to_start(&containers, &container_id, keeper_pid)?;
+        println!("{container_id}");
+        return Ok(());
+    }
+
+    let exit_code = run_and_finalize(
+        &container_id,
+        &bundle,
+        &rootfs,
+        &containers,
+        state,
+        &log_path,
+        rm,
+    )?;
+
+    // The container's own exit code becomes ours, matching `ocirun
+    // run`/real `podman run`: exit code 0 must mean "the container's
+    // process exited 0", not merely "ociman didn't error", so this
+    // bypasses `oci_cli_common::run_main`'s usual Ok(())-means-success
+    // mapping.
+    std::process::exit(exit_code);
+}
+
+/// Run `bundle`'s already-fully-prepared container to completion
+/// (`launch::run_reporting_pid`), then finalize its own persisted
+/// state exactly once the real exit code is known — shared, unchanged
+/// logic between the foreground (`ociman run`) and detached (`ociman
+/// run -d`) paths (see `cmd_run`'s own two call sites, `docs/design/
+/// 0098`).
+fn run_and_finalize(
+    container_id: &str,
+    bundle: &oci_runtime_core::Bundle,
+    rootfs: &Path,
+    containers: &StateStore,
+    mut state: oci_runtime_core::PersistedState,
+    log_path: &Path,
+    rm: bool,
+) -> anyhow::Result<i32> {
+    // Records a *live* pid (and status `Running`) before blocking
+    // on the container, unlike a plain `launch::run` — this is
+    // what makes a concurrent `ociman exec`/`ps`/`rm` against this
+    // same container, issued from another invocation while this
+    // one is still foreground, actually see something real rather
+    // than the "Creating" placeholder from above (see
+    // `docs/design/0023`), and — for a detached run — is exactly what
+    // the original CLI invocation's own `wait_for_detached_container_
+    // to_start` polls for.
+    let record_running = |pid: i32| {
+        state.status = Status::Running;
+        state.pid = Some(pid);
+        let _ = containers.write(&state);
+    };
+
+    // Always attempt the systemd cgroup driver for `ociman`'s own
+    // containers (matching real `podman`'s own default on
+    // systemd-based distros) — falls back to no cgroup at all
+    // (logged, not fatal) if no D-Bus session is reachable, so
+    // this is a pure improvement over the previous "never any
+    // cgroup at all" behavior, never a new hard requirement. See
+    // `docs/design/0033`/`0034`. `resources` (if `--memory` set
+    // one) rides along, translated into systemd unit properties
+    // rather than dropped — see `docs/design/0037`.
+    let cgroup_setup = oci_runtime_core::launch::CgroupSetup::Systemd {
+        scope_name: format!("ociman-{container_id}.scope"),
+        description: format!("oci-tools container {container_id}"),
+        resources: bundle
+            .spec
+            .linux
+            .as_ref()
+            .and_then(|l| l.resources.clone())
+            .map(Box::new),
+    };
+
+    // SAFETY: forwarded from this function's own two call sites (see
+    // each one's own safety comment): `ociman`'s own foreground
+    // process hasn't spawned any threads by this point, and a fresh
+    // `fork(2)` child (the detached path) is always single-threaded
+    // regardless of its parent.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        oci_runtime_core::launch::run_reporting_pid(
+            container_id,
+            bundle,
+            rootfs,
+            Some(log_path),
+            cgroup_setup,
+            record_running,
+        )
+    }
+    .context("running container");
+
+    let exit_code = match result {
+        Ok(code) => code,
+        Err(e) => {
+            let _ = containers.remove(container_id);
+            return Err(e);
+        }
+    };
+
     // Best-effort: the container's own transient systemd scope has
     // already been fully removed by systemd on its own if the
     // container's process exited normally — this only ever does real
     // work for the rare, previously-unhandled case of an abnormally
     // *failed* scope, matching real crun's own unconditional call at
     // scope-teardown time (see `docs/design/0096`).
-    reset_failed_systemd_scope(&container_id);
+    reset_failed_systemd_scope(container_id);
 
     if rm {
-        let _ = containers.remove(&container_id);
+        let _ = containers.remove(container_id);
     } else {
         state.status = Status::Stopped;
         state
@@ -983,12 +1101,48 @@ fn cmd_run(
         containers.write(&state)?;
     }
 
-    // The container's own exit code becomes ours, matching `ocirun
-    // run`/real `podman run`: exit code 0 must mean "the container's
-    // process exited 0", not merely "ociman didn't error", so this
-    // bypasses `oci_cli_common::run_main`'s usual Ok(())-means-success
-    // mapping.
-    std::process::exit(exit_code);
+    Ok(exit_code)
+}
+
+/// Block until a detached container's own keeper process (the
+/// backgrounded fork `cmd_run`'s own `detach` branch just created) has
+/// gotten far enough to report a real, running pid (or has already
+/// finished entirely, for a container whose own command exits almost
+/// immediately) — or report why it never did. Polls the same
+/// persisted state file every caller of this project's own
+/// container-targeting subcommands already reads, rather than any new
+/// IPC of its own — matching `docs/design/0023`'s own "a concurrent
+/// invocation sees something real" reasoning, just applied to the
+/// detaching invocation itself rather than an unrelated one.
+fn wait_for_detached_container_to_start(
+    containers: &StateStore,
+    container_id: &str,
+    keeper_pid: i32,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match containers.load(container_id) {
+            Ok(state) if state.status != Status::Creating => return Ok(()),
+            Ok(_) => {}
+            Err(oci_runtime_core::StateError::NotFound(_)) => {
+                anyhow::bail!(
+                    "container {container_id:?} failed to start (setup failed before it \
+                     ever reported a real pid)"
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
+        if !oci_runtime_core::process::alive(keeper_pid) {
+            anyhow::bail!(
+                "container {container_id:?} failed to start (its own detached process \
+                 exited unexpectedly)"
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for container {container_id:?} to start");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Create a fresh container state record with a freshly generated ID,
