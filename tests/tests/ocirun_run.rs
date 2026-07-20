@@ -347,14 +347,32 @@ fn run_applies_a_seccomp_profile_that_blocks_a_syscall() {
     let config_path = dir.path().join("config.json");
     let mut config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
-    // `mkdirat` (not `mkdir`) because raw `mkdir` isn't a valid syscall
-    // on aarch64 (this project's own CI/dev architecture — see
-    // docs/design/0016); every C library's `mkdir()` on this
-    // architecture already compiles down to `mkdirat(AT_FDCWD, ...)`.
+    // The real syscall `mkdir(1)` uses is genuinely architecture-
+    // dependent, not just `mkdirat` everywhere: glibc's own `mkdir()`
+    // (`sysdeps/unix/sysv/linux/mkdir.c`) calls the legacy `mkdir`
+    // syscall directly whenever the target still has one at all
+    // (`#ifdef __NR_mkdir`) — true on x86_64, which keeps it for
+    // compatibility — and only falls back to `mkdirat(AT_FDCWD, ...)`
+    // on architectures that never had a standalone `mkdir` syscall to
+    // begin with, aarch64 among them (see `docs/design/0016`, this
+    // project's own CI/dev architecture at the time this test was
+    // first written — the only one this had ever actually been
+    // verified against until real x86_64 CI hardware finally reached
+    // this test and found naming only `mkdirat` blocks nothing there
+    // at all). Picks the one real name that's actually correct for the
+    // current build's own target_arch, rather than unioning both
+    // unconditionally — a strict profile like this one genuinely
+    // rejects an unresolvable name on the wrong architecture (`mkdir`
+    // doesn't exist as a syscall on aarch64 at all).
+    let mkdir_syscall_name = if cfg!(target_arch = "x86_64") {
+        "mkdir"
+    } else {
+        "mkdirat"
+    };
     config["linux"]["seccomp"] = serde_json::json!({
         "defaultAction": "SCMP_ACT_ALLOW",
         "syscalls": [
-            {"names": ["mkdirat"], "action": "SCMP_ACT_ERRNO", "errnoRet": 13}
+            {"names": [mkdir_syscall_name], "action": "SCMP_ACT_ERRNO", "errnoRet": 13}
         ]
     });
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
@@ -443,10 +461,18 @@ fn run_applies_a_seccomp_profile_with_two_distinct_non_default_actions() {
     let config_path = dir.path().join("config.json");
     let mut config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    // Same real per-architecture `mkdir` syscall choice as
+    // `run_applies_a_seccomp_profile_that_blocks_a_syscall`'s own doc
+    // comment explains in full.
+    let mkdir_syscall_name = if cfg!(target_arch = "x86_64") {
+        "mkdir"
+    } else {
+        "mkdirat"
+    };
     config["linux"]["seccomp"] = serde_json::json!({
         "defaultAction": "SCMP_ACT_ALLOW",
         "syscalls": [
-            {"names": ["mkdirat"], "action": "SCMP_ACT_ERRNO", "errnoRet": 13},
+            {"names": [mkdir_syscall_name], "action": "SCMP_ACT_ERRNO", "errnoRet": 13},
             {
                 "names": ["kill"],
                 "action": "SCMP_ACT_ERRNO",
