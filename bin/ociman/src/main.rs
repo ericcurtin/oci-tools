@@ -127,10 +127,13 @@ enum Command {
     },
     /// List images in local storage.
     Images,
-    /// Print a locally stored image's config as JSON (like `podman
-    /// inspect`/`docker inspect`).
+    /// Print low-level JSON for a container or an image — matching
+    /// real `podman inspect`/`docker inspect`'s own default
+    /// resolution order: a container (by id or `--name`) is tried
+    /// first, falling back to an image (by reference, exactly as it
+    /// was pulled) if no such container exists.
     Inspect {
-        /// Image reference, exactly as it was pulled.
+        /// A container's ID/`--name`, or an image reference.
         reference: String,
     },
     /// Pull (if not already present), extract, and run an image's
@@ -682,7 +685,32 @@ fn cmd_images(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Real docker/podman's own default resolution order: try a container
+/// (by id or `--name`) first, only falling back to an image if no
+/// such container exists — checked directly against
+/// `~/git/podman/cmd/podman/inspect/inspect.go`'s own `inspectAll`
+/// (container, then image, then volume/network, in that order; this
+/// project only has the first two so far). A `reference_str` that
+/// resolves to neither is a real, image-store-flavored error (the
+/// same message this function has always given for an unknown image),
+/// not a confusing "neither a container nor an image" compound one —
+/// matches this project's own established preference for the clearer
+/// of two plausible error messages over a technically-more-complete
+/// one.
 fn cmd_inspect(reference_str: &str, json: bool) -> anyhow::Result<()> {
+    if let Ok(containers) = open_container_store()
+        && let Ok(id) = resolve_container_id(&containers, reference_str)
+        && let Ok(state) = containers.load(&id)
+    {
+        let view = ContainerInspectView::from_state(&state);
+        if json {
+            oci_cli_common::output::print_json(&view)?;
+        } else {
+            println!("{}", oci_cli_common::output::json_string(&view)?);
+        }
+        return Ok(());
+    }
+
     let reference = Reference::parse(reference_str)
         .with_context(|| format!("parsing image reference {reference_str:?}"))?;
     let store = open_store()?;
@@ -1054,6 +1082,65 @@ impl ContainerView {
                 .unwrap_or_default(),
             status: state.effective_status().to_string(),
             created: state.created.clone(),
+            exit_code: state
+                .annotations
+                .get(ANNOTATION_EXIT_CODE)
+                .and_then(|s| s.parse().ok()),
+        }
+    }
+}
+
+/// `docker inspect`/`podman inspect`-style view of one container
+/// record: the same fields [`ContainerView`] ("`ps`") already exposes,
+/// plus the lower-level `pid`/`bundle`/`rootfs` real `runc state`
+/// itself reports (this project's own `PersistedState` already tracks
+/// all three) — a deliberately narrower slice than real podman's own
+/// much richer `Config`/`HostConfig`/`NetworkSettings` inspect output,
+/// but a genuine improvement over `ociman inspect` only ever resolving
+/// against the image store at all (see `docs/design/0094`).
+#[derive(Debug, Serialize)]
+struct ContainerInspectView {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    image: String,
+    command: String,
+    status: String,
+    created: String,
+    /// `0` once stopped (never omitted here, unlike [`Self::name`]) —
+    /// matches `PersistedState::to_view`'s own established convention
+    /// for the same field.
+    pid: i32,
+    bundle: String,
+    rootfs: String,
+    exit_code: Option<i32>,
+}
+
+impl ContainerInspectView {
+    fn from_state(state: &oci_runtime_core::PersistedState) -> Self {
+        let status = state.effective_status();
+        ContainerInspectView {
+            id: state.id.clone(),
+            name: state.annotations.get(ANNOTATION_NAME).cloned(),
+            image: state
+                .annotations
+                .get(ANNOTATION_IMAGE)
+                .cloned()
+                .unwrap_or_default(),
+            command: state
+                .annotations
+                .get(ANNOTATION_COMMAND)
+                .cloned()
+                .unwrap_or_default(),
+            status: status.to_string(),
+            created: state.created.clone(),
+            pid: if status == Status::Stopped {
+                0
+            } else {
+                state.pid.unwrap_or(0)
+            },
+            bundle: state.bundle.clone(),
+            rootfs: state.rootfs.clone(),
             exit_code: state
                 .annotations
                 .get(ANNOTATION_EXIT_CODE)
