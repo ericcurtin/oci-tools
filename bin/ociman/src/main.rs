@@ -965,6 +965,14 @@ fn cmd_run(
         }
     };
 
+    // Best-effort: the container's own transient systemd scope has
+    // already been fully removed by systemd on its own if the
+    // container's process exited normally — this only ever does real
+    // work for the rare, previously-unhandled case of an abnormally
+    // *failed* scope, matching real crun's own unconditional call at
+    // scope-teardown time (see `docs/design/0096`).
+    reset_failed_systemd_scope(&container_id);
+
     if rm {
         let _ = containers.remove(&container_id);
     } else {
@@ -1225,11 +1233,29 @@ fn cmd_rm(id: &str, force: bool) -> anyhow::Result<()> {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        // Best-effort scope cleanup (see `docs/design/0096`): a
+        // `--force`-killed container is exactly the kind of abnormal
+        // stop that can leave its own transient systemd scope in a
+        // "failed" state rather than the clean, self-removing exit
+        // path a container that runs to completion on its own gets.
+        reset_failed_systemd_scope(&resolved);
     }
 
     containers.remove(&resolved)?;
     println!("{id}");
     Ok(())
+}
+
+/// Best-effort cleanup of `container_id`'s own transient systemd
+/// scope (see `docs/design/0033`'s "known, not-yet-handled edge case"
+/// and `docs/design/0096`): the scope name is fully deterministic
+/// (`cmd_run`'s own `CgroupSetup::Systemd::scope_name`), so this needs
+/// no new persisted state to know what to clean up. A no-op, not an
+/// error, for the overwhelmingly common case (a container that ran to
+/// completion on its own already had its scope fully removed by
+/// systemd itself, with nothing left to reset).
+fn reset_failed_systemd_scope(container_id: &str) {
+    oci_runtime_core::systemd_cgroup::reset_failed_unit(&format!("ociman-{container_id}.scope"));
 }
 
 /// Gracefully stop a running container (see [`Command::Stop`]'s own
@@ -1280,6 +1306,7 @@ fn cmd_stop(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
         for _ in 0..4 {
             std::thread::sleep(std::time::Duration::from_millis(200));
             if !oci_runtime_core::process::alive(pid) {
+                reset_failed_systemd_scope(&resolved);
                 println!("{id}");
                 return Ok(());
             }
@@ -1290,6 +1317,7 @@ fn cmd_stop(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(time_secs);
     while std::time::Instant::now() < deadline {
         if !oci_runtime_core::process::alive(pid) {
+            reset_failed_systemd_scope(&resolved);
             println!("{id}");
             return Ok(());
         }
@@ -1310,6 +1338,7 @@ fn cmd_stop(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    reset_failed_systemd_scope(&resolved);
 
     println!("{id}");
     Ok(())

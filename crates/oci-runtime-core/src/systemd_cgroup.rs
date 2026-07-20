@@ -243,6 +243,68 @@ fn create_scope_dbus_roundtrip(
         .and_then(|contents| parse_own_cgroup_path(&contents))
 }
 
+/// How long [`reset_failed_unit`] waits for the D-Bus round trip
+/// before giving up on it — shorter than [`JOB_WAIT_TIMEOUT`]: unlike
+/// [`create_scope`], this is a single, synchronous method call with no
+/// job to subscribe to or wait for at all (real crun's own equivalent,
+/// `reset_failed_unit` in `~/git/crun/src/libcrun/cgroup-systemd.c`,
+/// doesn't even check its own return value), so a well-behaved D-Bus
+/// session should always answer almost immediately.
+const RESET_FAILED_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Best-effort: ask systemd to forget `unit`'s own "failed" state (if
+/// any), so a scope that ended up there gets garbage-collected instead
+/// of lingering forever — matches real crun's own unconditional call
+/// to `reset_failed_unit` at scope-teardown time, return value
+/// discarded (checked directly, not assumed). A scope whose only
+/// member process exited *normally* is already fully removed by
+/// systemd on its own well before this ever runs (this module's own
+/// "known, not-yet-handled edge case" note — this function is what
+/// finally handles the *other* case, an abnormally-failed scope) —
+/// `ResetFailedUnit` on an already-gone unit answers with a real,
+/// expected "not loaded" error (confirmed directly via `busctl --user
+/// call ... ResetFailedUnit s <made-up-name>`, not assumed), which is
+/// simply the ordinary case here, not a real failure. Every outcome
+/// (a genuine reset, "not loaded", a D-Bus error, or a timeout) is
+/// logged at `debug` and never propagated: this exists purely to
+/// clean up a real, if rare, resource leak, never to affect whatever
+/// this project's own caller is otherwise doing.
+pub fn reset_failed_unit(unit: &str) {
+    let unit_owned = unit.to_string();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    // Deliberately not joined — same reasoning as `create_scope`'s own
+    // background thread: if the timeout below fires, this thread is
+    // simply abandoned, costing nothing since the whole process exits
+    // long before it could matter again.
+    std::thread::spawn(move || {
+        let result = reset_failed_unit_dbus_roundtrip(&unit_owned);
+        let _ = result_tx.send(result);
+    });
+    match result_rx.recv_timeout(RESET_FAILED_TIMEOUT) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::debug!(unit, error = %e, "resetting failed systemd unit (tolerated, likely already gone)");
+        }
+        Err(_) => {
+            tracing::debug!(unit, "timed out resetting failed systemd unit (tolerated)");
+        }
+    }
+}
+
+fn reset_failed_unit_dbus_roundtrip(unit: &str) -> io::Result<()> {
+    let connection = Connection::session().map_err(to_io_error)?;
+    connection
+        .call_method(
+            Some(SYSTEMD_BUS_NAME),
+            SYSTEMD_OBJECT_PATH,
+            Some(SYSTEMD_MANAGER_INTERFACE),
+            "ResetFailedUnit",
+            &(unit,),
+        )
+        .map_err(to_io_error)?;
+    Ok(())
+}
+
 /// Translate `resources` into systemd unit properties for a transient
 /// scope, matching real `crun`'s own translation
 /// (`cgroup-systemd.c`'s `append_resources`, checked directly) for the
@@ -732,5 +794,30 @@ mod tests {
                 // real reply, not systemd's own overall health.
                 !out.stdout.is_empty()
             })
+    }
+
+    /// A unit name that was never created at all is the overwhelmingly
+    /// common real case `reset_failed_unit` actually hits (a container
+    /// that ran to completion already had its own scope fully removed
+    /// by systemd itself) -- confirmed directly via `busctl --user
+    /// call ... ResetFailedUnit s <made-up-name>` before writing this
+    /// (a real "Unit ... not loaded" D-Bus error, not assumed). This
+    /// test only checks the plumbing itself: a real D-Bus round trip
+    /// that completes quickly (well under its own timeout) and never
+    /// panics -- reliably forcing a *genuinely* `failed`-substate
+    /// scope on demand is real, engineering-hard flakiness this
+    /// project's own module doc already flags, not attempted here.
+    #[test]
+    fn reset_failed_unit_completes_quickly_for_a_unit_that_was_never_created() {
+        if !systemd_user_session_available() {
+            eprintln!("skipping: no reachable `systemd --user` session");
+            return;
+        }
+        let started = std::time::Instant::now();
+        reset_failed_unit("oci-tools-test-never-existed-at-all.scope");
+        assert!(
+            started.elapsed() < RESET_FAILED_TIMEOUT,
+            "should complete well within its own timeout against a reachable bus"
+        );
     }
 }
