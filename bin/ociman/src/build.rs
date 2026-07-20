@@ -60,18 +60,24 @@
 //!   the exact same literal mode, to every copied file and directory
 //!   — checked directly against real `docker build`'s own observed
 //!   behavior; a symbolic mode like `u+rwx` isn't yet, see
-//!   `chmod_mode`'s own doc comment); `--chown` still isn't (this
-//!   project's own rootless single-uid-mapping design, and
-//!   `oci_layer::apply`'s own already-documented "doesn't chown"
-//!   scope limit) — rejected with a clear error rather than silently
-//!   ignored. A supported `COPY` commits one real
+//!   `chmod_mode`'s own doc comment); **`--chown=<user>[:<group>]` is
+//!   supported too** (resolved against the image's own `/etc/passwd`/
+//!   `/etc/group` via the same `user_resolve::resolve` `USER` already
+//!   uses, then applied via a real `lchown`-equivalent to every
+//!   copied file/directory/symlink, recursively — see `set_owner`'s
+//!   own doc comment for why a rootless build silently tolerating
+//!   `EPERM` here is this project's own already-established
+//!   single-uid-mapping limitation, not a new one, and why the
+//!   committed layer's own tar header still ends up byte-correct
+//!   either way since it's always built from the real, live file
+//!   metadata at commit time). A supported `COPY` commits one real
 //!   new layer per instruction line exactly like `RUN` does (via the
 //!   same diff/`commit_layer`/`record_layer` path), just from a plain
 //!   recursive file copy instead of running a command.
 //! * **`ADD` is supported for local sources.** Same scope limits as
 //!   `COPY` above (one or more explicit sources, glob patterns
-//!   included, `--chmod` but not `--chown`), plus real docker's own
-//!   documented archive-auto-extraction: a
+//!   included, `--chmod`/`--chown` both supported), plus real docker's
+//!   own documented archive-auto-extraction: a
 //!   non-directory local source that's a real tar archive (plain,
 //!   gzip, or zstd-compressed — `oci_layer::detect_archive`'s own doc
 //!   comment has the exact scope, checked directly against the
@@ -789,10 +795,17 @@ fn copy_instruction(
     rootfs: &Path,
     stage_ctx: &StageContext<'_>,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        flags.chown.is_none(),
-        "ociman build: COPY --chown is not yet supported"
-    );
+    let chown = flags
+        .chown
+        .as_deref()
+        .map(|c| crate::user_resolve::resolve(rootfs, c))
+        .transpose()
+        .with_context(|| {
+            format!(
+                "ociman build: COPY --chown={:?}",
+                flags.chown.as_deref().unwrap_or_default()
+            )
+        })?;
     let chmod = flags.chmod.as_deref().map(chmod_mode).transpose()?;
     anyhow::ensure!(
         !sources.is_empty(),
@@ -893,7 +906,7 @@ fn copy_instruction(
             dest_path.clone()
         };
 
-        copy_path_recursive(&source_path, &target, chmod).with_context(|| {
+        copy_path_recursive(&source_path, &target, chmod, chown).with_context(|| {
             format!("copying {} to {}", source_path.display(), target.display())
         })?;
     }
@@ -942,10 +955,17 @@ fn add_instruction(
     context: &Path,
     rootfs: &Path,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        flags.chown.is_none(),
-        "ociman build: ADD --chown is not yet supported"
-    );
+    let chown = flags
+        .chown
+        .as_deref()
+        .map(|c| crate::user_resolve::resolve(rootfs, c))
+        .transpose()
+        .with_context(|| {
+            format!(
+                "ociman build: ADD --chown={:?}",
+                flags.chown.as_deref().unwrap_or_default()
+            )
+        })?;
     let chmod = flags.chmod.as_deref().map(chmod_mode).transpose()?;
     anyhow::ensure!(
         !sources.is_empty(),
@@ -1002,6 +1022,9 @@ fn add_instruction(
         }
         write_new_file(&target, &downloaded.bytes, chmod.unwrap_or(0o600))
             .with_context(|| format!("writing downloaded {url:?} to {}", target.display()))?;
+        if let Some((uid, gid)) = chown {
+            set_owner(&target, uid, gid);
+        }
     }
     for source in &local_sources {
         // `ADD` has no `--from` at all (see `AddFlags`'s own doc
@@ -1053,6 +1076,20 @@ fn add_instruction(
                     dest_path.display()
                 )
             })?;
+            // Unlike `--chmod` (deliberately *not* applied to an
+            // archive's own extracted contents, see this function's
+            // own doc comment above), real Docker's own `--chown`
+            // **does** apply here — checked directly against a real
+            // Docker daemon on this host: `ADD --chown=2000:2000
+            // some.tar.gz /dest` overrides the archive's own recorded
+            // per-entry ownership, ending up `2000:2000` throughout
+            // `/dest`, not whatever uid/gid the archive itself
+            // recorded. Matches Docker's own documented rule ("that
+            // directory and its contents are chowned") applied to the
+            // destination directory itself, unconditionally.
+            if let Some((uid, gid)) = chown {
+                chown_recursive(&dest_path, uid, gid);
+            }
         } else {
             // Same file-vs-directory target resolution as
             // `copy_instruction` -- see its own doc comment for the
@@ -1069,7 +1106,7 @@ fn add_instruction(
             } else {
                 dest_path.clone()
             };
-            copy_path_recursive(&source_path, &target, chmod).with_context(|| {
+            copy_path_recursive(&source_path, &target, chmod, chown).with_context(|| {
                 format!("copying {} to {}", source_path.display(), target.display())
             })?;
         }
@@ -1291,7 +1328,24 @@ fn write_new_file(target: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> 
 /// first place, and `chmod(2)` on a symlink path affects whatever it
 /// points at, not the link, which would be a confusing, unintended
 /// side effect here).
-fn copy_path_recursive(src: &Path, dest: &Path, chmod: Option<u32>) -> anyhow::Result<()> {
+///
+/// `chown` (a resolved `(uid, gid)` from `--chown`), when given, is
+/// applied the same way, at every depth — but *unlike* `chmod`, it
+/// **is** applied to a symlink entry itself, via `lchown`-equivalent
+/// semantics (`set_owner`'s own doc comment): since this project keeps
+/// a copied symlink as a real symlink rather than dereferencing it,
+/// an ordinary `chown(2)` (which follows the link) would silently
+/// chown whatever arbitrary file the link happens to point at instead
+/// — including, for an absolute or `..`-escaping link target, a file
+/// entirely outside the copy's own scope. `lchown` avoids that
+/// unconditionally, matching what "chown the thing `COPY` actually
+/// created here" has to mean once symlinks are preserved as such.
+fn copy_path_recursive(
+    src: &Path,
+    dest: &Path,
+    chmod: Option<u32>,
+    chown: Option<(u32, u32)>,
+) -> anyhow::Result<()> {
     let metadata = std::fs::symlink_metadata(src)
         .with_context(|| format!("reading metadata for {}", src.display()))?;
     if metadata.is_dir() {
@@ -1300,9 +1354,12 @@ fn copy_path_recursive(src: &Path, dest: &Path, chmod: Option<u32>) -> anyhow::R
         if let Some(mode) = chmod {
             set_mode(dest, mode)?;
         }
+        if let Some((uid, gid)) = chown {
+            set_owner(dest, uid, gid);
+        }
         for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
             let entry = entry.with_context(|| format!("reading {}", src.display()))?;
-            copy_path_recursive(&entry.path(), &dest.join(entry.file_name()), chmod)?;
+            copy_path_recursive(&entry.path(), &dest.join(entry.file_name()), chmod, chown)?;
         }
     } else if metadata.file_type().is_symlink() {
         let link_target = std::fs::read_link(src)
@@ -1315,6 +1372,9 @@ fn copy_path_recursive(src: &Path, dest: &Path, chmod: Option<u32>) -> anyhow::R
         #[cfg(unix)]
         std::os::unix::fs::symlink(&link_target, dest)
             .with_context(|| format!("creating symlink {}", dest.display()))?;
+        if let Some((uid, gid)) = chown {
+            set_owner(dest, uid, gid);
+        }
     } else {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)
@@ -1324,6 +1384,9 @@ fn copy_path_recursive(src: &Path, dest: &Path, chmod: Option<u32>) -> anyhow::R
             .with_context(|| format!("copying {} to {}", src.display(), dest.display()))?;
         if let Some(mode) = chmod {
             set_mode(dest, mode)?;
+        }
+        if let Some((uid, gid)) = chown {
+            set_owner(dest, uid, gid);
         }
     }
     Ok(())
@@ -1352,6 +1415,77 @@ fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .with_context(|| format!("chmod {mode:o} {}", path.display()))
+}
+
+/// Set `path`'s own owner to `(uid, gid)`, via `fchownat(...,
+/// AT_SYMLINK_NOFOLLOW)` — an `lchown(2)`-equivalent, deliberately
+/// never following a symlink (see `copy_path_recursive`'s own doc
+/// comment on `chown` for why that matters here specifically).
+///
+/// Tolerant of `EPERM`, unlike [`set_mode`]: changing a file's
+/// permission bits never needs extra privilege for a file the calling
+/// process already owns, but changing its *owner* to an arbitrary
+/// `uid`/`gid` is a real, kernel-enforced privileged operation
+/// (`CAP_CHOWN`) whenever that `uid` isn't the calling process's own —
+/// squarely this project's own already-documented rootless
+/// single-uid-mapping limitation (the same one `-v`/`--volume`'s own
+/// bind-mount ownership and `oci_layer::apply`'s own extraction-time
+/// ownership already have, see their own doc comments), not a new one
+/// `--chown` introduces. A rootless `ociman build --chown=other-uid`
+/// therefore builds successfully (the requested ownership silently
+/// doesn't apply to the on-disk file, logged as a warning, matching
+/// this project's own established "tolerate known rootless
+/// limitations" pattern elsewhere) rather than failing the whole
+/// build outright; a real-root (or matching-uid) build applies it for
+/// real. Since the committed layer's own tar header is always built
+/// from each file's *real*, on-disk metadata at commit time
+/// (`oci_layer::export`'s `write_entry`), a real, successful `chown`
+/// here is automatically reflected in the layer's own recorded
+/// ownership too, with no separate tar-header-override plumbing
+/// needed at all.
+fn set_owner(path: &Path, uid: u32, gid: u32) {
+    let result = rustix::fs::chownat(
+        rustix::fs::CWD,
+        path,
+        Some(rustix::fs::Uid::from_raw(uid)),
+        Some(rustix::fs::Gid::from_raw(gid)),
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    );
+    if let Err(e) = result {
+        tracing::warn!(
+            path = %path.display(),
+            uid,
+            gid,
+            error = %e,
+            "--chown: setting file owner (tolerated; likely rootless without CAP_CHOWN)"
+        );
+    }
+}
+
+/// [`set_owner`] applied to `root` itself and every entry underneath
+/// it, recursively — used for `ADD --chown=... archive.tar.gz /dest`
+/// (see its own call site's doc comment for why this, unlike
+/// `--chmod`, really does need to walk an archive's own already-
+/// extracted contents after the fact, checked directly against real
+/// Docker). A read failure partway through (e.g. a real, transient
+/// race with something else touching the tree) is logged and
+/// tolerated, same as [`set_owner`] itself, rather than aborting the
+/// whole build over what's already a best-effort operation.
+fn chown_recursive(root: &Path, uid: u32, gid: u32) {
+    set_owner(root, uid, gid);
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or_default();
+        if is_dir {
+            chown_recursive(&path, uid, gid);
+        } else {
+            set_owner(&path, uid, gid);
+        }
+    }
 }
 
 /// `docker`/`podman build`'s own shell-form wrapping: a shell-form

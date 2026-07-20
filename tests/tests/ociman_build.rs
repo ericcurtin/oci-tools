@@ -1171,7 +1171,6 @@ fn copy_rejects_unsupported_flags_and_bad_glob_patterns() {
     );
 
     let cases = [
-        ("COPY --chown=1000:1000 a.txt /a.txt\n", "--chown"),
         ("COPY --chmod=not-octal a.txt /a.txt\n", "--chmod"),
         ("COPY --from=builder a.txt /a.txt\n", "--from"),
         (
@@ -1391,6 +1390,185 @@ fn add_chmod_does_not_apply_to_auto_extracted_archive_contents() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), "644\n");
 }
 
+/// `--chown=<uid>:<gid>` resolves numerically (no `/etc/passwd`
+/// lookup needed) and is reflected in the committed layer's own real
+/// tar header — checked directly against a real Docker daemon on this
+/// host before writing this test (`docs/design/0097`). Uses the
+/// *calling test process's own* real uid/gid: the only value
+/// guaranteed to succeed regardless of whether this test happens to
+/// run rootless or as real root (an arbitrary different uid needs
+/// `CAP_CHOWN`, tolerated-not-fatal when missing — see
+/// `chown_to_a_different_uid_is_tolerated_not_fatal_when_unprivileged`
+/// below for that case).
+#[test]
+fn copy_chown_is_reflected_in_the_committed_layers_own_tar_header() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/chown-copy-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let uid = rustix::process::getuid().as_raw();
+    let gid = rustix::process::getgid().as_raw();
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("file.txt"), "hello").unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!(
+            "FROM ociman-test/chown-copy-base:latest\nCOPY --chown={uid}:{gid} file.txt /file.txt\n"
+        ),
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/chown-copy-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let entries = last_layer_tar_entries(&store, "ociman-test/chown-copy-result:latest");
+    let entry = entries
+        .iter()
+        .find(|(path, _, _)| path == "file.txt")
+        .unwrap_or_else(|| panic!("no file.txt entry in {entries:?}"));
+    assert_eq!(entry.1, uid, "{entries:?}");
+    assert_eq!(entry.2, gid, "{entries:?}");
+}
+
+/// A rootless build's `--chown` to a uid that isn't the calling
+/// process's own is tolerated, not fatal — squarely this project's
+/// own already-established rootless single-uid-mapping limitation
+/// (the same one `-v`/`--volume`'s own bind-mount ownership and
+/// `oci_layer::apply`'s own extraction-time ownership already have),
+/// not a new one. Skipped outright when running as real root (uid 0),
+/// where the chown would simply succeed instead.
+#[test]
+fn chown_to_a_different_uid_is_tolerated_not_fatal_when_unprivileged() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if rustix::process::getuid().as_raw() == 0 {
+        eprintln!("skipping: running as real root, --chown would simply succeed");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/chown-unprivileged-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("file.txt"), "hello").unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/chown-unprivileged-base:latest\n\
+         COPY --chown=54321:54321 file.txt /file.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/chown-unprivileged-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "an unprivileged --chown to a different uid must be tolerated, not fail the build: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+/// Unlike `--chmod` (deliberately *not* applied to an archive's own
+/// extracted contents), real Docker's own `--chown` **does** apply to
+/// `ADD`'s auto-extracted archive contents — checked directly against
+/// a real Docker daemon on this host before writing this test
+/// (`ADD --chown=2000:2000 some.tar.gz /dest` overrides the archive's
+/// own recorded per-entry ownership throughout `/dest`, unlike
+/// `--chmod`'s own real, verified "leaves per-entry modes alone"
+/// behavior). Uses the calling process's own real uid/gid, for the
+/// same reason `copy_chown_is_reflected_in_the_committed_layers_own_
+/// tar_header` does.
+#[test]
+fn add_chown_does_apply_to_auto_extracted_archive_contents() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/chown-archive-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let uid = rustix::process::getuid().as_raw();
+    let gid = rustix::process::getgid().as_raw();
+
+    let context_dir = tempfile::tempdir().unwrap();
+    let archive_path = context_dir.path().join("payload.tar.gz");
+    write_gzip_tar(&archive_path, &[("inside.txt", b"archived content")]);
+    write_containerfile(
+        context_dir.path(),
+        &format!(
+            "FROM ociman-test/chown-archive-base:latest\n\
+             ADD --chown={uid}:{gid} payload.tar.gz /extracted\n"
+        ),
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/chown-archive-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let entries = last_layer_tar_entries(&store, "ociman-test/chown-archive-result:latest");
+    for path in ["extracted", "extracted/inside.txt"] {
+        let entry = entries
+            .iter()
+            .find(|(p, _, _)| p.trim_end_matches('/') == path)
+            .unwrap_or_else(|| panic!("no {path:?} entry in {entries:?}"));
+        assert_eq!(entry.1, uid, "{path}: {entries:?}");
+        assert_eq!(entry.2, gid, "{path}: {entries:?}");
+    }
+}
+
 fn write_gzip_tar(path: &Path, files: &[(&str, &[u8])]) {
     let gz_file = std::fs::File::create(path).unwrap();
     let encoder = flate2::write::GzEncoder::new(gz_file, flate2::Compression::default());
@@ -1403,6 +1581,44 @@ fn write_gzip_tar(path: &Path, files: &[(&str, &[u8])]) {
         builder.append_data(&mut header, name, *content).unwrap();
     }
     builder.into_inner().unwrap().finish().unwrap();
+}
+
+/// Read `reference`'s own *last* real committed layer back — the
+/// exact same real, gzip-compressed tar bytes `ociman build` itself
+/// wrote via `commit_layer` — returning `(path, uid, gid)` for every
+/// real entry. Used to verify `--chown` landed in the committed
+/// layer's own tar header: running the *built* container itself would
+/// never show this, since `oci_layer::apply`'s own already-documented
+/// extraction-time limitation never `chown`s on the way in (see
+/// `set_owner`'s own doc comment in `build.rs`) — the committed
+/// layer's own bytes are the only place `--chown`'s real effect is
+/// actually observable from outside this project.
+fn last_layer_tar_entries(store: &Store, reference: &str) -> Vec<(String, u32, u32)> {
+    // `resolve_image` looks up the *stored*, already-normalized
+    // reference exactly (`docker.io/<repo>:<tag>`, matching how
+    // `Reference::parse(...).to_string()` stores it in the first
+    // place) -- re-normalize here too, so callers can pass the same
+    // short form they gave `-t` on the command line.
+    let normalized = oci_spec_types::Reference::parse(reference)
+        .unwrap()
+        .to_string();
+    let record = store.resolve_image(&normalized).unwrap().unwrap();
+    let manifest = store.image_manifest(&record).unwrap();
+    let digest = &manifest.layers.last().unwrap().digest;
+    let blob = store.open_blob(digest).unwrap();
+    let decoder = flate2::read::GzDecoder::new(blob);
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .entries()
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().into_owned();
+            let uid = entry.header().uid().unwrap() as u32;
+            let gid = entry.header().gid().unwrap() as u32;
+            (path, uid, gid)
+        })
+        .collect()
 }
 
 /// `ADD` real docker's own documented archive-auto-extraction
