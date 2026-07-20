@@ -453,6 +453,17 @@ enum Command {
         /// The new name.
         name: String,
     },
+    /// Display the real processes running inside a container —
+    /// matching real `docker top`/`podman top`'s own `ps(1)`-passthrough
+    /// mode (custom AIX-style format descriptors aren't supported).
+    Top {
+        /// The container's ID or `--name`.
+        id: String,
+        /// Arguments passed straight through to the real host `ps`
+        /// binary (default: `-ef`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        ps_args: Vec<String>,
+    },
     /// Run an additional process inside an already-running container,
     /// joining its existing namespaces.
     Exec {
@@ -572,6 +583,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Kill { id, signal }) => cmd_kill(&id, &signal),
             Some(Command::Wait { id, interval }) => cmd_wait(&id, interval),
             Some(Command::Rename { id, name }) => cmd_rename(&id, &name),
+            Some(Command::Top { id, ps_args }) => cmd_top(&id, &ps_args),
             Some(Command::Exec {
                 id,
                 user,
@@ -1390,6 +1402,44 @@ fn cmd_rename(id: &str, new_name: &str) -> anyhow::Result<()> {
         .insert(ANNOTATION_NAME.to_string(), new_name.to_string());
     containers.write(&state)?;
     Ok(())
+}
+
+/// Display the real processes running inside a container: every pid
+/// in its own real, *current* cgroup (see `oci_runtime_core::cgroups::
+/// cgroup_dir_for_running_pid`/`all_pids`), filtered into the real
+/// host `ps` binary's own table output — matches real `docker top`/
+/// `podman top`'s own `ps(1)`-passthrough mode. Real podman also
+/// supports a custom AIX-style format-descriptor engine
+/// (`podman top ctrID pid seccomp args %C`, no real `ps` invocation at
+/// all); not implemented here — a deliberately narrower first slice,
+/// same reasoning as every other "narrow first increment" this
+/// project's own design notes already establish (see
+/// `docs/design/0095`).
+///
+/// Unlike `ocirun ps` (which re-loads a bundle's own `cgroupsPath`
+/// from `config.json`), `ociman`'s own containers get their cgroup
+/// from the *systemd* driver, whose real path is only known at
+/// container-creation time and isn't persisted anywhere — so this
+/// re-derives the real, current cgroup directly from `/proc/<pid>/
+/// cgroup` instead (works correctly regardless of which driver
+/// actually placed the pid there).
+fn cmd_top(id: &str, ps_args: &[String]) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let resolved = resolve_container_id(&containers, id)?;
+    let state = containers.load(&resolved)?;
+    if state.effective_status() != Status::Running {
+        anyhow::bail!("container {id:?} is not running");
+    }
+    let pid = state
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
+
+    let cgroup_dir =
+        oci_runtime_core::cgroups::cgroup_dir_for_running_pid(Path::new("/sys/fs/cgroup"), pid)
+            .with_context(|| format!("resolving cgroup for container {id:?}"))?;
+    let pids = oci_runtime_core::cgroups::all_pids(&cgroup_dir)
+        .with_context(|| format!("listing processes in {}", cgroup_dir.display()))?;
+    oci_runtime_core::cgroups::print_ps_table(&pids, ps_args).context("printing ps table")
 }
 
 /// Print a container's captured output (see `docs/design/0025`):

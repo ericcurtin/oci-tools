@@ -394,6 +394,34 @@ pub fn all_pids(cgroup_dir: &Path) -> io::Result<Vec<i32>> {
     Ok(pids)
 }
 
+/// The real, *current* cgroup v2 directory a running process is in —
+/// discovered directly from `/proc/<pid>/cgroup` rather than
+/// reconstructed from any assumed slice/scope-name convention, so it
+/// works correctly regardless of which cgroup driver actually placed
+/// `pid` there: the raw cgroupfs driver's own spec-derived
+/// `cgroupsPath` (`directory_for`), or the systemd driver's own
+/// transient scope, whose real path can vary depending on the
+/// caller's own delegated hierarchy (see
+/// `crate::systemd_cgroup::create_scope`'s own doc comment for why
+/// *it* reads this exact same file back rather than assuming a
+/// shape — `ociman top`, 0095, needs the identical real path but at a
+/// later, separate point in time than `create_scope`'s own one-time
+/// return value, so it re-derives it the same way rather than
+/// depending on anything persisted from container-creation time).
+pub fn cgroup_dir_for_running_pid(cgroup_root: &Path, pid: i32) -> io::Result<PathBuf> {
+    let contents = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    let relative = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("no cgroup v2 (\"0::\") entry in: {contents:?}"),
+            )
+        })?;
+    Ok(cgroup_root.join(relative.trim_start_matches('/')))
+}
+
 /// Read and parse one directory's own `cgroup.procs` file: one decimal
 /// pid per line. A completely empty file (the common case: an idle or
 /// just-created cgroup) parses to an empty `Vec`, not an error.
@@ -411,6 +439,62 @@ fn read_procs_file(cgroup_dir: &Path) -> io::Result<Vec<i32>> {
             })
         })
         .collect()
+}
+
+/// Run the real host `ps` binary (`ps_args`, or `-ef` if empty) and
+/// print only its header line plus every line whose own `PID` column
+/// is one of `pids` — matches real `runc ps`'s own table-format
+/// filtering logic exactly (`~/git/runc/ps.go`'s `getPidIndex` plus
+/// its own per-line loop), including erroring out (rather than
+/// silently skipping) on a line whose `PID` column doesn't parse: a
+/// real `ps` binary's output is well-formed by construction, so a
+/// parse failure here means the column index itself was wrong, a real
+/// bug worth surfacing rather than hiding.
+///
+/// Shared by `ocirun ps` and `ociman top` (see `docs/design/0090`/
+/// `0095`) — this project's own "one implementation per function"
+/// pillar means the actual filtering logic lives here exactly once,
+/// not once per binary.
+pub fn print_ps_table(pids: &[i32], ps_args: &[String]) -> io::Result<()> {
+    let args: Vec<&str> = if ps_args.is_empty() {
+        vec!["-ef"]
+    } else {
+        ps_args.iter().map(String::as_str).collect()
+    };
+    let output = std::process::Command::new("ps").args(&args).output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "ps exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let Some(header) = lines.next() else {
+        return Ok(());
+    };
+    let pid_index = header
+        .split_whitespace()
+        .position(|field| field == "PID")
+        .ok_or_else(|| io::Error::other("couldn't find PID field in ps output"))?;
+    println!("{header}");
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let pid_field = fields.get(pid_index).ok_or_else(|| {
+            io::Error::other(format!("ps output line has no PID field: {line:?}"))
+        })?;
+        let pid: i32 = pid_field
+            .parse()
+            .map_err(|e| io::Error::other(format!("unable to parse pid {pid_field:?}: {e}")))?;
+        if pids.contains(&pid) {
+            println!("{line}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -859,5 +943,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("cgroup.procs"), "not-a-pid\n").unwrap();
         assert!(all_pids(dir.path()).is_err());
+    }
+
+    #[test]
+    fn cgroup_dir_for_running_pid_matches_a_real_proc_self_cgroup() {
+        // A real, live pid (this test process's own) and a real
+        // `/proc` -- checked against the exact same file's own
+        // content, parsed independently here, rather than against a
+        // synthetic stand-in.
+        let own_pid = rustix::process::getpid().as_raw_nonzero().get();
+        let expected_relative = std::fs::read_to_string("/proc/self/cgroup")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap()
+            .trim_start_matches('/')
+            .to_string();
+
+        let cgroup_root = Path::new("/sys/fs/cgroup");
+        let dir = cgroup_dir_for_running_pid(cgroup_root, own_pid).unwrap();
+        assert_eq!(dir, cgroup_root.join(expected_relative));
+    }
+
+    #[test]
+    fn cgroup_dir_for_running_pid_reports_a_real_error_for_a_dead_pid() {
+        // A pid that (almost certainly) doesn't exist at all, so
+        // `/proc/<pid>/cgroup` itself can't be read.
+        assert!(cgroup_dir_for_running_pid(Path::new("/sys/fs/cgroup"), i32::MAX - 1).is_err());
     }
 }

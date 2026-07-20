@@ -638,63 +638,11 @@ fn cmd_ps(root: &Path, id: &str, format: &str, ps_args: &[String]) -> anyhow::Re
 
     match format {
         "json" => oci_cli_common::output::print_json(&pids),
-        "table" => print_ps_table(&pids, ps_args),
+        "table" => {
+            oci_runtime_core::cgroups::print_ps_table(&pids, ps_args).context("printing ps table")
+        }
         other => anyhow::bail!("invalid format option: {other:?} (want \"table\" or \"json\")"),
     }
-}
-
-/// Run the real host `ps` binary (`ps_args`, or `-ef` if empty) and
-/// print only its header line plus every line whose own `PID` column
-/// is one of `pids` — matches real `runc ps`'s own table-format
-/// filtering logic exactly (`~/git/runc/ps.go`'s `getPidIndex` plus
-/// its own per-line loop), including erroring out (rather than
-/// silently skipping) on a line whose `PID` column doesn't parse: a
-/// real `ps` binary's output is well-formed by construction, so a
-/// parse failure here means the column index itself was wrong, a real
-/// bug worth surfacing rather than hiding.
-fn print_ps_table(pids: &[i32], ps_args: &[String]) -> anyhow::Result<()> {
-    let args: Vec<&str> = if ps_args.is_empty() {
-        vec!["-ef"]
-    } else {
-        ps_args.iter().map(String::as_str).collect()
-    };
-    let output = std::process::Command::new("ps")
-        .args(&args)
-        .output()
-        .context("spawning ps")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "ps exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut lines = stdout.lines();
-    let Some(header) = lines.next() else {
-        return Ok(());
-    };
-    let pid_index = header
-        .split_whitespace()
-        .position(|field| field == "PID")
-        .context("couldn't find PID field in ps output")?;
-    println!("{header}");
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let pid_field = fields
-            .get(pid_index)
-            .with_context(|| format!("ps output line has no PID field: {line:?}"))?;
-        let pid: i32 = pid_field
-            .parse()
-            .with_context(|| format!("unable to parse pid {pid_field:?}"))?;
-        if pids.contains(&pid) {
-            println!("{line}");
-        }
-    }
-    Ok(())
 }
 
 fn cmd_exec(
