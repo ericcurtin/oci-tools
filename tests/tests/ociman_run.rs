@@ -323,7 +323,7 @@ fn run_privileged_still_honors_an_explicit_custom_seccomp_profile() {
         &store,
         "ociman-test/privileged-custom-seccomp:latest",
         &busybox,
-        &["sh", "mkdir"],
+        &["sh", "mkdir", "cat", "grep"],
         ContainerConfig::default(),
     );
 
@@ -344,16 +344,30 @@ fn run_privileged_still_honors_an_explicit_custom_seccomp_profile() {
         .args(["run", "--rm", "--privileged", "--security-opt"])
         .arg(format!("seccomp={}", profile_path.display()))
         .args(["ociman-test/privileged-custom-seccomp:latest"])
-        .args(["mkdir", "/testdir"])
+        .args([
+            "/bin/sh",
+            "-c",
+            // Diagnostic-rich: reports whether a seccomp filter is
+            // even active (`/proc/self/status`'s own `Seccomp:` field
+            // -- `2` is `SECCOMP_MODE_FILTER`, `0` is disabled) right
+            // before the real probe, so a future failure here shows
+            // *why*, not just *that*.
+            "grep -i seccomp /proc/self/status; /bin/mkdir /testdir",
+        ])
         .output()
         .expect("failed to spawn ociman run");
     assert!(
         !out.status.success(),
-        "the explicit custom profile should still block mkdir even under --privileged"
+        "the explicit custom profile should still block mkdir even under --privileged\n\
+         status: {:?}\nstdout: {}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("Operation not permitted"),
-        "stderr: {}",
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
 }
