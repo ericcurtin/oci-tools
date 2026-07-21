@@ -129,7 +129,13 @@
 //!   doc comment for the exact, checked-directly rules. No warning is
 //!   printed yet for a `--build-arg` whose name nothing in the file
 //!   ever declares (real `docker`/`podman` both print one) — a
-//!   separate, smaller future increment.
+//!   separate, smaller future increment. A declared `ARG`'s own
+//!   value is also injected into any *later* `RUN` step's own
+//!   temporary process environment (never persisted into the final
+//!   image's own `ENV`, and never overriding an explicit `ENV` of the
+//!   same name) — matching real `docker build`/`podman build`
+//!   exactly, checked directly (real BuildKit's own `dispatchRun`) —
+//!   see `run_step_spec`'s own doc comment and `docs/design/0119`.
 //! * **`-t`/`--tag` is required.** A real, taggable image needs a
 //!   reference to store it under; this project's `oci_store::Store`
 //!   has no "anonymous image, addressable only by ID" concept yet
@@ -557,6 +563,18 @@ fn build_stage(
     };
     let rootfs_dir = build_dir.as_ref().map(|dir| dir.path().join("rootfs"));
 
+    // Every stage-local `ARG` declared *so far* (with its own already-
+    // fully-resolved value -- override, inline default, or inherited
+    // meta-arg, whichever `expand_stage` already picked), in
+    // declaration order -- exactly what a `RUN` step needs to inject
+    // into its own temporary process environment, matching real
+    // Docker/BuildKit exactly (`dispatchRun`'s own `buildArgs :=
+    // d.state.buildArgs.FilterAllowed(...)`). Never persisted into
+    // `config.config.env` itself -- an `ARG`'s own value only ever
+    // ends up in the final image if a later `ENV` instruction
+    // explicitly re-declares it, the same real distinction real
+    // Docker makes.
+    let mut current_args: Vec<(String, String)> = Vec::new();
     for instruction in &stage.instructions {
         apply_instruction(
             instruction,
@@ -567,6 +585,7 @@ fn build_stage(
             context,
             stage_ctx,
             cache_candidates,
+            &mut current_args,
         )?;
     }
 
@@ -698,6 +717,7 @@ fn apply_instruction(
     context: &Path,
     stage_ctx: &StageContext<'_>,
     cache_candidates: &[crate::build_cache::CacheCandidate],
+    current_args: &mut Vec<(String, String)>,
 ) -> anyhow::Result<()> {
     match instruction {
         Instruction::Run(shell_or_exec) => {
@@ -711,6 +731,7 @@ fn apply_instruction(
                 store,
                 rootfs,
                 cache_candidates,
+                current_args,
             )?;
         }
         Instruction::Copy {
@@ -757,10 +778,26 @@ fn apply_instruction(
         Instruction::From { .. } => {
             unreachable!("a stage's own instructions never include the FROM that started it")
         }
-        // Already fully resolved by `expand_stage`; no config effect
-        // of its own. `SHELL` only affects a future shell-form `RUN`,
-        // which isn't supported yet either.
-        Instruction::Arg(_) | Instruction::Shell(_) => {}
+        // `SHELL` only affects a future shell-form `RUN`, which isn't
+        // supported yet either -- no config effect of its own.
+        Instruction::Shell(_) => {}
+        // No config effect of its own -- `expand_stage` already fully
+        // resolved every name's own value (override, inline default,
+        // or inherited meta-arg). Tracked in `current_args` (not
+        // `config.config.env`) purely so a *later* `RUN` in this same
+        // stage can see it in its own temporary process environment,
+        // matching real Docker exactly -- see `run_instruction`'s own
+        // doc comment. A bare `ARG NAME` with no default and no
+        // matching meta-arg resolves to `None` here and is correctly
+        // never added at all (nothing to inject).
+        Instruction::Arg(pairs) => {
+            for (name, value) in pairs {
+                if let Some(value) = value {
+                    current_args.retain(|(existing, _)| existing != name);
+                    current_args.push((name.clone(), value.clone()));
+                }
+            }
+        }
         Instruction::Env(pairs) => {
             let cc = config.config.get_or_insert_with(ContainerConfig::default);
             for (key, value) in pairs {
@@ -862,10 +899,36 @@ fn run_instruction(
     store: &oci_store::Store,
     rootfs: &Path,
     cache_candidates: &[crate::build_cache::CacheCandidate],
+    current_args: &[(String, String)],
 ) -> anyhow::Result<()> {
     let args = args_for(shell_or_exec);
     let command_text = args.join(" ");
-    let created_by = format!("RUN {command_text}");
+
+    // Every currently-declared `ARG` whose name isn't *already* a real
+    // `ENV` key -- matching real Docker's own `FilterAllowed` exactly
+    // (`buildArgs := d.state.buildArgs.FilterAllowed(stateRunConfig.
+    // Env)`): an `ARG` that shares a name with an explicit `ENV`
+    // never overrides it here, the persisted `ENV` value always wins.
+    let container_env = config.config.as_ref().map(|cc| cc.env.as_slice());
+    let arg_overlay = build_arg_overlay(container_env.unwrap_or(&[]), current_args);
+
+    // Folded into the cache key exactly like real Docker's own
+    // `prependEnvOnCmd` (visible in a real `docker history` as `RUN
+    // |1 VERSION=1.0 /bin/sh -c ...`) -- without this, a `--build-arg`
+    // override that changes what this exact `RUN` text would actually
+    // see (via `$VERSION` in the shell, say) would otherwise still
+    // hash-match an earlier build's own differently-parameterized
+    // cache entry and incorrectly reuse its stale layer.
+    let created_by = if arg_overlay.is_empty() {
+        format!("RUN {command_text}")
+    } else {
+        let assignments = arg_overlay
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("RUN |{} {assignments} {command_text}", arg_overlay.len())
+    };
 
     if let Some(cached) = crate::build_cache::find_cached_layer(
         cache_candidates,
@@ -877,7 +940,7 @@ fn run_instruction(
             .with_context(|| format!("reusing cached layer for RUN {command_text}"));
     }
 
-    let spec = run_step_spec(config, rootfs, args.clone())
+    let spec = run_step_spec(config, rootfs, args.clone(), &arg_overlay)
         .with_context(|| format!("preparing RUN {command_text}"))?;
     let bundle_dir = rootfs
         .parent()
@@ -969,10 +1032,33 @@ fn reuse_cached_layer(
 /// `cmd_run`'s own `synthesize_spec`, which also handles CLI resource
 /// flags, image `CMD` fallback, and a container hostname, none of
 /// which apply to a build step.
+/// Every entry of `current_args` whose own name isn't already a real
+/// key in `container_env` -- matching real Docker's own
+/// `BuildArgs.FilterAllowed` exactly (an `ARG` sharing a name with an
+/// explicit `ENV` never overrides it). Declaration order preserved
+/// (irrelevant to correctness -- environment variable order never
+/// changes what a shell resolves `$NAME` to -- but deterministic
+/// regardless, matching this project's own established preference).
+fn build_arg_overlay(
+    container_env: &[String],
+    current_args: &[(String, String)],
+) -> Vec<(String, String)> {
+    current_args
+        .iter()
+        .filter(|(name, _)| {
+            !container_env
+                .iter()
+                .any(|kv| kv.split_once('=').map(|(k, _)| k) == Some(name.as_str()))
+        })
+        .cloned()
+        .collect()
+}
+
 fn run_step_spec(
     config: &ImageConfig,
     rootfs: &Path,
     args: Vec<String>,
+    arg_overlay: &[(String, String)],
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -1003,6 +1089,24 @@ fn run_step_spec(
     process.user.gid = gid;
     if !container_config.env.is_empty() {
         process.env = container_config.env;
+    }
+    // Real Docker/BuildKit rule, checked directly (`dispatchRun`'s own
+    // `withEnv(append(stateRunConfig.Env, buildArgs...))`): every
+    // currently-declared `ARG` (not already shadowed by a real `ENV`
+    // key -- `arg_overlay` is already filtered that way) is injected
+    // into this one `RUN` step's own temporary process environment,
+    // exactly like this step's own persisted `ENV` values, but *never*
+    // written back into `config.config.env` itself -- an `ARG`'s own
+    // value only ever survives into the final image if a later `ENV`
+    // instruction explicitly re-declares it. This is what actually
+    // makes `RUN echo $SOME_ARG` see `SOME_ARG`'s own real value: the
+    // shell running inside the container does its own ordinary `$VAR`
+    // expansion using this process's own real environment, not a
+    // build-time text substitution this crate ever performs on a
+    // `RUN` step's own command line (see `oci_dockerfile::
+    // expand_stage`'s own doc comment for why not).
+    for (name, value) in arg_overlay {
+        process.env.push(format!("{name}={value}"));
     }
     // Same real `podman`-default capability set every other real
     // container this project runs gets (see `synthesize_spec`'s own

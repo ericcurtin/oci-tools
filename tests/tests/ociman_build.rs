@@ -2921,6 +2921,235 @@ fn build_arg_overrides_a_declared_args_own_default() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), "2.5 default\n");
 }
 
+/// Real Docker/BuildKit rule, checked directly against real `podman
+/// build` too (an identical Containerfile against a real installed
+/// `podman`, `$VERSION` really does resolve to `1.0` inside the `RUN`
+/// step): a declared `ARG`'s own value is injected into a *later*
+/// `RUN` step's own temporary process environment, so the shell
+/// running inside it can `$VAR`-expand it -- `oci_dockerfile::
+/// expand_stage` deliberately never touches `RUN`'s own command-line
+/// text at build-time (same as real Docker), so this only works if
+/// `ociman build` actually sets up that runtime environment, not
+/// through any string substitution.
+#[test]
+fn run_step_sees_a_declared_args_own_value_in_its_own_shell_environment() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/run-sees-arg-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/run-sees-arg-base:latest\n\
+         ARG VERSION=1.0\n\
+         RUN echo \"VERSION is [$VERSION]\" > /result.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/run-sees-arg-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/run-sees-arg-result:latest",
+            "--",
+            "cat",
+            "/result.txt",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "VERSION is [1.0]\n");
+
+    // Never persisted into the final image's own ENV -- matches real
+    // Docker exactly: an ARG's value only survives past the build if
+    // a later ENV instruction explicitly re-declares it, which this
+    // Containerfile never does.
+    let record = store
+        .resolve_image("docker.io/ociman-test/run-sees-arg-result:latest")
+        .unwrap()
+        .unwrap();
+    let config = store.image_config(&record).unwrap();
+    assert!(
+        !config
+            .config
+            .unwrap()
+            .env
+            .iter()
+            .any(|kv| kv.starts_with("VERSION="))
+    );
+}
+
+/// A `--build-arg` override changes what a `RUN` step's own shell
+/// actually sees, *and* correctly busts the local build cache for it
+/// -- rebuilding the exact same Containerfile with a different
+/// `--build-arg` value must not silently reuse an earlier build's own
+/// now-stale layer (its own file content really did depend on the
+/// old value).
+#[test]
+fn build_arg_override_changes_what_run_sees_and_busts_the_cache() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/run-arg-cache-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/run-arg-cache-base:latest\n\
+         ARG VERSION=1.0\n\
+         RUN echo \"VERSION is [$VERSION]\" > /result.txt\n",
+    );
+
+    let build_one = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/run-arg-cache-v1:latest",
+        ],
+    );
+    assert!(build_one.status.success());
+
+    let build_two = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/run-arg-cache-v2:latest",
+            "--build-arg",
+            "VERSION=2.0",
+        ],
+    );
+    assert!(
+        build_two.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build_two.stderr)
+    );
+
+    let record_one = store
+        .resolve_image("docker.io/ociman-test/run-arg-cache-v1:latest")
+        .unwrap()
+        .unwrap();
+    let record_two = store
+        .resolve_image("docker.io/ociman-test/run-arg-cache-v2:latest")
+        .unwrap()
+        .unwrap();
+    let manifest_one = store.image_manifest(&record_one).unwrap();
+    let manifest_two = store.image_manifest(&record_two).unwrap();
+    assert_ne!(
+        manifest_one.layers.last(),
+        manifest_two.layers.last(),
+        "a different --build-arg value must produce a genuinely different RUN layer, not a stale cache hit"
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/run-arg-cache-v2:latest",
+            "--",
+            "cat",
+            "/result.txt",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "VERSION is [2.0]\n");
+}
+
+/// Real Docker rule, checked directly (`BuildArgs.FilterAllowed`): an
+/// `ARG` sharing a name with an explicit `ENV` never overrides it in a
+/// `RUN` step's own environment -- the `ENV` value always wins.
+#[test]
+fn arg_never_overrides_an_explicit_env_with_the_same_name_in_a_run_step() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/arg-env-precedence-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/arg-env-precedence-base:latest\n\
+         ARG FOO=from-arg\n\
+         ENV FOO=from-env\n\
+         RUN echo \"FOO is [$FOO]\" > /result.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/arg-env-precedence-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/arg-env-precedence-result:latest",
+            "--",
+            "cat",
+            "/result.txt",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "FOO is [from-env]\n");
+}
+
 /// A `--build-arg` for a name nothing in the Containerfile ever
 /// declares has no effect at all (real `docker build`/`podman build`
 /// both just silently ignore it for the purposes of expansion,

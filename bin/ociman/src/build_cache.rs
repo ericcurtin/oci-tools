@@ -50,16 +50,26 @@
 //!   *especially*), so skipping it outright, not just skipping the
 //!   file I/O, is the entire point.
 //!
-//! # `RUN`'s own cache key is exactly its recorded `created_by` text
+//! # `RUN`'s own cache key is its recorded `created_by` text, with any currently-declared `ARG` values folded in
 //!
 //! No separate signature is computed for `RUN`: its `created_by` is
-//! already just the resolved shell/exec command text (`build.rs`'s
-//! own `run_instruction`), which already reflects any `--build-arg`/
-//! `ARG`/`ENV` substitution actually used inside the command line
-//! itself (`oci_dockerfile::expand_stage`'s own `$VAR` substitution
-//! runs before `RUN`'s own text is ever seen here) — matching real
-//! Docker's own classic builder, which likewise busts a `RUN` layer's
-//! cache on command-text-plus-parent-chain, with no filesystem
+//! the resolved shell/exec command text (`build.rs`'s own
+//! `run_instruction`) — `oci_dockerfile::expand_stage` deliberately
+//! never touches `RUN`'s own command-line text at build time (real
+//! Docker doesn't either; see its own module doc comment for why), so
+//! a literal `RUN echo $VERSION` stays exactly that in `created_by`,
+//! never becoming `RUN echo 1.0`. Since 0119, `ARG` values a `RUN`
+//! step can actually see (via its own injected process environment,
+//! not a text substitution — see `run_step_spec`'s own doc comment)
+//! are folded into `created_by` as a real prefix instead (matching
+//! real Docker's own `prependEnvOnCmd`, visible in a real `docker
+//! history` as `RUN |1 VERSION=1.0 /bin/sh -c ...`): without this, a
+//! `--build-arg` override that changes what the exact same `RUN` text
+//! would actually produce could otherwise still hash-match an earlier
+//! build's own differently-parameterized cache entry and incorrectly
+//! reuse its stale layer — matching real Docker's own classic
+//! builder, which likewise busts a `RUN` layer's cache on
+//! command-text-plus-build-args-plus-parent-chain, with no filesystem
 //! content digest of its own to compute (there's no source content to
 //! hash for a `RUN` in the first place).
 //!
