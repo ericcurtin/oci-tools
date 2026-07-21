@@ -2622,3 +2622,361 @@ fn build_arg_prints_no_warning_when_every_override_is_consumed() {
     );
     assert!(!String::from_utf8_lossy(&build.stderr).contains("[Warning]"));
 }
+
+/// The build cache (`build_cache` module): rebuilding the exact same
+/// `RUN`/`COPY` steps against the exact same base image and build
+/// context reuses the *first* build's own already-stored layers
+/// verbatim, rather than recomputing them.
+///
+/// This is checked the only way that actually proves reuse happened
+/// rather than merely "producing the same result again by
+/// coincidence": a `RUN` step's own committed layer is a real tar
+/// archive, and `/proc/sys/kernel/random/uuid` is a real kernel
+/// interface that returns a genuinely fresh random UUID on every
+/// single read (unlike, say, a PID -- which a fresh, single-process
+/// container's own shell would almost always see as `1` regardless of
+/// how many times it's really launched, or a whole-second mtime,
+/// which two builds running within the same wall-clock second could
+/// otherwise coincidentally share) -- so two genuinely *separate* real
+/// executions of `cat /proc/sys/kernel/random/uuid > /marker.txt` are
+/// certain to produce two different layer digests. If the second
+/// build's own manifest layer digests come back byte-for-byte
+/// identical to the first build's own, the second `RUN` provably
+/// never actually ran a second time.
+#[test]
+fn rebuilding_the_same_containerfile_reuses_previously_built_layers() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cache-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("app.txt"), b"hello cache").unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/cache-base:latest\n\
+         RUN cat /proc/sys/kernel/random/uuid > /marker.txt\n\
+         COPY app.txt /app.txt\n",
+    );
+
+    let first = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/cache-first:latest",
+        ],
+    );
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    // A real, separate process boundary between the two builds --
+    // not strictly required for the PID/mtime argument above, but
+    // makes "these really are two independent invocations" explicit.
+    let second = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/cache-second:latest",
+        ],
+    );
+    assert!(
+        second.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let first_record = store
+        .resolve_image("docker.io/ociman-test/cache-first:latest")
+        .unwrap()
+        .unwrap();
+    let second_record = store
+        .resolve_image("docker.io/ociman-test/cache-second:latest")
+        .unwrap()
+        .unwrap();
+    let first_manifest = store.image_manifest(&first_record).unwrap();
+    let second_manifest = store.image_manifest(&second_record).unwrap();
+
+    assert_eq!(
+        first_manifest.layers, second_manifest.layers,
+        "the second build should have reused every one of the first build's own layers, not \
+         recomputed them"
+    );
+
+    let first_config = store.image_config(&first_record).unwrap();
+    let second_config = store.image_config(&second_record).unwrap();
+    assert_eq!(first_config.rootfs.diff_ids, second_config.rootfs.diff_ids);
+    assert_eq!(first_config.history.len(), 2);
+    assert_eq!(second_config.history.len(), 2);
+    assert_eq!(first_config.history, second_config.history);
+}
+
+/// `--no-cache` disables the reuse [`rebuilding_the_same_containerfile_
+/// reuses_previously_built_layers`] just proved happens by default:
+/// with `--no-cache`, a rebuild of the identical `RUN` step actually
+/// re-executes, producing a genuinely different layer digest (same
+/// real, genuinely-random `/proc/sys/kernel/random/uuid` argument as
+/// that test, in reverse).
+#[test]
+fn no_cache_forces_a_real_re_execution_instead_of_reusing_a_cached_layer() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/no-cache-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/no-cache-base:latest\nRUN cat /proc/sys/kernel/random/uuid > /marker.txt\n",
+    );
+
+    let first = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/no-cache-first:latest",
+        ],
+    );
+    assert!(first.status.success());
+
+    let second = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/no-cache-second:latest",
+            "--no-cache",
+        ],
+    );
+    assert!(second.status.success());
+
+    let first_record = store
+        .resolve_image("docker.io/ociman-test/no-cache-first:latest")
+        .unwrap()
+        .unwrap();
+    let second_record = store
+        .resolve_image("docker.io/ociman-test/no-cache-second:latest")
+        .unwrap()
+        .unwrap();
+    let first_manifest = store.image_manifest(&first_record).unwrap();
+    let second_manifest = store.image_manifest(&second_record).unwrap();
+
+    assert_ne!(
+        first_manifest.layers, second_manifest.layers,
+        "--no-cache must re-run RUN for real, producing a genuinely new layer"
+    );
+}
+
+/// A `COPY` whose source content actually changed between two builds
+/// must never be served from the cache, even though the instruction's
+/// own literal text (`COPY app.txt /app.txt`) is unchanged — the real
+/// content digest folded into `created_by` (see the `build_cache`
+/// module's own doc comment) is what makes this distinction, not the
+/// Containerfile text alone.
+#[test]
+fn a_copy_source_whose_content_changed_is_not_served_from_the_cache() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copy-cache-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("app.txt"), b"version one").unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copy-cache-base:latest\nCOPY app.txt /app.txt\n",
+    );
+
+    let first = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/copy-cache-first:latest",
+        ],
+    );
+    assert!(first.status.success());
+
+    // Same instruction text, genuinely different content.
+    std::fs::write(
+        context_dir.path().join("app.txt"),
+        b"version two -- changed!",
+    )
+    .unwrap();
+    let second = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/copy-cache-second:latest",
+        ],
+    );
+    assert!(second.status.success());
+
+    let first_record = store
+        .resolve_image("docker.io/ociman-test/copy-cache-first:latest")
+        .unwrap()
+        .unwrap();
+    let second_record = store
+        .resolve_image("docker.io/ociman-test/copy-cache-second:latest")
+        .unwrap()
+        .unwrap();
+    let first_manifest = store.image_manifest(&first_record).unwrap();
+    let second_manifest = store.image_manifest(&second_record).unwrap();
+
+    assert_ne!(
+        first_manifest.layers, second_manifest.layers,
+        "changed COPY source content must bust the cache, not reuse the stale layer"
+    );
+
+    // And the built image really does contain the *new* content, not
+    // a stale cached copy.
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/copy-cache-second:latest",
+            "--",
+            "cat",
+            "/app.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "version two -- changed!"
+    );
+}
+
+/// A change earlier in the instruction sequence (a different `RUN`)
+/// is never served from the cache — matching real Docker/BuildKit's
+/// own "one miss invalidates everything after it" cache semantics
+/// (real buildah's own `historyAndDiffIDsMatch` is a full-history-
+/// prefix match, not a per-instruction lookup independent of
+/// position; see the `build_cache` module's own doc comment).
+///
+/// Only the changed `RUN` step's own layer is asserted here, not the
+/// unchanged `COPY` after it: unlike `RUN`'s own real, essentially
+/// unique-per-execution output (see this file's own other cache
+/// tests), copying the exact same, unchanged source file always
+/// produces byte-identical tar bytes regardless of whether real
+/// copying happened again or a cache lookup skipped it — a
+/// genuinely-re-run `COPY` of unchanged content is indistinguishable
+/// from a cache hit by digest alone, in *any* per-instruction-diff
+/// architecture (this project's own included), so it isn't a useful
+/// signal for "was the cache consulted here" the way `RUN`'s own
+/// PID-dependent output is.
+#[test]
+fn a_change_earlier_in_the_file_busts_the_cache_for_every_later_step_too() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/prefix-cache-base:latest",
+        &busybox,
+        &["sh", "mkdir"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("app.txt"), b"unchanged content").unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/prefix-cache-base:latest\n\
+         RUN mkdir -p /one\n\
+         COPY app.txt /app.txt\n",
+    );
+
+    let first = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/prefix-cache-first:latest",
+        ],
+    );
+    assert!(first.status.success());
+
+    // Change only the *first* RUN's own command text; the COPY step
+    // (and its source content) is completely unchanged.
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/prefix-cache-base:latest\n\
+         RUN mkdir -p /one-different\n\
+         COPY app.txt /app.txt\n",
+    );
+    let second = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/prefix-cache-second:latest",
+        ],
+    );
+    assert!(second.status.success());
+
+    let first_record = store
+        .resolve_image("docker.io/ociman-test/prefix-cache-first:latest")
+        .unwrap()
+        .unwrap();
+    let second_record = store
+        .resolve_image("docker.io/ociman-test/prefix-cache-second:latest")
+        .unwrap()
+        .unwrap();
+    let first_manifest = store.image_manifest(&first_record).unwrap();
+    let second_manifest = store.image_manifest(&second_record).unwrap();
+
+    // The changed RUN step is never served from the cache -- it's a
+    // real, genuinely different instruction, so there's nothing to
+    // even consider reusing.
+    assert_ne!(first_manifest.layers[1], second_manifest.layers[1]);
+}

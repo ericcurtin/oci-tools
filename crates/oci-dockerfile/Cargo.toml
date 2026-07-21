@@ -1,6 +1,6 @@
 [package]
 name = "oci-dockerfile"
-description = "Dockerfile/Containerfile parser, build graph, and build cache"
+description = "Dockerfile/Containerfile parser and build graph"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

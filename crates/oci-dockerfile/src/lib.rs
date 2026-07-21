@@ -1,17 +1,19 @@
-//! Dockerfile/Containerfile parser, build graph, and build cache.
+//! Dockerfile/Containerfile parser and build graph.
 //!
 //! **Status: parsing/build-graph plus the layer-commit plumbing.**
 //! `parse` turns raw Dockerfile/Containerfile text into an ordered
 //! list of [`Instruction`]s; the actual build *executor* — driving
 //! `RUN` steps via `oci-runtime-core`, copying files for `COPY`,
 //! committing layers via [`commit_layer`], resolving `--build-arg`
-//! overrides via [`expand_meta_args`]/[`expand_stage`] — lives in
-//! `ociman build` (`bin/ociman/src/build.rs`), layered on top of this
-//! crate rather than in it (see `docs/design/0050`-`0059` for that
-//! side's own increments). This crate itself stays a pure, `ociman`-
-//! independent library: parsing, `$VAR` expansion, the dependency
-//! graph, and the one piece of layer-commit glue ([`commit_layer`])
-//! narrow enough to have no build-executor-loop concerns of its own.
+//! overrides via [`expand_meta_args`]/[`expand_stage`], and the local
+//! build cache (`ociman build`'s own `build_cache` module, 0101) —
+//! lives in `ociman build` (`bin/ociman/src/build.rs`), layered on top
+//! of this crate rather than in it (see `docs/design/0050`-`0059` for
+//! that side's own increments). This crate itself stays a pure,
+//! `ociman`-independent library: parsing, `$VAR` expansion, the
+//! dependency graph, and the one piece of layer-commit glue
+//! ([`commit_layer`]) narrow enough to have no build-executor-loop
+//! concerns of its own.
 //!
 //! Every lexical/grammar rule this crate implements was checked
 //! directly against the real, current BuildKit Dockerfile frontend
@@ -49,11 +51,6 @@
 //!   `--exclude=`, `ADD --link`/`--keep-git-dir`/`--checksum=`/
 //!   `--unpack`) — a Containerfile using any of these fails to parse
 //!   with a clear error, rather than being silently misparsed.
-//! - The build cache this crate's own module doc has always planned —
-//!   the dependency graph above tells `ociman build` *what order* to
-//!   build stages in and *which* stages it can skip for a given
-//!   target, but nothing actually caches a previous build's own
-//!   result yet.
 //! - `--build-arg`'s own CLI-string parsing (`KEY=value`/bare `KEY`
 //!   pulled from the calling process's own environment, matching real
 //!   `docker build --build-arg`/`podman build --build-arg`) is

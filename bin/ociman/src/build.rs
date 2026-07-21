@@ -119,6 +119,14 @@
 //!   (unlike real `podman build` without `-t`, which still records an
 //!   untagged, ID-only image) — clear error instead of inventing that
 //!   plumbing here.
+//! * **A real local build cache is on by default** (`--no-cache`
+//!   disables it) — every `RUN`/`COPY`/`ADD` step is first checked
+//!   against every image already in local storage
+//!   ([`crate::build_cache`]) and, on a match, its already-stored
+//!   layer is reused verbatim instead of re-executing the step at
+//!   all. See [`build_cache`][crate::build_cache]'s own doc comment
+//!   for the full matching algorithm (ported from real buildah's own
+//!   model) and `docs/design/0101`.
 //!
 //! Every metadata instruction (`ENV`/`LABEL`/`WORKDIR`/`USER`/
 //! `ENTRYPOINT`/`CMD`/`EXPOSE`/`VOLUME`/`STOPSIGNAL`/`MAINTAINER`,
@@ -154,12 +162,14 @@ struct BuildResult {
 /// `podman build`'s own default preference), tagging the result as
 /// `tag`. See this module's own doc comment for exactly what's
 /// supported so far.
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_build(
     context: &Path,
     dockerfile: Option<&Path>,
     tag: Option<&str>,
     build_args: &[String],
     target: Option<&str>,
+    no_cache: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let tag = tag.context(
@@ -217,6 +227,15 @@ pub fn cmd_build(
         copy_from_deps.iter().flatten().copied().collect();
 
     let store = crate::open_store()?;
+    // Loaded once, up front -- see `build_cache`'s own doc comment for
+    // why re-reading it per instruction is unnecessary (nothing about
+    // local storage changes mid-build) and `--no-cache` simply means
+    // "act as if local storage had no images at all yet".
+    let cache_candidates = if no_cache {
+        Vec::new()
+    } else {
+        crate::build_cache::load_candidates(&store)
+    };
     let mut built: std::collections::HashMap<usize, BuiltStage> = std::collections::HashMap::new();
     for &stage_index in &build_order {
         let stage = oci_dockerfile::expand_stage(&global_args, &build_args, &stages[stage_index])
@@ -266,6 +285,7 @@ pub fn cmd_build(
             base_layers,
             force_rootfs,
             &stage_ctx,
+            &cache_candidates,
         )?;
         built.insert(stage_index, built_stage);
     }
@@ -367,6 +387,7 @@ impl StageContext<'_> {
 /// (some later stage's own `COPY --from=` reads from this one) —
 /// otherwise never pays for a tempdir or a base-layer extraction, and
 /// its own returned layer list stays byte-identical to `base_layers`.
+#[allow(clippy::too_many_arguments)]
 fn build_stage(
     store: &oci_store::Store,
     context: &Path,
@@ -375,6 +396,7 @@ fn build_stage(
     base_layers: Vec<Descriptor>,
     force_rootfs: bool,
     stage_ctx: &StageContext<'_>,
+    cache_candidates: &[crate::build_cache::CacheCandidate],
 ) -> anyhow::Result<BuiltStage> {
     let mut config = base_config;
     let mut layers = base_layers;
@@ -415,6 +437,7 @@ fn build_stage(
             rootfs_dir.as_deref(),
             context,
             stage_ctx,
+            cache_candidates,
         )?;
     }
 
@@ -545,13 +568,21 @@ fn apply_instruction(
     rootfs: Option<&Path>,
     context: &Path,
     stage_ctx: &StageContext<'_>,
+    cache_candidates: &[crate::build_cache::CacheCandidate],
 ) -> anyhow::Result<()> {
     match instruction {
         Instruction::Run(shell_or_exec) => {
             let rootfs = rootfs.expect(
                 "cmd_build always prepares a rootfs when the stage contains a RUN instruction",
             );
-            run_instruction(shell_or_exec, config, layers, store, rootfs)?;
+            run_instruction(
+                shell_or_exec,
+                config,
+                layers,
+                store,
+                rootfs,
+                cache_candidates,
+            )?;
         }
         Instruction::Copy {
             flags,
@@ -562,7 +593,16 @@ fn apply_instruction(
                 "cmd_build always prepares a rootfs when the stage contains a COPY instruction",
             );
             copy_instruction(
-                flags, sources, dest, config, layers, store, context, rootfs, stage_ctx,
+                flags,
+                sources,
+                dest,
+                config,
+                layers,
+                store,
+                context,
+                rootfs,
+                stage_ctx,
+                cache_candidates,
             )?;
         }
         Instruction::Add {
@@ -573,7 +613,17 @@ fn apply_instruction(
             let rootfs = rootfs.expect(
                 "cmd_build always prepares a rootfs when the stage contains an ADD instruction",
             );
-            add_instruction(flags, sources, dest, config, layers, store, context, rootfs)?;
+            add_instruction(
+                flags,
+                sources,
+                dest,
+                config,
+                layers,
+                store,
+                context,
+                rootfs,
+                cache_candidates,
+            )?;
         }
         Instruction::From { .. } => {
             unreachable!("a stage's own instructions never include the FROM that started it")
@@ -662,9 +712,21 @@ fn run_instruction(
     layers: &mut Vec<Descriptor>,
     store: &oci_store::Store,
     rootfs: &Path,
+    cache_candidates: &[crate::build_cache::CacheCandidate],
 ) -> anyhow::Result<()> {
     let args = args_for(shell_or_exec);
     let command_text = args.join(" ");
+    let created_by = format!("RUN {command_text}");
+
+    if let Some(cached) = crate::build_cache::find_cached_layer(
+        cache_candidates,
+        &config.history,
+        layers.len(),
+        &created_by,
+    ) {
+        return reuse_cached_layer(store, rootfs, config, layers, cached)
+            .with_context(|| format!("reusing cached layer for RUN {command_text}"));
+    }
 
     let spec = run_step_spec(config, rootfs, args.clone())
         .with_context(|| format!("preparing RUN {command_text}"))?;
@@ -701,7 +763,51 @@ fn run_instruction(
         .with_context(|| format!("diffing rootfs after RUN {command_text}"))?;
     let committed = commit_layer(store, rootfs, &diff)
         .with_context(|| format!("committing layer for RUN {command_text}"))?;
-    record_layer(config, layers, &committed, format!("RUN {command_text}"));
+    record_layer(config, layers, &committed, created_by);
+    Ok(())
+}
+
+/// Reuse an already-stored layer instead of re-running/re-copying an
+/// instruction: extract it onto `rootfs` (so a later instruction in
+/// this same stage, or a later stage's own `COPY --from=`, sees the
+/// exact same on-disk result a real re-execution would have produced
+/// — this project tracks a stage's own state as a real, live rootfs
+/// directory rather than layered mounts, so a skipped instruction
+/// still has to leave that directory in the right state) and record
+/// it into `config`/`layers`.
+///
+/// Deliberately doesn't go through [`record_layer`] (unlike every
+/// other commit site in this file): that helper always timestamps a
+/// history entry *now*, right for a layer this same call genuinely
+/// just produced, but wrong for one that's actually a real leftover
+/// from whenever `cached`'s own source image was originally built —
+/// [`crate::build_cache::CachedLayer::history_entry`] is that
+/// original entry, reused verbatim (its own real `created` timestamp
+/// included) instead.
+fn reuse_cached_layer(
+    store: &oci_store::Store,
+    rootfs: &Path,
+    config: &mut ImageConfig,
+    layers: &mut Vec<Descriptor>,
+    cached: crate::build_cache::CachedLayer,
+) -> anyhow::Result<()> {
+    let crate::build_cache::CachedLayer {
+        descriptor,
+        diff_id,
+        history_entry,
+    } = cached;
+
+    let compression = crate::compression_for_media_type(&descriptor.media_type)
+        .with_context(|| format!("cached layer {}", descriptor.digest))?;
+    let blob = store
+        .open_blob(&descriptor.digest)
+        .with_context(|| format!("opening cached layer blob {}", descriptor.digest))?;
+    oci_layer::apply(blob, compression, rootfs)
+        .with_context(|| format!("applying cached layer {}", descriptor.digest))?;
+
+    layers.push(descriptor);
+    config.rootfs.diff_ids.push(diff_id);
+    config.history.push(history_entry);
     Ok(())
 }
 
@@ -794,6 +900,7 @@ fn copy_instruction(
     context: &Path,
     rootfs: &Path,
     stage_ctx: &StageContext<'_>,
+    cache_candidates: &[crate::build_cache::CacheCandidate],
 ) -> anyhow::Result<()> {
     let chown = flags
         .chown
@@ -811,10 +918,14 @@ fn copy_instruction(
         !sources.is_empty(),
         "ociman build: COPY requires at least one source"
     );
-    let command_text = match &flags.from {
-        Some(from) => format!("COPY --from={from} {} {dest}", sources.join(" ")),
-        None => format!("COPY {} {dest}", sources.join(" ")),
-    };
+    let command_text = copy_add_command_text(
+        "COPY",
+        flags.from.as_deref(),
+        flags.chmod.as_deref(),
+        flags.chown.as_deref(),
+        sources,
+        dest,
+    );
 
     // Real Docker/BuildKit rule, checked directly (`parser.go`'s own
     // `parseCopy`): a source path is always relative to its own root
@@ -858,6 +969,31 @@ fn copy_instruction(
         "ociman build: when using COPY with more than one source file, the destination must be \
          a directory and end with a / ({dest:?})"
     );
+
+    // Checked up front (not just implicitly by the copy loop further
+    // down) so a missing source fails with a clear "does not exist"
+    // error before the content-digest hash below ever tries (and
+    // fails, with a far less clear I/O error) to read it.
+    ensure_sources_exist(source_root, &sources, "COPY")?;
+
+    // A real content digest of exactly what's about to be copied,
+    // folded into the recorded `created_by` -- see `build_cache`'s
+    // own doc comment for why `COPY`/`ADD` need this (unlike `RUN`)
+    // and why it must be computed before the cache lookup below, not
+    // after.
+    let content_digest = crate::build_cache::content_digest(source_root, &sources)
+        .with_context(|| format!("hashing COPY source content for {command_text}"))?;
+    let created_by = format!("{command_text} # {content_digest}");
+
+    if let Some(cached) = crate::build_cache::find_cached_layer(
+        cache_candidates,
+        &config.history,
+        layers.len(),
+        &created_by,
+    ) {
+        return reuse_cached_layer(store, rootfs, config, layers, cached)
+            .with_context(|| format!("reusing cached layer for {command_text}"));
+    }
 
     // A relative destination is resolved against the working
     // directory currently in effect, same as a `RUN` step's own `cwd`
@@ -914,8 +1050,36 @@ fn copy_instruction(
         .with_context(|| format!("diffing rootfs after {command_text}"))?;
     let committed = commit_layer(store, rootfs, &diff)
         .with_context(|| format!("committing layer for {command_text}"))?;
-    record_layer(config, layers, &committed, command_text);
+    record_layer(config, layers, &committed, created_by);
     Ok(())
+}
+
+/// The human-readable prefix of a `COPY`/`ADD` instruction's own
+/// recorded `created_by` (before [`copy_instruction`]/
+/// [`add_instruction`] each fold in their own real content digest —
+/// see `build_cache`'s own doc comment for why). Shared between both
+/// since the two instructions only differ in whether `--from` even
+/// exists at all (`ADD` has none, see [`AddFlags`]'s own doc comment).
+fn copy_add_command_text(
+    instruction_name: &str,
+    from: Option<&str>,
+    chmod: Option<&str>,
+    chown: Option<&str>,
+    sources: &[String],
+    dest: &str,
+) -> String {
+    let mut text = instruction_name.to_string();
+    if let Some(from) = from {
+        text.push_str(&format!(" --from={from}"));
+    }
+    if let Some(chmod) = chmod {
+        text.push_str(&format!(" --chmod={chmod}"));
+    }
+    if let Some(chown) = chown {
+        text.push_str(&format!(" --chown={chown}"));
+    }
+    text.push_str(&format!(" {} {dest}", sources.join(" ")));
+    text
 }
 
 /// `ADD` — like [`copy_instruction`], but a *local, non-directory*
@@ -954,6 +1118,7 @@ fn add_instruction(
     store: &oci_store::Store,
     context: &Path,
     rootfs: &Path,
+    cache_candidates: &[crate::build_cache::CacheCandidate],
 ) -> anyhow::Result<()> {
     let chown = flags
         .chown
@@ -971,7 +1136,14 @@ fn add_instruction(
         !sources.is_empty(),
         "ociman build: ADD requires at least one source"
     );
-    let command_text = format!("ADD {} {dest}", sources.join(" "));
+    let command_text = copy_add_command_text(
+        "ADD",
+        None,
+        flags.chmod.as_deref(),
+        flags.chown.as_deref(),
+        sources,
+        dest,
+    );
 
     // Remote URL sources never participate in glob expansion (and
     // `contains_wildcards` would misfire on a URL's own `?query=`
@@ -994,6 +1166,36 @@ fn add_instruction(
         "ociman build: when using ADD with more than one source file, the destination must be \
          a directory and end with a / ({dest:?})"
     );
+
+    // A cache lookup needs a real content digest of what's about to
+    // be copied (see `copy_instruction`'s own identical handling) --
+    // deliberately skipped whenever a remote URL source is present
+    // (fetching it just to hash it would defeat the entire point of
+    // a cache hit, and this project doesn't yet implement real
+    // BuildKit's own `ETag`/`Last-Modified`-based remote-content
+    // change detection that would make a URL source cacheable
+    // without refetching it at all).
+    let created_by = if url_sources.is_empty() {
+        // Same "fail fast with a clear message, before hashing" order
+        // as `copy_instruction`'s own identical check -- see its own
+        // doc comment.
+        ensure_sources_exist(context, &local_sources, "ADD")?;
+        let content_digest = crate::build_cache::content_digest(context, &local_sources)
+            .with_context(|| format!("hashing ADD source content for {command_text}"))?;
+        let created_by = format!("{command_text} # {content_digest}");
+        if let Some(cached) = crate::build_cache::find_cached_layer(
+            cache_candidates,
+            &config.history,
+            layers.len(),
+            &created_by,
+        ) {
+            return reuse_cached_layer(store, rootfs, config, layers, cached)
+                .with_context(|| format!("reusing cached layer for {command_text}"));
+        }
+        created_by
+    } else {
+        command_text.clone()
+    };
 
     let container_config = config.config.clone().unwrap_or_default();
     let resolved_dest = resolve_workdir(container_config.working_dir.as_deref(), dest);
@@ -1116,7 +1318,7 @@ fn add_instruction(
         .with_context(|| format!("diffing rootfs after {command_text}"))?;
     let committed = commit_layer(store, rootfs, &diff)
         .with_context(|| format!("committing layer for {command_text}"))?;
-    record_layer(config, layers, &committed, command_text);
+    record_layer(config, layers, &committed, created_by);
     Ok(())
 }
 
@@ -1207,6 +1409,31 @@ fn resolve_sources(
     Ok(resolved)
 }
 
+/// Verify every one of `sources` (already glob-resolved by
+/// [`resolve_sources`]) exists under `source_root`, with the same
+/// clear "source does not exist" message `copy_instruction`'s/
+/// `add_instruction`'s own copy loop already produced further down —
+/// checked up front instead so a real caller (the content-digest hash
+/// [`copy_instruction`]/`add_instruction` each compute right after
+/// this) never has to surface a confusing raw I/O error for what is
+/// simply a missing source.
+fn ensure_sources_exist(
+    source_root: &Path,
+    sources: &[String],
+    instruction_name: &str,
+) -> anyhow::Result<()> {
+    for source in sources {
+        let source_path = safe_join(source_root, source.trim_start_matches('/'))
+            .with_context(|| format!("resolving {instruction_name} source {source:?}"))?;
+        anyhow::ensure!(
+            source_path.exists(),
+            "{instruction_name} source {source:?} does not exist in {}",
+            source_root.display()
+        );
+    }
+    Ok(())
+}
+
 /// Every real path (file or directory alike, at any depth) under
 /// `source_root` whose own path relative to `source_root` matches
 /// `pattern`, in lexical order.
@@ -1258,7 +1485,7 @@ fn walk_relative_paths(root: &Path, dir: &Path, out: &mut Vec<String>) -> anyhow
 /// treated as context/rootfs-rooted, not host-absolute — see
 /// [`copy_instruction`]'s own doc comment on why `COPY /foo` doesn't
 /// mean the host's own `/foo`.
-fn safe_join(base: &Path, relative: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn safe_join(base: &Path, relative: &str) -> anyhow::Result<PathBuf> {
     let mut out = base.to_path_buf();
     for component in Path::new(relative).components() {
         match component {

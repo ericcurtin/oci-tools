@@ -14,6 +14,7 @@
 //! v1 command set.
 
 mod build;
+mod build_cache;
 mod user_resolve;
 
 use std::path::{Path, PathBuf};
@@ -124,6 +125,13 @@ enum Command {
         /// all, same as with no `--target` given.
         #[arg(long = "target")]
         target: Option<String>,
+        /// Never reuse a previous build's own layers — every
+        /// `RUN`/`COPY`/`ADD` actually re-executes, matching real
+        /// `docker build --no-cache`/`podman build --no-cache`
+        /// exactly. See the `build_cache` module's own doc comment
+        /// for how the cache this disables actually works.
+        #[arg(long = "no-cache")]
+        no_cache: bool,
     },
     /// List images in local storage.
     Images,
@@ -530,12 +538,14 @@ fn main() -> std::process::ExitCode {
                 tag,
                 build_arg,
                 target,
+                no_cache,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
                 tag.as_deref(),
                 &build_arg,
                 target.as_deref(),
+                no_cache,
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),
