@@ -166,6 +166,17 @@ enum Command {
         /// `myrepo/myimage:v2`.
         target: String,
     },
+    /// Show an image's own layer history, matching real `docker
+    /// history`/`podman history`: newest (top) layer first, each
+    /// row's own creation timestamp, the instruction that produced
+    /// it, and its real stored (compressed) layer size — `0` for a
+    /// metadata-only instruction (`ENV`/`WORKDIR`/... ) that produced
+    /// no new layer at all.
+    History {
+        /// Image reference, exactly as it was pulled, built, or
+        /// tagged.
+        reference: String,
+    },
     /// Print low-level JSON for a container or an image — matching
     /// real `podman inspect`/`docker inspect`'s own default
     /// resolution order: a container (by id or `--name`) is tried
@@ -582,6 +593,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Images) => cmd_images(cli.global.json),
             Some(Command::Rmi { reference, force }) => cmd_rmi(&reference, force, cli.global.json),
             Some(Command::Tag { source, target }) => cmd_tag(&source, &target, cli.global.json),
+            Some(Command::History { reference }) => cmd_history(&reference, cli.global.json),
             Some(Command::Inspect { reference }) => cmd_inspect(&reference, cli.global.json),
             Some(Command::Run {
                 image,
@@ -863,6 +875,143 @@ fn cmd_tag(source_str: &str, target_str: &str, json: bool) -> anyhow::Result<()>
         })?;
     } else {
         println!("{target}");
+    }
+    Ok(())
+}
+
+/// One row of `ociman history`'s own output, newest layer first —
+/// see [`cmd_history`]'s own doc comment for exactly how `size` is
+/// derived.
+#[derive(Debug, Serialize)]
+struct HistoryEntryView {
+    created: String,
+    created_by: String,
+    size: u64,
+    comment: String,
+}
+
+/// Show an image's own real layer history — see [`Command::History`]'s
+/// own doc comment for the exact real-`docker history`/`podman
+/// history`-matching output shape.
+///
+/// `ImageConfig.history` (`config.rootfs.diff_ids`'s own sibling list,
+/// see `crates/oci-dockerfile/src/commit.rs`'s `record_layer`/
+/// `record_empty_history`) already has everything each row needs
+/// *except* a real byte size, which lives on the *manifest*'s own
+/// `layers` list instead, one entry per **non**-empty-layer history
+/// entry, both in the same bottom-layer-first relative order — the
+/// exact same "walk history, only advance a separate layer-list index
+/// for a non-`empty_layer` entry" correspondence `ociman build`'s own
+/// local build cache (`bin/ociman/src/build_cache.rs`,
+/// `find_cached_layer`) already relies on for the very same reason.
+///
+/// **A subtlety checked directly against a real bug this same
+/// reasoning almost shipped with**: `history` is not guaranteed to
+/// describe *every* layer. A base image pulled from a real registry
+/// (or, in this project's own test suite, `seed_image`'s deliberately
+/// bare fixture) commonly has one or more real layers with no
+/// `history` entries at all — since `ociman build`'s own
+/// `record_layer` only ever *appends* to both `history` and
+/// `rootfs.diff_ids`/`layers` together, any layer lacking a
+/// description can only ever be one of the *earliest* (bottommost)
+/// ones, never interspersed with described ones later in the same
+/// list. So the non-empty history entries always correspond to the
+/// **last** `non_empty_count` entries of `manifest.layers`/
+/// `rootfs.diff_ids`, not the first `non_empty_count` — starting the
+/// walk's own layer index at `0` instead (as if every layer always
+/// had a description) silently attributes an *earlier* undescribed
+/// layer's own size to a *later*, real, described one whenever they
+/// coexist, which `history_lists_real_layers_and_metadata_entries_
+/// newest_first`'s own real `RUN`-then-`ENV` build over a bare
+/// `seed_image` base (exactly this real shape) catches directly:
+/// without this offset, the `RUN` layer's own reported size was the
+/// *base* layer's own (much larger) size instead.
+///
+/// Factored out of [`cmd_history`] as a small, pure function (no
+/// store/reference resolution of its own) specifically so this
+/// alignment logic has a direct, real-store-independent unit test —
+/// see this module's own `tests::history_layer_sizes_*` below.
+fn history_layer_sizes(
+    history: &[oci_spec_types::image::HistoryEntry],
+    layers: &[oci_spec_types::image::Descriptor],
+) -> Vec<u64> {
+    let non_empty_count = history.iter().filter(|e| !e.empty_layer).count();
+    let mut layer_index = layers.len().saturating_sub(non_empty_count);
+    history
+        .iter()
+        .map(|entry| {
+            if entry.empty_layer {
+                0
+            } else {
+                let size = layers
+                    .get(layer_index)
+                    .map(|descriptor| descriptor.size)
+                    .unwrap_or(0);
+                layer_index += 1;
+                size
+            }
+        })
+        .collect()
+}
+
+fn cmd_history(reference_str: &str, json: bool) -> anyhow::Result<()> {
+    let reference = Reference::parse(reference_str)
+        .with_context(|| format!("parsing image reference {reference_str:?}"))?;
+    let store = open_store()?;
+    let record = store
+        .resolve_image(&reference.to_string())
+        .with_context(|| format!("looking up {reference} in local storage"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("{reference}: no such image in local storage (run `ociman pull` first)")
+        })?;
+    let manifest = store
+        .image_manifest(&record)
+        .with_context(|| format!("reading manifest for {reference}"))?;
+    let config = store
+        .image_config(&record)
+        .with_context(|| format!("reading config for {reference}"))?;
+
+    let sizes = history_layer_sizes(&config.history, &manifest.layers);
+    let mut views: Vec<HistoryEntryView> = config
+        .history
+        .iter()
+        .zip(sizes)
+        .map(|(entry, size)| HistoryEntryView {
+            created: entry.created.clone().unwrap_or_default(),
+            created_by: entry.created_by.clone().unwrap_or_default(),
+            size,
+            comment: entry.comment.clone().unwrap_or_default(),
+        })
+        .collect();
+    // Newest (top) layer first, matching real `docker history`/
+    // `podman history` -- `config.history` itself is stored
+    // bottom-layer-first (the same append order `record_layer`/
+    // `record_empty_history` always use).
+    views.reverse();
+
+    if json {
+        oci_cli_common::output::print_json(&views)?;
+        return Ok(());
+    }
+
+    if views.is_empty() {
+        println!("no history");
+        return Ok(());
+    }
+    println!("{:<24} {:<60} {:>12}", "CREATED", "CREATED BY", "SIZE");
+    for view in &views {
+        // Real `docker history`'s own established truncation (long
+        // shell commands are the common case) -- char-based, not
+        // byte-based, so this never panics on a multi-byte UTF-8
+        // boundary the way a naive byte-slice truncation could.
+        let created_by: String = if view.created_by.chars().count() > 60 {
+            let mut truncated: String = view.created_by.chars().take(57).collect();
+            truncated.push_str("...");
+            truncated
+        } else {
+            view.created_by.clone()
+        };
+        println!("{:<24} {:<60} {:>12}", view.created, created_by, view.size);
     }
     Ok(())
 }
@@ -2992,5 +3141,64 @@ mod tests {
         let base = strings(&["CAP_FOWNER", "CAP_CHOWN"]);
         let result = merge_capabilities(&base, &strings(&["chown"]), &[]).unwrap();
         assert_eq!(result, strings(&["CAP_CHOWN", "CAP_FOWNER"]));
+    }
+
+    fn history_entry(empty_layer: bool) -> oci_spec_types::image::HistoryEntry {
+        oci_spec_types::image::HistoryEntry {
+            created: None,
+            created_by: None,
+            author: None,
+            comment: None,
+            empty_layer,
+        }
+    }
+
+    fn layer_descriptor(size: u64) -> oci_spec_types::image::Descriptor {
+        oci_spec_types::image::Descriptor {
+            media_type: MEDIA_TYPE_IMAGE_LAYER_GZIP.to_string(),
+            digest: oci_spec_types::digest::sha256(size.to_string().as_bytes()),
+            size,
+            urls: vec![],
+            annotations: Default::default(),
+            platform: None,
+        }
+    }
+
+    #[test]
+    fn history_layer_sizes_when_every_layer_has_a_history_entry() {
+        // The common, fully-`ociman-build`-native case: history and
+        // layers stay in perfect lockstep, so the walk starts at
+        // index 0.
+        let history = vec![
+            history_entry(false),
+            history_entry(true),
+            history_entry(false),
+        ];
+        let layers = vec![layer_descriptor(100), layer_descriptor(200)];
+        assert_eq!(history_layer_sizes(&history, &layers), vec![100, 0, 200]);
+    }
+
+    #[test]
+    fn history_layer_sizes_offsets_for_an_undescribed_base_layer() {
+        // The real bug this function's own doc comment describes:
+        // one real layer (the base image's own) has *no* history
+        // entry at all, so the walk must start at index 1, not 0 --
+        // otherwise the RUN layer's own size would be misattributed
+        // to the base layer's.
+        let history = vec![history_entry(false), history_entry(true)];
+        let layers = vec![layer_descriptor(1_000_000), layer_descriptor(161)];
+        assert_eq!(history_layer_sizes(&history, &layers), vec![161, 0]);
+    }
+
+    #[test]
+    fn history_layer_sizes_is_empty_for_an_image_with_no_history_at_all() {
+        let layers = vec![layer_descriptor(1_000_000)];
+        assert!(history_layer_sizes(&[], &layers).is_empty());
+    }
+
+    #[test]
+    fn history_layer_sizes_every_entry_empty_never_touches_layers() {
+        let history = vec![history_entry(true), history_entry(true)];
+        assert_eq!(history_layer_sizes(&history, &[]), vec![0, 0]);
     }
 }
