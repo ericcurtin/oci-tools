@@ -87,6 +87,20 @@ enum Command {
         /// `quay.io/foo/bar@sha256:...`.
         reference: String,
     },
+    /// Push an already-stored image back to its own registry/
+    /// repository/tag, matching real `docker push`/`podman push`'s
+    /// own single-argument form (no `DESTINATION`, which real podman
+    /// also supports for pushing to an *explicit*, possibly different
+    /// target/transport — narrower scope here, see `docs/design/
+    /// 0127`). Skips any blob the registry already has, the same real
+    /// cross-push deduplication both real tools rely on.
+    Push {
+        /// The already-stored image to push — a reference exactly as
+        /// it was pulled/built/tagged, or a real or short image ID
+        /// (the same short ID `ociman images`' own `DIGEST` column
+        /// prints).
+        reference: String,
+    },
     /// Log in to a container registry, matching real `docker login`/
     /// `podman login`'s own auth-file format exactly (`--username`/
     /// `--password` write straight through to the same
@@ -628,6 +642,7 @@ fn main() -> std::process::ExitCode {
                  arrives with later milestones)"
             ),
             Some(Command::Pull { reference }) => cmd_pull(&reference, cli.global.json),
+            Some(Command::Push { reference }) => cmd_push(&reference, cli.global.json),
             Some(Command::Login {
                 registry,
                 username,
@@ -781,6 +796,39 @@ fn cmd_pull(reference_str: &str, json: bool) -> anyhow::Result<()> {
         .with_context(|| format!("reading back manifest for {reference}"))?;
     if json {
         oci_cli_common::output::print_json(&ImageView::from_summary(summary))?;
+    } else {
+        println!("{}", record.manifest_digest);
+    }
+    Ok(())
+}
+
+/// `ociman push`'s own `--json` output.
+#[derive(Debug, Serialize)]
+struct PushResult {
+    reference: String,
+    digest: String,
+}
+
+fn cmd_push(reference_str: &str, json: bool) -> anyhow::Result<()> {
+    let store = open_store()?;
+    let resolved = resolve_image_by_reference_or_id(&store, reference_str)?
+        .ok_or_else(|| anyhow::anyhow!("{reference_str}: no such image in local storage"))?;
+    let record = resolved.record();
+    let reference = Reference::parse(&record.reference)
+        .with_context(|| format!("parsing image reference {:?}", record.reference))?;
+    let mut client = oci_registry::Client::new();
+
+    let progress = oci_cli_common::progress::spinner(format!("pushing {}", reference.familiar()));
+    let result = oci_registry::push_image(&mut client, &store, &reference, record)
+        .with_context(|| format!("pushing {reference}"));
+    progress.finish_and_clear();
+    result?;
+
+    if json {
+        oci_cli_common::output::print_json(&PushResult {
+            reference: reference.to_string(),
+            digest: record.manifest_digest.to_string(),
+        })?;
     } else {
         println!("{}", record.manifest_digest);
     }

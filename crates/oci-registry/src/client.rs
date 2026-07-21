@@ -152,8 +152,15 @@ impl Client {
         let mut resp = self.request_with_auth(
             reference.registry_host(),
             reference.repository(),
-            &url,
-            &[("Accept", accept.as_str())],
+            "pull",
+            |client, bearer| {
+                let mut req = client.agent.get(&url).header("Accept", &accept);
+                if let Some(bearer) = bearer {
+                    req = req.header("Authorization", format!("Bearer {bearer}"));
+                }
+                req.call()
+                    .map_err(|e| RegistryError::Transport(e.to_string()))
+            },
         )?;
 
         let status = resp.status();
@@ -215,8 +222,19 @@ impl Client {
             reference.repository(),
             digest
         );
-        let mut resp =
-            self.request_with_auth(reference.registry_host(), reference.repository(), &url, &[])?;
+        let mut resp = self.request_with_auth(
+            reference.registry_host(),
+            reference.repository(),
+            "pull",
+            |client, bearer| {
+                let mut req = client.agent.get(&url);
+                if let Some(bearer) = bearer {
+                    req = req.header("Authorization", format!("Bearer {bearer}"));
+                }
+                req.call()
+                    .map_err(|e| RegistryError::Transport(e.to_string()))
+            },
+        )?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.body_mut().read_to_string().unwrap_or_default();
@@ -244,30 +262,28 @@ impl Client {
         }
     }
 
-    /// Issue a GET, transparently handling the bearer-token challenge/
+    /// Issue a request, transparently handling the bearer-token challenge/
     /// response dance on a `401` (using a cached token when we already
-    /// have one for this repository's pull scope).
+    /// have one for this repository's own `scope_actions` scope, e.g.
+    /// `"pull"` or, for a push, `"pull,push"` — checked directly against
+    /// real Docker Registry v2 API tokens: a push needs a scope granting
+    /// both actions, not `"push"` alone).
+    ///
+    /// `send` builds and issues the actual HTTP request given a bearer
+    /// token (or `None`, for the first, credential-less attempt) — the
+    /// one part that genuinely differs per call site (GET with an
+    /// `Accept` header for a manifest, a plain GET for a blob, `HEAD`/
+    /// `POST`/`PUT` for a push) — so this method itself stays entirely
+    /// about the auth orchestration, shared by every one of them.
     fn request_with_auth(
         &mut self,
         registry_host: &str,
         repository: &str,
-        url: &str,
-        headers: &[(&str, &str)],
+        scope_actions: &str,
+        send: impl Fn(&Client, Option<&str>) -> Result<ureq::http::Response<ureq::Body>, RegistryError>,
     ) -> Result<ureq::http::Response<ureq::Body>, RegistryError> {
-        let default_scope = format!("repository:{repository}:pull");
+        let default_scope = format!("repository:{repository}:{scope_actions}");
         let key = (registry_host.to_string(), default_scope.clone());
-
-        let send = |client: &Client, bearer: Option<&str>| -> Result<_, RegistryError> {
-            let mut req = client.agent.get(url);
-            for (k, v) in headers {
-                req = req.header(*k, *v);
-            }
-            if let Some(bearer) = bearer {
-                req = req.header("Authorization", format!("Bearer {bearer}"));
-            }
-            req.call()
-                .map_err(|e| RegistryError::Transport(e.to_string()))
-        };
 
         let cached = self.tokens.get(&key).map(|t| t.token.clone());
         let resp = send(self, cached.as_deref())?;
@@ -296,6 +312,198 @@ impl Client {
 
         send(self, Some(&token))
     }
+
+    /// Whether `digest` already exists in `reference`'s own repository
+    /// on the registry — a real `HEAD` request against the OCI
+    /// Distribution Spec's own blob endpoint, checked directly against
+    /// a real local `registry:2` instance: `200` means "already
+    /// there" (skip re-uploading it, the same real cross-push
+    /// deduplication a real `docker push`/`podman push` also relies
+    /// on), `404` means "not there yet, upload it". Uses the
+    /// `"pull,push"` token scope (not `"push"` alone) — checked
+    /// directly against a real registry's own `WWW-Authenticate`
+    /// challenge for this exact endpoint, which asks for both actions
+    /// even for what is, on its own, a read-only check.
+    pub fn blob_exists(
+        &mut self,
+        reference: &Reference,
+        digest: &Digest,
+    ) -> Result<bool, RegistryError> {
+        let registry_host = reference.registry_host();
+        let repository = reference.repository();
+        let url = format!(
+            "{}://{registry_host}/v2/{repository}/blobs/{digest}",
+            self.scheme(registry_host)
+        );
+        let resp =
+            self.request_with_auth(registry_host, repository, "pull,push", |client, bearer| {
+                let mut req = client.agent.head(&url);
+                if let Some(bearer) = bearer {
+                    req = req.header("Authorization", format!("Bearer {bearer}"));
+                }
+                req.call()
+                    .map_err(|e| RegistryError::Transport(e.to_string()))
+            })?;
+        match resp.status().as_u16() {
+            200 => Ok(true),
+            404 => Ok(false),
+            other => Err(RegistryError::UnexpectedStatus {
+                url,
+                status: other,
+                body: String::new(),
+            }),
+        }
+    }
+
+    /// Upload `data` (a real, already-open file — streamed, never
+    /// fully read into memory, matching this project's own established
+    /// convention for a real layer's own possibly-large content, see
+    /// `oci_store::Store::open_blob`'s own doc comment) as `digest` in
+    /// `reference`'s own repository — the real OCI Distribution Spec's
+    /// own "start an upload session, then one monolithic `PUT`" push
+    /// flow (checked directly, step by step, against a real local
+    /// `registry:2` instance, not assumed from the spec text alone):
+    /// `POST .../blobs/uploads/` (`202 Accepted`, a real `Location`
+    /// header naming the actual upload URL — either a full URL or an
+    /// absolute path, both handled, both observed directly from a real
+    /// registry), then `PUT <location>?digest=<digest>` with the real
+    /// file content as the body. Does **not** itself check whether the
+    /// blob already exists first — see [`Client::blob_exists`] for
+    /// that; callers combine the two (`push`'s own orchestration).
+    pub fn upload_blob(
+        &mut self,
+        reference: &Reference,
+        digest: &Digest,
+        data: std::fs::File,
+    ) -> Result<(), RegistryError> {
+        let registry_host = reference.registry_host();
+        let repository = reference.repository();
+        let scheme = self.scheme(registry_host);
+
+        let start_url = format!("{scheme}://{registry_host}/v2/{repository}/blobs/uploads/");
+        let resp =
+            self.request_with_auth(registry_host, repository, "pull,push", |client, bearer| {
+                let mut req = client.agent.post(&start_url);
+                if let Some(bearer) = bearer {
+                    req = req.header("Authorization", format!("Bearer {bearer}"));
+                }
+                req.send_empty()
+                    .map_err(|e| RegistryError::Transport(e.to_string()))
+            })?;
+        if resp.status().as_u16() != 202 {
+            return Err(RegistryError::UnexpectedStatus {
+                url: start_url,
+                status: resp.status().as_u16(),
+                body: String::new(),
+            });
+        }
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                RegistryError::Auth(
+                    "registry did not send a Location header for the upload session".to_string(),
+                )
+            })?
+            .to_string();
+        let upload_url =
+            append_digest_query(&resolve_location(scheme, registry_host, &location), digest);
+
+        // A `RefCell`, not a plain `File`, so the `Fn` closure below can
+        // re-seek to the start before every real send attempt --
+        // `request_with_auth` may call it a second time (a fresh bearer
+        // token after a `401`), and a real file's own read cursor must
+        // not still be partway through from a first, failed attempt.
+        let file = std::cell::RefCell::new(data);
+        let resp2 =
+            self.request_with_auth(registry_host, repository, "pull,push", |client, bearer| {
+                use std::io::{Seek, SeekFrom};
+                file.borrow_mut()
+                    .seek(SeekFrom::Start(0))
+                    .map_err(|e| RegistryError::Transport(e.to_string()))?;
+                let mut req = client
+                    .agent
+                    .put(&upload_url)
+                    .content_type("application/octet-stream");
+                if let Some(bearer) = bearer {
+                    req = req.header("Authorization", format!("Bearer {bearer}"));
+                }
+                let borrowed = file.borrow();
+                req.send(&*borrowed)
+                    .map_err(|e| RegistryError::Transport(e.to_string()))
+            })?;
+        let status2 = resp2.status();
+        if !status2.is_success() {
+            return Err(RegistryError::UnexpectedStatus {
+                url: upload_url,
+                status: status2.as_u16(),
+                body: String::new(),
+            });
+        }
+        Ok(())
+    }
+
+    /// `PUT` a manifest (or index) to `reference`'s own repository at
+    /// `manifest_ref` (a tag or a digest string) with `media_type` as
+    /// its own `Content-Type` — real registries reject a manifest
+    /// `PUT` with the wrong (or missing) content type, checked
+    /// directly against a real local `registry:2` instance.
+    pub fn push_manifest(
+        &mut self,
+        reference: &Reference,
+        manifest_ref: &str,
+        media_type: &str,
+        bytes: &[u8],
+    ) -> Result<(), RegistryError> {
+        let registry_host = reference.registry_host();
+        let repository = reference.repository();
+        let url = format!(
+            "{}://{registry_host}/v2/{repository}/manifests/{manifest_ref}",
+            self.scheme(registry_host)
+        );
+        let resp =
+            self.request_with_auth(registry_host, repository, "pull,push", |client, bearer| {
+                let mut req = client.agent.put(&url).content_type(media_type);
+                if let Some(bearer) = bearer {
+                    req = req.header("Authorization", format!("Bearer {bearer}"));
+                }
+                req.send(bytes)
+                    .map_err(|e| RegistryError::Transport(e.to_string()))
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(RegistryError::UnexpectedStatus {
+                url,
+                status: status.as_u16(),
+                body: String::new(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Resolve a `Location` response header (from starting a blob upload
+/// session) into a real, absolute URL — real registries send either a
+/// full URL or just an absolute path, both confirmed directly against
+/// a real local `registry:2` instance.
+fn resolve_location(scheme: &str, registry_host: &str, location: &str) -> String {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        location.to_string()
+    } else if let Some(rest) = location.strip_prefix('/') {
+        format!("{scheme}://{registry_host}/{rest}")
+    } else {
+        format!("{scheme}://{registry_host}/{location}")
+    }
+}
+
+/// Append `digest=<digest>` to `url`'s own query string — correctly
+/// whether `url` already has other query parameters (a real registry
+/// commonly includes its own opaque state token in the upload
+/// session's own `Location` header already) or none at all.
+fn append_digest_query(url: &str, digest: &Digest) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}digest={digest}")
 }
 
 #[cfg(test)]
@@ -403,8 +611,16 @@ mod tests {
 
         let mut client = Client::with_credentials(Credentials::empty());
         let url = format!("http://{}/v2/testrepo/manifests/latest", mock.addr);
+        let get = |client: &Client, bearer: Option<&str>| {
+            let mut req = client.agent.get(&url);
+            if let Some(bearer) = bearer {
+                req = req.header("Authorization", format!("Bearer {bearer}"));
+            }
+            req.call()
+                .map_err(|e| RegistryError::Transport(e.to_string()))
+        };
         let mut resp = client
-            .request_with_auth(&mock.addr.to_string(), "testrepo", &url, &[])
+            .request_with_auth(&mock.addr.to_string(), "testrepo", "pull", get)
             .unwrap();
         assert!(resp.status().is_success());
         let body = resp.body_mut().read_to_string().unwrap();
@@ -414,7 +630,7 @@ mod tests {
         // extra token-endpoint round trip (there is only one more accept()
         // queued by MockRegistry::start, for the manifest re-request).
         let resp2 = client
-            .request_with_auth(&mock.addr.to_string(), "testrepo", &url, &[])
+            .request_with_auth(&mock.addr.to_string(), "testrepo", "pull", get)
             .unwrap();
         assert!(resp2.status().is_success());
     }
