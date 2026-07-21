@@ -1049,6 +1049,67 @@ struct PruneResult {
     blobs_reclaimed_bytes: u64,
     rootfs_cache_entries_removed: usize,
     rootfs_cache_reclaimed_bytes: u64,
+    build_scratch_entries_removed: usize,
+    build_scratch_reclaimed_bytes: u64,
+}
+
+/// How old a `build-scratch/` entry (`bin/ociman/src/build.rs`'s own
+/// `build_scratch_root`) must be before this pass treats it as
+/// abandoned, safe to remove outright — `docs/design/0121`'s own
+/// chosen liveness check, deliberately simple (an mtime-age threshold,
+/// matching common `tmpreaper`/`systemd-tmpfiles` practice) rather
+/// than a lock file held for a build's own full duration: a real,
+/// but low-probability, race against a same-machine, unusually-long-
+/// running (over an hour) *concurrent* build is an accepted trade-off
+/// for not needing that extra bookkeeping — an `ociman build` this
+/// slow, running at the exact moment a separate `ociman prune` also
+/// happens to run, is not a scenario this project's own CI or typical
+/// usage actually hits.
+const BUILD_SCRATCH_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Sweep `build-scratch/` for entries at least [`BUILD_SCRATCH_MAX_AGE`]
+/// old, removing each outright and summing their own real on-disk size
+/// (`oci_store::dir_size`, the same hardlink-aware calculation
+/// [`oci_store::prune`] already relies on for its own report). Unlike
+/// the rootfs cache or blobs, nothing here is ever "still reachable" —
+/// every entry is pure leftover working state from a `ociman build`
+/// that has already finished (successfully or not) and has no further
+/// use for it; age is the only question. A missing `build-scratch/`
+/// directory (no build has ever run against this store) is a real,
+/// silent no-op, not an error — matches [`oci_store::prune`]'s own
+/// identical "an entirely absent root is fine" handling.
+fn prune_build_scratch(store: &Store) -> anyhow::Result<(usize, u64)> {
+    let root = build::build_scratch_root(store);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", root.display())),
+    };
+
+    let mut removed = 0usize;
+    let mut reclaimed_bytes = 0u64;
+    let now = std::time::SystemTime::now();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", root.display()))?;
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age < BUILD_SCRATCH_MAX_AGE {
+            continue;
+        }
+        let size = oci_store::dir_size(&path).unwrap_or(0);
+        std::fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
+        removed += 1;
+        reclaimed_bytes += size;
+    }
+    Ok((removed, reclaimed_bytes))
 }
 
 /// Reclaim disk space no longer needed by anything currently tagged
@@ -1098,6 +1159,8 @@ fn cmd_prune(json: bool, all: bool) -> anyhow::Result<()> {
         .context("garbage-collecting unreferenced blobs")?;
     let cache_report = oci_store::prune(&store, &rootfs_setup::cache_root(&store))
         .context("pruning unreferenced rootfs-cache entries")?;
+    let (build_scratch_entries_removed, build_scratch_reclaimed_bytes) =
+        prune_build_scratch(&store).context("pruning abandoned build-scratch entries")?;
 
     if json {
         oci_cli_common::output::print_json(&PruneResult {
@@ -1106,6 +1169,8 @@ fn cmd_prune(json: bool, all: bool) -> anyhow::Result<()> {
             blobs_reclaimed_bytes: blob_report.reclaimed_bytes,
             rootfs_cache_entries_removed: cache_report.removed.len(),
             rootfs_cache_reclaimed_bytes: cache_report.reclaimed_bytes,
+            build_scratch_entries_removed,
+            build_scratch_reclaimed_bytes,
         })?;
     } else {
         if all {
@@ -1124,6 +1189,9 @@ fn cmd_prune(json: bool, all: bool) -> anyhow::Result<()> {
             "rootfs cache: removed {}, reclaimed {} bytes",
             cache_report.removed.len(),
             cache_report.reclaimed_bytes
+        );
+        println!(
+            "build scratch: removed {build_scratch_entries_removed}, reclaimed {build_scratch_reclaimed_bytes} bytes"
         );
     }
     Ok(())

@@ -196,7 +196,19 @@ pub fn prune(store: &Store, cache_root: &Path) -> Result<CachePruneReport, Store
 /// skipped rather than failing the whole size calculation — this
 /// figure is already advisory, not something anything else depends on
 /// for correctness.
-fn dir_size(dir: &Path) -> std::io::Result<u64> {
+/// A directory's own real, on-disk size — every regular file's own
+/// byte length, symlinks never followed (a symlink's own inode is a
+/// handful of bytes for the link text itself, not its target's size),
+/// and a hardlinked file (this project's own known-common real shape
+/// for a base image's own applet layout, `docs/design/0106`) counted
+/// exactly once no matter how many names point at the same real
+/// inode (`(dev, ino)`-deduplicated) — the exact same real bug
+/// `docs/design/0111` found and fixed for [`prune`]'s own reporting.
+/// `pub`, not just crate-private, so `ociman prune`'s own build-
+/// scratch sweep (`docs/design/0121`) can reuse this directly rather
+/// than risk reintroducing that same hardlink-double-counting bug in
+/// a second, independent implementation.
+pub fn dir_size(dir: &Path) -> std::io::Result<u64> {
     let mut seen = HashSet::new();
     dir_size_inner(dir, &mut seen)
 }

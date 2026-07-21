@@ -44,7 +44,7 @@ mod rootfs_cache;
 
 pub use describe::ImageSummary;
 pub use images::{ImageRecord, ImagesError};
-pub use rootfs_cache::{CachePruneReport, cache_dir_for, ensure_cached, prune};
+pub use rootfs_cache::{CachePruneReport, cache_dir_for, dir_size, ensure_cached, prune};
 
 /// Errors returned by [`Store`] operations.
 #[derive(Debug, thiserror::Error)]

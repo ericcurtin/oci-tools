@@ -406,3 +406,140 @@ fn prune_all_matches_by_manifest_digest_not_the_exact_tag_string_a_container_use
             .is_some()
     );
 }
+
+/// A real `ociman build`'s own scratch rootfs (`bin/ociman/src/
+/// build.rs`'s own `build_scratch_root`) is deliberately *not* cleaned
+/// up the instant the build finishes (`docs/design/0121`) -- it's a
+/// real, on-disk `build-scratch/` entry `ociman prune` reclaims later
+/// instead. A *fresh* one (this test's own build just finished) is
+/// still well under the age threshold, so a `prune` run right
+/// afterward must leave it alone.
+#[test]
+fn prune_leaves_a_fresh_build_scratch_entry_alone() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-scratch-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/build-scratch-base:latest\nRUN echo hi > /marker.txt\n",
+    )
+    .unwrap();
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-scratch-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let scratch_root = storage_dir.path().join("build-scratch");
+    let entries_before: Vec<_> = std::fs::read_dir(&scratch_root).unwrap().collect();
+    assert_eq!(
+        entries_before.len(),
+        1,
+        "the build's own scratch rootfs must still be on disk right after the build finishes"
+    );
+
+    let prune = ociman(storage_dir.path(), &["--json", "prune"]);
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(view["build_scratch_entries_removed"], 0, "{view:?}");
+
+    let entries_after: Vec<_> = std::fs::read_dir(&scratch_root).unwrap().collect();
+    assert_eq!(
+        entries_after.len(),
+        1,
+        "a fresh build-scratch entry must not be reclaimed yet"
+    );
+}
+
+/// The other half: once a `build-scratch/` entry is old enough (its
+/// own real mtime backdated here, rather than waiting a real hour in
+/// a test), `ociman prune` does reclaim it -- removed outright, and
+/// its own real on-disk size correctly counted towards
+/// `build_scratch_reclaimed_bytes`.
+#[test]
+fn prune_reclaims_an_old_build_scratch_entry() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-scratch-old-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/build-scratch-old-base:latest\nRUN echo hi > /marker.txt\n",
+    )
+    .unwrap();
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-scratch-old-result:latest",
+        ],
+    );
+    assert!(build.status.success());
+
+    let scratch_root = storage_dir.path().join("build-scratch");
+    let entry = std::fs::read_dir(&scratch_root)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+
+    // Backdate its own real mtime well past the one-hour threshold --
+    // a real, on-disk timestamp change (`futimens`-equivalent via
+    // `File::set_times`), not a mock or a shortened threshold.
+    let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+    let file = std::fs::File::open(&entry).unwrap();
+    file.set_modified(two_hours_ago).unwrap();
+
+    let prune = ociman(storage_dir.path(), &["--json", "prune"]);
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(view["build_scratch_entries_removed"], 1, "{view:?}");
+    assert!(
+        view["build_scratch_reclaimed_bytes"].as_u64().unwrap() > 0,
+        "{view:?}"
+    );
+    assert!(!entry.exists());
+}

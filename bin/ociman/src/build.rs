@@ -150,6 +150,18 @@
 //!   all. See [`build_cache`][crate::build_cache]'s own doc comment
 //!   for the full matching algorithm (ported from real buildah's own
 //!   model) and `docs/design/0101`.
+//! * **A build's own scratch rootfs isn't deleted the instant the
+//!   build finishes.** It lives under [`build_scratch_root`] (a real,
+//!   persistent subdirectory of this store's own root) instead of a
+//!   plain system `/tmp` entry, and `ociman prune` is the only thing
+//!   that ever removes it — a real, measured performance win (see
+//!   `docs/design/0121`): eagerly `remove_dir_all`-ing a whole rootfs
+//!   synchronously, on every single build, is real cost this
+//!   project's own benchmarks care about, and deferring it to an
+//!   explicit `ociman prune` (rather than, say, the very next build
+//!   opportunistically sweeping it) is what actually keeps that cost
+//!   off *every* build's own measured wall-clock time, not just moves
+//!   which specific invocation pays it.
 //!
 //! Every metadata instruction (`ENV`/`LABEL`/`WORKDIR`/`USER`/
 //! `ENTRYPOINT`/`CMD`/`EXPOSE`/`VOLUME`/`STOPSIGNAL`/`MAINTAINER`/
@@ -437,23 +449,37 @@ fn scratch_base_config() -> ImageConfig {
     }
 }
 
+/// Where a build's own scratch rootfs directories live — a real,
+/// persistent subdirectory of this store's own root (a sibling of
+/// `rootfs-cache/`, see `rootfs_setup::cache_root`), *not* a plain
+/// system `/tmp` entry. `ociman prune` (`docs/design/0121`) is the
+/// only thing that ever removes anything from here — see
+/// `BuiltStage`'s own doc comment for why nothing else does.
+pub(crate) fn build_scratch_root(store: &oci_store::Store) -> PathBuf {
+    store.root().join("build-scratch")
+}
+
 /// One stage's own final result: everything a *later* stage's own
 /// `FROM <this-stage's-name>` needs to start from (its own `config`
 /// and layer list — already-committed layers, so a dependent stage
 /// can extract them the exact same way it would extract any external
 /// image's own layers), everything a later stage's own `COPY
-/// --from=<this-stage's-name>` needs to read from (`rootfs_dir`, kept
-/// alive by holding onto `_build_dir` for as long as this `BuiltStage`
-/// itself lives), and everything [`cmd_build`] itself needs once this
-/// happens to be the target stage.
+/// --from=<this-stage's-name>` needs to read from (`rootfs_dir`), and
+/// everything [`cmd_build`] itself needs once this happens to be the
+/// target stage.
+///
+/// `rootfs_dir`, when set, lives under [`build_scratch_root`] — a
+/// real, on-disk directory this struct's own `Drop` deliberately never
+/// cleans up (see `build_stage`'s own doc comment for why: eagerly
+/// deleting it here is real, measured cost this project's own
+/// benchmarks care about, `docs/design/0120`/`0121`). It's reclaimed
+/// instead by `ociman prune`'s own dedicated pass, the same "explicit
+/// reclaim, not automatic" trade-off this project already accepts for
+/// unreferenced blobs and the rootfs cache.
 struct BuiltStage {
     config: ImageConfig,
     layers: Vec<Descriptor>,
     rootfs_dir: Option<PathBuf>,
-    /// Held only for its `Drop` (cleans up the scratch directory once
-    /// nothing references this stage's own result anymore) —
-    /// `rootfs_dir` above is what every actual read goes through.
-    _build_dir: Option<tempfile::TempDir>,
 }
 
 /// Read-only view of every stage already built earlier in this same
@@ -528,8 +554,23 @@ fn build_stage(
             )
         });
     let build_dir = if needs_rootfs {
-        let dir = tempfile::tempdir().context("creating build scratch directory")?;
-        let rootfs_dir = dir.path().join("rootfs");
+        let scratch_root = build_scratch_root(store);
+        std::fs::create_dir_all(&scratch_root)
+            .with_context(|| format!("creating {}", scratch_root.display()))?;
+        // Deliberately *not* `tempfile::tempdir()` (a plain system
+        // `/tmp` entry, deleted the instant its own `TempDir` value is
+        // dropped): `.into_path()` disarms that automatic cleanup,
+        // leaving a real directory under this store's own
+        // `build-scratch/` for `ociman prune` to reclaim later instead
+        // — see `BuiltStage`'s own doc comment and `docs/design/0121`
+        // for why paying that real, measured deletion cost eagerly,
+        // synchronously, on every single build isn't the right
+        // trade-off.
+        let dir = tempfile::Builder::new()
+            .tempdir_in(&scratch_root)
+            .context("creating build scratch directory")?
+            .keep();
+        let rootfs_dir = dir.join("rootfs");
         std::fs::create_dir_all(&rootfs_dir)
             .with_context(|| format!("creating {}", rootfs_dir.display()))?;
         match base_manifest_digest {
@@ -561,7 +602,7 @@ fn build_stage(
     } else {
         None
     };
-    let rootfs_dir = build_dir.as_ref().map(|dir| dir.path().join("rootfs"));
+    let rootfs_dir = build_dir.as_ref().map(|dir| dir.join("rootfs"));
 
     // Every stage-local `ARG` declared *so far* (with its own already-
     // fully-resolved value -- override, inline default, or inherited
@@ -593,7 +634,6 @@ fn build_stage(
         config,
         layers,
         rootfs_dir,
-        _build_dir: build_dir,
     })
 }
 
