@@ -122,12 +122,23 @@ pub fn rootless_overlay_supported(scratch_dir: &Path) -> bool {
 /// Best-effort `chmod 0700` every directory under (and including)
 /// `root`, deepest-first, so a subsequent `remove_dir_all` can always
 /// traverse and unlink everything regardless of what a real overlay
-/// mount's own kernel bookkeeping left behind — see
-/// [`rootless_overlay_supported`]'s own call site for why this exists
-/// at all. Errors are silently tolerated throughout: this is a
-/// cleanup nicety on top of an already-computed real result, not
-/// something worth surfacing a failure for on its own.
-fn reset_permissions_for_removal(root: &Path) {
+/// mount's own kernel bookkeeping left behind. Errors are silently
+/// tolerated throughout: this is a cleanup nicety on top of an
+/// already-computed real result, not something worth surfacing a
+/// failure for on its own.
+///
+/// Used by [`rootless_overlay_supported`]'s own probe cleanup, and by
+/// [`crate::state::StateStore::remove`] as a fallback when removing a
+/// real container's own directory fails outright: a container whose
+/// own rootfs used a real overlay mount (`ociman run`'s own
+/// `rootfs_setup` module, `docs/design/0110`) leaves exactly the same
+/// locked-down `workdir/work` subdirectory behind in its own bundle
+/// directory once it exits, for the identical kernel-level reason —
+/// caught directly (not assumed to generalize) by that crate's own
+/// real `ociman rm`/`--rm` integration test failing with a real
+/// `EACCES`/`EPERM` the moment a container actually using the overlay
+/// path was removed for the first time.
+pub fn reset_permissions_for_removal(root: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
 
     // Fixed up *before* attempting to list `root`'s own children, not

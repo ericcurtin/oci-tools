@@ -315,7 +315,28 @@ impl StateStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 Err(StateError::NotFound(id.to_string()))
             }
-            Err(e) => Err(e.into()),
+            Err(_) => {
+                // A real rootless overlay-mounted container (`ociman
+                // run`'s own `rootfs_setup` module, `docs/design/
+                // 0110`) leaves its own `workdir/work` subdirectory
+                // locked to mode `0000` behind once it exits — the
+                // same real kernel-level bookkeeping `crate::overlay`'s
+                // own feasibility probe already found and worked
+                // around for its own scratch directories (`docs/
+                // design/0108`). Retried once, after resetting
+                // permissions everywhere under `dir`, rather than
+                // paying that reset's own real (if small) per-
+                // directory cost on every ordinary removal that would
+                // already have succeeded on the first attempt.
+                crate::overlay::reset_permissions_for_removal(&dir);
+                fs::remove_dir_all(&dir).map_err(|e| {
+                    if e.kind() == io::ErrorKind::NotFound {
+                        StateError::NotFound(id.to_string())
+                    } else {
+                        e.into()
+                    }
+                })
+            }
         }
     }
 

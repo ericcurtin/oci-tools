@@ -15,6 +15,7 @@
 
 mod build;
 mod build_cache;
+mod rootfs_setup;
 mod user_resolve;
 
 use std::path::{Path, PathBuf};
@@ -1171,21 +1172,39 @@ fn cmd_run(
         std::fs::create_dir_all(&rootfs_dir)
             .with_context(|| format!("creating {}", rootfs_dir.display()))?;
 
-        for layer in &manifest.layers {
-            let compression = compression_for_media_type(&layer.media_type)
-                .with_context(|| format!("layer {}", layer.digest))?;
-            let blob = store
-                .open_blob(&layer.digest)
-                .with_context(|| format!("opening layer blob {}", layer.digest))?;
-            oci_layer::apply(blob, compression, &rootfs_dir)
-                .with_context(|| format!("applying layer {}", layer.digest))?;
-        }
+        // See `rootfs_setup`'s own doc comment for the full design:
+        // either a real rootless overlay mount populates `rootfs_dir`
+        // (nothing extracted into it directly at all, `user_resolve_
+        // root` pointing at the read-only cache instead), or -- the
+        // always-correct fallback, unconditionally used until this
+        // increment and still exactly this code path whenever the
+        // environment doesn't support the former -- every layer gets
+        // extracted directly into it, exactly as `ociman run` has
+        // always done.
+        let setup = rootfs_setup::decide(&store, &bundle_dir, &record.manifest_digest, &manifest);
+        let user_resolve_root = match &setup {
+            rootfs_setup::RootfsSetup::Extract => {
+                for layer in &manifest.layers {
+                    let compression = compression_for_media_type(&layer.media_type)
+                        .with_context(|| format!("layer {}", layer.digest))?;
+                    let blob = store
+                        .open_blob(&layer.digest)
+                        .with_context(|| format!("opening layer blob {}", layer.digest))?;
+                    oci_layer::apply(blob, compression, &rootfs_dir)
+                        .with_context(|| format!("applying layer {}", layer.digest))?;
+                }
+                rootfs_dir.clone()
+            }
+            rootfs_setup::RootfsSetup::Overlay {
+                user_resolve_root, ..
+            } => user_resolve_root.clone(),
+        };
 
-        let spec = synthesize_spec(
+        let mut spec = synthesize_spec(
             &config,
             &container_id,
             args,
-            &rootfs_dir,
+            &user_resolve_root,
             memory_limit_bytes,
             memory_swap_bytes,
             cpus,
@@ -1201,6 +1220,13 @@ fn cmd_run(
             entrypoint.as_deref(),
             &volumes,
         )?;
+        // Prepended, not appended: `spec.mounts`' own already-present
+        // entries (`/proc`, `/dev`, ...) are all subdirectories of the
+        // root this overlay mount itself provides, and must be
+        // applied after it.
+        if let rootfs_setup::RootfsSetup::Overlay { mount, .. } = setup {
+            spec.mounts.insert(0, mount);
+        }
         if let Some(process) = &spec.process {
             state
                 .annotations
@@ -2645,9 +2671,30 @@ fn cmd_exec(
         // pivoted into) — the same resolution `run` itself uses for
         // an image's `USER` config field (0024), reused here so
         // `--user app` works exactly as well as `--user 1000` does.
-        let rootfs = bundle
-            .rootfs_path()
-            .ok_or_else(|| anyhow::anyhow!("bundle at {} has no root", state.bundle))?;
+        //
+        // Read through `/proc/<pid>/root` — the kernel's own live
+        // view of exactly what this already-running container
+        // process's own root filesystem contains right now — rather
+        // than `bundle.rootfs_path()`'s own plain host-side directory
+        // path. The two agree for a container whose own rootfs was
+        // populated by direct extraction (this project's own
+        // established approach until `docs/design/0110`), but not for
+        // one using a real rootless overlay mount instead
+        // (`rootfs_setup::RootfsSetup::Overlay`): that mount exists
+        // only *inside* the container's own private mount namespace,
+        // so a plain host-side read of `bundle.rootfs_path()` would
+        // just see the empty directory the overlay itself mounted
+        // onto, missing everything the image (and any write the
+        // container has made since) actually provides — caught
+        // directly by this project's own existing `ociman_exec.rs`
+        // test suite the moment the overlay path first landed, not
+        // assumed. `/proc/<pid>/root` is correct either way (and for
+        // any *other* mount this container's own init might set up in
+        // the future) since it reflects the kernel's own real,
+        // current view of that specific process's own mount
+        // namespace, not an assumption about how this project's own
+        // rootfs happened to be constructed.
+        let rootfs = PathBuf::from(format!("/proc/{pid}/root"));
         let (uid, gid) = resolve_user(&rootfs, user)?;
         effective_user.uid = uid;
         effective_user.gid = gid;
