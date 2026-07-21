@@ -46,6 +46,30 @@ pub const MEDIA_TYPE_DOCKER_CONFIG: &str = "application/vnd.docker.container.ima
 /// registries serve Docker-v2 manifests by default).
 pub const MEDIA_TYPE_DOCKER_LAYER_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
 
+/// Deserializes a JSON `null` the same as an absent field — into `T`'s
+/// own [`Default`] — instead of the hard type-mismatch error serde
+/// otherwise gives a non-`Option` field for an explicit `null` (only
+/// a genuinely *missing* field falls back to `#[serde(default)]` on
+/// its own; a field that's *present* but `null` is a different case
+/// serde doesn't treat the same way). Real Docker-built image
+/// configs routinely emit exactly this shape for an unset map/array
+/// `ContainerConfig` field (Go's own `encoding/json` marshals a `nil`
+/// map/slice as `null`, not `{}`/`[]`) — caught directly, not
+/// theoretically: a real, current `docker.io/library/ubuntu:24.04`
+/// pull's own config blob has a literal `"Volumes": null`, which
+/// failed every `ociman` command touching that image's config
+/// (`run`/`inspect`/...) with "invalid type: null, expected a map"
+/// before every [`ContainerConfig`] field this affects
+/// (`exposed_ports`/`volumes`/`labels`) started using this instead of
+/// a bare `#[serde(default)]`.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// A content descriptor: identifies content by digest, media type, and size.
 /// The unit that every manifest/index/config reference is built from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,13 +324,25 @@ pub struct ContainerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     /// Declared exposed ports (`"80/tcp"` -> `{}`), informational only.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub exposed_ports: BTreeMap<String, serde_json::Value>,
     /// Declared anonymous-volume mount points.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub volumes: BTreeMap<String, serde_json::Value>,
     /// Free-form image labels (`org.opencontainers.image.*` and others).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub labels: BTreeMap<String, String>,
     /// `STOPSIGNAL` default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -422,6 +458,34 @@ mod tests {
         assert_eq!(container_config.entrypoint, None);
         assert_eq!(config.architecture.as_deref(), Some("arm64"));
         assert_eq!(config.rootfs.diff_ids.len(), 1);
+    }
+
+    #[test]
+    fn parses_real_ubuntu_image_config_with_an_explicit_null_volumes_field() {
+        // Captured verbatim from a real `docker.io/library/ubuntu:
+        // 24.04` pull's own config blob — not hand-written. Its own
+        // `config.Volumes` is a literal JSON `null` (Go's own
+        // `encoding/json` marshals a `nil` map as `null`, not `{}`),
+        // which every `ociman` command touching this image's config
+        // (`run`/`inspect`/...) failed on with "invalid type: null,
+        // expected a map" before `exposed_ports`/`volumes`/`labels`
+        // started using `null_as_default` instead of a bare
+        // `#[serde(default)]` (which only ever covers a field missing
+        // entirely, not one present-but-`null`) — a real, current
+        // compatibility gap against one of the most common base
+        // images on Docker Hub, not a hypothetical edge case.
+        let raw = include_str!("../tests/fixtures/ubuntu-24.04-image-config.json");
+        let config: ImageConfig = serde_json::from_str(raw).unwrap();
+        let container_config = config.config.expect("ubuntu sets a config object");
+        assert_eq!(container_config.cmd, Some(vec!["/bin/bash".to_string()]));
+        assert!(container_config.volumes.is_empty());
+        assert!(container_config.entrypoint.is_none());
+        assert_eq!(
+            container_config
+                .labels
+                .get("org.opencontainers.image.version"),
+            Some(&"24.04".to_string())
+        );
     }
 
     #[test]

@@ -1,0 +1,93 @@
+{
+    "architecture": "arm64",
+    "config": {
+        "Hostname": "",
+        "Domainname": "",
+        "User": "",
+        "AttachStdin": false,
+        "AttachStdout": false,
+        "AttachStderr": false,
+        "Tty": false,
+        "OpenStdin": false,
+        "StdinOnce": false,
+        "Env": [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ],
+        "Cmd": [
+            "/bin/bash"
+        ],
+        "Image": "sha256:af11c30b318c875020928591871ff630215e7da24fa06de7ea883ef70b7ac85d",
+        "Volumes": null,
+        "WorkingDir": "",
+        "Entrypoint": null,
+        "OnBuild": null,
+        "Labels": {
+            "org.opencontainers.image.version": "24.04"
+        }
+    },
+    "container": "e31b0d13b5fc07d7b6d40d5c57528284c0eb34511f540c12a345bf1a8035d0c2",
+    "container_config": {
+        "Hostname": "e31b0d13b5fc",
+        "Domainname": "",
+        "User": "",
+        "AttachStdin": false,
+        "AttachStdout": false,
+        "AttachStderr": false,
+        "Tty": false,
+        "OpenStdin": false,
+        "StdinOnce": false,
+        "Env": [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ],
+        "Cmd": [
+            "/bin/sh",
+            "-c",
+            "#(nop) ",
+            "CMD [\"/bin/bash\"]"
+        ],
+        "Image": "sha256:af11c30b318c875020928591871ff630215e7da24fa06de7ea883ef70b7ac85d",
+        "Volumes": null,
+        "WorkingDir": "",
+        "Entrypoint": null,
+        "OnBuild": null,
+        "Labels": {
+            "org.opencontainers.image.version": "24.04"
+        }
+    },
+    "created": "2026-06-22T21:25:07.904519372Z",
+    "docker_version": "26.1.3",
+    "history": [
+        {
+            "created": "2026-06-22T21:25:05.142178096Z",
+            "created_by": "/bin/sh -c #(nop)  ARG RELEASE",
+            "empty_layer": true
+        },
+        {
+            "created": "2026-06-22T21:25:05.207126346Z",
+            "created_by": "/bin/sh -c #(nop)  ARG LAUNCHPAD_BUILD_ARCH",
+            "empty_layer": true
+        },
+        {
+            "created": "2026-06-22T21:25:05.26801665Z",
+            "created_by": "/bin/sh -c #(nop)  LABEL org.opencontainers.image.version=24.04",
+            "empty_layer": true
+        },
+        {
+            "created": "2026-06-22T21:25:07.608478572Z",
+            "created_by": "/bin/sh -c #(nop) ADD file:cdc9a547b921f36a32310f732815bbee6c6e4f5bd768ab5d49cdc0aa1b9f4785 in / "
+        },
+        {
+            "created": "2026-06-22T21:25:07.904519372Z",
+            "created_by": "/bin/sh -c #(nop)  CMD [\"/bin/bash\"]",
+            "empty_layer": true
+        }
+    ],
+    "os": "linux",
+    "rootfs": {
+        "type": "layers",
+        "diff_ids": [
+            "sha256:2c042ab36ee22da5e09730c3dce27e9d84ff1cc8af8e5a8ed2275c05f0133445"
+        ]
+    },
+    "variant": "v8"
+}
