@@ -28,10 +28,12 @@
 //!   **`COPY --from=<external-image>`** (a name that isn't any earlier
 //!   stage's own) **is supported too**: `--from` is resolved as a
 //!   stage name first and, if that fails, as a real image reference —
-//!   pulled (or reused, if already present locally) and extracted into
-//!   its own scratch rootfs just for that one `COPY`
-//!   (`external_image_source_root`), matching real BuildKit's own
-//!   `dispatchCopy` exactly.
+//!   pulled (or reused, if already present locally) and read directly
+//!   from the same per-manifest-digest rootfs cache `ociman run`
+//!   (0110)/a stage's own external base layers (0112) already build
+//!   and reuse (`external_image_source_root`), matching real
+//!   BuildKit's own `dispatchCopy` exactly — see 0115 for why no
+//!   per-`COPY` extraction is needed here at all, unlike those two.
 //! * **`RUN` is supported.** A `RUN` step materializes the base
 //!   image's own layers into a real, persistent scratch rootfs
 //!   (created once per build, reused cumulatively across every `RUN`/
@@ -1018,22 +1020,23 @@ fn copy_instruction(
     // own doc comment), even one written with a leading `/` -- `COPY
     // /foo /bar` copies `<root>/foo`, never a host-absolute `/foo`.
     //
-    // `_external_image_tempdir` is held only for its own `Drop` (the
-    // scratch directory it points `source_root` at must outlive every
-    // use of `source_root` below, but is cleaned up automatically once
-    // this function returns) -- the same pattern `BuiltStage`'s own
-    // `_build_dir` already established for the analogous per-stage
-    // case.
-    let mut _external_image_tempdir: Option<tempfile::TempDir> = None;
+    // `_external_image_cache_dir` holds the resolved path only so the
+    // `match` arms can return borrows of a real local binding (a
+    // `PathBuf`, not a `TempDir` -- unlike before this cache-reuse
+    // optimization landed, nothing here needs its own cleanup: the
+    // rootfs cache directory `external_image_source_root` now returns
+    // is a persistent, shared, `ociman prune`-managed one, the same
+    // one `ociman run`'s own overlay `lowerdir` already reads from
+    // this same way).
+    let _external_image_cache_dir;
     let source_root: &Path = match &flags.from {
         None => context,
         Some(from) => match stage_ctx.rootfs_for(from) {
             Some(rootfs) => rootfs,
             None => {
-                let dir = external_image_source_root(store, from)
+                _external_image_cache_dir = external_image_source_root(store, from)
                     .with_context(|| format!("ociman build: COPY --from={from:?}"))?;
-                _external_image_tempdir = Some(dir);
-                _external_image_tempdir.as_ref().unwrap().path()
+                _external_image_cache_dir.as_path()
             }
         },
     };
@@ -1409,23 +1412,33 @@ fn add_instruction(
 /// earlier stage in this same Containerfile: parse it as a real image
 /// reference, pull it (or reuse an already-pulled copy — the same
 /// `resolve_or_pull` `cmd_build`'s own `FROM <image>` handling already
-/// uses), and extract every one of its own layers into a fresh
-/// scratch directory — matching real BuildKit's own `COPY
-/// --from=<external-image>` (an ordinary image reference is exactly
-/// what a real Containerfile's own `--from` accepts beyond a stage
-/// name; checked directly against `~/git/moby/daemon/builder/
-/// dockerfile/dispatchers.go`'s own `dispatchCopy`, which resolves
-/// `--from` as a stage name first and otherwise falls through to
-/// `getImageMount`, an ordinary image pull).
+/// uses), and return the same per-manifest-digest rootfs cache
+/// directory (`oci_store::ensure_cached`, 0109) `ociman run`
+/// (0110)/a stage's own external base layers (0112) already build and
+/// reuse — matching real BuildKit's own `COPY --from=<external-image>`
+/// (an ordinary image reference is exactly what a real Containerfile's
+/// own `--from` accepts beyond a stage name; checked directly against
+/// `~/git/moby/daemon/builder/dockerfile/dispatchers.go`'s own
+/// `dispatchCopy`, which resolves `--from` as a stage name first and
+/// otherwise falls through to `getImageMount`, an ordinary image
+/// pull).
 ///
-/// The returned [`tempfile::TempDir`] must be kept alive by the caller
-/// (bound to a real variable, not a temporary) for as long as its own
-/// path is still being read from — dropping it deletes the scratch
-/// directory.
-fn external_image_source_root(
-    store: &oci_store::Store,
-    from: &str,
-) -> anyhow::Result<tempfile::TempDir> {
+/// Unlike a stage's own base layers (`build_stage`, which needs a
+/// *writable* rootfs kept alive for however many further `RUN`/`COPY`
+/// instructions the stage has), a `COPY --from=<external-image>`'s own
+/// source root is only ever *read* from (see `copy_instruction`'s own
+/// `copy_path_recursive` calls, always `source_path -> target`, never
+/// the other way) — so, unlike 0112's own `clone_cache_tree`, no copy
+/// is needed here at all: the cache directory itself can be returned
+/// and read from directly, the exact same safe "read-only, shared,
+/// never written to" usage `ociman run`'s own overlay `lowerdir`
+/// (0110) already established for this same cache. A real, measured
+/// win over the previous per-`COPY` fresh-extraction-into-a-throwaway-
+/// tempdir behavior whenever the same external image is used as a
+/// `--from=` source more than once (in one build or across several) —
+/// previously paid the real decompress-and-extract cost every single
+/// time, now paid at most once, ever, per distinct manifest digest.
+fn external_image_source_root(store: &oci_store::Store, from: &str) -> anyhow::Result<PathBuf> {
     let reference = Reference::parse(from).with_context(|| {
         format!(
             "{from:?} is neither an earlier stage in this Containerfile nor a valid image \
@@ -1436,18 +1449,14 @@ fn external_image_source_root(
     let manifest = store
         .image_manifest(&record)
         .with_context(|| format!("reading manifest for {reference}"))?;
-    let dir = tempfile::tempdir()
-        .context("creating a scratch directory for an external COPY --from= image")?;
-    for layer in &manifest.layers {
-        let compression = crate::compression_for_media_type(&layer.media_type)
-            .with_context(|| format!("layer {}", layer.digest))?;
-        let blob = store
-            .open_blob(&layer.digest)
-            .with_context(|| format!("opening layer blob {}", layer.digest))?;
-        oci_layer::apply(blob, compression, dir.path())
-            .with_context(|| format!("applying layer {}", layer.digest))?;
-    }
-    Ok(dir)
+    let cache_root = crate::rootfs_setup::cache_root(store);
+    oci_store::ensure_cached(
+        store,
+        &cache_root,
+        &record.manifest_digest,
+        &manifest.layers,
+    )
+    .with_context(|| format!("building/reusing the rootfs cache for {reference}"))
 }
 
 /// Resolve `sources` (each either a literal path, or — per real
