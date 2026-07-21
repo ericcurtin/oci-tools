@@ -954,6 +954,120 @@ fn no_label_flag_at_all_adds_no_extra_history_entry() {
     assert_eq!(label_history_entries, vec!["LABEL foo=bar"]);
 }
 
+/// `--annotation KEY=VALUE` (repeatable, bare `KEY` means an empty
+/// value) sets the built *manifest's* own top-level `annotations` --
+/// distinct from `--label`, which sets `Config.Labels` instead --
+/// matching real `podman build --annotation` exactly, confirmed
+/// directly against the real pushed manifest's own raw JSON.
+#[test]
+fn annotation_flag_sets_the_built_manifests_own_top_level_annotations() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/annotation-flag-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/annotation-flag-base:latest\nLABEL foo=a-label-not-an-annotation\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/annotation-flag-result:latest",
+            "--annotation",
+            "foo=bar",
+            "--annotation",
+            "bareword",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/annotation-flag-result:latest")
+        .unwrap()
+        .unwrap();
+    let manifest = store.image_manifest(&record).unwrap();
+    assert_eq!(
+        manifest.annotations.get("foo").map(String::as_str),
+        Some("bar")
+    );
+    assert_eq!(
+        manifest.annotations.get("bareword").map(String::as_str),
+        Some("")
+    );
+
+    // `--annotation` never touches `Config.Labels` at all -- the real
+    // `LABEL foo=...` from the Containerfile stays exactly what it
+    // was, untouched by the *different* `foo=bar` given to
+    // `--annotation`.
+    let config = store.image_config(&record).unwrap();
+    assert_eq!(
+        config.config.unwrap().labels.get("foo").map(String::as_str),
+        Some("a-label-not-an-annotation")
+    );
+}
+
+/// No `--annotation` at all leaves the built manifest's own
+/// `annotations` empty, same as before this flag existed.
+#[test]
+fn no_annotation_flag_at_all_leaves_manifest_annotations_empty() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/no-annotation-flag-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/no-annotation-flag-base:latest\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/no-annotation-flag-result:latest",
+        ],
+    );
+    assert!(build.status.success());
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/no-annotation-flag-result:latest")
+        .unwrap()
+        .unwrap();
+    let manifest = store.image_manifest(&record).unwrap();
+    assert!(manifest.annotations.is_empty());
+}
+
 /// `--target <name>` builds only that named stage (and whatever it
 /// depends on), never the stages after it in the file -- proven the
 /// same way `an_unreferenced_stage_is_pruned_and_never_built` proves

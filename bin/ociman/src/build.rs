@@ -212,6 +212,7 @@ pub fn cmd_build(
     ignorefile: Option<&Path>,
     iidfile: Option<&Path>,
     labels: &[String],
+    annotations: &[String],
     json: bool,
 ) -> anyhow::Result<()> {
     let tag = tag.context(
@@ -389,7 +390,7 @@ pub fn cmd_build(
     // directly: it shows up as its own extra `LABEL` step at the very
     // end of the build, so it overrides a same-key `LABEL` already in
     // the Containerfile itself, not the other way around.
-    let labels = parse_labels(labels);
+    let labels = parse_key_value_pairs(labels);
     if !labels.is_empty() {
         let cc = config.config.get_or_insert_with(ContainerConfig::default);
         for (key, value) in &labels {
@@ -406,6 +407,14 @@ pub fn cmd_build(
         .ingest(&config_bytes[..])
         .context("storing image config")?;
 
+    // `--annotation` sets the built *manifest's* own top-level
+    // `annotations` (an OCI-manifest-level concept, distinct from
+    // `--label`'s `Config.Labels`) — confirmed directly against a real
+    // `podman build --annotation`, inspecting the real pushed
+    // manifest's own raw JSON.
+    let manifest_annotations: BTreeMap<String, String> =
+        parse_key_value_pairs(annotations).into_iter().collect();
+
     let manifest = ImageManifest {
         schema_version: 2,
         media_type: Some(MEDIA_TYPE_IMAGE_MANIFEST.to_string()),
@@ -418,7 +427,7 @@ pub fn cmd_build(
             platform: None,
         },
         layers,
-        annotations: BTreeMap::new(),
+        annotations: manifest_annotations,
     };
     let manifest_bytes = serde_json::to_vec(&manifest).context("serializing image manifest")?;
     let manifest_ingested = store
@@ -766,28 +775,34 @@ fn parse_build_args(build_args: &[String]) -> std::collections::HashMap<String, 
     resolved
 }
 
-/// Parse `--label`'s own repeated `KEY=VALUE` (or bare `KEY`, for an
-/// empty value — matching real `podman build --label`'s own tolerant
-/// parse, confirmed directly: `--label bareword` becomes
-/// `bareword=""`, not a parse error) command-line strings into an
-/// ordered list of pairs, later duplicate keys overwriting an earlier
-/// one's own *value* in place (keeping its original position) rather
-/// than moving it to the end — unlike [`parse_build_args`], a bare
-/// `--label KEY` (no `=` at all) never falls back to this process's
-/// own environment; real `podman build --label` doesn't either.
-fn parse_labels(labels: &[String]) -> Vec<(String, String)> {
+/// Parse `--label`'s or `--annotation`'s own repeated `KEY=VALUE` (or
+/// bare `KEY`, for an empty value — matching real `podman build
+/// --label`/`--annotation`'s own identical tolerant parse, confirmed
+/// directly for both: `--label bareword`/`--annotation bareword` both
+/// become `bareword=""`, never a parse error) command-line strings
+/// into an ordered list of pairs, later duplicate keys overwriting an
+/// earlier one's own *value* in place (keeping its original position)
+/// rather than moving it to the end — unlike [`parse_build_args`], a
+/// bare `KEY` (no `=` at all) never falls back to this process's own
+/// environment; real `podman build --label`/`--annotation` don't
+/// either. Shared by both flags (rather than two near-identical
+/// functions) since their own CLI parsing rules are, confirmed
+/// directly, exactly the same — only what the resulting pairs get
+/// applied *to* differs (`ImageConfig.config.labels` vs. the built
+/// manifest's own top-level `annotations`).
+fn parse_key_value_pairs(values: &[String]) -> Vec<(String, String)> {
     let mut resolved: Vec<(String, String)> = Vec::new();
     let mut index_of: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for label in labels {
-        let (key, value) = match label.split_once('=') {
-            Some((key, value)) => (key, value),
-            None => (label.as_str(), ""),
+    for value in values {
+        let (key, val) = match value.split_once('=') {
+            Some((key, val)) => (key, val),
+            None => (value.as_str(), ""),
         };
         if let Some(&index) = index_of.get(key) {
-            resolved[index].1 = value.to_string();
+            resolved[index].1 = val.to_string();
         } else {
             index_of.insert(key, resolved.len());
-            resolved.push((key.to_string(), value.to_string()));
+            resolved.push((key.to_string(), val.to_string()));
         }
     }
     resolved
@@ -2559,24 +2574,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_labels_uses_key_equals_value_verbatim() {
-        let resolved = parse_labels(&["foo=bar".to_string()]);
+    fn parse_key_value_pairs_uses_key_equals_value_verbatim() {
+        let resolved = parse_key_value_pairs(&["foo=bar".to_string()]);
         assert_eq!(resolved, vec![("foo".to_string(), "bar".to_string())]);
     }
 
     #[test]
-    fn parse_labels_a_bare_key_with_no_equals_sign_means_an_empty_value() {
+    fn parse_key_value_pairs_a_bare_key_with_no_equals_sign_means_an_empty_value() {
         // Confirmed directly against real `podman build --label
-        // bareword`: becomes `bareword=""`, never a parse error and
-        // never pulled from this process's own environment (unlike
-        // `parse_build_args`' own bare-`KEY` handling).
-        let resolved = parse_labels(&["bareword".to_string()]);
+        // bareword`/`--annotation bareword`: both become
+        // `bareword=""`, never a parse error and never pulled from
+        // this process's own environment (unlike `parse_build_args`'
+        // own bare-`KEY` handling).
+        let resolved = parse_key_value_pairs(&["bareword".to_string()]);
         assert_eq!(resolved, vec![("bareword".to_string(), String::new())]);
     }
 
     #[test]
-    fn parse_labels_later_entries_for_the_same_key_overwrite_in_place() {
-        let resolved = parse_labels(&[
+    fn parse_key_value_pairs_later_entries_for_the_same_key_overwrite_in_place() {
+        let resolved = parse_key_value_pairs(&[
             "foo=first".to_string(),
             "bar=middle".to_string(),
             "foo=second".to_string(),
@@ -2591,8 +2607,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_labels_of_an_empty_list_is_empty() {
-        assert!(parse_labels(&[]).is_empty());
+    fn parse_key_value_pairs_of_an_empty_list_is_empty() {
+        assert!(parse_key_value_pairs(&[]).is_empty());
     }
 
     fn meta_args_and_stages(input: &str) -> (Vec<Instruction>, Vec<oci_dockerfile::Stage>) {

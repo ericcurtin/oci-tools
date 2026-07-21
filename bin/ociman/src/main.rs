@@ -216,6 +216,15 @@ enum Command {
         /// shows it as its own extra build step.
         #[arg(long = "label", value_name = "KEY=VALUE")]
         label: Vec<String>,
+        /// Set an OCI annotation on the built image's own manifest
+        /// (`KEY=value`, or bare `KEY` for an empty value, repeatable)
+        /// — matching real `podman build --annotation` exactly
+        /// (checked directly, including against the real pushed
+        /// manifest's own raw JSON): distinct from `--label`, which
+        /// sets `Config.Labels` instead of the manifest's own
+        /// top-level `annotations`.
+        #[arg(long = "annotation", value_name = "KEY=VALUE")]
+        annotation: Vec<String>,
     },
     /// List images in local storage.
     Images,
@@ -719,6 +728,7 @@ fn main() -> std::process::ExitCode {
                 ignorefile,
                 iidfile,
                 label,
+                annotation,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
@@ -730,6 +740,7 @@ fn main() -> std::process::ExitCode {
                 ignorefile.as_deref(),
                 iidfile.as_deref(),
                 &label,
+                &annotation,
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),
