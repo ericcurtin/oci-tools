@@ -114,13 +114,24 @@ pub fn decide(
     }
 }
 
+/// The rootfs-cache's own root directory, under the same storage root
+/// every other kind of this project's own on-disk state (blobs,
+/// images, containers) already lives under. Also used by `ociman
+/// prune`'s own cleanup pass (`main.rs`'s `cmd_prune`) — the one
+/// shared source of truth for this path, rather than two independent
+/// `.join("rootfs-cache")` calls silently drifting apart if this ever
+/// changes.
+pub(crate) fn cache_root(store: &Store) -> PathBuf {
+    store.root().join("rootfs-cache")
+}
+
 fn prepare_overlay(
     store: &Store,
     bundle_dir: &Path,
     manifest_digest: &Digest,
     manifest: &ImageManifest,
 ) -> anyhow::Result<RootfsSetup> {
-    let cache_root = store.root().join("rootfs-cache");
+    let cache_root = cache_root(store);
     let cache_dir = oci_store::ensure_cached(store, &cache_root, manifest_digest, manifest)
         .context("building/reusing the rootfs cache")?;
 

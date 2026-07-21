@@ -175,6 +175,17 @@ enum Command {
         /// tagged.
         reference: String,
     },
+    /// Reclaim disk space no longer needed by anything currently
+    /// tagged: unreferenced blobs (`Store::gc`'s own real mark-and-
+    /// sweep, already implemented but never wired to any command
+    /// before this one) and rootfs-cache entries (`docs/design/0109`)
+    /// for a manifest digest no image reference resolves to anymore.
+    /// Matches real `docker system prune`/`podman system prune`'s own
+    /// "only reclaim what's genuinely unreferenced, only when asked"
+    /// convention — never run implicitly by `rmi`/`rm`, which would
+    /// tax every ordinary removal with a full reachability scan for a
+    /// benefit only worth paying for occasionally.
+    Prune,
     /// Print low-level JSON for a container or an image — matching
     /// real `podman inspect`/`docker inspect`'s own default
     /// resolution order: a container (by id or `--name`) is tried
@@ -592,6 +603,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Rmi { reference, force }) => cmd_rmi(&reference, force, cli.global.json),
             Some(Command::Tag { source, target }) => cmd_tag(&source, &target, cli.global.json),
             Some(Command::History { reference }) => cmd_history(&reference, cli.global.json),
+            Some(Command::Prune) => cmd_prune(cli.global.json),
             Some(Command::Inspect { reference }) => cmd_inspect(&reference, cli.global.json),
             Some(Command::Run {
                 image,
@@ -1010,6 +1022,53 @@ fn cmd_history(reference_str: &str, json: bool) -> anyhow::Result<()> {
             view.created_by.clone()
         };
         println!("{:<24} {:<60} {:>12}", view.created, created_by, view.size);
+    }
+    Ok(())
+}
+
+/// `ociman prune`'s own `--json` output: both real, independent
+/// reclamation passes this command runs, reported separately (never
+/// summed into one opaque total) since they reclaim two genuinely
+/// different kinds of on-disk state for two different reasons.
+#[derive(Debug, Serialize)]
+struct PruneResult {
+    blobs_removed: usize,
+    blobs_reclaimed_bytes: u64,
+    rootfs_cache_entries_removed: usize,
+    rootfs_cache_reclaimed_bytes: u64,
+}
+
+/// Reclaim disk space no longer needed by anything currently tagged —
+/// see [`Command::Prune`]'s own doc comment for the exact policy
+/// (real, mark-and-sweep reachability from every current image
+/// pointer, run only when explicitly asked, never implicitly).
+fn cmd_prune(json: bool) -> anyhow::Result<()> {
+    let store = open_store()?;
+
+    let blob_report = store
+        .gc()
+        .context("garbage-collecting unreferenced blobs")?;
+    let cache_report = oci_store::prune(&store, &rootfs_setup::cache_root(&store))
+        .context("pruning unreferenced rootfs-cache entries")?;
+
+    if json {
+        oci_cli_common::output::print_json(&PruneResult {
+            blobs_removed: blob_report.removed.len(),
+            blobs_reclaimed_bytes: blob_report.reclaimed_bytes,
+            rootfs_cache_entries_removed: cache_report.removed.len(),
+            rootfs_cache_reclaimed_bytes: cache_report.reclaimed_bytes,
+        })?;
+    } else {
+        println!(
+            "blobs: removed {}, reclaimed {} bytes",
+            blob_report.removed.len(),
+            blob_report.reclaimed_bytes
+        );
+        println!(
+            "rootfs cache: removed {}, reclaimed {} bytes",
+            cache_report.removed.len(),
+            cache_report.reclaimed_bytes
+        );
     }
     Ok(())
 }

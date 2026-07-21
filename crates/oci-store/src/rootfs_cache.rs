@@ -2,40 +2,27 @@
 //! image's own real layer stack (`oci_layer::apply`, one call per
 //! layer) is real, measurable work (see `docs/design/0106`'s own
 //! `strace`-measured syscall counts) that's *identical* for every
-//! container of the same image — today, `ociman run` still pays that
-//! cost fresh on every single invocation. This module makes it happen
-//! at most once per distinct manifest digest, not once per container.
+//! container of the same image — before this module existed, `ociman
+//! run` paid that cost fresh on every single invocation. Since
+//! `docs/design/0110`, `ociman run` uses this cache as a real
+//! overlay mount's own `lowerdir` (a cached, already-extracted rootfs
+//! is only ever *safely* shared read-only this way — sharing it via a
+//! plain recursive copy would still pay the same per-file write cost
+//! this module's own whole point is to avoid paying more than once,
+//! and sharing it via hardlinks would let a write inside *any* one
+//! container silently corrupt the shared cache for *every other*
+//! container of the same image, since a hardlink is the same
+//! underlying inode, not an independent copy).
 //!
-//! **Nothing in `ociman run`'s own live container path uses this
-//! yet.** This is pure groundwork, landed as its own increment ahead
-//! of the actual wiring, matching this project's own long-established
-//! pattern (e.g. 0039-0049's parser/diff/export/commit primitives,
-//! wired into `ociman build` for the first time only at 0050) — see
-//! `docs/design/0108`'s own "What this doesn't do yet" section, which
-//! named this exact primitive as the other missing piece (alongside
-//! the overlay-mount feasibility probe that increment itself landed,
-//! `oci_runtime_core::overlay`) before a future increment can safely
-//! wire a real overlay-based rootfs into `ociman run`, using this
-//! cache's own output as the read-only `lowerdir`.
-//!
-//! # Why this alone is not yet a usable optimization on its own
-//!
-//! A cached, already-extracted rootfs is only *safely* reusable
-//! across multiple containers read-only — sharing it via a plain
-//! recursive copy would still pay the same per-file write cost this
-//! module's own whole point is to avoid paying more than once, and
-//! sharing it via hardlinks (a tempting shortcut) would let a write
-//! inside *any* one container silently corrupt the shared cache for
-//! *every other* container of the same image, since a hardlink is the
-//! same underlying inode, not an independent copy. Real safety here
-//! needs a real copy-on-write layer between a container and this
-//! cache (a real overlay mount, `lowerdir` pointed at this cache's own
-//! output, `upperdir`/`workdir` private per container) — exactly what
-//! `oci_runtime_core::overlay`'s own feasibility probe (0108) exists
-//! to help decide when it's safe to attempt. This module's own job
-//! stops at "build the cache correctly and safely," not at deciding
-//! how a container ends up seeing it.
+//! [`prune`] closes the other half of the lifecycle this cache's own
+//! existence introduces: every distinct manifest digest `ociman run`
+//! has ever used leaves a real, uncompressed-on-disk cache entry
+//! behind forever otherwise, unbounded disk growth this project's own
+//! "ensure we don't run out of disk space" standard cares about
+//! directly — see its own doc comment for how it decides what's still
+//! needed.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use oci_spec_types::Digest;
@@ -123,6 +110,124 @@ pub fn ensure_cached(
     }
 
     Ok(dest)
+}
+
+/// Cache entries removed, and bytes reclaimed, by a [`prune`] run —
+/// the same shape [`crate::GcReport`] already established for this
+/// crate's own blob garbage collection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CachePruneReport {
+    /// Manifest digests whose own cache entry was removed.
+    pub removed: Vec<Digest>,
+    /// Total bytes reclaimed.
+    pub reclaimed_bytes: u64,
+}
+
+/// Remove every cache entry under `cache_root` whose own manifest
+/// digest no longer resolves to *any* image reference in `store` —
+/// mark-and-sweep, the same real approach [`crate::Store::gc`] already
+/// uses for blob storage, just against a much smaller "reachable" set
+/// (this cache is keyed directly by manifest digest, so "reachable"
+/// here is simply the digest half of every [`crate::ImageRecord`]
+/// [`crate::Store::list_images`] returns — no manifest/config/layer
+/// graph walk needed the way blob reachability requires, since this
+/// cache has no equivalent of a shared layer blob two different
+/// manifests might both still need).
+///
+/// A build already in progress (a real `ensure_cached` call's own
+/// scratch `tempfile::tempdir_in` directory, not yet renamed into
+/// place) is recognized by its own leading `.tmp` prefix — the same
+/// convention [`crate::Store::gc`] itself already established for the
+/// identical concern on the blob side — and left alone rather than
+/// treated as an orphaned entry.
+pub fn prune(store: &Store, cache_root: &Path) -> Result<CachePruneReport, StoreError> {
+    let reachable: HashSet<String> = store
+        .list_images()?
+        .into_iter()
+        .map(|record| record.manifest_digest.hex().to_string())
+        .collect();
+
+    let mut report = CachePruneReport::default();
+    let entries = match std::fs::read_dir(cache_root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(hex) = file_name.to_str() else {
+            continue;
+        };
+        if hex.starts_with(".tmp") || reachable.contains(hex) {
+            continue;
+        }
+        let path = entry.path();
+        let size = dir_size(&path).unwrap_or(0);
+        std::fs::remove_dir_all(&path)?;
+        report.reclaimed_bytes += size;
+        if let Ok(digest) = Digest::parse(&format!("sha256:{hex}")) {
+            report.removed.push(digest);
+        }
+    }
+    Ok(report)
+}
+
+/// Total size in bytes of every regular file under `dir`, recursively
+/// — [`prune`]'s own "how much did removing this cache entry actually
+/// reclaim" figure.
+///
+/// **Counts each real inode once, not once per directory entry.** A
+/// real cache entry for a hardlink-heavy image (`docs/design/0106`'s
+/// own busybox example: every applet a separate hardlink to one real
+/// `busybox` binary) would otherwise have that one binary's own size
+/// added again for every single hardlinked name pointing at it —
+/// caught directly, not assumed: a first pass at this function
+/// reported reclaiming ~490 MB for a real cache entry whose own
+/// actual on-disk usage (confirmed with `du` before and after a real
+/// `ociman prune`) was a few MB, exactly this over-count. `seen`
+/// tracks `(dev, ino)` pairs (`std::os::unix::fs::MetadataExt`) so a
+/// later hardlink to an already-counted inode contributes nothing
+/// further, matching what real disk usage actually recovers.
+///
+/// Best-effort otherwise: a file that vanishes between being listed
+/// and `stat`ed (a real, if rare, race with a concurrent removal of
+/// the very entry [`prune`] itself is about to remove) is simply
+/// skipped rather than failing the whole size calculation — this
+/// figure is already advisory, not something anything else depends on
+/// for correctness.
+fn dir_size(dir: &Path) -> std::io::Result<u64> {
+    let mut seen = HashSet::new();
+    dir_size_inner(dir, &mut seen)
+}
+
+fn dir_size_inner(dir: &Path, seen: &mut HashSet<(u64, u64)>) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(entry) = entry else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            total += dir_size_inner(&entry.path(), seen).unwrap_or(0);
+        } else if let Ok(metadata) = entry.metadata() {
+            // A symlink's own `metadata()` (not `symlink_metadata()`)
+            // would follow it and double-count (or reach entirely
+            // outside `dir`) the target -- skip symlinks' own size
+            // entirely, matching how disk usage really works (a
+            // symlink's own inode is a handful of bytes for the
+            // link text itself, not its target's size).
+            if file_type.is_symlink() {
+                continue;
+            }
+            if seen.insert((metadata.dev(), metadata.ino())) {
+                total += metadata.len();
+            }
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -260,5 +365,173 @@ mod tests {
             .map(|e| e.unwrap().path())
             .collect();
         assert_eq!(entries, vec![cache_dir]);
+    }
+
+    #[test]
+    fn prune_removes_a_cache_entry_no_image_references_anymore() {
+        let (_dir, store) = temp_store();
+        let cache_root = tempfile::tempdir().unwrap();
+        let manifest = seed_one_layer_manifest(&store, "hello.txt", b"orphaned content");
+        let digest = sha256(b"fake-manifest-digest-orphan");
+        let cache_dir = ensure_cached(&store, cache_root.path(), &digest, &manifest).unwrap();
+        assert!(cache_dir.exists());
+        // Deliberately no `store.put_image` for this digest at all --
+        // nothing references it.
+
+        let report = prune(&store, cache_root.path()).unwrap();
+
+        assert_eq!(report.removed, vec![digest]);
+        assert!(report.reclaimed_bytes > 0);
+        assert!(!cache_dir.exists());
+    }
+
+    #[test]
+    fn prune_keeps_a_cache_entry_a_real_image_still_references() {
+        let (_dir, store) = temp_store();
+        let cache_root = tempfile::tempdir().unwrap();
+        let manifest = seed_one_layer_manifest(&store, "hello.txt", b"still needed");
+        let digest = sha256(b"fake-manifest-digest-kept");
+        let cache_dir = ensure_cached(&store, cache_root.path(), &digest, &manifest).unwrap();
+        store
+            .put_image(&crate::ImageRecord {
+                reference: "docker.io/library/kept:latest".to_string(),
+                manifest_digest: digest.clone(),
+            })
+            .unwrap();
+
+        let report = prune(&store, cache_root.path()).unwrap();
+
+        assert!(report.removed.is_empty());
+        assert_eq!(report.reclaimed_bytes, 0);
+        assert!(cache_dir.exists());
+        assert_eq!(
+            std::fs::read(cache_dir.join("hello.txt")).unwrap(),
+            b"still needed"
+        );
+    }
+
+    #[test]
+    fn prune_ignores_an_in_progress_build_directory() {
+        let (_dir, store) = temp_store();
+        let cache_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cache_root.path()).unwrap();
+        let scratch = tempfile::tempdir_in(cache_root.path()).unwrap();
+        std::fs::write(scratch.path().join("partial"), b"not done yet").unwrap();
+
+        let report = prune(&store, cache_root.path()).unwrap();
+
+        assert!(report.removed.is_empty());
+        assert!(
+            scratch.path().exists(),
+            "an in-progress build must survive prune"
+        );
+    }
+
+    #[test]
+    fn prune_on_a_missing_cache_root_is_a_real_no_op_not_an_error() {
+        let (_dir, store) = temp_store();
+        let cache_root = tempfile::tempdir().unwrap();
+        let missing = cache_root.path().join("never-created");
+
+        let report = prune(&store, &missing).unwrap();
+
+        assert_eq!(report, CachePruneReport::default());
+    }
+
+    #[test]
+    fn prune_with_two_images_keeps_only_the_still_referenced_one() {
+        let (_dir, store) = temp_store();
+        let cache_root = tempfile::tempdir().unwrap();
+        let manifest_a = seed_one_layer_manifest(&store, "a.txt", b"content a");
+        let manifest_b = seed_one_layer_manifest(&store, "b.txt", b"content b");
+        let digest_a = sha256(b"digest-prune-a");
+        let digest_b = sha256(b"digest-prune-b");
+        let dir_a = ensure_cached(&store, cache_root.path(), &digest_a, &manifest_a).unwrap();
+        let dir_b = ensure_cached(&store, cache_root.path(), &digest_b, &manifest_b).unwrap();
+        store
+            .put_image(&crate::ImageRecord {
+                reference: "docker.io/library/a:latest".to_string(),
+                manifest_digest: digest_a.clone(),
+            })
+            .unwrap();
+
+        let report = prune(&store, cache_root.path()).unwrap();
+
+        assert_eq!(report.removed, vec![digest_b]);
+        assert!(dir_a.exists());
+        assert!(!dir_b.exists());
+    }
+
+    /// The real bug `dir_size`'s own doc comment describes, caught
+    /// directly (a real ~490 MB reported reclaim for what `du` showed
+    /// was really a few MB) rather than by inspection alone: a real
+    /// hardlink-heavy layer (matching real `docs/design/0106`'s own
+    /// busybox example — one real binary, many hardlinked names
+    /// pointing at it) must not have its own single real size counted
+    /// once per hardlinked name.
+    #[test]
+    fn prune_reclaimed_bytes_counts_a_hardlinked_file_once_not_once_per_link() {
+        let (_dir, store) = temp_store();
+        let cache_root = tempfile::tempdir().unwrap();
+
+        let content = vec![b'x'; 4096];
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o755);
+        header.set_size(content.len() as u64);
+        builder
+            .append_data(&mut header, "bin/real", content.as_slice())
+            .unwrap();
+        // Ten more names, all real hardlinks to the one real file
+        // above -- matching a real busybox image's own applet shape,
+        // just with a round number for an easy assertion.
+        for name in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"] {
+            let mut link_header = tar::Header::new_gnu();
+            link_header.set_entry_type(tar::EntryType::Link);
+            link_header.set_mode(0o755);
+            link_header.set_size(0);
+            builder
+                .append_link(&mut link_header, format!("bin/{name}"), "bin/real")
+                .unwrap();
+        }
+        let tar_bytes = builder.into_inner().unwrap();
+        let mut compressed = Vec::new();
+        let mut encoder =
+            flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar_bytes).unwrap();
+        encoder.finish().unwrap();
+        let ingested = store.ingest(compressed.as_slice()).unwrap();
+
+        let manifest = ImageManifest {
+            schema_version: 2,
+            media_type: None,
+            config: Descriptor {
+                media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+                digest: sha256(b"unused-config"),
+                size: 0,
+                urls: vec![],
+                annotations: BTreeMap::new(),
+                platform: None,
+            },
+            layers: vec![Descriptor {
+                media_type: MEDIA_TYPE_IMAGE_LAYER_GZIP.to_string(),
+                digest: ingested.digest,
+                size: ingested.size,
+                urls: vec![],
+                annotations: BTreeMap::new(),
+                platform: None,
+            }],
+            annotations: BTreeMap::new(),
+        };
+        let digest = sha256(b"digest-hardlink-dedup");
+        ensure_cached(&store, cache_root.path(), &digest, &manifest).unwrap();
+
+        let report = prune(&store, cache_root.path()).unwrap();
+
+        assert_eq!(report.removed, vec![digest]);
+        // Eleven hardlinked names, one real 4096-byte file -- not
+        // eleven times that.
+        assert_eq!(report.reclaimed_bytes, 4096);
     }
 }
