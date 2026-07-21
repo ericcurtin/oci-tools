@@ -26,6 +26,12 @@
 //!   without fall back to their own file name, decreasing version
 //!   order, boot-counting suffix removed.
 //!
+//! `ociboot grubenv` (`bin/ociboot/src/main.rs`) is the first real CLI
+//! surface built on [`grubenv`]: a generic, real, pure-Rust
+//! `grub-editenv` equivalent (`create`/`list`/`set`/`unset`, verified
+//! byte-for-byte compatible with the real binary — `docs/design/
+//! 0125`) — deliberately no BLS-specific policy of its own yet.
+//!
 //! Planned scope (still ahead):
 //! - atomic default-entry flips built on [`grubenv`] (upgrade keeps
 //!   the previous deployment's entry for rollback)

@@ -10,10 +10,15 @@
 //! layered mode (milestone 6). Shares `oci-registry`/`oci-store` with
 //! `ociman` — one pull path for containers and OS images alike.
 //!
-//! `list` (this file) is the first real subcommand: wiring `oci_bls`'s
-//! already-built, already-tested `scan_entries`/`sort_entries` primitives
-//! into an actual "show me the real boot menu, in the real order the boot
-//! loader would show it" command — see `docs/design/0087`.
+//! `list` was the first real subcommand: wiring `oci_bls`'s already-
+//! built, already-tested `scan_entries`/`sort_entries` primitives into
+//! an actual "show me the real boot menu, in the real order the boot
+//! loader would show it" command — see `docs/design/0087`. `grubenv`
+//! is the second: a real, pure-Rust `grub-editenv` equivalent
+//! (`create`/`list`/`set`/`unset`, byte-for-byte compatible — see
+//! `docs/design/0125`), the generic mechanism the eventual `saved_
+//! entry`/boot-counting *protocol* (milestone 6, still ahead) will be
+//! built on top of.
 
 use std::path::{Path, PathBuf};
 
@@ -46,6 +51,51 @@ enum Command {
         #[arg(long, value_name = "DIR", default_value = "/boot/loader/entries")]
         boot_dir: PathBuf,
     },
+    /// Read or edit a real GRUB environment block (`grubenv`) —
+    /// matching real `grub-editenv`'s own CLI surface exactly
+    /// (`create`/`list`/`set`/`unset`), backed by this project's own
+    /// pure-Rust, byte-for-byte-compatible implementation
+    /// (`oci_bls::grubenv`) instead of the real binary — the first of
+    /// this project's own planned "external tools wrapped behind
+    /// traits here so pure-Rust replacements can be swapped in later"
+    /// pieces (`oci-bls`'s own module doc comment) to actually ship.
+    /// `saved_entry`/boot-counting protocol semantics built on top of
+    /// this are still ahead (milestone 6) — this subcommand is
+    /// deliberately just the generic key/value editor, no BLS-specific
+    /// policy of its own.
+    Grubenv {
+        /// The grubenv file itself (real installs:
+        /// `/boot/grub2/grubenv` or `/boot/grub/grubenv`, depending on
+        /// distro convention — real `grub-editenv` itself defaults to
+        /// `/boot/grub/grubenv` when given `-`, but this project makes
+        /// no such assumption; always pass a real path explicitly).
+        #[arg(long, value_name = "FILE")]
+        file: PathBuf,
+        #[command(subcommand)]
+        action: GrubenvAction,
+    },
+}
+
+/// `ociboot grubenv`'s own subcommands — real `grub-editenv`'s own
+/// four, verbatim (checked directly: `grub-editenv --help` against the
+/// real, installed binary), including its exact wording for what each
+/// one does.
+#[derive(Debug, clap::Subcommand)]
+enum GrubenvAction {
+    /// Create a blank environment block file.
+    Create,
+    /// List the current variables.
+    List,
+    /// Set variables.
+    Set {
+        /// One or more `NAME=VALUE` assignments.
+        assignments: Vec<String>,
+    },
+    /// Delete variables.
+    Unset {
+        /// One or more variable names to remove.
+        names: Vec<String>,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -58,6 +108,7 @@ fn main() -> std::process::ExitCode {
         );
         match cli.command {
             Some(Command::List { boot_dir }) => cmd_list(&boot_dir),
+            Some(Command::Grubenv { file, action }) => cmd_grubenv(&file, action),
             None => anyhow::bail!(
                 "no subcommand given (try `ociboot list`); \
                  `install` arrives with milestone 5"
@@ -85,6 +136,47 @@ fn cmd_list(boot_dir: &Path) -> anyhow::Result<()> {
         match discovered.entry.version() {
             Some(version) => println!("{title} ({version}){status}"),
             None => println!("{title}{status}"),
+        }
+    }
+    Ok(())
+}
+
+/// `ociboot grubenv`: matches real `grub-editenv`'s own four
+/// subcommands exactly, backed by [`oci_bls::grubenv`] instead of the
+/// real binary.
+fn cmd_grubenv(file: &Path, action: GrubenvAction) -> anyhow::Result<()> {
+    match action {
+        GrubenvAction::Create => {
+            oci_bls::grubenv::write(file, &oci_bls::GrubEnv::new())
+                .with_context(|| format!("creating {}", file.display()))?;
+        }
+        GrubenvAction::List => {
+            let env = oci_bls::grubenv::read(file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            for (key, value) in env.entries() {
+                println!("{key}={value}");
+            }
+        }
+        GrubenvAction::Set { assignments } => {
+            let mut env = oci_bls::grubenv::read(file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            for assignment in &assignments {
+                let (name, value) = assignment.split_once('=').ok_or_else(|| {
+                    anyhow::anyhow!("invalid parameter {assignment:?} (expected NAME=VALUE)")
+                })?;
+                env.set(name, value);
+            }
+            oci_bls::grubenv::write(file, &env)
+                .with_context(|| format!("writing {}", file.display()))?;
+        }
+        GrubenvAction::Unset { names } => {
+            let mut env = oci_bls::grubenv::read(file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            for name in &names {
+                env.unset(name);
+            }
+            oci_bls::grubenv::write(file, &env)
+                .with_context(|| format!("writing {}", file.display()))?;
         }
     }
     Ok(())

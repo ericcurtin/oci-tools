@@ -111,6 +111,14 @@ impl GrubEnv {
             .map(|(_, v)| v.as_str())
     }
 
+    /// Every `(key, value)` pair currently set, in the same order
+    /// they'd be written back out (`ociboot grubenv list`'s own
+    /// backing — matches real `grub-editenv list`'s own insertion-
+    /// order output).
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
     /// Set `key` to `value`. If `key` already exists, its value is
     /// replaced *in place* (its original position among the other
     /// entries is preserved); otherwise it's appended after the last
