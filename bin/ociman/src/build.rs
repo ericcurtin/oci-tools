@@ -210,6 +210,7 @@ pub fn cmd_build(
     no_cache: bool,
     tls_verify: bool,
     ignorefile: Option<&Path>,
+    iidfile: Option<&Path>,
     json: bool,
 ) -> anyhow::Result<()> {
     let tag = tag.context(
@@ -410,6 +411,14 @@ pub fn cmd_build(
             manifest_digest: manifest_ingested.digest.clone(),
         })
         .context("recording built image")?;
+
+    if let Some(path) = iidfile {
+        // No trailing newline -- matches real `podman build
+        // --iidfile` exactly (checked directly against a real
+        // installed `podman build`).
+        std::fs::write(path, manifest_ingested.digest.to_string())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
 
     warn_on_unused_build_args(&meta_args, &stages, &build_args);
 

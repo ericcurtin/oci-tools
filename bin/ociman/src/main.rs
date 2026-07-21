@@ -199,6 +199,13 @@ enum Command {
         /// error, not a silent "no patterns" fallback).
         #[arg(long = "ignorefile", value_name = "PATH")]
         ignorefile: Option<PathBuf>,
+        /// Write the built image's own digest (`sha256:<hex>`, no
+        /// trailing newline) to this file after a successful build —
+        /// matching real `podman build --iidfile` exactly (checked
+        /// directly: real podman writes the bare `sha256:...` string,
+        /// no surrounding whitespace at all).
+        #[arg(long = "iidfile", value_name = "PATH")]
+        iidfile: Option<PathBuf>,
     },
     /// List images in local storage.
     Images,
@@ -700,6 +707,7 @@ fn main() -> std::process::ExitCode {
                 no_cache,
                 tls_verify,
                 ignorefile,
+                iidfile,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
@@ -709,6 +717,7 @@ fn main() -> std::process::ExitCode {
                 no_cache,
                 tls_verify,
                 ignorefile.as_deref(),
+                iidfile.as_deref(),
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),

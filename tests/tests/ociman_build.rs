@@ -4570,3 +4570,65 @@ fn ignorefile_flag_pointing_at_a_nonexistent_path_is_a_clear_error() {
     );
     assert!(!build.status.success());
 }
+
+/// `--iidfile <path>` writes the built image's own digest
+/// (`sha256:<hex>`, no trailing newline) to that file after a
+/// successful build -- matching real `podman build --iidfile`
+/// exactly, confirmed directly against a real installed `podman`.
+#[test]
+fn iidfile_flag_writes_the_built_images_own_digest_with_no_trailing_newline() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/iidfile-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/iidfile-base:latest\nLABEL marker=iidfile-test\n",
+    );
+
+    let iidfile_dir = tempfile::tempdir().unwrap();
+    let iidfile_path = iidfile_dir.path().join("iid.txt");
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/iidfile-result:latest",
+            "--iidfile",
+            iidfile_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let written = std::fs::read_to_string(&iidfile_path).unwrap();
+    assert!(
+        !written.ends_with('\n') && !written.ends_with(' '),
+        "iidfile content must have no trailing whitespace, got {written:?}"
+    );
+    assert!(
+        written.starts_with("sha256:") && written.len() == "sha256:".len() + 64,
+        "iidfile content must be a bare sha256 digest, got {written:?}"
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/iidfile-result:latest")
+        .unwrap()
+        .unwrap();
+    assert_eq!(written, record.manifest_digest.to_string());
+}
