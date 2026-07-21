@@ -87,6 +87,31 @@ enum Command {
         /// `quay.io/foo/bar@sha256:...`.
         reference: String,
     },
+    /// Log in to a container registry, matching real `docker login`/
+    /// `podman login`'s own auth-file format exactly (`--username`/
+    /// `--password` write straight through to the same
+    /// `$REGISTRY_AUTH_FILE`/`$XDG_RUNTIME_DIR/containers/auth.json`
+    /// file `ociman pull`/`ociman build` already read credentials
+    /// from). Deliberately does **not** verify the credentials against
+    /// the real registry first the way both real tools do — see
+    /// `oci_registry::credentials::set`'s own doc comment for why.
+    Login {
+        /// The registry host to log in to, e.g. `quay.io`,
+        /// `ghcr.io`, `docker.io`.
+        registry: String,
+        #[arg(short, long)]
+        username: String,
+        #[arg(short, long)]
+        password: String,
+    },
+    /// Remove a registry's own stored credentials, matching real
+    /// `docker logout`/`podman logout`. A no-op (not an error) if
+    /// `registry` was never logged in to in the first place.
+    Logout {
+        /// The registry host to log out of, exactly as given to
+        /// `ociman login`.
+        registry: String,
+    },
     /// Build an image from a Dockerfile/Containerfile. See the
     /// `build` module's own doc comment for exactly what's supported
     /// so far.
@@ -603,6 +628,12 @@ fn main() -> std::process::ExitCode {
                  arrives with later milestones)"
             ),
             Some(Command::Pull { reference }) => cmd_pull(&reference, cli.global.json),
+            Some(Command::Login {
+                registry,
+                username,
+                password,
+            }) => cmd_login(&registry, &username, &password, cli.global.json),
+            Some(Command::Logout { registry }) => cmd_logout(&registry, cli.global.json),
             Some(Command::Build {
                 context,
                 file,
@@ -752,6 +783,83 @@ fn cmd_pull(reference_str: &str, json: bool) -> anyhow::Result<()> {
         oci_cli_common::output::print_json(&ImageView::from_summary(summary))?;
     } else {
         println!("{}", record.manifest_digest);
+    }
+    Ok(())
+}
+
+/// The real, default auth-file *write* path — deliberately **not**
+/// the same as `Credentials::load`'s own read-side `candidate_paths`
+/// (which additionally falls back to `~/.config/containers/auth.json`
+/// and `~/.docker/config.json`, for read-time compatibility with
+/// other tools' own files): checked directly against real podman's
+/// own `getPathToAuthWithOS` (`~/git/container-libs/image/pkg/docker/
+/// config/config.go`), which never writes to either of those by
+/// default, always preferring a real, ephemeral runtime-dir location
+/// instead — `$REGISTRY_AUTH_FILE` if set, else `$XDG_RUNTIME_DIR/
+/// containers/auth.json` if set, else a real, computed `/run/user/
+/// <uid>/containers/auth.json` (this project's own `oci_cli_common::
+/// identity::effective_uid_gid`, not `$HOME`-based at all).
+fn default_auth_file_write_path() -> PathBuf {
+    if let Ok(path) = std::env::var("REGISTRY_AUTH_FILE") {
+        return PathBuf::from(path);
+    }
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(dir).join("containers").join("auth.json");
+    }
+    let (uid, _) = oci_cli_common::identity::effective_uid_gid();
+    PathBuf::from(format!("/run/user/{uid}"))
+        .join("containers")
+        .join("auth.json")
+}
+
+/// `ociman login`'s own `--json` output.
+#[derive(Debug, Serialize)]
+struct LoginResult {
+    registry: String,
+    auth_file: String,
+}
+
+fn cmd_login(registry: &str, username: &str, password: &str, json: bool) -> anyhow::Result<()> {
+    let path = default_auth_file_write_path();
+    oci_registry::credentials::set(&path, registry, username, password)
+        .with_context(|| format!("writing credentials for {registry} to {}", path.display()))?;
+
+    if json {
+        oci_cli_common::output::print_json(&LoginResult {
+            registry: registry.to_string(),
+            auth_file: path.display().to_string(),
+        })?;
+    } else {
+        println!("Login Succeeded!");
+    }
+    Ok(())
+}
+
+/// `ociman logout`'s own `--json` output.
+#[derive(Debug, Serialize)]
+struct LogoutResult {
+    registry: String,
+    removed: bool,
+}
+
+fn cmd_logout(registry: &str, json: bool) -> anyhow::Result<()> {
+    let path = default_auth_file_write_path();
+    let removed = oci_registry::credentials::unset(&path, registry).with_context(|| {
+        format!(
+            "removing credentials for {registry} from {}",
+            path.display()
+        )
+    })?;
+
+    if json {
+        oci_cli_common::output::print_json(&LogoutResult {
+            registry: registry.to_string(),
+            removed,
+        })?;
+    } else if removed {
+        println!("Removed login credentials for {registry}");
+    } else {
+        println!("Not logged in to {registry}");
     }
     Ok(())
 }
