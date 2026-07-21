@@ -3586,6 +3586,101 @@ fn a_copy_source_whose_content_changed_is_not_served_from_the_cache() {
     );
 }
 
+/// A change *inside* a `.dockerignore`-excluded directory must never
+/// bust the cache for a `COPY` step that reads from the context --
+/// that content is never actually copied in the first place, so
+/// there's nothing for the cache to correctly invalidate over (the
+/// real bug this test guards against: `build_cache::content_digest`
+/// used to hash every byte under a `COPY` source unconditionally,
+/// `.dockerignore` or not, wasting real time on content that would
+/// never even be read otherwise, and busting the cache for a layer
+/// whose own actually-copied content never changed at all).
+#[test]
+fn a_change_inside_a_dockerignored_directory_never_busts_the_cache() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/dockerignore-cache-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("keep.txt"), b"kept content").unwrap();
+    std::fs::create_dir(context_dir.path().join("node_modules")).unwrap();
+    std::fs::write(
+        context_dir.path().join("node_modules/whatever.js"),
+        b"version one",
+    )
+    .unwrap();
+    write_dockerignore(context_dir.path(), "node_modules\n");
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/dockerignore-cache-base:latest\nCOPY . /app\n",
+    );
+
+    let first = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/dockerignore-cache-first:latest",
+        ],
+    );
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    // Only the excluded file's own content changes -- `keep.txt`
+    // itself, and every other real instruction, stay exactly the
+    // same.
+    std::fs::write(
+        context_dir.path().join("node_modules/whatever.js"),
+        b"a completely different version two",
+    )
+    .unwrap();
+    let second = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/dockerignore-cache-second:latest",
+        ],
+    );
+    assert!(
+        second.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let first_record = store
+        .resolve_image("docker.io/ociman-test/dockerignore-cache-first:latest")
+        .unwrap()
+        .unwrap();
+    let second_record = store
+        .resolve_image("docker.io/ociman-test/dockerignore-cache-second:latest")
+        .unwrap()
+        .unwrap();
+    let first_manifest = store.image_manifest(&first_record).unwrap();
+    let second_manifest = store.image_manifest(&second_record).unwrap();
+
+    assert_eq!(
+        first_manifest.layers, second_manifest.layers,
+        "a change inside an excluded directory must never bust the cache -- that content was \
+         never actually copied in the first place"
+    );
+}
+
 /// A change earlier in the instruction sequence (a different `RUN`)
 /// is never served from the cache — matching real Docker/BuildKit's
 /// own "one miss invalidates everything after it" cache semantics

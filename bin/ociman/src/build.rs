@@ -1373,7 +1373,7 @@ fn copy_instruction(
     // own doc comment for why `COPY`/`ADD` need this (unlike `RUN`)
     // and why it must be computed before the cache lookup below, not
     // after.
-    let content_digest = crate::build_cache::content_digest(source_root, &sources)
+    let content_digest = crate::build_cache::content_digest(source_root, &sources, context_ignore)
         .with_context(|| format!("hashing COPY source content for {command_text}"))?;
     let created_by = format!("{command_text} # {content_digest}");
 
@@ -1578,8 +1578,9 @@ fn add_instruction(
         // as `copy_instruction`'s own identical check -- see its own
         // doc comment.
         ensure_sources_exist(context, &local_sources, "ADD", Some(dockerignore))?;
-        let content_digest = crate::build_cache::content_digest(context, &local_sources)
-            .with_context(|| format!("hashing ADD source content for {command_text}"))?;
+        let content_digest =
+            crate::build_cache::content_digest(context, &local_sources, Some(dockerignore))
+                .with_context(|| format!("hashing ADD source content for {command_text}"))?;
         let created_by = format!("{command_text} # {content_digest}");
         if let Some(cached) = crate::build_cache::find_cached_layer(
             cache_candidates,

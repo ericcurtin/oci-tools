@@ -243,11 +243,28 @@ pub fn find_cached_layer(
 /// unless `--chmod` overrides it, which is folded into `created_by`
 /// separately, see `build.rs`'s own `copy_instruction`/
 /// `add_instruction`).
-pub fn content_digest(source_root: &Path, sources: &[String]) -> anyhow::Result<Digest> {
+/// `context_ignore`, when `Some`, is this build's own compiled
+/// `.dockerignore` (`None` for a `COPY --from=<stage>`/
+/// `--from=<external-image>` source, which is never subject to
+/// `.dockerignore` at all — see `build.rs`'s own `copy_instruction`
+/// doc comment) — an excluded path is skipped entirely, never read or
+/// hashed at all, exactly mirroring `copy_path_recursive`'s own
+/// identical skip (real bytes that are never actually copied should
+/// never affect the cache key either; hashing them anyway would be
+/// both wasted work — confirmed with a real benchmark, see `docs/
+/// design/0133` — and a real, if harmless, cache-invalidation bug: a
+/// change inside an excluded directory would otherwise still bust the
+/// cache for a layer whose own copied content never actually changed
+/// at all).
+pub fn content_digest(
+    source_root: &Path,
+    sources: &[String],
+    context_ignore: Option<&oci_dockerfile::DockerIgnore>,
+) -> anyhow::Result<Digest> {
     let mut hasher = Sha256Writer::new();
     for source in sources {
         let path = crate::build::safe_join(source_root, source.trim_start_matches('/'))?;
-        hash_path(&path, source, &mut hasher)?;
+        hash_path(&path, source, context_ignore, &mut hasher)?;
     }
     Ok(hasher.finish_digest())
 }
@@ -259,11 +276,34 @@ pub fn content_digest(source_root: &Path, sources: &[String]) -> anyhow::Result<
 /// `expand_wildcard_source`'s established "lexical order" convention
 /// elsewhere in this same build executor) so the digest never depends
 /// on a directory's own arbitrary on-disk readdir order.
-fn hash_path(path: &Path, label: &str, hasher: &mut Sha256Writer) -> anyhow::Result<()> {
+fn hash_path(
+    path: &Path,
+    label: &str,
+    context_ignore: Option<&oci_dockerfile::DockerIgnore>,
+    hasher: &mut Sha256Writer,
+) -> anyhow::Result<()> {
     use std::io::Write as _;
 
     let metadata = std::fs::symlink_metadata(path)
         .with_context(path, "reading metadata for content digest")?;
+
+    if let Some(ignore) = context_ignore
+        && ignore.is_ignored(label)
+    {
+        if metadata.is_dir() && ignore.has_negation() {
+            let mut entries: Vec<_> = std::fs::read_dir(path)
+                .with_context(path, "reading directory")?
+                .collect::<std::io::Result<_>>()
+                .with_context(path, "reading directory entry")?;
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                let child_label = format!("{label}/{}", entry.file_name().to_string_lossy());
+                hash_path(&entry.path(), &child_label, context_ignore, hasher)?;
+            }
+        }
+        return Ok(());
+    }
+
     if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(path).with_context(path, "reading symlink target")?;
         writeln!(hasher, "L {label} -> {}", target.display())?;
@@ -276,7 +316,7 @@ fn hash_path(path: &Path, label: &str, hasher: &mut Sha256Writer) -> anyhow::Res
         entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
             let child_label = format!("{label}/{}", entry.file_name().to_string_lossy());
-            hash_path(&entry.path(), &child_label, hasher)?;
+            hash_path(&entry.path(), &child_label, context_ignore, hasher)?;
         }
     } else {
         let bytes = std::fs::read(path).with_context(path, "reading file content")?;
@@ -476,10 +516,10 @@ mod tests {
     fn content_digest_changes_when_file_content_changes() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), b"one").unwrap();
-        let first = content_digest(dir.path(), &["a.txt".to_string()]).unwrap();
+        let first = content_digest(dir.path(), &["a.txt".to_string()], None).unwrap();
 
         std::fs::write(dir.path().join("a.txt"), b"two").unwrap();
-        let second = content_digest(dir.path(), &["a.txt".to_string()]).unwrap();
+        let second = content_digest(dir.path(), &["a.txt".to_string()], None).unwrap();
 
         assert_ne!(first, second);
     }
@@ -489,8 +529,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/a.txt"), b"content").unwrap();
-        let first = content_digest(dir.path(), &["sub".to_string()]).unwrap();
-        let second = content_digest(dir.path(), &["sub".to_string()]).unwrap();
+        let first = content_digest(dir.path(), &["sub".to_string()], None).unwrap();
+        let second = content_digest(dir.path(), &["sub".to_string()], None).unwrap();
         assert_eq!(first, second);
     }
 
@@ -498,10 +538,55 @@ mod tests {
     fn content_digest_changes_when_a_file_is_renamed() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), b"content").unwrap();
-        let first = content_digest(dir.path(), &["a.txt".to_string()]).unwrap();
+        let first = content_digest(dir.path(), &["a.txt".to_string()], None).unwrap();
 
         std::fs::rename(dir.path().join("a.txt"), dir.path().join("b.txt")).unwrap();
-        let second = content_digest(dir.path(), &["b.txt".to_string()]).unwrap();
+        let second = content_digest(dir.path(), &["b.txt".to_string()], None).unwrap();
+
+        assert_ne!(first, second);
+    }
+
+    /// A change *inside* a `.dockerignore`-excluded directory must
+    /// never affect the digest at all -- that content is never
+    /// actually copied, so it must never bust the cache either (the
+    /// real bug this test guards against: an earlier version of this
+    /// function hashed every byte under `sources` unconditionally,
+    /// `context_ignore` or not).
+    #[test]
+    fn content_digest_ignores_a_dockerignored_directorys_own_content_entirely() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("node_modules")).unwrap();
+        std::fs::write(dir.path().join("node_modules/a.txt"), b"one").unwrap();
+        let ignore = oci_dockerfile::DockerIgnore::compile(&["node_modules".to_string()]).unwrap();
+
+        let first = content_digest(dir.path(), &[".".to_string()], Some(&ignore)).unwrap();
+        std::fs::write(
+            dir.path().join("node_modules/a.txt"),
+            b"completely different",
+        )
+        .unwrap();
+        let second = content_digest(dir.path(), &[".".to_string()], Some(&ignore)).unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    /// The exact same change *does* still bust the cache once nothing
+    /// excludes it -- confirming the test above is actually exercising
+    /// `context_ignore`, not merely a digest that never picks up
+    /// nested changes at all.
+    #[test]
+    fn content_digest_still_reacts_to_the_same_change_with_no_dockerignore_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("node_modules")).unwrap();
+        std::fs::write(dir.path().join("node_modules/a.txt"), b"one").unwrap();
+
+        let first = content_digest(dir.path(), &[".".to_string()], None).unwrap();
+        std::fs::write(
+            dir.path().join("node_modules/a.txt"),
+            b"completely different",
+        )
+        .unwrap();
+        let second = content_digest(dir.path(), &[".".to_string()], None).unwrap();
 
         assert_ne!(first, second);
     }
