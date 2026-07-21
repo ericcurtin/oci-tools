@@ -256,11 +256,15 @@ fn expand_instruction(
         // itself already committed to as the list's own order.
         Instruction::Expose(ports) => Ok(Instruction::Expose(expand_all(ports, env)?)),
         // Deliberately untouched -- see this function's own doc
-        // comment.
+        // comment. `HEALTHCHECK CMD <command>`'s own command line is
+        // exactly the same kind of shell/exec command line as
+        // `RUN`/`CMD`/`ENTRYPOINT`, never expanded here for the same
+        // reason.
         Instruction::Run(_)
         | Instruction::Cmd(_)
         | Instruction::Entrypoint(_)
         | Instruction::Shell(_)
+        | Instruction::Healthcheck(_)
         | Instruction::From { .. } => Ok(instruction.clone()),
     }
 }

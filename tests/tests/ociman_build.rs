@@ -180,6 +180,161 @@ fn env_updates_an_existing_key_in_place_rather_than_duplicating() {
     );
 }
 
+#[test]
+fn healthcheck_cmd_with_every_flag_is_stored_in_the_built_images_config() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/healthcheck-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/healthcheck-base:latest\n\
+         HEALTHCHECK --interval=5s --timeout=3s --start-period=30s \
+         --retries=3 CMD [\"echo\", \"ok\"]\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/healthcheck-built:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/healthcheck-built:latest")
+        .unwrap()
+        .unwrap();
+    let config = store.image_config(&record).unwrap();
+    let healthcheck = config
+        .config
+        .expect("container config")
+        .healthcheck
+        .expect("HEALTHCHECK should be recorded");
+    assert_eq!(
+        healthcheck.test,
+        vec!["CMD".to_string(), "echo".to_string(), "ok".to_string()]
+    );
+    assert_eq!(healthcheck.interval, 5_000_000_000);
+    assert_eq!(healthcheck.timeout, 3_000_000_000);
+    assert_eq!(healthcheck.start_period, 30_000_000_000);
+    assert_eq!(healthcheck.start_interval, 0);
+    assert_eq!(healthcheck.retries, 3);
+}
+
+#[test]
+fn healthcheck_none_overrides_a_base_images_own_healthcheck() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/healthcheck-none-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            healthcheck: Some(oci_spec_types::image::HealthcheckConfig {
+                test: vec!["CMD-SHELL".to_string(), "true".to_string()],
+                interval: 1_000_000_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/healthcheck-none-base:latest\nHEALTHCHECK NONE\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/healthcheck-none-built:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/healthcheck-none-built:latest")
+        .unwrap()
+        .unwrap();
+    let config = store.image_config(&record).unwrap();
+    let healthcheck = config
+        .config
+        .expect("container config")
+        .healthcheck
+        .expect("HEALTHCHECK NONE should still be recorded, not just dropped");
+    assert_eq!(healthcheck.test, vec!["NONE".to_string()]);
+    assert_eq!(healthcheck.interval, 0);
+}
+
+#[test]
+fn healthcheck_with_an_invalid_flag_is_a_clear_build_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/healthcheck-bad-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/healthcheck-bad-base:latest\n\
+         HEALTHCHECK --retries=-1 CMD [\"true\"]\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/healthcheck-bad-built:latest",
+        ],
+    );
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(stderr.contains("cannot be negative"), "{stderr}");
+}
+
 /// A real, end-to-end `RUN` step: runs a real command in a real
 /// rootless container against the base image's own materialized
 /// layers, diffs what changed, and commits it as a genuinely new

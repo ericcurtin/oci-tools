@@ -137,14 +137,17 @@
 //!   model) and `docs/design/0101`.
 //!
 //! Every metadata instruction (`ENV`/`LABEL`/`WORKDIR`/`USER`/
-//! `ENTRYPOINT`/`CMD`/`EXPOSE`/`VOLUME`/`STOPSIGNAL`/`MAINTAINER`,
-//! `ARG` per its own `--build-arg` handling above, `SHELL` as a
-//! no-op) is fully applied to a working copy of the `FROM` base
-//! image's own config, matching real `docker build`'s own
+//! `ENTRYPOINT`/`CMD`/`EXPOSE`/`VOLUME`/`STOPSIGNAL`/`MAINTAINER`/
+//! `HEALTHCHECK`, `ARG` per its own `--build-arg` handling above,
+//! `SHELL` as a no-op) is fully applied to a working copy of the
+//! `FROM` base image's own config, matching real `docker build`'s own
 //! `history`/config-mutation behavior for each. A stage with no `RUN`
 //! at all never materializes a rootfs and its built image's own layer
 //! list stays byte-identical to its base image's — the scratch rootfs
 //! is only ever created when the stage actually contains a `RUN`.
+//! (`HEALTHCHECK` is parsed and stored as inert image config metadata
+//! only — actually running it periodically against a live container
+//! is out of scope so far, see `docs/design/0116`.)
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -776,6 +779,21 @@ fn apply_instruction(
         Instruction::Maintainer(who) => {
             config.author = Some(who.clone());
             oci_dockerfile::record_empty_history(config, format!("MAINTAINER {who}"));
+        }
+        Instruction::Healthcheck(cmd) => {
+            let cc = config.config.get_or_insert_with(ContainerConfig::default);
+            cc.healthcheck = Some(oci_spec_types::image::HealthcheckConfig {
+                test: cmd.test.clone(),
+                interval: cmd.interval,
+                timeout: cmd.timeout,
+                start_period: cmd.start_period,
+                start_interval: cmd.start_interval,
+                retries: cmd.retries,
+            });
+            oci_dockerfile::record_empty_history(
+                config,
+                format!("HEALTHCHECK {}", cmd.test.join(" ")),
+            );
         }
     }
     Ok(())

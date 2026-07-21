@@ -7,14 +7,13 @@
 //! documentation.
 //!
 //! **Deliberately not handled yet** (see the crate's own doc comment
-//! for the reasoning): `ONBUILD`, `HEALTHCHECK`, heredocs
-//! (`<<EOF ... EOF`), `ARG`/`ENV` variable substitution/interpolation
-//! within other instructions' own arguments, and every BuildKit-only
-//! flag (`RUN --mount=`/`--network=`/`--security=`/`--device=`,
-//! `COPY --link`/`--parents`/`--exclude=`, `ADD --link`/
-//! `--keep-git-dir`/`--checksum=`/`--unpack`) — a Containerfile using
-//! any of these is rejected with a clear error, not silently
-//! misparsed.
+//! for the reasoning): `ONBUILD`, heredocs (`<<EOF ... EOF`), `ARG`/
+//! `ENV` variable substitution/interpolation within other
+//! instructions' own arguments, and every BuildKit-only flag (`RUN
+//! --mount=`/`--network=`/`--security=`/`--device=`, `COPY --link`/
+//! `--parents`/`--exclude=`, `ADD --link`/`--keep-git-dir`/
+//! `--checksum=`/`--unpack`) — a Containerfile using any of these is
+//! rejected with a clear error, not silently misparsed.
 
 use crate::lexer::LogicalLine;
 
@@ -53,6 +52,30 @@ pub struct AddFlags {
     pub chown: Option<String>,
     /// Permission mode to `chmod` the added files to.
     pub chmod: Option<String>,
+}
+
+/// A `HEALTHCHECK` instruction's own parsed value — see
+/// [`Instruction::Healthcheck`]'s own doc comment. Field shapes match
+/// real Docker's own `HealthcheckConfig` wire representation exactly
+/// (checked directly against `~/git/moby/vendor/github.com/moby/
+/// buildkit/frontend/dockerfile/instructions/parse.go`'s own
+/// `parseHealthcheck`), so `ociman build` can store this directly with
+/// no extra translation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HealthcheckCommand {
+    /// `["NONE"]`, `["CMD", ...]` (exec form), or `["CMD-SHELL",
+    /// "<command>"]` (shell form).
+    pub test: Vec<String>,
+    /// Nanoseconds; `0` means not given on this instruction.
+    pub interval: i64,
+    /// Nanoseconds; `0` means not given on this instruction.
+    pub timeout: i64,
+    /// Nanoseconds; `0` means not given on this instruction.
+    pub start_period: i64,
+    /// Nanoseconds; `0` means not given on this instruction.
+    pub start_interval: i64,
+    /// `0` means not given on this instruction.
+    pub retries: i64,
 }
 
 /// One parsed Dockerfile/Containerfile instruction. Argument values
@@ -132,6 +155,18 @@ pub enum Instruction {
     /// parseable syntax — matches real `parseString`'s own handling
     /// (a linter-only deprecation warning, never a parse error).
     Maintainer(String),
+    /// How to check the running container is healthy —
+    /// `HEALTHCHECK NONE` (explicitly disables any healthcheck
+    /// inherited from the base image) or `HEALTHCHECK
+    /// [--interval=][--timeout=][--start-period=][--start-interval=]
+    /// [--retries=] CMD <command>` (exec or shell form, same grammar
+    /// as `RUN`/`CMD`). **Executing a healthcheck periodically is out
+    /// of scope for this project so far** — this variant is only ever
+    /// parsed and stored as inert image config metadata (see
+    /// [`crate::commit`]/`ociman build`'s own `apply_instruction`),
+    /// matching this crate's own established "narrow first increment"
+    /// pattern.
+    Healthcheck(HealthcheckCommand),
 }
 
 /// Parse one logical line into an [`Instruction`]. `line_number` (from
@@ -215,7 +250,7 @@ pub fn parse_instruction(line: &LogicalLine) -> Result<Instruction, String> {
             Ok(Instruction::Shell(words))
         }
         "ONBUILD" => err("ONBUILD is not supported yet"),
-        "HEALTHCHECK" => err("HEALTHCHECK is not supported yet"),
+        "HEALTHCHECK" => parse_healthcheck(&rest).or_else(|e| err(&e)),
         "" => err("empty instruction"),
         other => err(&format!("unknown instruction {other:?}")),
     }
@@ -360,6 +395,171 @@ fn parse_add(rest: &str) -> Result<Instruction, String> {
         sources,
         dest,
     })
+}
+
+/// `HEALTHCHECK NONE` or `HEALTHCHECK [--interval=][--timeout=]
+/// [--start-period=][--start-interval=][--retries=] CMD <command>` —
+/// checked directly against real BuildKit's own `parseHealthcheck`
+/// (`~/git/moby/vendor/github.com/moby/buildkit/frontend/dockerfile/
+/// instructions/parse.go`): flags are parsed unconditionally (even
+/// ahead of `NONE`, matching the real parser's own "declare every flag
+/// before inspecting the type word" structure — a `--interval=` next
+/// to `NONE` parses without error, simply unused, exactly like real
+/// BuildKit), then the first remaining word is `NONE` (must be the
+/// only remaining word) or `CMD` (anything else is `"Unknown type ...
+/// in HEALTHCHECK (try CMD)"`, the real message verbatim) followed by
+/// a command in either shell or exec form, same as `RUN`/`CMD`.
+fn parse_healthcheck(rest: &str) -> Result<Instruction, String> {
+    let (raw_flags, rest) = split_leading_flags(rest);
+    let mut cmd = HealthcheckCommand::default();
+    for (name, value) in raw_flags {
+        match name.as_str() {
+            "interval" => cmd.interval = parse_optional_go_duration("interval", &value)?,
+            "timeout" => cmd.timeout = parse_optional_go_duration("timeout", &value)?,
+            "start-period" => {
+                cmd.start_period = parse_optional_go_duration("start-period", &value)?
+            }
+            "start-interval" => {
+                cmd.start_interval = parse_optional_go_duration("start-interval", &value)?
+            }
+            "retries" => {
+                if !value.is_empty() {
+                    let retries: i64 = value
+                        .parse()
+                        .map_err(|_| format!("HEALTHCHECK: invalid --retries value {value:?}"))?;
+                    if retries < 0 {
+                        return Err(format!("--retries cannot be negative ({retries})"));
+                    }
+                    cmd.retries = retries;
+                }
+            }
+            other => return Err(format!("HEALTHCHECK: unsupported flag --{other}")),
+        }
+    }
+
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return Err("HEALTHCHECK requires at least one argument".to_string());
+    }
+    let (typ, command_rest) = split_command(trimmed);
+    match typ.to_ascii_uppercase().as_str() {
+        "NONE" => {
+            if !command_rest.trim().is_empty() {
+                return Err("HEALTHCHECK NONE takes no arguments".to_string());
+            }
+            cmd.test = vec!["NONE".to_string()];
+        }
+        "CMD" => {
+            if command_rest.trim().is_empty() {
+                return Err("Missing command after HEALTHCHECK CMD".to_string());
+            }
+            cmd.test = match parse_shell_or_exec(&command_rest)? {
+                ShellOrExec::Exec(argv) => {
+                    let mut test = vec!["CMD".to_string()];
+                    test.extend(argv);
+                    test
+                }
+                ShellOrExec::Shell(command) => vec!["CMD-SHELL".to_string(), command],
+            };
+        }
+        other => return Err(format!("Unknown type {other:?} in HEALTHCHECK (try CMD)")),
+    }
+    Ok(Instruction::Healthcheck(cmd))
+}
+
+/// Parse a `HEALTHCHECK` duration flag's own value (`--interval=`/
+/// `--timeout=`/`--start-period=`/`--start-interval=`): an empty value
+/// (flag not given at all — [`split_leading_flags`] still reports it
+/// with an empty value if written bare, but every real caller always
+/// writes `--flag=value`) means "not given", `0`; anything else must
+/// parse via [`parse_go_duration`] and, unless it's exactly zero, be
+/// at least one millisecond — checked directly against real
+/// BuildKit's own `parseOptInterval`, including its own exact
+/// millisecond floor and its own `"%s cannot be less than %s"` message
+/// shape (`field` names which flag, matching `f.name` there).
+fn parse_optional_go_duration(field: &str, value: &str) -> Result<i64, String> {
+    if value.is_empty() {
+        return Ok(0);
+    }
+    let ns = parse_go_duration(value)?;
+    if ns == 0 {
+        return Ok(0);
+    }
+    const MINIMUM_DURATION_NS: i64 = 1_000_000; // 1ms, real BuildKit's own floor.
+    if ns < MINIMUM_DURATION_NS {
+        return Err(format!("{field} {value:?} cannot be less than 1ms"));
+    }
+    Ok(ns)
+}
+
+/// Parse a Go-style duration string (e.g. `"300ms"`, `"1.5h"`,
+/// `"2h45m"`) into a real nanosecond count — matches real Go's own
+/// `time.ParseDuration` grammar (checked directly against its own
+/// documented behavior): an optional sign, then one or more
+/// `<decimal-number><unit>` pairs concatenated with no separator
+/// (`"2h45m"`, not `"2h 45m"`), where a number may have a fractional
+/// part and a unit is one of `"ns"`, `"us"`/`"µs"`/`"μs"`, `"ms"`,
+/// `"s"`, `"m"`, `"h"`. The literal string `"0"` (no unit at all) is a
+/// real special case Go itself accepts.
+fn parse_go_duration(s: &str) -> Result<i64, String> {
+    if s == "0" {
+        return Ok(0);
+    }
+    let invalid = || format!("time: invalid duration {s:?}");
+    let mut chars = s.chars().peekable();
+    let negative = match chars.peek() {
+        Some('-') => {
+            chars.next();
+            true
+        }
+        Some('+') => {
+            chars.next();
+            false
+        }
+        _ => false,
+    };
+
+    let mut total_ns: f64 = 0.0;
+    let mut saw_any = false;
+    while chars.peek().is_some() {
+        let mut number = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() || c == '.' {
+                number.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if number.is_empty() {
+            return Err(invalid());
+        }
+        let mut unit = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() || c == '.' {
+                break;
+            }
+            unit.push(c);
+            chars.next();
+        }
+        let unit_ns: f64 = match unit.as_str() {
+            "ns" => 1.0,
+            "us" | "µs" | "μs" => 1_000.0,
+            "ms" => 1_000_000.0,
+            "s" => 1_000_000_000.0,
+            "m" => 60_000_000_000.0,
+            "h" => 3_600_000_000_000.0,
+            _ => return Err(format!("time: unknown unit {unit:?} in duration {s:?}")),
+        };
+        let value: f64 = number.parse().map_err(|_| invalid())?;
+        total_ns += value * unit_ns;
+        saw_any = true;
+    }
+    if !saw_any {
+        return Err(invalid());
+    }
+    let total_ns = total_ns.round() as i64;
+    Ok(if negative { -total_ns } else { total_ns })
 }
 
 fn parse_sources_and_dest(rest: &str) -> Result<(Vec<String>, String), String> {
@@ -804,17 +1004,161 @@ mod tests {
     }
 
     #[test]
-    fn onbuild_and_healthcheck_are_explicitly_rejected() {
+    fn onbuild_is_explicitly_rejected() {
         let line = LogicalLine {
             line_number: 1,
             text: "ONBUILD RUN echo hi".to_string(),
         };
         assert!(parse_instruction(&line).is_err());
+    }
+
+    #[test]
+    fn healthcheck_none_disables_any_inherited_healthcheck() {
+        assert_eq!(
+            parse("HEALTHCHECK NONE"),
+            Instruction::Healthcheck(HealthcheckCommand {
+                test: vec!["NONE".to_string()],
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn healthcheck_none_with_extra_arguments_is_an_error() {
         let line = LogicalLine {
             line_number: 1,
-            text: "HEALTHCHECK NONE".to_string(),
+            text: "HEALTHCHECK NONE extra".to_string(),
         };
-        assert!(parse_instruction(&line).is_err());
+        let err = parse_instruction(&line).unwrap_err();
+        assert!(err.contains("takes no arguments"), "{err}");
+    }
+
+    #[test]
+    fn healthcheck_cmd_shell_form_becomes_cmd_shell() {
+        assert_eq!(
+            parse("HEALTHCHECK CMD curl -f http://localhost/ || exit 1"),
+            Instruction::Healthcheck(HealthcheckCommand {
+                test: vec![
+                    "CMD-SHELL".to_string(),
+                    "curl -f http://localhost/ || exit 1".to_string()
+                ],
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn healthcheck_cmd_exec_form_becomes_cmd_with_argv() {
+        assert_eq!(
+            parse(r#"HEALTHCHECK CMD ["curl", "-f", "http://localhost/"]"#),
+            Instruction::Healthcheck(HealthcheckCommand {
+                test: vec![
+                    "CMD".to_string(),
+                    "curl".to_string(),
+                    "-f".to_string(),
+                    "http://localhost/".to_string(),
+                ],
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn healthcheck_cmd_with_no_command_is_an_error() {
+        let line = LogicalLine {
+            line_number: 1,
+            text: "HEALTHCHECK CMD".to_string(),
+        };
+        let err = parse_instruction(&line).unwrap_err();
+        assert!(err.contains("Missing command"), "{err}");
+    }
+
+    #[test]
+    fn healthcheck_unknown_type_is_a_clear_error() {
+        let line = LogicalLine {
+            line_number: 1,
+            text: "HEALTHCHECK FROBNICATE echo hi".to_string(),
+        };
+        let err = parse_instruction(&line).unwrap_err();
+        assert!(err.contains("Unknown type"), "{err}");
+        assert!(err.contains("try CMD"), "{err}");
+    }
+
+    #[test]
+    fn healthcheck_parses_every_flag_into_real_nanoseconds() {
+        assert_eq!(
+            parse(
+                "HEALTHCHECK --interval=5s --timeout=3s --start-period=30s \
+                 --start-interval=2s --retries=3 CMD [\"true\"]"
+            ),
+            Instruction::Healthcheck(HealthcheckCommand {
+                test: vec!["CMD".to_string(), "true".to_string()],
+                interval: 5_000_000_000,
+                timeout: 3_000_000_000,
+                start_period: 30_000_000_000,
+                start_interval: 2_000_000_000,
+                retries: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn healthcheck_compound_duration_matches_real_go_semantics() {
+        assert_eq!(
+            parse("HEALTHCHECK --interval=1h30m CMD [\"true\"]"),
+            Instruction::Healthcheck(HealthcheckCommand {
+                test: vec!["CMD".to_string(), "true".to_string()],
+                interval: 5_400_000_000_000,
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn healthcheck_negative_retries_is_a_clear_error() {
+        let line = LogicalLine {
+            line_number: 1,
+            text: "HEALTHCHECK --retries=-1 CMD true".to_string(),
+        };
+        let err = parse_instruction(&line).unwrap_err();
+        assert!(err.contains("cannot be negative"), "{err}");
+    }
+
+    #[test]
+    fn healthcheck_interval_under_one_millisecond_is_a_clear_error() {
+        let line = LogicalLine {
+            line_number: 1,
+            text: "HEALTHCHECK --interval=500us CMD true".to_string(),
+        };
+        let err = parse_instruction(&line).unwrap_err();
+        assert!(err.contains("cannot be less than 1ms"), "{err}");
+    }
+
+    #[test]
+    fn healthcheck_unsupported_flag_is_a_clear_error() {
+        let line = LogicalLine {
+            line_number: 1,
+            text: "HEALTHCHECK --bogus=1 CMD true".to_string(),
+        };
+        let err = parse_instruction(&line).unwrap_err();
+        assert!(err.contains("unsupported flag --bogus"), "{err}");
+    }
+
+    #[test]
+    fn parse_go_duration_matches_real_go_time_parseduration_examples() {
+        assert_eq!(parse_go_duration("0").unwrap(), 0);
+        assert_eq!(parse_go_duration("300ms").unwrap(), 300_000_000);
+        assert_eq!(parse_go_duration("1.5h").unwrap(), 5_400_000_000_000);
+        assert_eq!(
+            parse_go_duration("2h45m").unwrap(),
+            2 * 3_600_000_000_000 + 45 * 60_000_000_000
+        );
+        assert_eq!(parse_go_duration("-1.5h").unwrap(), -5_400_000_000_000);
+        assert_eq!(parse_go_duration("100ns").unwrap(), 100);
+        assert_eq!(parse_go_duration("1µs").unwrap(), 1_000);
+        assert_eq!(parse_go_duration("1us").unwrap(), 1_000);
+        assert!(parse_go_duration("bogus").is_err());
+        assert!(parse_go_duration("5x").is_err());
     }
 
     #[test]

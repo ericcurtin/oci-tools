@@ -46,10 +46,10 @@
 //!
 //! **Deliberately not implemented yet** in this crate, each a
 //! separate, later increment of its own:
-//! - `ONBUILD`, `HEALTHCHECK`, heredocs (`<<EOF ... EOF`), and every
-//!   BuildKit-only flag (`RUN --mount=`, `COPY --link`/`--parents`/
-//!   `--exclude=`, `ADD --link`/`--keep-git-dir`/`--checksum=`/
-//!   `--unpack`) — a Containerfile using any of these fails to parse
+//! - `ONBUILD`, heredocs (`<<EOF ... EOF`), and every BuildKit-only
+//!   flag (`RUN --mount=`, `COPY --link`/`--parents`/`--exclude=`,
+//!   `ADD --link`/`--keep-git-dir`/`--checksum=`/`--unpack`) — a
+//!   Containerfile using any of these fails to parse
 //!   with a clear error, rather than being silently misparsed.
 //! - `--build-arg`'s own CLI-string parsing (`KEY=value`/bare `KEY`
 //!   pulled from the calling process's own environment, matching real

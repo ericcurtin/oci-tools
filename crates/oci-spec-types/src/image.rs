@@ -347,6 +347,61 @@ pub struct ContainerConfig {
     /// `STOPSIGNAL` default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_signal: Option<String>,
+    /// `HEALTHCHECK` default, if the image (or a later stage building
+    /// on it) ever sets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<HealthcheckConfig>,
+}
+
+/// A `HEALTHCHECK` instruction's own effect on the image config —
+/// matches real Docker's own wire representation exactly (`Test`,
+/// `Interval`/`Timeout`/`StartPeriod`/`StartInterval` as nanosecond
+/// counts, `Retries`), so a real pulled image's own `Healthcheck`
+/// object (or one `ociman build` writes) round-trips byte for byte.
+/// `0` means "not set"/"inherit" for every numeric field here — the
+/// same convention real Docker's own `HealthcheckConfig` uses (a
+/// `HEALTHCHECK` instruction that never mentions `--interval=`, for
+/// instance, leaves it at its zero value, not some other sentinel).
+///
+/// **Executing a healthcheck periodically is out of scope for this
+/// project so far** — matches this project's own already-established
+/// "narrow first increment" pattern (e.g. `ociman top`'s own
+/// deliberately-narrower-than-real-podman scope): this struct is only
+/// ever parsed (`oci-dockerfile`'s own `HealthcheckCommand`), stored,
+/// and round-tripped (`ociman inspect`/`ociman history`/a later
+/// `FROM`), never actually run against a live container.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct HealthcheckConfig {
+    /// `["NONE"]` (explicitly disables any inherited healthcheck),
+    /// `["CMD", ...]` (exec form), or `["CMD-SHELL", "<command>"]`
+    /// (shell form) — matches real Docker's own `Test` field exactly,
+    /// the same three shapes `parse_healthcheck` already produces.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test: Vec<String>,
+    /// Nanoseconds between checks; `0` means inherit/unset.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub interval: i64,
+    /// Nanoseconds before a single check is considered hung; `0`
+    /// means inherit/unset.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub timeout: i64,
+    /// Nanoseconds the container gets to initialize before failures
+    /// count against `retries`; `0` means inherit/unset.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub start_period: i64,
+    /// Nanoseconds between checks during the start period; `0` means
+    /// inherit/unset.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub start_interval: i64,
+    /// Consecutive failures needed to consider the container
+    /// unhealthy; `0` means inherit/unset.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub retries: i64,
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
 }
 
 /// The `rootfs` object: how to reconstruct the container filesystem from
