@@ -221,19 +221,7 @@ pub fn cmd_build(
     let text = std::fs::read_to_string(&dockerfile_path)
         .with_context(|| format!("reading {}", dockerfile_path.display()))?;
 
-    // A `.dockerignore` at the context root, real `docker build`/
-    // `podman build` syntax and semantics (`oci_dockerfile::
-    // dockerignore`'s own doc comment has the exact rules, each
-    // checked directly against a real `podman build`) — no file at
-    // all means nothing is ever excluded, same as real docker/podman.
-    let dockerignore_path = context.join(".dockerignore");
-    let dockerignore_patterns = match std::fs::read_to_string(&dockerignore_path) {
-        Ok(text) => oci_dockerfile::parse_dockerignore(&text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => {
-            return Err(e).with_context(|| format!("reading {}", dockerignore_path.display()));
-        }
-    };
+    let dockerignore_patterns = read_ignore_patterns(context)?;
     let dockerignore = oci_dockerfile::DockerIgnore::compile(&dockerignore_patterns)
         .map_err(|_| anyhow::anyhow!("ociman build: invalid .dockerignore pattern"))?;
 
@@ -770,6 +758,51 @@ fn resolve_dockerfile_path(context: &Path, dockerfile: Option<&Path>) -> anyhow:
         "no Containerfile or Dockerfile found in {} (use -f/--file to specify one explicitly)",
         context.display()
     );
+}
+
+/// Read this build's own raw `.dockerignore`-syntax pattern list from
+/// `context`'s root — `.containerignore`, if present, wins outright;
+/// `.dockerignore` is only ever consulted as a fallback when
+/// `.containerignore` doesn't exist at all; neither one present means
+/// no patterns at all (nothing ever excluded). Checked directly
+/// against real buildah's own current source (`~/git/podman/vendor/
+/// go.podman.io/buildah/pkg/parse/parse.go`'s own `ContainerIgnoreFile`,
+/// the function real `podman build`/`buildah build` actually calls —
+/// confirmed independently with two real `podman build` runs, one
+/// with only `.containerignore` present, one with both present at
+/// once) and with real `podman`/`buildah`'s own documented rationale:
+/// `.containerignore` is the tool-neutral name this project (and
+/// podman/buildah) prefers, `.dockerignore` the long-established one
+/// every other build tool still emits and expects.
+///
+/// Deliberately narrower than real buildah in one specific way: a
+/// per-Containerfile-named ignore file (`<dockerfile>.containerignore`/
+/// `<dockerfile>.dockerignore`, e.g. `Containerfile.dev.dockerignore`)
+/// isn't recognized at all yet — real buildah's own source has a
+/// second, *inconsistent* precedence rule for exactly that shape
+/// (`.dockerignore` silently overwrites an already-found
+/// `.containerignore` there, the opposite of the plain, root-level
+/// rule this function implements), and a real Containerfile using a
+/// non-default name at all is itself a comparatively rare case this
+/// project hasn't seen a real need for yet — left for a dedicated,
+/// separately-scoped future increment rather than replicating an
+/// upstream self-inconsistency without its own real justification.
+fn read_ignore_patterns(context: &Path) -> anyhow::Result<Vec<String>> {
+    let containerignore_path = context.join(".containerignore");
+    match std::fs::read_to_string(&containerignore_path) {
+        Ok(text) => Ok(oci_dockerfile::parse_dockerignore(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let dockerignore_path = context.join(".dockerignore");
+            match std::fs::read_to_string(&dockerignore_path) {
+                Ok(text) => Ok(oci_dockerfile::parse_dockerignore(&text)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(e) => {
+                    Err(e).with_context(|| format!("reading {}", dockerignore_path.display()))
+                }
+            }
+        }
+        Err(e) => Err(e).with_context(|| format!("reading {}", containerignore_path.display())),
+    }
 }
 
 /// Apply one already-`$VAR`-expanded instruction to a working copy of

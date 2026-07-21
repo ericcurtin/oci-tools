@@ -3680,6 +3680,10 @@ fn write_dockerignore(dir: &Path, contents: &str) {
     std::fs::write(dir.join(".dockerignore"), contents).unwrap();
 }
 
+fn write_containerignore(dir: &Path, contents: &str) {
+    std::fs::write(dir.join(".containerignore"), contents).unwrap();
+}
+
 /// `.dockerignore` excludes a named file from a whole-context `COPY .
 /// /app` -- the most common real-world use -- while an un-matched
 /// file still copies normally. Every non-obvious `.dockerignore` rule
@@ -4223,4 +4227,139 @@ fn dockerignore_does_not_apply_to_copy_from_an_earlier_stage() {
         String::from_utf8_lossy(&run.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&run.stdout), "ignored\n");
+}
+
+/// `.containerignore` alone (no `.dockerignore` at all) works exactly
+/// like `.dockerignore` does -- confirmed directly against real
+/// `podman build`.
+#[test]
+fn containerignore_alone_excludes_a_named_file() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/containerignore-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("a.txt"), "a\n").unwrap();
+    std::fs::write(context_dir.path().join("b.txt"), "b\n").unwrap();
+    write_containerignore(context_dir.path(), "b.txt\n");
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/containerignore-base:latest\n\
+         COPY . /app\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/containerignore-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/containerignore-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "find /app -type f | sort",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "/app/.containerignore\n/app/Containerfile\n/app/a.txt\n"
+    );
+}
+
+/// When both `.containerignore` and `.dockerignore` exist at the
+/// context root, `.containerignore` wins outright -- `.dockerignore`
+/// is never even consulted, matching real `podman build`/`buildah
+/// build`'s own actual current behavior, confirmed directly (real
+/// `ContainerIgnoreFile` in `~/git/podman/vendor/go.podman.io/buildah/
+/// pkg/parse/parse.go`, and independently with a real `podman build`
+/// run against a context with both files present at once): a file
+/// `.dockerignore` alone would have excluded survives here, because
+/// `.containerignore`'s own pattern list is the only one that's ever
+/// read at all.
+#[test]
+fn containerignore_wins_outright_over_a_dockerignore_present_at_the_same_time() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/containerignore-precedence-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("a.txt"), "a\n").unwrap();
+    std::fs::write(context_dir.path().join("b.txt"), "b\n").unwrap();
+    // `.containerignore` excludes `b.txt`; `.dockerignore` excludes
+    // `a.txt` instead -- if `.dockerignore` were consulted at all,
+    // `a.txt` would be missing from the result below.
+    write_containerignore(context_dir.path(), "b.txt\n");
+    write_dockerignore(context_dir.path(), "a.txt\n");
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/containerignore-precedence-base:latest\n\
+         COPY . /app\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/containerignore-precedence-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/containerignore-precedence-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "find /app -type f | sort",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "/app/.containerignore\n/app/.dockerignore\n/app/Containerfile\n/app/a.txt\n"
+    );
 }
