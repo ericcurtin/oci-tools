@@ -208,6 +208,7 @@ pub fn cmd_build(
     build_args: &[String],
     target: Option<&str>,
     no_cache: bool,
+    tls_verify: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let tag = tag.context(
@@ -302,7 +303,7 @@ pub fn cmd_build(
                 let base_reference = Reference::parse(&stage.base_name).with_context(|| {
                     format!("parsing base image reference {:?}", stage.base_name)
                 })?;
-                let base_record = crate::resolve_or_pull(&store, &base_reference)?;
+                let base_record = crate::resolve_or_pull(&store, &base_reference, tls_verify)?;
                 let base_manifest = store
                     .image_manifest(&base_record)
                     .with_context(|| format!("reading manifest for {base_reference}"))?;
@@ -364,6 +365,7 @@ pub fn cmd_build(
             force_rootfs,
             &stage_ctx,
             &cache_candidates,
+            tls_verify,
         )?;
         built.insert(stage_index, built_stage);
     }
@@ -542,6 +544,7 @@ fn build_stage(
     force_rootfs: bool,
     stage_ctx: &StageContext<'_>,
     cache_candidates: &[crate::build_cache::CacheCandidate],
+    tls_verify: bool,
 ) -> anyhow::Result<BuiltStage> {
     let mut config = base_config;
     let mut layers = base_layers;
@@ -627,6 +630,7 @@ fn build_stage(
             stage_ctx,
             cache_candidates,
             &mut current_args,
+            tls_verify,
         )?;
     }
 
@@ -758,6 +762,7 @@ fn apply_instruction(
     stage_ctx: &StageContext<'_>,
     cache_candidates: &[crate::build_cache::CacheCandidate],
     current_args: &mut Vec<(String, String)>,
+    tls_verify: bool,
 ) -> anyhow::Result<()> {
     match instruction {
         Instruction::Run(shell_or_exec) => {
@@ -793,6 +798,7 @@ fn apply_instruction(
                 rootfs,
                 stage_ctx,
                 cache_candidates,
+                tls_verify,
             )?;
         }
         Instruction::Add {
@@ -1194,6 +1200,7 @@ fn copy_instruction(
     rootfs: &Path,
     stage_ctx: &StageContext<'_>,
     cache_candidates: &[crate::build_cache::CacheCandidate],
+    tls_verify: bool,
 ) -> anyhow::Result<()> {
     let chown = flags
         .chown
@@ -1242,7 +1249,7 @@ fn copy_instruction(
         Some(from) => match stage_ctx.rootfs_for(from) {
             Some(rootfs) => rootfs,
             None => {
-                _external_image_cache_dir = external_image_source_root(store, from)
+                _external_image_cache_dir = external_image_source_root(store, from, tls_verify)
                     .with_context(|| format!("ociman build: COPY --from={from:?}"))?;
                 _external_image_cache_dir.as_path()
             }
@@ -1646,14 +1653,18 @@ fn add_instruction(
 /// `--from=` source more than once (in one build or across several) —
 /// previously paid the real decompress-and-extract cost every single
 /// time, now paid at most once, ever, per distinct manifest digest.
-fn external_image_source_root(store: &oci_store::Store, from: &str) -> anyhow::Result<PathBuf> {
+fn external_image_source_root(
+    store: &oci_store::Store,
+    from: &str,
+    tls_verify: bool,
+) -> anyhow::Result<PathBuf> {
     let reference = Reference::parse(from).with_context(|| {
         format!(
             "{from:?} is neither an earlier stage in this Containerfile nor a valid image \
              reference"
         )
     })?;
-    let record = crate::resolve_or_pull(store, &reference)?;
+    let record = crate::resolve_or_pull(store, &reference, tls_verify)?;
     let manifest = store
         .image_manifest(&record)
         .with_context(|| format!("reading manifest for {reference}"))?;

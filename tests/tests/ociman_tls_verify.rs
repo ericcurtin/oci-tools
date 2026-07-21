@@ -16,7 +16,8 @@ use std::path::Path;
 use std::process::Command;
 use std::thread;
 
-use oci_tools_tests::bin_path;
+use oci_store::Store;
+use oci_tools_tests::{bin_path, busybox_path, seed_image};
 
 fn ociman(storage_root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin_path("ociman"))
@@ -98,6 +99,86 @@ fn start_mock_with_a_real_image() -> MockRegistry {
 
     let layer_bytes = b"a fake layer tarball".to_vec();
     let layer_digest = oci_spec_types::digest::sha256(&layer_bytes);
+
+    let manifest = oci_spec_types::image::ImageManifest {
+        schema_version: 2,
+        media_type: Some(oci_spec_types::image::MEDIA_TYPE_IMAGE_MANIFEST.to_string()),
+        config: oci_spec_types::image::Descriptor {
+            media_type: oci_spec_types::image::MEDIA_TYPE_IMAGE_CONFIG.to_string(),
+            digest: config_digest.clone(),
+            size: config_bytes.len() as u64,
+            urls: vec![],
+            annotations: Default::default(),
+            platform: None,
+        },
+        layers: vec![oci_spec_types::image::Descriptor {
+            media_type: oci_spec_types::image::MEDIA_TYPE_IMAGE_LAYER_GZIP.to_string(),
+            digest: layer_digest.clone(),
+            size: layer_bytes.len() as u64,
+            urls: vec![],
+            annotations: Default::default(),
+            platform: None,
+        }],
+        annotations: Default::default(),
+    };
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/v2/testrepo/manifests/latest".to_string(),
+        (
+            oci_spec_types::image::MEDIA_TYPE_IMAGE_MANIFEST,
+            manifest_bytes,
+        ),
+    );
+    routes.insert(
+        format!("/v2/testrepo/blobs/{config_digest}"),
+        ("application/octet-stream", config_bytes),
+    );
+    routes.insert(
+        format!("/v2/testrepo/blobs/{layer_digest}"),
+        ("application/octet-stream", layer_bytes),
+    );
+    MockRegistry::start(routes)
+}
+
+/// Same shape as [`start_mock_with_a_real_image`], except its one
+/// layer is a *real* tar+gzip archive containing a single regular
+/// file — needed by `ociman build`'s own `FROM`/`COPY --from=` path,
+/// which (unlike plain `ociman pull`) actually extracts a layer into
+/// a real rootfs cache directory whenever the stage runs a `RUN`/
+/// `COPY` or is itself a `COPY --from=` source (see `ensure_cached` in
+/// `crates/oci-store/src/rootfs_cache.rs`); a non-tar placeholder blob
+/// like `start_mock_with_a_real_image`'s would fail to extract.
+fn start_mock_with_a_real_extractable_image() -> MockRegistry {
+    let mut tar_builder = tar::Builder::new(Vec::new());
+    let contents = b"from the external image\n";
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_size(contents.len() as u64);
+    header.set_mode(0o644);
+    tar_builder
+        .append_data(&mut header, "marker.txt", &contents[..])
+        .unwrap();
+    let tar_bytes = tar_builder.into_inner().unwrap();
+    let diff_id = oci_spec_types::digest::sha256(&tar_bytes);
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar_bytes).unwrap();
+    let layer_bytes = encoder.finish().unwrap();
+    let layer_digest = oci_spec_types::digest::sha256(&layer_bytes);
+
+    let config = oci_spec_types::image::ImageConfig {
+        architecture: Some(std::env::consts::ARCH.to_string()),
+        os: Some("linux".to_string()),
+        rootfs: oci_spec_types::image::RootFs {
+            kind: "layers".to_string(),
+            diff_ids: vec![diff_id],
+        },
+        ..Default::default()
+    };
+    let config_bytes = serde_json::to_vec(&config).unwrap();
+    let config_digest = oci_spec_types::digest::sha256(&config_bytes);
 
     let manifest = oci_spec_types::image::ImageManifest {
         schema_version: 2,
@@ -336,4 +417,163 @@ fn push_without_tls_verify_false_refuses_plain_http_by_default() {
         &["push", &format!("{}/testrepo:latest", dest_mock.addr)],
     );
     assert!(!push.status.success());
+}
+
+fn write_containerfile(dir: &Path, contents: &str) {
+    std::fs::write(dir.join("Containerfile"), contents).unwrap();
+}
+
+/// `ociman build`'s own `FROM <registry>/...` path shares `resolve_or_
+/// pull` with `ociman pull`/`ociman run` (see `docs/design/0129`), so
+/// this proves `--tls-verify` actually reaches it too, not just the
+/// standalone `pull`/`push`/`run` commands already covered above. No
+/// `RUN`/`COPY` in this stage, so nothing ever extracts the mock's
+/// layer — a metadata-only instruction (`LABEL`) is enough to force a
+/// real build, matching `ociman_build.rs`'s own metadata-only test.
+#[test]
+fn build_from_with_tls_verify_false_pulls_the_base_image_over_plain_http() {
+    let mock = start_mock_with_a_real_image();
+    let storage_dir = tempfile::tempdir().unwrap();
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!(
+            "FROM {}/testrepo:latest\nLABEL pulled=over-plain-http\n",
+            mock.addr
+        ),
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "tls-verify-test/from-result:latest",
+            "--tls-verify=false",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+#[test]
+fn build_from_without_tls_verify_false_refuses_plain_http_by_default() {
+    let mock = start_mock_with_a_real_image();
+    let storage_dir = tempfile::tempdir().unwrap();
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!(
+            "FROM {}/testrepo:latest\nLABEL pulled=over-plain-http\n",
+            mock.addr
+        ),
+    );
+
+    // Default (`--tls-verify` omitted): attempts HTTPS against a
+    // registry that only ever speaks plain HTTP here.
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "tls-verify-test/from-result:latest",
+        ],
+    );
+    assert!(!build.status.success());
+}
+
+/// `COPY --from=<external-image>`'s own pull call site
+/// (`external_image_source_root` in `bin/ociman/src/build.rs`) is a
+/// second, separate `resolve_or_pull` call site from `FROM`'s —
+/// exercised here specifically because it's the one that actually
+/// extracts the pulled layer into a real rootfs cache directory
+/// (`ensure_cached`), unlike the metadata-only `FROM` test above.
+#[test]
+fn build_copy_from_with_tls_verify_false_pulls_and_extracts_over_plain_http() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let mock = start_mock_with_a_real_extractable_image();
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "tls-verify-test/copyfrom-consumer-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        oci_spec_types::image::ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!(
+            "FROM tls-verify-test/copyfrom-consumer-base:latest\n\
+             COPY --from={}/testrepo:latest /marker.txt /marker.txt\n",
+            mock.addr
+        ),
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "tls-verify-test/copyfrom-result:latest",
+            "--tls-verify=false",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+#[test]
+fn build_copy_from_without_tls_verify_false_refuses_plain_http_by_default() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let mock = start_mock_with_a_real_extractable_image();
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "tls-verify-test/copyfrom-consumer-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        oci_spec_types::image::ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!(
+            "FROM tls-verify-test/copyfrom-consumer-base:latest\n\
+             COPY --from={}/testrepo:latest /marker.txt /marker.txt\n",
+            mock.addr
+        ),
+    );
+
+    // Default (`--tls-verify` omitted): attempts HTTPS against a
+    // registry that only ever speaks plain HTTP here.
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "tls-verify-test/copyfrom-result:latest",
+        ],
+    );
+    assert!(!build.status.success());
 }

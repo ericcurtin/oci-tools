@@ -183,6 +183,13 @@ enum Command {
         /// for how the cache this disables actually works.
         #[arg(long = "no-cache")]
         no_cache: bool,
+        /// Require HTTPS and verify certificates when pulling any
+        /// external base image this build's own `FROM`/`COPY --from=`
+        /// needs (only consulted for one not already present in local
+        /// storage) — see `Command::Pull`'s own identical flag for
+        /// the exact same syntax/semantics.
+        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        tls_verify: bool,
     },
     /// List images in local storage.
     Images,
@@ -523,6 +530,12 @@ enum Command {
         /// container, not a bug specific to `-v`.
         #[arg(short, long = "volume", value_name = "HOST:CONTAINER[:ro]")]
         volume: Vec<String>,
+        /// Require HTTPS and verify certificates when pulling `image`
+        /// (only consulted if it isn't already present in local
+        /// storage) — see `Command::Pull`'s own identical flag for the
+        /// exact same syntax/semantics.
+        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        tls_verify: bool,
     },
     /// List containers.
     Ps {
@@ -676,6 +689,7 @@ fn main() -> std::process::ExitCode {
                 build_arg,
                 target,
                 no_cache,
+                tls_verify,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
@@ -683,6 +697,7 @@ fn main() -> std::process::ExitCode {
                 &build_arg,
                 target.as_deref(),
                 no_cache,
+                tls_verify,
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),
@@ -713,6 +728,7 @@ fn main() -> std::process::ExitCode {
                 workdir,
                 entrypoint,
                 volume,
+                tls_verify,
             }) => cmd_run(
                 &image,
                 &args,
@@ -735,6 +751,7 @@ fn main() -> std::process::ExitCode {
                 workdir.as_deref(),
                 entrypoint.as_deref(),
                 &volume,
+                tls_verify,
             ),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
@@ -1514,6 +1531,7 @@ fn cmd_run(
     workdir: Option<&str>,
     entrypoint: Option<&str>,
     volumes: &[String],
+    tls_verify: bool,
 ) -> anyhow::Result<()> {
     let entrypoint = entrypoint.map(parse_entrypoint);
     let volumes = volumes
@@ -1567,7 +1585,7 @@ fn cmd_run(
     let reference = Reference::parse(image_ref)
         .with_context(|| format!("parsing image reference {image_ref:?}"))?;
     let store = open_store()?;
-    let record = resolve_or_pull(&store, &reference)?;
+    let record = resolve_or_pull(&store, &reference, tls_verify)?;
 
     let manifest = store
         .image_manifest(&record)
@@ -2522,14 +2540,20 @@ fn cmd_logs(id: &str) -> anyhow::Result<()> {
 
 /// Look `reference` up in local storage, pulling it first if it isn't
 /// there yet (mirrors `cmd_pull`, minus the summary printing).
-fn resolve_or_pull(store: &Store, reference: &Reference) -> anyhow::Result<ImageRecord> {
+/// `tls_verify` matches `Command::Pull`'s own identical flag — see
+/// `registry_client`'s own doc comment.
+fn resolve_or_pull(
+    store: &Store,
+    reference: &Reference,
+    tls_verify: bool,
+) -> anyhow::Result<ImageRecord> {
     if let Some(record) = store
         .resolve_image(&reference.to_string())
         .with_context(|| format!("looking up {reference} in local storage"))?
     {
         return Ok(record);
     }
-    let mut client = oci_registry::Client::new();
+    let mut client = registry_client(reference.registry_host(), tls_verify);
     let progress = oci_cli_common::progress::spinner(format!("pulling {}", reference.familiar()));
     let result = oci_registry::pull_image(&mut client, store, reference, &Platform::host())
         .with_context(|| format!("pulling {reference}"));
