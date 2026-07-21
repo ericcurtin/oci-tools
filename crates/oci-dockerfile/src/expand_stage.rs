@@ -259,12 +259,18 @@ fn expand_instruction(
         // comment. `HEALTHCHECK CMD <command>`'s own command line is
         // exactly the same kind of shell/exec command line as
         // `RUN`/`CMD`/`ENTRYPOINT`, never expanded here for the same
-        // reason.
+        // reason. `ONBUILD`'s own stored trigger text is raw,
+        // unparsed, and re-parsed fresh at the point it actually fires
+        // in a *later*, separate build (`parse_onbuild_trigger`) --
+        // this build's own `$VAR` state has no bearing on that later
+        // build's own environment, so expanding it here would be
+        // outright wrong, not just unnecessary.
         Instruction::Run(_)
         | Instruction::Cmd(_)
         | Instruction::Entrypoint(_)
         | Instruction::Shell(_)
         | Instruction::Healthcheck(_)
+        | Instruction::Onbuild(_)
         | Instruction::From { .. } => Ok(instruction.clone()),
     }
 }

@@ -351,6 +351,20 @@ pub struct ContainerConfig {
     /// on it) ever sets one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<HealthcheckConfig>,
+    /// Raw, unparsed `ONBUILD` trigger texts registered by this exact
+    /// image (never inherited further than one `FROM` — see
+    /// `oci-dockerfile`'s own `Instruction::Onbuild` for the full
+    /// real-Docker-matching semantics `ociman build` implements: a
+    /// later build's own `FROM` resolving to this image runs each of
+    /// these, in order, then clears this list in the *resulting*
+    /// image's own config, unless that later build declares new
+    /// `ONBUILD` instructions of its own).
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub on_build: Vec<String>,
 }
 
 /// A `HEALTHCHECK` instruction's own effect on the image config —
@@ -377,7 +391,16 @@ pub struct HealthcheckConfig {
     /// `["CMD", ...]` (exec form), or `["CMD-SHELL", "<command>"]`
     /// (shell form) — matches real Docker's own `Test` field exactly,
     /// the same three shapes `parse_healthcheck` already produces.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// `deserialize_with = "null_as_default"` for the same
+    /// proven-real reason `exposed_ports`/`volumes`/`labels`/
+    /// `on_build` all need it: a nil Go slice marshals to a literal
+    /// JSON `null`, not `[]`, and a bare `#[serde(default)]` alone
+    /// only covers the field being *absent*, not explicitly `null`.
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub test: Vec<String>,
     /// Nanoseconds between checks; `0` means inherit/unset.
     #[serde(default, skip_serializing_if = "is_zero_i64")]
@@ -541,6 +564,31 @@ mod tests {
                 .get("org.opencontainers.image.version"),
             Some(&"24.04".to_string())
         );
+        // This exact real fixture's own `"OnBuild": null` is what this
+        // struct's own `on_build` field needs `null_as_default` for
+        // too, the same real bug class as `volumes` above — caught by
+        // this project's own full test suite the moment `on_build` was
+        // added without it (0118).
+        assert!(container_config.on_build.is_empty());
+    }
+
+    #[test]
+    fn healthcheck_test_tolerates_an_explicit_null_the_same_way_onbuild_does() {
+        // Synthetic (no known real image's own fixture happens to
+        // combine a set `Healthcheck` object with a literal `null`
+        // `Test` specifically) but exercising the exact same real bug
+        // class as `on_build`/`volumes` above, proactively fixed
+        // rather than waiting to find a real fixture that hits it.
+        let raw = r#"{
+            "rootfs": {"type": "layers", "diff_ids": []},
+            "config": {
+                "Healthcheck": {"Test": null, "Retries": 3}
+            }
+        }"#;
+        let config: ImageConfig = serde_json::from_str(raw).unwrap();
+        let healthcheck = config.config.unwrap().healthcheck.unwrap();
+        assert!(healthcheck.test.is_empty());
+        assert_eq!(healthcheck.retries, 3);
     }
 
     #[test]

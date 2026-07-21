@@ -7,13 +7,13 @@
 //! documentation.
 //!
 //! **Deliberately not handled yet** (see the crate's own doc comment
-//! for the reasoning): `ONBUILD`, heredocs (`<<EOF ... EOF`), `ARG`/
-//! `ENV` variable substitution/interpolation within other
-//! instructions' own arguments, and every BuildKit-only flag (`RUN
-//! --mount=`/`--network=`/`--security=`/`--device=`, `COPY --link`/
-//! `--parents`/`--exclude=`, `ADD --link`/`--keep-git-dir`/
-//! `--checksum=`/`--unpack`) — a Containerfile using any of these is
-//! rejected with a clear error, not silently misparsed.
+//! for the reasoning): heredocs (`<<EOF ... EOF`), `ARG`/`ENV`
+//! variable substitution/interpolation within other instructions' own
+//! arguments, and every BuildKit-only flag (`RUN --mount=`/
+//! `--network=`/`--security=`/`--device=`, `COPY --link`/`--parents`/
+//! `--exclude=`, `ADD --link`/`--keep-git-dir`/`--checksum=`/
+//! `--unpack`) — a Containerfile using any of these is rejected with a
+//! clear error, not silently misparsed.
 
 use crate::lexer::LogicalLine;
 
@@ -167,6 +167,22 @@ pub enum Instruction {
     /// matching this crate's own established "narrow first increment"
     /// pattern.
     Healthcheck(HealthcheckCommand),
+    /// `ONBUILD <instruction>` — registers `<instruction>`'s own raw,
+    /// unparsed text (everything after the `ONBUILD ` prefix,
+    /// case-insensitively stripped) to run later, in order, the
+    /// moment a *different* build's own `FROM` resolves to this image
+    /// — never in the build that declares it. Stored as a raw string
+    /// rather than a pre-parsed [`Instruction`], matching real
+    /// BuildKit's own `OnbuildCommand.Expression` exactly: the trigger
+    /// is only ever parsed fresh at the point it actually fires (see
+    /// [`parse_onbuild_trigger`]), not when this `ONBUILD` instruction
+    /// itself is first declared — real, checked-directly rule
+    /// (`~/git/moby/daemon/builder/dockerfile/dispatchers.go`'s own
+    /// `dispatchTriggeredOnBuild`). `ONBUILD ONBUILD ...` (chaining)
+    /// and `ONBUILD FROM`/`ONBUILD MAINTAINER` are all real,
+    /// checked-directly parse errors, rejected by [`parse_onbuild`]
+    /// itself, never reaching this variant.
+    Onbuild(String),
 }
 
 /// Parse one logical line into an [`Instruction`]. `line_number` (from
@@ -249,7 +265,7 @@ pub fn parse_instruction(line: &LogicalLine) -> Result<Instruction, String> {
             }
             Ok(Instruction::Shell(words))
         }
-        "ONBUILD" => err("ONBUILD is not supported yet"),
+        "ONBUILD" => parse_onbuild(&rest).or_else(|e| err(&e)),
         "HEALTHCHECK" => parse_healthcheck(&rest).or_else(|e| err(&e)),
         "" => err("empty instruction"),
         other => err(&format!("unknown instruction {other:?}")),
@@ -409,6 +425,54 @@ fn parse_add(rest: &str) -> Result<Instruction, String> {
 /// only remaining word) or `CMD` (anything else is `"Unknown type ...
 /// in HEALTHCHECK (try CMD)"`, the real message verbatim) followed by
 /// a command in either shell or exec form, same as `RUN`/`CMD`.
+/// `ONBUILD <instruction>` — checked directly against real BuildKit's
+/// own `parseOnBuild` (`~/git/moby/vendor/github.com/moby/buildkit/
+/// frontend/dockerfile/instructions/parse.go`): the wrapped
+/// instruction's own name (its first word) may not itself be
+/// `ONBUILD` (no chaining — real error message wording matched
+/// verbatim), `FROM`, or `MAINTAINER` (both rejected with real
+/// BuildKit's own `"%s isn't allowed as an ONBUILD trigger"` wording).
+/// Anything else is accepted and stored **verbatim** (not parsed
+/// here at all — see [`Instruction::Onbuild`]'s own doc comment for
+/// why), even if it would later turn out to be its own parse error
+/// once actually triggered — matches real BuildKit exactly: `ONBUILD`
+/// only checks the *first word*, nothing about the rest of the line.
+fn parse_onbuild(rest: &str) -> Result<Instruction, String> {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return Err("ONBUILD requires at least one argument".to_string());
+    }
+    let (trigger_name, _) = split_command(trimmed);
+    match trigger_name.to_ascii_uppercase().as_str() {
+        "ONBUILD" => return Err("Chaining ONBUILD via `ONBUILD ONBUILD` isn't allowed".to_string()),
+        "MAINTAINER" | "FROM" => {
+            return Err(format!(
+                "{} isn't allowed as an ONBUILD trigger",
+                trigger_name.to_ascii_uppercase()
+            ));
+        }
+        _ => {}
+    }
+    Ok(Instruction::Onbuild(trimmed.to_string()))
+}
+
+/// Parse a single, already-isolated instruction line — no logical-line
+/// continuation/comment-splicing needed (see `crate::lexer` for that,
+/// irrelevant here: an `ONBUILD` trigger's own stored text is already
+/// one complete instruction, never split across several source
+/// lines). Used by `ociman build` to re-parse an `ONBUILD` trigger's
+/// raw stored text at the exact point it actually fires — a later,
+/// separate build's own `FROM` resolving to an image that declared
+/// one — matching real BuildKit's own `dispatchTriggeredOnBuild`,
+/// which parses the trigger fresh at that later point too, not when
+/// `ONBUILD` was first declared.
+pub fn parse_onbuild_trigger(text: &str) -> Result<Instruction, String> {
+    parse_instruction(&LogicalLine {
+        line_number: 0,
+        text: text.to_string(),
+    })
+}
+
 fn parse_healthcheck(rest: &str) -> Result<Instruction, String> {
     let (raw_flags, rest) = split_leading_flags(rest);
     let mut cmd = HealthcheckCommand::default();
@@ -1004,12 +1068,83 @@ mod tests {
     }
 
     #[test]
-    fn onbuild_is_explicitly_rejected() {
+    fn onbuild_stores_the_wrapped_instructions_raw_text_verbatim() {
+        assert_eq!(
+            parse("ONBUILD RUN echo hi"),
+            Instruction::Onbuild("RUN echo hi".to_string())
+        );
+        assert_eq!(
+            parse("ONBUILD COPY . /app"),
+            Instruction::Onbuild("COPY . /app".to_string())
+        );
+    }
+
+    #[test]
+    fn onbuild_with_no_argument_is_an_error() {
         let line = LogicalLine {
             line_number: 1,
-            text: "ONBUILD RUN echo hi".to_string(),
+            text: "ONBUILD".to_string(),
         };
-        assert!(parse_instruction(&line).is_err());
+        let err = parse_instruction(&line).unwrap_err();
+        assert!(err.contains("at least one argument"), "{err}");
+    }
+
+    #[test]
+    fn onbuild_chaining_is_a_clear_error() {
+        let line = LogicalLine {
+            line_number: 1,
+            text: "ONBUILD ONBUILD RUN echo hi".to_string(),
+        };
+        let err = parse_instruction(&line).unwrap_err();
+        assert!(err.contains("Chaining ONBUILD"), "{err}");
+    }
+
+    #[test]
+    fn onbuild_rejects_from_and_maintainer_as_triggers() {
+        let line = LogicalLine {
+            line_number: 1,
+            text: "ONBUILD FROM ubuntu".to_string(),
+        };
+        let err = parse_instruction(&line).unwrap_err();
+        assert!(err.contains("isn't allowed as an ONBUILD trigger"), "{err}");
+
+        let line = LogicalLine {
+            line_number: 1,
+            text: "ONBUILD MAINTAINER someone@example.com".to_string(),
+        };
+        let err = parse_instruction(&line).unwrap_err();
+        assert!(err.contains("isn't allowed as an ONBUILD trigger"), "{err}");
+    }
+
+    #[test]
+    fn onbuild_trigger_name_check_is_case_insensitive() {
+        let line = LogicalLine {
+            line_number: 1,
+            text: "onbuild from ubuntu".to_string(),
+        };
+        let err = parse_instruction(&line).unwrap_err();
+        assert!(err.contains("isn't allowed as an ONBUILD trigger"), "{err}");
+    }
+
+    #[test]
+    fn parse_onbuild_trigger_reparses_the_stored_raw_text_into_a_real_instruction() {
+        assert_eq!(
+            parse_onbuild_trigger("COPY . /app").unwrap(),
+            Instruction::Copy {
+                flags: CopyFlags::default(),
+                sources: vec![".".to_string()],
+                dest: "/app".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_onbuild_trigger("RUN echo hi").unwrap(),
+            Instruction::Run(ShellOrExec::Shell("echo hi".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_onbuild_trigger_surfaces_a_real_parse_error() {
+        assert!(parse_onbuild_trigger("").is_err());
     }
 
     #[test]

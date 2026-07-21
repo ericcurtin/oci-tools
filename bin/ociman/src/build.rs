@@ -108,6 +108,15 @@
 //!   `Config.Env` still gets seeded with the same default `PATH`
 //!   neither real tool leaves out even here. See
 //!   [`scratch_base_config`]'s own doc comment.
+//! * **`ONBUILD` is supported**, real cross-build execution included
+//!   (not just parsed and stored, unlike `HEALTHCHECK`): a trigger is
+//!   stored verbatim by the build that declares it, then actually
+//!   fires — in order, before any of a later, separate build's own
+//!   explicit instructions — the moment that later build's own `FROM`
+//!   resolves to this image, and is consumed exactly once (never
+//!   propagated past that one `FROM`, unless the later build declares
+//!   new `ONBUILD` triggers of its own) — matching real `docker
+//!   build`/`podman build` exactly. See `docs/design/0118`.
 //! * **`--build-arg KEY=value` (or bare `--build-arg KEY`, pulling
 //!   from `ociman`'s own process environment) is supported**,
 //!   matching real `docker build --build-arg`/`podman build
@@ -289,6 +298,38 @@ pub fn cmd_build(
                 )
             }
         };
+
+        // Real Docker/BuildKit rule, checked directly
+        // (`~/git/moby/daemon/builder/dockerfile/dispatchers.go`'s own
+        // `initializeStage`/`dispatchTriggeredOnBuild`): any `ONBUILD`
+        // trigger the base's own config carries fires immediately, in
+        // order, right after `FROM` resolves -- before any of this
+        // stage's own explicit instructions -- and is consumed exactly
+        // once. `std::mem::take` both fires it here *and* clears it
+        // from `base_config` in the same step, so the built image this
+        // stage produces only ever carries whatever *new* `ONBUILD`
+        // instructions this stage itself declares, never the ones
+        // that already fired here -- matching real Docker's own "only
+        // ever inherited one `FROM` deep" behavior exactly.
+        let mut base_config = base_config;
+        let onbuild_triggers = base_config
+            .config
+            .as_mut()
+            .map(|cc| std::mem::take(&mut cc.on_build))
+            .unwrap_or_default();
+        let mut stage = stage;
+        if !onbuild_triggers.is_empty() {
+            let mut prefixed =
+                Vec::with_capacity(onbuild_triggers.len() + stage.instructions.len());
+            for trigger in &onbuild_triggers {
+                let instruction = oci_dockerfile::parse_onbuild_trigger(trigger).map_err(|e| {
+                    anyhow::anyhow!("ociman build: re-parsing ONBUILD trigger {trigger:?}: {e}")
+                })?;
+                prefixed.push(instruction);
+            }
+            prefixed.extend(stage.instructions);
+            stage.instructions = prefixed;
+        }
 
         let stage_ctx = StageContext {
             stages: &stages,
@@ -794,6 +835,11 @@ fn apply_instruction(
                 config,
                 format!("HEALTHCHECK {}", cmd.test.join(" ")),
             );
+        }
+        Instruction::Onbuild(trigger) => {
+            let cc = config.config.get_or_insert_with(ContainerConfig::default);
+            cc.on_build.push(trigger.clone());
+            oci_dockerfile::record_empty_history(config, format!("ONBUILD {trigger}"));
         }
     }
     Ok(())

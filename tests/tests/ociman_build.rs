@@ -335,6 +335,203 @@ fn healthcheck_with_an_invalid_flag_is_a_clear_build_error() {
     assert!(stderr.contains("cannot be negative"), "{stderr}");
 }
 
+/// End-to-end, real cross-build `ONBUILD`: the trigger is stored (not
+/// run) by the build that declares it, then actually fires -- a real
+/// new layer, a real file the trigger's own `RUN` created -- the
+/// moment a *later*, separate build's own `FROM` resolves to that
+/// image, matching real `docker build`/`podman build` exactly.
+#[test]
+fn onbuild_trigger_fires_in_a_later_build_using_this_image_as_its_base() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/onbuild-plain-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    // First build: declares ONBUILD, never runs it.
+    let declaring_context = tempfile::tempdir().unwrap();
+    write_containerfile(
+        declaring_context.path(),
+        "FROM ociman-test/onbuild-plain-base:latest\n\
+         ONBUILD RUN echo hi > /onbuild-marker.txt\n",
+    );
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            declaring_context.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/onbuild-declaring:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let declaring_record = store
+        .resolve_image("docker.io/ociman-test/onbuild-declaring:latest")
+        .unwrap()
+        .unwrap();
+    let declaring_config = store.image_config(&declaring_record).unwrap();
+    assert_eq!(
+        declaring_config.config.unwrap().on_build,
+        vec!["RUN echo hi > /onbuild-marker.txt".to_string()],
+        "the declaring build itself must only ever store the trigger, never run it"
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/onbuild-declaring:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "test -f /onbuild-marker.txt && echo present || echo absent",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "absent\n");
+
+    // Second, separate build: FROM the first build's own result, no
+    // instructions of its own at all -- the ONBUILD trigger must
+    // still fire, producing a real new layer with the real file its
+    // own RUN step created.
+    let child_context = tempfile::tempdir().unwrap();
+    write_containerfile(
+        child_context.path(),
+        "FROM ociman-test/onbuild-declaring:latest\n",
+    );
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            child_context.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/onbuild-child:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let child_record = store
+        .resolve_image("docker.io/ociman-test/onbuild-child:latest")
+        .unwrap()
+        .unwrap();
+    let child_manifest = store.image_manifest(&child_record).unwrap();
+    let declaring_manifest = store.image_manifest(&declaring_record).unwrap();
+    assert_eq!(
+        child_manifest.layers.len(),
+        declaring_manifest.layers.len() + 1,
+        "the fired ONBUILD trigger must produce exactly one real new layer"
+    );
+    // Consumed exactly once -- the child's own config carries no
+    // ONBUILD of its own, so it never propagates to a hypothetical
+    // grandchild build.
+    let child_config = store.image_config(&child_record).unwrap();
+    assert!(
+        child_config
+            .config
+            .map(|cc| cc.on_build)
+            .unwrap_or_default()
+            .is_empty()
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/onbuild-child:latest",
+            "--",
+            "/bin/cat",
+            "/onbuild-marker.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "hi\n");
+}
+
+/// A malformed `ONBUILD` trigger (anything past the trigger keyword
+/// itself is never validated at declare time -- see `parse_onbuild`'s
+/// own doc comment) surfaces as a real, clear error only once a later
+/// build actually re-parses and fires it, not silently ignored or
+/// misapplied.
+#[test]
+fn onbuild_trigger_with_an_unparseable_body_is_a_clear_error_when_it_fires() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/onbuild-bad-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let declaring_context = tempfile::tempdir().unwrap();
+    write_containerfile(
+        declaring_context.path(),
+        "FROM ociman-test/onbuild-bad-base:latest\n\
+         ONBUILD FROBNICATE something\n",
+    );
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            declaring_context.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/onbuild-bad-declaring:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "declaring an ONBUILD trigger is never itself validated beyond its own keyword: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let child_context = tempfile::tempdir().unwrap();
+    write_containerfile(
+        child_context.path(),
+        "FROM ociman-test/onbuild-bad-declaring:latest\n",
+    );
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            child_context.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/onbuild-bad-child:latest",
+        ],
+    );
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("FROBNICATE") || stderr.contains("unknown instruction"),
+        "{stderr}"
+    );
+}
+
 /// A real, end-to-end `RUN` step: runs a real command in a real
 /// rootless container against the base image's own materialized
 /// layers, diffs what changed, and commits it as a genuinely new

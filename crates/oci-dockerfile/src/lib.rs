@@ -46,11 +46,11 @@
 //!
 //! **Deliberately not implemented yet** in this crate, each a
 //! separate, later increment of its own:
-//! - `ONBUILD`, heredocs (`<<EOF ... EOF`), and every BuildKit-only
-//!   flag (`RUN --mount=`, `COPY --link`/`--parents`/`--exclude=`,
-//!   `ADD --link`/`--keep-git-dir`/`--checksum=`/`--unpack`) — a
-//!   Containerfile using any of these fails to parse
-//!   with a clear error, rather than being silently misparsed.
+//! - Heredocs (`<<EOF ... EOF`), and every BuildKit-only flag (`RUN
+//!   --mount=`, `COPY --link`/`--parents`/`--exclude=`, `ADD --link`/
+//!   `--keep-git-dir`/`--checksum=`/`--unpack`) — a Containerfile
+//!   using any of these fails to parse with a clear error, rather
+//!   than being silently misparsed.
 //! - `--build-arg`'s own CLI-string parsing (`KEY=value`/bare `KEY`
 //!   pulled from the calling process's own environment, matching real
 //!   `docker build --build-arg`/`podman build --build-arg`) is
@@ -79,7 +79,7 @@ pub use dependencies::{resolve_copy_from_dependencies, resolve_dependencies, sta
 pub use download::{DownloadError, Downloaded, download};
 pub use expand_stage::{expand_meta_args, expand_stage};
 pub use glob::{BadPattern, contains_wildcards, match_pattern};
-pub use instruction::{AddFlags, CopyFlags, Instruction, ShellOrExec};
+pub use instruction::{AddFlags, CopyFlags, Instruction, ShellOrExec, parse_onbuild_trigger};
 pub use shell_expand::expand;
 pub use stage::{Stage, declared_arg_names, find_stage, group_stages};
 
