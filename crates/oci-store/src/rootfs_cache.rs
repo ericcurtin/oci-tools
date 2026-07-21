@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use oci_spec_types::Digest;
-use oci_spec_types::image::ImageManifest;
+use oci_spec_types::image::Descriptor;
 
 use crate::{Store, StoreError};
 
@@ -65,7 +65,7 @@ pub fn ensure_cached(
     store: &Store,
     cache_root: &Path,
     manifest_digest: &Digest,
-    manifest: &ImageManifest,
+    layers: &[Descriptor],
 ) -> Result<PathBuf, StoreError> {
     let dest = cache_dir_for(cache_root, manifest_digest);
     if dest.is_dir() {
@@ -75,7 +75,7 @@ pub fn ensure_cached(
     std::fs::create_dir_all(cache_root)?;
     let build_dir = tempfile::tempdir_in(cache_root)?;
 
-    for layer in &manifest.layers {
+    for layer in layers {
         let compression =
             oci_layer::compression_for_media_type(&layer.media_type).ok_or_else(|| {
                 StoreError::UnsupportedLayerMediaType {
@@ -234,7 +234,7 @@ fn dir_size_inner(dir: &Path, seen: &mut HashSet<(u64, u64)>) -> std::io::Result
 mod tests {
     use super::*;
     use oci_spec_types::digest::sha256;
-    use oci_spec_types::image::{Descriptor, MEDIA_TYPE_IMAGE_LAYER_GZIP};
+    use oci_spec_types::image::{Descriptor, ImageManifest, MEDIA_TYPE_IMAGE_LAYER_GZIP};
     use std::collections::BTreeMap;
 
     fn temp_store() -> (tempfile::TempDir, Store) {
@@ -296,7 +296,8 @@ mod tests {
         let manifest = seed_one_layer_manifest(&store, "hello.txt", b"hello cache");
         let digest = sha256(b"fake-manifest-digest-one");
 
-        let cache_dir = ensure_cached(&store, cache_root.path(), &digest, &manifest).unwrap();
+        let cache_dir =
+            ensure_cached(&store, cache_root.path(), &digest, &manifest.layers).unwrap();
 
         assert_eq!(cache_dir, cache_dir_for(cache_root.path(), &digest));
         assert_eq!(
@@ -312,14 +313,14 @@ mod tests {
         let manifest = seed_one_layer_manifest(&store, "hello.txt", b"first build");
         let digest = sha256(b"fake-manifest-digest-two");
 
-        let first = ensure_cached(&store, cache_root.path(), &digest, &manifest).unwrap();
+        let first = ensure_cached(&store, cache_root.path(), &digest, &manifest.layers).unwrap();
 
         // Mutate the cache directly (something only a real second
         // *build* would ever undo) -- if `ensure_cached` rebuilt
         // instead of reusing, this change would be gone.
         std::fs::write(first.join("hello.txt"), b"mutated by the test").unwrap();
 
-        let second = ensure_cached(&store, cache_root.path(), &digest, &manifest).unwrap();
+        let second = ensure_cached(&store, cache_root.path(), &digest, &manifest.layers).unwrap();
 
         assert_eq!(first, second);
         assert_eq!(
@@ -338,8 +339,10 @@ mod tests {
         let digest_a = sha256(b"digest-a");
         let digest_b = sha256(b"digest-b");
 
-        let dir_a = ensure_cached(&store, cache_root.path(), &digest_a, &manifest_a).unwrap();
-        let dir_b = ensure_cached(&store, cache_root.path(), &digest_b, &manifest_b).unwrap();
+        let dir_a =
+            ensure_cached(&store, cache_root.path(), &digest_a, &manifest_a.layers).unwrap();
+        let dir_b =
+            ensure_cached(&store, cache_root.path(), &digest_b, &manifest_b.layers).unwrap();
 
         assert_ne!(dir_a, dir_b);
         assert!(dir_a.join("a.txt").exists());
@@ -355,7 +358,8 @@ mod tests {
         let manifest = seed_one_layer_manifest(&store, "hello.txt", b"content");
         let digest = sha256(b"fake-manifest-digest-three");
 
-        let cache_dir = ensure_cached(&store, cache_root.path(), &digest, &manifest).unwrap();
+        let cache_dir =
+            ensure_cached(&store, cache_root.path(), &digest, &manifest.layers).unwrap();
 
         // Exactly one entry under `cache_root`: the real cache
         // directory itself, no stray `tempfile::tempdir_in` scratch
@@ -373,7 +377,8 @@ mod tests {
         let cache_root = tempfile::tempdir().unwrap();
         let manifest = seed_one_layer_manifest(&store, "hello.txt", b"orphaned content");
         let digest = sha256(b"fake-manifest-digest-orphan");
-        let cache_dir = ensure_cached(&store, cache_root.path(), &digest, &manifest).unwrap();
+        let cache_dir =
+            ensure_cached(&store, cache_root.path(), &digest, &manifest.layers).unwrap();
         assert!(cache_dir.exists());
         // Deliberately no `store.put_image` for this digest at all --
         // nothing references it.
@@ -391,7 +396,8 @@ mod tests {
         let cache_root = tempfile::tempdir().unwrap();
         let manifest = seed_one_layer_manifest(&store, "hello.txt", b"still needed");
         let digest = sha256(b"fake-manifest-digest-kept");
-        let cache_dir = ensure_cached(&store, cache_root.path(), &digest, &manifest).unwrap();
+        let cache_dir =
+            ensure_cached(&store, cache_root.path(), &digest, &manifest.layers).unwrap();
         store
             .put_image(&crate::ImageRecord {
                 reference: "docker.io/library/kept:latest".to_string(),
@@ -446,8 +452,10 @@ mod tests {
         let manifest_b = seed_one_layer_manifest(&store, "b.txt", b"content b");
         let digest_a = sha256(b"digest-prune-a");
         let digest_b = sha256(b"digest-prune-b");
-        let dir_a = ensure_cached(&store, cache_root.path(), &digest_a, &manifest_a).unwrap();
-        let dir_b = ensure_cached(&store, cache_root.path(), &digest_b, &manifest_b).unwrap();
+        let dir_a =
+            ensure_cached(&store, cache_root.path(), &digest_a, &manifest_a.layers).unwrap();
+        let dir_b =
+            ensure_cached(&store, cache_root.path(), &digest_b, &manifest_b.layers).unwrap();
         store
             .put_image(&crate::ImageRecord {
                 reference: "docker.io/library/a:latest".to_string(),
@@ -525,7 +533,7 @@ mod tests {
             annotations: BTreeMap::new(),
         };
         let digest = sha256(b"digest-hardlink-dedup");
-        ensure_cached(&store, cache_root.path(), &digest, &manifest).unwrap();
+        ensure_cached(&store, cache_root.path(), &digest, &manifest.layers).unwrap();
 
         let report = prune(&store, cache_root.path()).unwrap();
 

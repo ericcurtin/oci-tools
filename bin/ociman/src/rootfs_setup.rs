@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use oci_spec_types::Digest;
-use oci_spec_types::image::ImageManifest;
+use oci_spec_types::image::Descriptor;
 use oci_spec_types::runtime::Mount;
 use oci_store::Store;
 
@@ -97,12 +97,12 @@ pub fn decide(
     store: &Store,
     bundle_dir: &Path,
     manifest_digest: &Digest,
-    manifest: &ImageManifest,
+    layers: &[Descriptor],
 ) -> RootfsSetup {
     if !rootless_overlay_supported_cached(store.root()) {
         return RootfsSetup::Extract;
     }
-    match prepare_overlay(store, bundle_dir, manifest_digest, manifest) {
+    match prepare_overlay(store, bundle_dir, manifest_digest, layers) {
         Ok(setup) => setup,
         Err(e) => {
             tracing::warn!(
@@ -129,10 +129,10 @@ fn prepare_overlay(
     store: &Store,
     bundle_dir: &Path,
     manifest_digest: &Digest,
-    manifest: &ImageManifest,
+    layers: &[Descriptor],
 ) -> anyhow::Result<RootfsSetup> {
     let cache_root = cache_root(store);
-    let cache_dir = oci_store::ensure_cached(store, &cache_root, manifest_digest, manifest)
+    let cache_dir = oci_store::ensure_cached(store, &cache_root, manifest_digest, layers)
         .context("building/reusing the rootfs cache")?;
 
     let upper = bundle_dir.join("upper");

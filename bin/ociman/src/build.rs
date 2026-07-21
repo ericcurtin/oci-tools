@@ -143,11 +143,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use oci_dockerfile::{AddFlags, CopyFlags, Instruction, ShellOrExec, commit_layer, record_layer};
-use oci_spec_types::Reference;
 use oci_spec_types::image::{
     ContainerConfig, Descriptor, ImageConfig, ImageManifest, MEDIA_TYPE_IMAGE_CONFIG,
     MEDIA_TYPE_IMAGE_MANIFEST,
 };
+use oci_spec_types::{Digest, Reference};
 use oci_store::ImageRecord;
 use serde::Serialize;
 
@@ -241,17 +241,21 @@ pub fn cmd_build(
         let stage = oci_dockerfile::expand_stage(&global_args, &build_args, &stages[stage_index])
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        let (base_config, base_layers) = match deps[stage_index] {
+        let (base_config, base_layers, base_manifest_digest) = match deps[stage_index] {
             // `FROM <earlier-stage-name>`: start from that stage's own
             // already-built config/layers directly -- no store lookup,
             // no re-pulling, no re-running anything (`stages_needed_
             // for`'s own ascending order guarantees it was already
-            // built earlier in this same loop).
+            // built earlier in this same loop). There is no cached
+            // rootfs for an in-memory stage result to reuse (it never
+            // had a manifest digest of its own in the first place), so
+            // `build_stage` falls back to the plain per-layer
+            // extraction loop for this case -- see its own doc comment.
             Some(earlier_index) => {
                 let earlier = built.get(&earlier_index).expect(
                     "stages_needed_for always orders a dependency before its own dependent",
                 );
-                (earlier.config.clone(), earlier.layers.clone())
+                (earlier.config.clone(), earlier.layers.clone(), None)
             }
             None => {
                 anyhow::ensure!(
@@ -268,7 +272,11 @@ pub fn cmd_build(
                 let base_config = store
                     .image_config(&base_record)
                     .with_context(|| format!("reading config for {base_reference}"))?;
-                (base_config, base_manifest.layers.clone())
+                (
+                    base_config,
+                    base_manifest.layers.clone(),
+                    Some(base_record.manifest_digest.clone()),
+                )
             }
         };
 
@@ -283,6 +291,7 @@ pub fn cmd_build(
             &stage,
             base_config,
             base_layers,
+            base_manifest_digest.as_ref(),
             force_rootfs,
             &stage_ctx,
             &cache_candidates,
@@ -387,6 +396,26 @@ impl StageContext<'_> {
 /// (some later stage's own `COPY --from=` reads from this one) —
 /// otherwise never pays for a tempdir or a base-layer extraction, and
 /// its own returned layer list stays byte-identical to `base_layers`.
+///
+/// When `base_manifest_digest` is `Some` (this stage's base is a real
+/// external image, not an earlier in-memory stage), the scratch
+/// rootfs is populated from `oci_store::ensure_cached`'s own
+/// per-manifest-digest cache (0109/0110) via a plain recursive copy
+/// (`clone_cache_tree`) instead of a fresh `oci_layer::apply` pass
+/// over every base layer -- a real, measured cost for a multi-layer
+/// image (see `docs/design/0112`): the very same cache `ociman run`
+/// already builds and reuses, since the same manifest digest always
+/// means the same fully-extracted content either way. An overlay
+/// mount (0110's own approach for `ociman run`) is not used here
+/// instead because a build's own rootfs must stay writable for
+/// however many further `RUN`/`COPY` instructions this stage has, for
+/// as long as this whole multi-stage build runs (potentially across
+/// several other stages' own work in between) -- a lifetime overlay's
+/// own upper/lower/work-dir bookkeeping isn't a good fit for. An
+/// earlier stage's own in-memory result (`base_manifest_digest ==
+/// None`) has no cache entry of its own to reuse in the first place
+/// (it was never pulled from a registry under any single manifest
+/// digest), so it always falls back to the plain per-layer loop.
 #[allow(clippy::too_many_arguments)]
 fn build_stage(
     store: &oci_store::Store,
@@ -394,6 +423,7 @@ fn build_stage(
     stage: &oci_dockerfile::Stage,
     base_config: ImageConfig,
     base_layers: Vec<Descriptor>,
+    base_manifest_digest: Option<&Digest>,
     force_rootfs: bool,
     stage_ctx: &StageContext<'_>,
     cache_candidates: &[crate::build_cache::CacheCandidate],
@@ -413,14 +443,30 @@ fn build_stage(
         let rootfs_dir = dir.path().join("rootfs");
         std::fs::create_dir_all(&rootfs_dir)
             .with_context(|| format!("creating {}", rootfs_dir.display()))?;
-        for layer in &layers {
-            let compression = crate::compression_for_media_type(&layer.media_type)
-                .with_context(|| format!("layer {}", layer.digest))?;
-            let blob = store
-                .open_blob(&layer.digest)
-                .with_context(|| format!("opening layer blob {}", layer.digest))?;
-            oci_layer::apply(blob, compression, &rootfs_dir)
-                .with_context(|| format!("applying base layer {}", layer.digest))?;
+        match base_manifest_digest {
+            Some(digest) => {
+                let cache_root = crate::rootfs_setup::cache_root(store);
+                let cache_dir = oci_store::ensure_cached(store, &cache_root, digest, &layers)
+                    .context("building/reusing the rootfs cache")?;
+                clone_cache_tree(&cache_dir, &rootfs_dir).with_context(|| {
+                    format!(
+                        "cloning cached rootfs {} into {}",
+                        cache_dir.display(),
+                        rootfs_dir.display()
+                    )
+                })?;
+            }
+            None => {
+                for layer in &layers {
+                    let compression = crate::compression_for_media_type(&layer.media_type)
+                        .with_context(|| format!("layer {}", layer.digest))?;
+                    let blob = store
+                        .open_blob(&layer.digest)
+                        .with_context(|| format!("opening layer blob {}", layer.digest))?;
+                    oci_layer::apply(blob, compression, &rootfs_dir)
+                        .with_context(|| format!("applying base layer {}", layer.digest))?;
+                }
+            }
         }
         Some(dir)
     } else {
@@ -1619,6 +1665,66 @@ fn copy_path_recursive(
     Ok(())
 }
 
+/// Clone `src` (a fully-extracted rootfs cache directory --
+/// `oci_store::ensure_cached`'s own output) into `dest` (a fresh,
+/// empty scratch rootfs), preserving every entry's own real
+/// permission bits exactly, directories included. Deliberately
+/// distinct from `copy_path_recursive` above: that one is tuned for
+/// `COPY`/`ADD` instruction semantics, where an *optional* `--chmod`
+/// override is the norm and a plain new directory's own default mode
+/// is otherwise an acceptable, already-established outcome; this
+/// function's whole point instead is to reproduce, via a plain,
+/// independent copy, the *exact* same result `oci_layer::apply` would
+/// have produced extracting the same layers fresh -- silently
+/// dropping a directory's own unusual mode (`/tmp`'s `1777`, for
+/// instance) here would be a real, silent correctness regression
+/// relative to the uncached path it's replacing.
+///
+/// Never `chown`s anything: `oci_layer::apply` itself never does
+/// either (see its own module doc comment), always leaving every
+/// extracted entry owned by the real calling process's own uid/gid --
+/// so a cache entry built by the same real user this build itself
+/// runs as already has the right ownership without this function
+/// doing anything about it.
+fn clone_cache_tree(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = std::fs::symlink_metadata(src)
+        .with_context(|| format!("reading metadata for {}", src.display()))?;
+    if metadata.is_dir() {
+        std::fs::create_dir_all(dest)
+            .with_context(|| format!("creating directory {}", dest.display()))?;
+        set_mode(dest, metadata.permissions().mode())?;
+        for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
+            let entry = entry.with_context(|| format!("reading {}", src.display()))?;
+            clone_cache_tree(&entry.path(), &dest.join(entry.file_name()))?;
+        }
+    } else if metadata.file_type().is_symlink() {
+        let link_target = std::fs::read_link(src)
+            .with_context(|| format!("reading symlink {}", src.display()))?;
+        // No pre-removal here (unlike `copy_path_recursive`'s own
+        // symlink branch, which can land on a destination an earlier
+        // `COPY` in the same stage already populated): `dest` is
+        // always somewhere inside a scratch rootfs this same call
+        // just created fresh, one level up, so nothing can already
+        // exist at this exact path yet -- a real, measured cost
+        // otherwise (`docs/design/0112`'s own `strace` run showed
+        // exactly one guaranteed-to-fail `unlinkat` per symlink, pure
+        // wasted overhead across every symlink a real image ships,
+        // commonly hundreds for a busybox-style applet layout).
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&link_target, dest)
+            .with_context(|| format!("creating symlink {}", dest.display()))?;
+    } else {
+        // `std::fs::copy` already preserves a plain file's own
+        // permission bits (documented behavior on Unix), so there is
+        // nothing more to do for the common case here.
+        std::fs::copy(src, dest)
+            .with_context(|| format!("copying {} to {}", src.display(), dest.display()))?;
+    }
+    Ok(())
+}
+
 /// Parse a `--chmod` value: an octal permission mode string (e.g.
 /// `"0741"`, `"755"`), `0..=0o7777` — real BuildKit also accepts a
 /// symbolic form (`u+rwx,g-w`, via its own `mode.Parse`), deliberately
@@ -1969,5 +2075,78 @@ mod tests {
         let build_args =
             std::collections::HashMap::from([("UNRELATED_ARG".to_string(), "x".to_string())]);
         assert!(unused_build_arg_names(&meta_args, &stages, &build_args).is_empty());
+    }
+
+    #[test]
+    fn clone_cache_tree_preserves_file_content_and_a_plain_files_own_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let file_path = src.path().join("hello.txt");
+        std::fs::write(&file_path, b"hello cache").unwrap();
+        set_mode(&file_path, 0o640).unwrap();
+
+        clone_cache_tree(src.path(), dest.path().join("rootfs").as_path()).unwrap();
+
+        let cloned = dest.path().join("rootfs").join("hello.txt");
+        assert_eq!(std::fs::read(&cloned).unwrap(), b"hello cache");
+        let mode = std::fs::symlink_metadata(&cloned)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o640,
+            "a plain file's own mode must survive the clone"
+        );
+    }
+
+    #[test]
+    fn clone_cache_tree_preserves_an_unusual_directory_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let special_dir = src.path().join("tmp");
+        std::fs::create_dir(&special_dir).unwrap();
+        // The real, well-known case this test exists for: a base
+        // image's own `/tmp` commonly ships world-writable-plus-
+        // sticky (`1777`) -- a mode a plain `create_dir_all` on the
+        // destination side would never reproduce on its own.
+        set_mode(&special_dir, 0o1777).unwrap();
+
+        let dest_root = dest.path().join("rootfs");
+        clone_cache_tree(src.path(), &dest_root).unwrap();
+
+        let cloned_dir = dest_root.join("tmp");
+        let mode = std::fs::symlink_metadata(&cloned_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode, 0o1777,
+            "a directory's own unusual mode must survive the clone, not just a plain file's"
+        );
+    }
+
+    #[test]
+    fn clone_cache_tree_preserves_a_symlink_as_a_real_symlink() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("real"), b"target").unwrap();
+        std::os::unix::fs::symlink("real", src.path().join("link")).unwrap();
+
+        let dest_root = dest.path().join("rootfs");
+        clone_cache_tree(src.path(), &dest_root).unwrap();
+
+        let cloned_link = dest_root.join("link");
+        let link_metadata = std::fs::symlink_metadata(&cloned_link).unwrap();
+        assert!(
+            link_metadata.file_type().is_symlink(),
+            "must stay a real symlink, not get dereferenced into a plain file copy"
+        );
+        assert_eq!(std::fs::read_link(&cloned_link).unwrap(), Path::new("real"));
     }
 }

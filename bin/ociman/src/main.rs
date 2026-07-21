@@ -1240,7 +1240,12 @@ fn cmd_run(
         // environment doesn't support the former -- every layer gets
         // extracted directly into it, exactly as `ociman run` has
         // always done.
-        let setup = rootfs_setup::decide(&store, &bundle_dir, &record.manifest_digest, &manifest);
+        let setup = rootfs_setup::decide(
+            &store,
+            &bundle_dir,
+            &record.manifest_digest,
+            &manifest.layers,
+        );
         let user_resolve_root = match &setup {
             rootfs_setup::RootfsSetup::Extract => {
                 for layer in &manifest.layers {
