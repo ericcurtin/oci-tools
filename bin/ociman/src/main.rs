@@ -151,6 +151,21 @@ enum Command {
         #[arg(short, long)]
         force: bool,
     },
+    /// Tag an already-stored image under a second reference, matching
+    /// real `docker tag`/`podman tag`: both references end up
+    /// pointing at the exact same manifest digest — no blobs are
+    /// copied (this project's own store is content-addressed, so a
+    /// second tag is purely a second pointer file). Overwrites
+    /// `target` if it already resolves to something else, same as
+    /// both real tools.
+    Tag {
+        /// The already-stored image to tag, exactly as it was pulled
+        /// or previously tagged.
+        source: String,
+        /// The new reference to create (or overwrite), e.g.
+        /// `myrepo/myimage:v2`.
+        target: String,
+    },
     /// Print low-level JSON for a container or an image — matching
     /// real `podman inspect`/`docker inspect`'s own default
     /// resolution order: a container (by id or `--name`) is tried
@@ -566,6 +581,7 @@ fn main() -> std::process::ExitCode {
             ),
             Some(Command::Images) => cmd_images(cli.global.json),
             Some(Command::Rmi { reference, force }) => cmd_rmi(&reference, force, cli.global.json),
+            Some(Command::Tag { source, target }) => cmd_tag(&source, &target, cli.global.json),
             Some(Command::Inspect { reference }) => cmd_inspect(&reference, cli.global.json),
             Some(Command::Run {
                 image,
@@ -802,6 +818,51 @@ fn cmd_rmi(reference_str: &str, force: bool, json: bool) -> anyhow::Result<()> {
         })?;
     } else {
         println!("{canonical}");
+    }
+    Ok(())
+}
+
+/// `ociman tag`'s own `--json` output.
+#[derive(Debug, Serialize)]
+struct TagResult {
+    source: String,
+    target: String,
+}
+
+/// Tag an already-stored image under a second reference — see
+/// [`Command::Tag`]'s own doc comment for the exact real-`docker
+/// tag`/`podman tag`-matching semantics. No blob is copied or even
+/// read: [`oci_store::Store::put_image`] just writes a second pointer
+/// file for `target` at the exact same `manifest_digest` `source`
+/// already resolves to, since this project's own store is
+/// content-addressed (the same reasoning `ociman build`'s own final
+/// `store.put_image` call already relies on for its own `-t`/`--tag`).
+fn cmd_tag(source_str: &str, target_str: &str, json: bool) -> anyhow::Result<()> {
+    let source = Reference::parse(source_str)
+        .with_context(|| format!("parsing image reference {source_str:?}"))?;
+    let target = Reference::parse(target_str)
+        .with_context(|| format!("parsing image reference {target_str:?}"))?;
+
+    let store = open_store()?;
+    let record = store
+        .resolve_image(&source.to_string())
+        .with_context(|| format!("looking up {source} in local storage"))?
+        .ok_or_else(|| anyhow::anyhow!("{source}: no such image in local storage"))?;
+
+    store
+        .put_image(&ImageRecord {
+            reference: target.to_string(),
+            manifest_digest: record.manifest_digest,
+        })
+        .with_context(|| format!("tagging {source} as {target}"))?;
+
+    if json {
+        oci_cli_common::output::print_json(&TagResult {
+            source: source.to_string(),
+            target: target.to_string(),
+        })?;
+    } else {
+        println!("{target}");
     }
     Ok(())
 }
