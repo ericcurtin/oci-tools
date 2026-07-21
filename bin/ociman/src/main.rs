@@ -134,7 +134,13 @@ enum Command {
     /// List images in local storage.
     Images,
     /// Remove an image from local storage, matching real `docker
-    /// rmi`/`podman rmi`. Refuses to remove an image still referenced
+    /// rmi`/`podman rmi`. Resolves by tag reference or by a real or
+    /// short image ID (the same short ID `ociman images`' own
+    /// `DIGEST` column prints) — removing *by ID* when more than one
+    /// tag points at that exact image needs `--force` too (removes
+    /// every one of them), matching real `podman rmi`'s own identical
+    /// policy; removing by an exact tag never needs it just because a
+    /// sibling tag exists. Refuses to remove an image still referenced
     /// by any container (running or stopped) unless `--force`, which
     /// removes those containers first (killing any still running one,
     /// same as `ociman rm --force`).
@@ -782,13 +788,19 @@ fn cmd_images(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `ociman rmi`'s own `--json` output: the canonical reference removed,
-/// plus any container ids removed along with it (`--force` only —
-/// always empty otherwise, since a dependent container without
-/// `--force` is a hard error, not a partial success).
+/// `ociman rmi`'s own `--json` output: the primary reference removed
+/// (the exact tag given, or — resolving by image ID — the first of
+/// however many tags that ID had), any *other* tags removed alongside
+/// it (only ever non-empty when resolving by ID with more than one
+/// tag, see [`cmd_rmi`]'s own doc comment), plus any container ids
+/// removed along with it (`--force` only — always empty otherwise,
+/// since a dependent container without `--force` is a hard error, not
+/// a partial success).
 #[derive(Debug, Serialize)]
 struct RmiResult {
     reference: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    additional_references_removed: Vec<String>,
     removed_containers: Vec<String>,
 }
 
@@ -800,38 +812,67 @@ struct RmiResult {
 /// stopped one, which real podman can still `start` again later)
 /// would leave that container's own `ociman inspect`/`ps` output
 /// pointing at nothing, matching neither tool's own documented
-/// behavior. Only removes the store's own tag/digest *pointer*
+/// behavior. Only removes the store's own tag/digest *pointer*(s)
 /// ([`oci_store::Store::remove_image`]) — the underlying blobs (a
 /// manifest/config/layer another tag might still share, per this
-/// project's own content-addressed dedup) are reclaimed later by a
-/// future `gc` command, not implicitly here.
+/// project's own content-addressed dedup) are reclaimed later by
+/// `ociman prune`, not implicitly here.
+///
+/// Resolves by tag *or* image ID (`resolve_image_by_reference_or_id`,
+/// 0122) — but removing *by ID* when more than one tag points at that
+/// exact image needs `--force`, matching real `podman rmi`'s own
+/// identical policy exactly (checked directly: `podman rmi <id>`
+/// against a real two-tags-one-image local store refuses with "unable
+/// to delete image ... by ID with more than one tag ... please force
+/// removal"; `podman rmi -f <id>` then untags all of them). Removing
+/// by an exact *tag* never has this restriction, force or not — real
+/// docker/podman both only ever untag the one name given that way,
+/// checked directly the same way, regardless of how many sibling tags
+/// exist.
 fn cmd_rmi(reference_str: &str, force: bool, json: bool) -> anyhow::Result<()> {
-    let reference = Reference::parse(reference_str)
-        .with_context(|| format!("parsing image reference {reference_str:?}"))?;
-    let canonical = reference.to_string();
-
     let store = open_store()?;
-    anyhow::ensure!(
-        store
-            .resolve_image(&canonical)
-            .with_context(|| format!("looking up {reference} in local storage"))?
-            .is_some(),
-        "{reference}: no such image in local storage"
-    );
+    let resolved = resolve_image_by_reference_or_id(&store, reference_str)?
+        .ok_or_else(|| anyhow::anyhow!("{reference_str}: no such image in local storage"))?;
+
+    let references_to_remove: Vec<String> = match &resolved {
+        ResolvedImage::Tag(record) => vec![record.reference.clone()],
+        ResolvedImage::Id(record) => {
+            let mut siblings: Vec<String> = store
+                .list_images()
+                .context("listing local images")?
+                .into_iter()
+                .filter(|r| r.manifest_digest == record.manifest_digest)
+                .map(|r| r.reference)
+                .collect();
+            siblings.sort();
+            anyhow::ensure!(
+                force || siblings.len() <= 1,
+                "unable to delete image {reference_str:?} by ID with more than one tag ({}); \
+                 please force removal",
+                siblings.join(", ")
+            );
+            siblings
+        }
+    };
 
     let containers = open_container_store()?;
     let dependents: Vec<String> = containers
         .list()
         .context("listing containers")?
         .into_iter()
-        .filter(|state| state.annotations.get(ANNOTATION_IMAGE) == Some(&canonical))
+        .filter(|state| {
+            state
+                .annotations
+                .get(ANNOTATION_IMAGE)
+                .is_some_and(|image| references_to_remove.contains(image))
+        })
         .map(|state| state.id)
         .collect();
     if !dependents.is_empty() {
         anyhow::ensure!(
             force,
-            "image {reference} is in use by {} container(s) ({}); use -f/--force to remove them \
-             too, or `ociman rm` them first",
+            "image {reference_str} is in use by {} container(s) ({}); use -f/--force to remove \
+             them too, or `ociman rm` them first",
             dependents.len(),
             dependents.join(", ")
         );
@@ -841,17 +882,25 @@ fn cmd_rmi(reference_str: &str, force: bool, json: bool) -> anyhow::Result<()> {
         }
     }
 
-    store
-        .remove_image(&canonical)
-        .with_context(|| format!("removing {reference}"))?;
+    for reference in &references_to_remove {
+        store
+            .remove_image(reference)
+            .with_context(|| format!("removing {reference}"))?;
+    }
 
+    let (primary, rest) = references_to_remove
+        .split_first()
+        .expect("at least the resolved image's own reference is always present");
     if json {
         oci_cli_common::output::print_json(&RmiResult {
-            reference: canonical,
+            reference: primary.clone(),
+            additional_references_removed: rest.to_vec(),
             removed_containers: dependents,
         })?;
     } else {
-        println!("{canonical}");
+        for reference in &references_to_remove {
+            println!("{reference}");
+        }
     }
     Ok(())
 }
@@ -1226,11 +1275,12 @@ fn cmd_inspect(reference_str: &str, json: bool) -> anyhow::Result<()> {
     }
 
     let store = open_store()?;
-    let record = resolve_image_by_reference_or_id(&store, reference_str)?.ok_or_else(|| {
+    let resolved = resolve_image_by_reference_or_id(&store, reference_str)?.ok_or_else(|| {
         anyhow::anyhow!("{reference_str}: no such image in local storage (run `ociman pull` first)")
     })?;
+    let record = resolved.record();
     let config = store
-        .image_config(&record)
+        .image_config(record)
         .with_context(|| format!("reading config for {}", record.reference))?;
 
     if json {
@@ -1726,16 +1776,39 @@ fn validate_container_name(name: &str) -> anyhow::Result<()> {
 /// checked directly this way rather than just picking the first
 /// match, matching real docker's own "Multiple IDs found" refusal
 /// instead of silently guessing).
+/// Which of the two ways [`resolve_image_by_reference_or_id`] matched
+/// `spec` — callers that need to know (like [`cmd_rmi`]'s own "removing
+/// *by ID* with more than one tag needs `--force`" policy, matching
+/// real `podman rmi`'s own identical rule, checked directly) inspect
+/// this; ones that don't (like `cmd_inspect`, which only ever reads,
+/// never removes) can just call [`ResolvedImage::record`] and ignore
+/// which arm it came from.
+enum ResolvedImage {
+    /// `spec` was itself an existing tag reference.
+    Tag(ImageRecord),
+    /// `spec` didn't match any tag; resolved via a real or short image
+    /// ID fallback instead.
+    Id(ImageRecord),
+}
+
+impl ResolvedImage {
+    fn record(&self) -> &ImageRecord {
+        match self {
+            ResolvedImage::Tag(record) | ResolvedImage::Id(record) => record,
+        }
+    }
+}
+
 fn resolve_image_by_reference_or_id(
     store: &Store,
     spec: &str,
-) -> anyhow::Result<Option<ImageRecord>> {
+) -> anyhow::Result<Option<ResolvedImage>> {
     if let Ok(reference) = Reference::parse(spec)
         && let Some(record) = store
             .resolve_image(&reference.to_string())
             .with_context(|| format!("looking up {reference} in local storage"))?
     {
-        return Ok(Some(record));
+        return Ok(Some(ResolvedImage::Tag(record)));
     }
 
     let candidate = spec
@@ -1760,7 +1833,7 @@ fn resolve_image_by_reference_or_id(
     }
     match by_digest.len() {
         0 => Ok(None),
-        1 => Ok(by_digest.into_values().next()),
+        1 => Ok(by_digest.into_values().next().map(ResolvedImage::Id)),
         n => anyhow::bail!("image ID {spec:?} is ambiguous: matches {n} different images"),
     }
 }

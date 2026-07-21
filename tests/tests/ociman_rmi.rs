@@ -143,6 +143,173 @@ fn rmi_of_an_unknown_reference_is_a_clear_error() {
     );
 }
 
+/// Real docker/podman rule, checked directly: `rmi` resolves by image
+/// ID too, not just a tag reference -- the exact short digest `ociman
+/// images`' own `DIGEST` column already prints. A single-tagged image
+/// removed this way needs no `--force` at all (no ambiguity: exactly
+/// one tag to remove).
+#[test]
+fn rmi_removes_a_real_image_by_its_own_short_id() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rmi-by-id:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let record = store
+        .resolve_image("docker.io/ociman-test/rmi-by-id:latest")
+        .unwrap()
+        .unwrap();
+    let short_id = record.manifest_digest.hex()[..12].to_string();
+
+    let rmi = ociman(storage_dir.path(), &["rmi", &short_id]);
+    assert!(
+        rmi.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rmi.stderr)
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-by-id:latest")
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Real `podman rmi`'s own exact policy, checked directly against a
+/// real installed `podman` before implementing this: removing *by ID*
+/// when more than one tag points at that exact image refuses without
+/// `--force` (listing every tag in the error), and removes all of them
+/// with it.
+#[test]
+fn rmi_by_id_with_multiple_tags_needs_force_and_then_removes_every_tag() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rmi-multi-tag:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let tag = ociman(
+        storage_dir.path(),
+        &[
+            "tag",
+            "ociman-test/rmi-multi-tag:latest",
+            "ociman-test/rmi-multi-tag:aliased",
+        ],
+    );
+    assert!(tag.status.success());
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/rmi-multi-tag:latest")
+        .unwrap()
+        .unwrap();
+    let short_id = record.manifest_digest.hex()[..12].to_string();
+
+    let rmi = ociman(storage_dir.path(), &["rmi", &short_id]);
+    assert!(!rmi.status.success());
+    let stderr = String::from_utf8_lossy(&rmi.stderr);
+    assert!(stderr.contains("more than one tag"), "{stderr}");
+    assert!(stderr.contains("please force removal"), "{stderr}");
+    // Neither tag was touched by the refused attempt.
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-multi-tag:latest")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-multi-tag:aliased")
+            .unwrap()
+            .is_some()
+    );
+
+    let rmi_forced = ociman(storage_dir.path(), &["rmi", "--force", &short_id]);
+    assert!(
+        rmi_forced.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rmi_forced.stderr)
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-multi-tag:latest")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-multi-tag:aliased")
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Removing by an exact *tag* (not an ID) never needs `--force` just
+/// because a sibling tag exists -- real docker/podman both only ever
+/// untag the one name given that way, checked directly the same way.
+#[test]
+fn rmi_by_an_exact_tag_never_needs_force_even_with_a_sibling_tag() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rmi-tag-not-id:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let tag = ociman(
+        storage_dir.path(),
+        &[
+            "tag",
+            "ociman-test/rmi-tag-not-id:latest",
+            "ociman-test/rmi-tag-not-id:aliased",
+        ],
+    );
+    assert!(tag.status.success());
+
+    let rmi = ociman(
+        storage_dir.path(),
+        &["rmi", "ociman-test/rmi-tag-not-id:latest"],
+    );
+    assert!(
+        rmi.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rmi.stderr)
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-tag-not-id:latest")
+            .unwrap()
+            .is_none()
+    );
+    // The sibling tag survives untouched.
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-tag-not-id:aliased")
+            .unwrap()
+            .is_some()
+    );
+}
+
 #[test]
 fn rmi_refuses_an_image_still_used_by_a_stopped_container_without_force() {
     let Some(busybox) = busybox_path() else {
