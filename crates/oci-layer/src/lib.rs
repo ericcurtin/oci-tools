@@ -98,6 +98,24 @@ pub enum Compression {
     Zstd,
 }
 
+/// Map an OCI layer descriptor's own media type to how [`apply`]
+/// should decompress it — `None` for a media type this project
+/// doesn't recognize as a real image layer at all. Shared by every
+/// caller that reads a stored layer blob back out and needs to know
+/// how to decompress it (`ociman run`/`build`'s own base-layer
+/// extraction, `oci_store`'s own rootfs cache, ...) so the mapping
+/// itself lives in exactly one place, matching this project's own
+/// "share as much Rust code as possible" standard.
+pub fn compression_for_media_type(media_type: &str) -> Option<Compression> {
+    match media_type {
+        oci_spec_types::image::MEDIA_TYPE_IMAGE_LAYER_GZIP
+        | oci_spec_types::image::MEDIA_TYPE_DOCKER_LAYER_GZIP => Some(Compression::Gzip),
+        oci_spec_types::image::MEDIA_TYPE_IMAGE_LAYER => Some(Compression::None),
+        oci_spec_types::image::MEDIA_TYPE_IMAGE_LAYER_ZSTD => Some(Compression::Zstd),
+        _ => None,
+    }
+}
+
 /// Errors from [`apply`].
 #[derive(Debug, thiserror::Error)]
 pub enum LayerError {
@@ -410,6 +428,35 @@ fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn compression_for_media_type_recognizes_every_real_layer_media_type() {
+        assert_eq!(
+            compression_for_media_type(oci_spec_types::image::MEDIA_TYPE_IMAGE_LAYER_GZIP),
+            Some(Compression::Gzip)
+        );
+        assert_eq!(
+            compression_for_media_type(oci_spec_types::image::MEDIA_TYPE_DOCKER_LAYER_GZIP),
+            Some(Compression::Gzip)
+        );
+        assert_eq!(
+            compression_for_media_type(oci_spec_types::image::MEDIA_TYPE_IMAGE_LAYER),
+            Some(Compression::None)
+        );
+        assert_eq!(
+            compression_for_media_type(oci_spec_types::image::MEDIA_TYPE_IMAGE_LAYER_ZSTD),
+            Some(Compression::Zstd)
+        );
+    }
+
+    #[test]
+    fn compression_for_media_type_is_none_for_anything_else() {
+        assert_eq!(
+            compression_for_media_type("application/vnd.oci.image.config.v1+json"),
+            None
+        );
+        assert_eq!(compression_for_media_type(""), None);
+    }
 
     /// Build an in-memory (uncompressed) tar stream from `(path, kind)`
     /// pairs for the simple cases (`Dir`/`File(content)`), used across

@@ -40,9 +40,11 @@ use oci_spec_types::image::Manifest;
 
 mod describe;
 mod images;
+mod rootfs_cache;
 
 pub use describe::ImageSummary;
 pub use images::{ImageRecord, ImagesError};
+pub use rootfs_cache::{cache_dir_for, ensure_cached};
 
 /// Errors returned by [`Store`] operations.
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +82,14 @@ pub enum StoreError {
     UnexpectedIndex {
         /// The index blob's digest.
         digest: Digest,
+    },
+    /// A layer descriptor's own media type isn't one
+    /// [`oci_layer::compression_for_media_type`] recognizes — surfaced by
+    /// [`crate::ensure_cached`] while extracting a manifest's own layers.
+    #[error("unsupported layer media type: {media_type:?}")]
+    UnsupportedLayerMediaType {
+        /// The unrecognized media type string.
+        media_type: String,
     },
 }
 

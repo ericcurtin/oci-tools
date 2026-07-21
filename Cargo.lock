@@ -843,9 +843,12 @@ dependencies = [
 name = "oci-store"
 version = "0.1.0"
 dependencies = [
+ "flate2",
+ "oci-layer",
  "oci-spec-types",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "thiserror",
 ]

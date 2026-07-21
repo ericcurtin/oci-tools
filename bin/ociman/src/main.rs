@@ -24,10 +24,7 @@ use clap::Parser;
 use oci_runtime_core::StateStore;
 use oci_runtime_core::state::Status;
 use oci_spec_types::Reference;
-use oci_spec_types::image::{
-    ContainerConfig, MEDIA_TYPE_DOCKER_LAYER_GZIP, MEDIA_TYPE_IMAGE_LAYER,
-    MEDIA_TYPE_IMAGE_LAYER_GZIP, MEDIA_TYPE_IMAGE_LAYER_ZSTD, Platform,
-};
+use oci_spec_types::image::{ContainerConfig, Platform};
 use oci_store::{ImageRecord, ImageSummary, Store};
 use serde::Serialize;
 
@@ -2001,16 +1998,14 @@ fn resolve_or_pull(store: &Store, reference: &Reference) -> anyhow::Result<Image
 }
 
 /// Map a layer descriptor's media type to how [`oci_layer::apply`]
-/// should decompress it.
+/// should decompress it — a thin, `anyhow`-flavored wrapper around
+/// [`oci_layer::compression_for_media_type`] (the shared mapping
+/// itself, also used by `oci_store`'s own rootfs cache) so every
+/// existing call site here keeps its own established `Result`-with-
+/// context error shape unchanged.
 fn compression_for_media_type(media_type: &str) -> anyhow::Result<oci_layer::Compression> {
-    match media_type {
-        MEDIA_TYPE_IMAGE_LAYER_GZIP | MEDIA_TYPE_DOCKER_LAYER_GZIP => {
-            Ok(oci_layer::Compression::Gzip)
-        }
-        MEDIA_TYPE_IMAGE_LAYER => Ok(oci_layer::Compression::None),
-        MEDIA_TYPE_IMAGE_LAYER_ZSTD => Ok(oci_layer::Compression::Zstd),
-        other => anyhow::bail!("unsupported layer media type: {other:?}"),
-    }
+    oci_layer::compression_for_media_type(media_type)
+        .ok_or_else(|| anyhow::anyhow!("unsupported layer media type: {media_type:?}"))
 }
 
 /// Build a rootless runtime-spec for `config`'s container defaults,
@@ -3155,7 +3150,7 @@ mod tests {
 
     fn layer_descriptor(size: u64) -> oci_spec_types::image::Descriptor {
         oci_spec_types::image::Descriptor {
-            media_type: MEDIA_TYPE_IMAGE_LAYER_GZIP.to_string(),
+            media_type: oci_spec_types::image::MEDIA_TYPE_IMAGE_LAYER_GZIP.to_string(),
             digest: oci_spec_types::digest::sha256(size.to_string().as_bytes()),
             size,
             urls: vec![],

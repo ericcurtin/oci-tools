@@ -10,11 +10,16 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+oci-layer.workspace = true
 oci-spec-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true
+tar.workspace = true
 
 [lints]
 workspace = true
