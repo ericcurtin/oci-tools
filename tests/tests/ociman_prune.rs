@@ -213,3 +213,196 @@ fn prune_removes_an_orphaned_rootfs_cache_entry_when_one_exists() {
     );
     assert!(!cache_dir.exists());
 }
+
+#[test]
+fn prune_without_all_leaves_an_unused_but_still_tagged_image_alone() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/prune-all-default:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    // No `--all` -- matches real `docker system prune`'s own default:
+    // a still-tagged image is never touched, even if nothing
+    // currently uses it.
+    let prune = ociman(storage_dir.path(), &["--json", "prune"]);
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(view["images_removed"], serde_json::json!([]), "{view:?}");
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/prune-all-default:latest")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn prune_all_removes_an_image_no_container_uses_and_reclaims_its_blobs_too() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/prune-all-unused:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let record = store
+        .resolve_image("docker.io/ociman-test/prune-all-unused:latest")
+        .unwrap()
+        .unwrap();
+    let manifest = store.image_manifest(&record).unwrap();
+    let layer_digest = manifest.layers[0].digest.clone();
+
+    let prune = ociman(storage_dir.path(), &["--json", "prune", "--all"]);
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(
+        view["images_removed"],
+        serde_json::json!(["docker.io/ociman-test/prune-all-unused:latest"]),
+        "{view:?}"
+    );
+    // The image's own tag is gone *and*, in this same `prune --all`
+    // call, its now-orphaned blob is reclaimed too -- no second
+    // `ociman prune` invocation needed.
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/prune-all-unused:latest")
+            .unwrap()
+            .is_none()
+    );
+    assert!(view["blobs_removed"].as_u64().unwrap() > 0, "{view:?}");
+    assert!(!store.has_blob(&layer_digest));
+}
+
+#[test]
+fn prune_all_keeps_an_image_a_stopped_container_still_uses() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/prune-all-in-use:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    // Foreground `run` (no `--rm`, no `-d`): exits fast on its own,
+    // leaving a real, stopped container record behind -- exactly what
+    // `--all`'s own "is this image used by any container, running or
+    // stopped" check needs to see.
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "ociman-test/prune-all-in-use:latest",
+            "--",
+            "/bin/true",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let prune = ociman(storage_dir.path(), &["--json", "prune", "--all"]);
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(view["images_removed"], serde_json::json!([]), "{view:?}");
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/prune-all-in-use:latest")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn prune_all_matches_by_manifest_digest_not_the_exact_tag_string_a_container_used() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/prune-all-multi-tag:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    // A second tag pointing at the exact same manifest digest --
+    // `ociman tag`'s own whole point.
+    let tag = ociman(
+        storage_dir.path(),
+        &[
+            "tag",
+            "ociman-test/prune-all-multi-tag:latest",
+            "ociman-test/prune-all-multi-tag:aliased",
+        ],
+    );
+    assert!(tag.status.success());
+
+    // Only the *first* tag is ever actually used by a container.
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "ociman-test/prune-all-multi-tag:latest",
+            "--",
+            "/bin/true",
+        ],
+    );
+    assert!(run.status.success());
+
+    let prune = ociman(storage_dir.path(), &["--json", "prune", "--all"]);
+    assert!(prune.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    // Neither tag is removed -- both resolve to the same real image,
+    // which a container does use, even though this second tag's own
+    // exact string was never itself passed to `ociman run`.
+    assert_eq!(view["images_removed"], serde_json::json!([]), "{view:?}");
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/prune-all-multi-tag:latest")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/prune-all-multi-tag:aliased")
+            .unwrap()
+            .is_some()
+    );
+}

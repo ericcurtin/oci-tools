@@ -185,7 +185,17 @@ enum Command {
     /// convention — never run implicitly by `rmi`/`rm`, which would
     /// tax every ordinary removal with a full reachability scan for a
     /// benefit only worth paying for occasionally.
-    Prune,
+    Prune {
+        /// Also remove every image not currently used by any
+        /// container (running or stopped), not just already-untagged
+        /// blobs/cache entries — matching real `docker system prune
+        /// -a`/`podman system prune -a`'s own more aggressive mode.
+        /// Without this flag (the default), an image still tagged is
+        /// never touched even if nothing currently uses it, matching
+        /// real `docker system prune`'s own default.
+        #[arg(short, long)]
+        all: bool,
+    },
     /// Print low-level JSON for a container or an image — matching
     /// real `podman inspect`/`docker inspect`'s own default
     /// resolution order: a container (by id or `--name`) is tried
@@ -603,7 +613,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Rmi { reference, force }) => cmd_rmi(&reference, force, cli.global.json),
             Some(Command::Tag { source, target }) => cmd_tag(&source, &target, cli.global.json),
             Some(Command::History { reference }) => cmd_history(&reference, cli.global.json),
-            Some(Command::Prune) => cmd_prune(cli.global.json),
+            Some(Command::Prune { all }) => cmd_prune(cli.global.json, all),
             Some(Command::Inspect { reference }) => cmd_inspect(&reference, cli.global.json),
             Some(Command::Run {
                 image,
@@ -1026,24 +1036,62 @@ fn cmd_history(reference_str: &str, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `ociman prune`'s own `--json` output: both real, independent
-/// reclamation passes this command runs, reported separately (never
-/// summed into one opaque total) since they reclaim two genuinely
-/// different kinds of on-disk state for two different reasons.
+/// `ociman prune`'s own `--json` output: every real, independent
+/// reclamation pass this command runs, reported separately (never
+/// summed into one opaque total) since they reclaim genuinely
+/// different kinds of on-disk state for different reasons.
+/// `images_removed` is always present but only ever non-empty with
+/// `--all` (without it, this pass never runs at all).
 #[derive(Debug, Serialize)]
 struct PruneResult {
+    images_removed: Vec<String>,
     blobs_removed: usize,
     blobs_reclaimed_bytes: u64,
     rootfs_cache_entries_removed: usize,
     rootfs_cache_reclaimed_bytes: u64,
 }
 
-/// Reclaim disk space no longer needed by anything currently tagged —
-/// see [`Command::Prune`]'s own doc comment for the exact policy
-/// (real, mark-and-sweep reachability from every current image
-/// pointer, run only when explicitly asked, never implicitly).
-fn cmd_prune(json: bool) -> anyhow::Result<()> {
+/// Reclaim disk space no longer needed by anything currently tagged
+/// (or, with `all`, no longer used by anything at all — see
+/// [`Command::Prune`]'s own doc comment for the exact policy either
+/// way), run only when explicitly asked, never implicitly.
+fn cmd_prune(json: bool, all: bool) -> anyhow::Result<()> {
     let store = open_store()?;
+
+    // `--all`'s own extra pass runs *before* the blob/cache GC below
+    // so that an image this pass just untags immediately makes its
+    // own now-unreferenced blobs/cache entries eligible for the same
+    // GC run, rather than needing a second `ociman prune` invocation
+    // to actually reclaim them.
+    let mut images_removed = Vec::new();
+    if all {
+        let containers = open_container_store()?;
+        // Matched by the underlying manifest digest, not the exact
+        // reference string a container happened to be started with:
+        // two tags pointing at the same image (`ociman tag`'s own
+        // whole point) must both count as "in use" if a container
+        // uses *either* one, the same real image either way.
+        let mut in_use_digests: std::collections::HashSet<oci_spec_types::Digest> =
+            std::collections::HashSet::new();
+        for state in containers.list().context("listing containers")? {
+            if let Some(image_ref) = state.annotations.get(ANNOTATION_IMAGE)
+                && let Some(record) = store
+                    .resolve_image(image_ref)
+                    .context("resolving a container's own image reference")?
+            {
+                in_use_digests.insert(record.manifest_digest);
+            }
+        }
+        for record in store.list_images().context("listing images")? {
+            if in_use_digests.contains(&record.manifest_digest) {
+                continue;
+            }
+            store
+                .remove_image(&record.reference)
+                .with_context(|| format!("removing unused image {}", record.reference))?;
+            images_removed.push(record.reference);
+        }
+    }
 
     let blob_report = store
         .gc()
@@ -1053,12 +1101,20 @@ fn cmd_prune(json: bool) -> anyhow::Result<()> {
 
     if json {
         oci_cli_common::output::print_json(&PruneResult {
+            images_removed,
             blobs_removed: blob_report.removed.len(),
             blobs_reclaimed_bytes: blob_report.reclaimed_bytes,
             rootfs_cache_entries_removed: cache_report.removed.len(),
             rootfs_cache_reclaimed_bytes: cache_report.reclaimed_bytes,
         })?;
     } else {
+        if all {
+            println!(
+                "images: removed {} ({})",
+                images_removed.len(),
+                images_removed.join(", ")
+            );
+        }
         println!(
             "blobs: removed {}, reclaimed {} bytes",
             blob_report.removed.len(),
