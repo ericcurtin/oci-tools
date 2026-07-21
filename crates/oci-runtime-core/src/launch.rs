@@ -1,10 +1,11 @@
 //! Assembling namespaces, rootless ID mapping, the rootfs setup sequence,
-//! and process execution into an actual container: create-and-start
-//! ("run") in one step, the same shape as runc/crun's own `run`
-//! subcommand — as opposed to the separate `create`+`start` two-phase
-//! lifecycle (which needs a persistent background process surviving
-//! after the CLI invocation returns, and is not implemented yet; see
-//! `docs/design/`).
+//! and process execution into an actual container: [`run`] (create-and-
+//! start in one step, the same shape as runc/crun's own `run`
+//! subcommand) *and* the separate `create`+`start` two-phase lifecycle
+//! ([`create`], needing a persistent background process surviving
+//! after the `create` invocation itself returns, blocked on
+//! `crate::exec_fifo`'s own real named-pipe handshake until a later,
+//! separate `start` — `docs/design/0017`).
 //!
 //! Every piece this module assembles was already built and independently
 //! verified in earlier increments: [`crate::namespaces`] (`unshare` +

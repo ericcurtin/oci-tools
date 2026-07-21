@@ -43,7 +43,7 @@
 //! `~/git/crun/src/libcrun/cgroup-systemd.c` directly, not re-derived
 //! from documentation prose alone).
 //!
-//! # A known, not-yet-handled edge case
+//! # A real edge case, found and fixed (0096)
 //!
 //! A scope whose only member process exits normally is automatically
 //! stopped and removed by systemd on its own — verified directly, no
@@ -53,8 +53,13 @@
 //! `StartTransientUnit` succeeding and the pid actually existing) can
 //! be left behind in a `failed` state instead of being cleaned up
 //! automatically — observed directly while iterating on this module's
-//! own scratch verification. Not yet handled here; see this module's
-//! own "what's still not here" note in `docs/design/0033`.
+//! own scratch verification, and originally left as a known,
+//! not-yet-handled gap (`docs/design/0033`). [`reset_failed_unit`]
+//! closes it (0096): a real `ResetFailedUnit` D-Bus call, made from
+//! three real call sites in `ociman`'s own `cmd_run`/`cmd_stop`/
+//! `cmd_rm` (wherever a container's process is actually confirmed to
+//! have stopped), matching real crun's own unconditional call to the
+//! same D-Bus method at scope-teardown time.
 
 use std::io;
 use std::path::PathBuf;

@@ -456,12 +456,14 @@ pub struct LinuxCpu {
         skip_serializing_if = "Option::is_none"
     )]
     pub realtime_period: Option<u64>,
-    /// `cpuset.cpus`-style CPU list (e.g. `"0-3"`). Not yet translated to
-    /// a cgroup write.
+    /// `cpuset.cpus`-style CPU list (e.g. `"0-3"`) — written verbatim,
+    /// with no numeric conversion, to the real `cpuset.cpus` cgroup
+    /// file (`oci_runtime_core::cgroups::plan_cpu`, `docs/design/
+    /// 0056`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cpus: String,
-    /// `cpuset.mems`-style memory-node list. Not yet translated to a
-    /// cgroup write.
+    /// `cpuset.mems`-style memory-node list — written the same way,
+    /// to the real `cpuset.mems` cgroup file.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mems: String,
 }

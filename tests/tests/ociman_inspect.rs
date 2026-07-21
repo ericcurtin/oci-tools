@@ -168,3 +168,91 @@ fn inspect_of_an_unknown_reference_is_a_clear_error() {
     );
     assert!(!out.status.success());
 }
+
+/// Real docker/podman rule, checked directly: `inspect` (and `rmi`)
+/// resolve by image ID too, not just a tag reference -- the exact
+/// short digest `ociman images`' own `DIGEST` column already prints.
+#[test]
+fn inspect_resolves_a_real_image_by_its_own_short_id() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-by-id:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let record = store
+        .resolve_image("docker.io/ociman-test/inspect-by-id:latest")
+        .unwrap()
+        .unwrap();
+    let full_hex = record.manifest_digest.hex().to_string();
+    let short_id = &full_hex[..12];
+
+    let inspect = ociman(storage_dir.path(), &["inspect", short_id]);
+    assert!(
+        inspect.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let config: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert!(config.get("architecture").is_some(), "{config:?}");
+
+    // The full digest (with and without the `sha256:` prefix) works
+    // too, matching real `docker inspect <full-id>`.
+    let inspect_full = ociman(storage_dir.path(), &["inspect", &full_hex]);
+    assert!(inspect_full.status.success());
+    let inspect_prefixed = ociman(
+        storage_dir.path(),
+        &["inspect", &format!("sha256:{full_hex}")],
+    );
+    assert!(inspect_prefixed.status.success());
+}
+
+/// Two tags pointing at the exact same image (`ociman tag`) must never
+/// make resolving that image by its own (now doubly-referenced) ID
+/// ambiguous -- only two genuinely *different* images sharing a
+/// digest prefix should be.
+#[test]
+fn inspect_by_id_is_not_ambiguous_when_multiple_tags_share_the_same_digest() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-by-id-aliased:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let tag = ociman(
+        storage_dir.path(),
+        &[
+            "tag",
+            "ociman-test/inspect-by-id-aliased:latest",
+            "ociman-test/inspect-by-id-aliased:v2",
+        ],
+    );
+    assert!(tag.status.success());
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/inspect-by-id-aliased:latest")
+        .unwrap()
+        .unwrap();
+    let short_id = &record.manifest_digest.hex()[..12];
+
+    let inspect = ociman(storage_dir.path(), &["inspect", short_id]);
+    assert!(
+        inspect.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+}

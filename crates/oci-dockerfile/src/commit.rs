@@ -11,13 +11,14 @@
 //! This module owns exactly that handoff, plus recording the result
 //! into an image being built ([`record_layer`]/[`record_empty_history`]),
 //! and nothing more: it does not parse a Dockerfile, run a `RUN` step,
-//! or decide *when* to diff a rootfs (a future build executor's own
-//! job, still not implemented — see this crate's own top-level doc
-//! comment) — it only turns an already-computed [`oci_layer::Change`]
-//! list plus the live rootfs it was computed from into one new, real,
-//! stored layer, and knows how to fold that (or a non-layer-producing
-//! instruction) into an [`ImageConfig`]/manifest layer list a future
-//! build executor is assembling stage by stage.
+//! or decide *when* to diff a rootfs (that's `ociman build`'s own job
+//! — `bin/ociman/src/build.rs`'s `run_instruction`/`copy_instruction`,
+//! see this crate's own top-level doc comment) — it only turns an
+//! already-computed [`oci_layer::Change`] list plus the live rootfs it
+//! was computed from into one new, real, stored layer, and knows how
+//! to fold that (or a non-layer-producing instruction) into an
+//! [`ImageConfig`]/manifest layer list the build executor assembles
+//! stage by stage.
 
 use std::collections::BTreeMap;
 use std::io;

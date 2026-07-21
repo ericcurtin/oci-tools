@@ -1,6 +1,9 @@
 //! Dockerfile-style `$VAR`/`${VAR}` variable expansion — the engine
-//! only, not yet wired into any [`crate::Instruction`] (see this
-//! module's own "not yet wired in" note below for why).
+//! wired into most [`crate::Instruction`] variants via
+//! [`crate::expand_stage`]/[`crate::expand_meta_args`] (`docs/design/
+//! 0042`; deliberately *not* `RUN`/`CMD`/`ENTRYPOINT`/`SHELL`/
+//! `HEALTHCHECK`/`ONBUILD`'s own command-line text — see `expand_
+//! stage`'s own doc comment for why not).
 //!
 //! Every rule here was checked directly against BuildKit's own
 //! implementation (`~/git/moby/vendor/github.com/moby/buildkit/
@@ -61,21 +64,22 @@
 //! practice to defer to a later increment; using one of them is a
 //! clear parse error here, not a silent misparse.
 //!
-//! # Not yet wired into [`crate::Instruction`]
+//! # Wired into [`crate::Instruction`] via per-stage environment scoping
 //!
 //! Real expansion needs to know the accumulated `ARG`/`ENV`
 //! environment *at the point each instruction appears* — which resets
 //! at each `FROM` (a new build stage starts with a mostly-fresh
 //! environment; only meta-`ARG`s declared before the very first
-//! `FROM`, and only if re-declared inside the stage, carry over) — a
-//! scoping rule that only makes real sense once instructions are
-//! grouped into stages by their own `FROM` boundaries, which is a
-//! separate, later increment (`crate`'s own module doc: "build graph:
-//! stage DAG"). Shipping and thoroughly testing the expansion engine
-//! itself first, independent of that not-yet-built grouping, matches
-//! this project's own established pattern (e.g. `systemd_cgroup::
-//! create_scope` in `oci-tools`' own `docs/design/0033`, tested
-//! standalone before `docs/design/0034` wired it in).
+//! `FROM`, and only if re-declared inside the stage, carry over).
+//! [`crate::expand_stage`] (`docs/design/0042`) is what actually
+//! threads that scoping rule through the crate's own stage-grouped
+//! instruction list (`crate::group_stages`), calling this module's own
+//! [`expand`] at each point that needs it. This engine itself was
+//! shipped and thoroughly tested standalone first, independent of
+//! that grouping, matching this project's own established pattern
+//! (e.g. `systemd_cgroup::create_scope` in `oci-tools`' own `docs/
+//! design/0033`, tested standalone before `docs/design/0034` wired it
+//! in).
 
 use std::collections::HashMap;
 use std::iter::Peekable;

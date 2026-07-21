@@ -99,10 +99,9 @@
 //!   here is local-storage-only, matching this project's own
 //!   established "narrow first increment" pattern.
 //! * No cache invalidation beyond prefix/text matching — an image
-//!   removed from local storage (`ociman rmi`, not implemented yet
-//!   either) simply stops being a candidate the next time
-//!   [`load_candidates`] runs; there is no separate cache-specific
-//!   pruning of its own.
+//!   removed from local storage (`ociman rmi`, 0102) simply stops
+//!   being a candidate the next time [`load_candidates`] runs; there
+//!   is no separate cache-specific pruning of its own.
 
 use std::path::Path;
 

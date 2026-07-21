@@ -200,7 +200,9 @@ enum Command {
     /// real `podman inspect`/`docker inspect`'s own default
     /// resolution order: a container (by id or `--name`) is tried
     /// first, falling back to an image (by reference, exactly as it
-    /// was pulled) if no such container exists.
+    /// was pulled, or by a real or short image ID — a hex prefix of
+    /// its own manifest digest, the same short ID `ociman images`'
+    /// own `DIGEST` column prints) if no such container exists.
     Inspect {
         /// A container's ID/`--name`, or an image reference.
         reference: String,
@@ -1223,18 +1225,13 @@ fn cmd_inspect(reference_str: &str, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let reference = Reference::parse(reference_str)
-        .with_context(|| format!("parsing image reference {reference_str:?}"))?;
     let store = open_store()?;
-    let record = store
-        .resolve_image(&reference.to_string())
-        .with_context(|| format!("looking up {reference} in local storage"))?
-        .ok_or_else(|| {
-            anyhow::anyhow!("{reference}: no such image in local storage (run `ociman pull` first)")
-        })?;
+    let record = resolve_image_by_reference_or_id(&store, reference_str)?.ok_or_else(|| {
+        anyhow::anyhow!("{reference_str}: no such image in local storage (run `ociman pull` first)")
+    })?;
     let config = store
         .image_config(&record)
-        .with_context(|| format!("reading config for {reference}"))?;
+        .with_context(|| format!("reading config for {}", record.reference))?;
 
     if json {
         oci_cli_common::output::print_json(&config)?;
@@ -1710,6 +1707,62 @@ fn validate_container_name(name: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Resolve `spec` to a stored image record: first as an ordinary tag
+/// reference (the overwhelmingly common case, and the only thing
+/// `ociman` supported resolving an image by before this), then, if
+/// that fails, as a real or short image ID — a hex prefix of its own
+/// manifest digest, no `sha256:` prefix required — matching real
+/// `docker inspect a1b2c3d4`/`podman inspect a1b2c3d4`'s own
+/// convention exactly (the same short ID `ociman images`' own
+/// `DIGEST` column already prints, 12 hex characters by default, but
+/// any real prefix length works here too, same as real docker/
+/// podman). Deduplicated by the *real* underlying digest, not by tag
+/// count: two tags pointing at the exact same image (`ociman tag`'s
+/// own whole point) never make an ID prefix ambiguous — only two
+/// genuinely *different* images that happen to share a digest prefix
+/// do (a real, if rare in practice, `sha256` collision-adjacent case;
+/// checked directly this way rather than just picking the first
+/// match, matching real docker's own "Multiple IDs found" refusal
+/// instead of silently guessing).
+fn resolve_image_by_reference_or_id(
+    store: &Store,
+    spec: &str,
+) -> anyhow::Result<Option<ImageRecord>> {
+    if let Ok(reference) = Reference::parse(spec)
+        && let Some(record) = store
+            .resolve_image(&reference.to_string())
+            .with_context(|| format!("looking up {reference} in local storage"))?
+    {
+        return Ok(Some(record));
+    }
+
+    let candidate = spec
+        .strip_prefix("sha256:")
+        .unwrap_or(spec)
+        .to_ascii_lowercase();
+    if candidate.is_empty()
+        || candidate.len() > 64
+        || !candidate.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Ok(None);
+    }
+
+    let mut by_digest: std::collections::HashMap<String, ImageRecord> =
+        std::collections::HashMap::new();
+    for record in store.list_images().context("listing local images")? {
+        if record.manifest_digest.hex().starts_with(&candidate) {
+            by_digest
+                .entry(record.manifest_digest.hex().to_string())
+                .or_insert(record);
+        }
+    }
+    match by_digest.len() {
+        0 => Ok(None),
+        1 => Ok(by_digest.into_values().next()),
+        n => anyhow::bail!("image ID {spec:?} is ambiguous: matches {n} different images"),
+    }
 }
 
 /// Resolve `reference` (whatever a user gave any container-targeting
