@@ -49,7 +49,11 @@ now skips re-running/re-copying a `RUN`/`COPY`/`ADD` step outright
 whenever an earlier build already produced the exact same result
 (full-history-prefix matching plus a real content digest for
 `COPY`/`ADD`, ported from real buildah's own model — see
-`docs/design/0101`; `--no-cache` disables it)). Milestone 3 also grew
+`docs/design/0101`; `--no-cache` disables it)); `FROM scratch` is
+supported too, producing a real, genuinely empty base image (no
+layers, no inherited config beyond the same default `PATH` real
+`docker build`/`podman build` both still bake in even here — see
+`docs/design/0114`). Milestone 3 also grew
 real
 `--memory-swap`/
 `--cpuset-cpus`/`--cpuset-mems`/`--security-opt seccomp=`/a real
@@ -87,7 +91,7 @@ milestone.
 | 1 | workspace skeleton, `oci-cli-common`, 4-VM CI matrix | **done** |
 | 2 | `oci-spec-types`/`oci-registry`/`oci-store`; `ociman pull/images/inspect` | **done** (plus `ociman rmi`, including refusing to remove an image a container still depends on unless `--force`, and `ociman tag`, both beyond the original scope — see `docs/design/0102`-`0103`) |
 | 3 | `oci-runtime-core` + `ocirun`; `ociman run/exec/ps/logs` rootless | **done** (plus systemd cgroups with automated failed-scope cleanup, all six real lifecycle hooks including `createContainer`/`startContainer`, running for both the combined `run` and the separate `create`/`start`/`delete` lifecycle, seccomp, resource limits, `--security-opt seccomp=`, a real `podman`-default capability set, `--cap-add`/`--cap-drop`, `--privileged`, `--read-only`, `-e`/`--env`, `--hostname`, `-w`/`--workdir`, `--entrypoint`, `-v`/`--volume`, `ocirun features`, `ocirun create/run --pid-file`, `ocirun ps`, `ocirun update`, `ociman kill`, `ociman wait`, `ociman rename`, `ociman inspect` for containers, `ociman top`, `ociman run -d`/`--detach`, beyond the original scope) |
-| 4 | `oci-dockerfile`; `ociman build` (multi-stage, cache) | in progress — `RUN`/`COPY`/`ADD`/`--build-arg`/`--target` work end to end and commit real layers, including multiple explicit sources, glob patterns, `COPY --from=<external-image>`, `ADD` from a remote URL, multiple `ARG` names on one line, `COPY`/`ADD --chmod`/`--chown`, a real local build cache (`--no-cache` to disable), and `ociman history` for viewing a built image's own real layer history (see `docs/design/0050`-`0060`, `0068`, `0072`-`0079`, `0097`, `0101`, `0104`) |
+| 4 | `oci-dockerfile`; `ociman build` (multi-stage, cache) | in progress — `RUN`/`COPY`/`ADD`/`--build-arg`/`--target` work end to end and commit real layers, including multiple explicit sources, glob patterns, `COPY --from=<external-image>`, `ADD` from a remote URL, multiple `ARG` names on one line, `COPY`/`ADD --chmod`/`--chown`, a real local build cache (`--no-cache` to disable), `FROM scratch`, and `ociman history` for viewing a built image's own real layer history (see `docs/design/0050`-`0060`, `0068`, `0072`-`0079`, `0097`, `0101`, `0104`, `0114`) |
 | 5 | erofs/mount/BLS; `ociboot install to-disk`; dracut module; QEMU boot test | in progress — `oci-erofs` builds real, verified-deterministic erofs images via `mkfs.erofs`, seals/verifies them with real fs-verity ioctls, and has a detached dm-verity fallback via `veritysetup`; `oci-bls` reads/writes the real grubenv block and Type #1 BLS entries, scans `/loader/entries/` as a directory, implements the real spec's own boot-counting filename convention, and sorts entries per the real spec's own "Sorting" section including full UAPI.10 version comparison (all verified against the real uapi-group spec/tools); `oci-mount` attaches/detaches real loop devices; `ociboot` now has its first real subcommand, `list` (see `docs/design/0061`-`0066`, `0070`-`0071`, `0087`); the `boot_success` grubenv protocol, actually mounting a verified image at boot, `ociboot`'s other subcommands (`install`/`upgrade`/etc.), and the dracut module are not started yet |
 | 6 | upgrade/switch/rollback/status/gc; /etc merge; boot counting; layered mode | — |
 | 7 | `ocicri` (critest subset), `ocibox` | — |

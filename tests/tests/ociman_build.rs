@@ -592,10 +592,21 @@ fn target_naming_no_real_stage_is_a_clear_error() {
 }
 
 #[test]
-fn rejects_from_scratch_with_a_clear_error() {
+fn from_scratch_builds_a_real_zero_base_layer_image_matching_real_docker_podman() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
     let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+
     let context_dir = tempfile::tempdir().unwrap();
-    write_containerfile(context_dir.path(), "FROM scratch\n");
+    std::fs::copy(&busybox, context_dir.path().join("busybox")).unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM scratch\n\
+         COPY busybox /bin/busybox\n",
+    );
 
     let build = ociman(
         storage_dir.path(),
@@ -603,12 +614,115 @@ fn rejects_from_scratch_with_a_clear_error() {
             "build",
             context_dir.path().to_str().unwrap(),
             "-t",
-            "x:latest",
+            "ociman-test/scratch-built:latest",
         ],
     );
-    assert!(!build.status.success());
-    let stderr = String::from_utf8_lossy(&build.stderr);
-    assert!(stderr.contains("FROM scratch"), "{stderr}");
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/scratch-built:latest")
+        .unwrap()
+        .expect("built image should be recorded in the store");
+    let manifest = store.image_manifest(&record).unwrap();
+    // No base image at all -- the one real `COPY` is the *only* layer.
+    assert_eq!(manifest.layers.len(), 1);
+
+    let config = store.image_config(&record).unwrap();
+    // Real, running-host platform info -- there is no base manifest to
+    // have inherited it from the way every other stage's own config
+    // does.
+    assert_eq!(
+        config.architecture.as_deref(),
+        Some(
+            oci_spec_types::image::Platform::host()
+                .architecture
+                .as_str()
+        )
+    );
+    assert_eq!(config.os.as_deref(), Some("linux"));
+    let cc = config.config.expect("container config");
+    // Matches real `docker build`/`podman build`'s own observed
+    // behavior: even a `FROM scratch` image gets a default `PATH`
+    // baked in (checked directly against both real tools' own
+    // `inspect` output for a real `FROM scratch` build).
+    assert_eq!(
+        cc.env,
+        vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()]
+    );
+
+    // Not just metadata -- the copied binary actually runs, in a
+    // rootfs that started with nothing at all beyond what this one
+    // `COPY` put there.
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/scratch-built:latest",
+            "--",
+            "/bin/busybox",
+            "echo",
+            "hello from scratch",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "hello from scratch\n");
+}
+
+#[test]
+fn from_scratch_with_no_filesystem_touching_instructions_still_builds_a_real_empty_image() {
+    // No `RUN`/`COPY`/`ADD` at all -- matches real `docker build`/
+    // `podman build`: a `FROM scratch` stage with only metadata
+    // instructions still produces a real, valid (if useless) image
+    // with zero layers, rather than being rejected.
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM scratch\n\
+         LABEL empty=\"yes\"\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/scratch-empty:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/scratch-empty:latest")
+        .unwrap()
+        .unwrap();
+    let manifest = store.image_manifest(&record).unwrap();
+    assert_eq!(manifest.layers.len(), 0);
+    let config = store.image_config(&record).unwrap();
+    assert_eq!(
+        config
+            .config
+            .unwrap()
+            .labels
+            .get("empty")
+            .map(String::as_str),
+        Some("yes")
+    );
 }
 
 #[test]

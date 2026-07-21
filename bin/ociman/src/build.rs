@@ -98,8 +98,14 @@
 //!   `noDecompress` for exactly this source kind) — see
 //!   `add_instruction`'s own doc comment for the exact, checked-
 //!   directly filename-determination and file-mode rules.
-//! * **`FROM scratch` is rejected too** (no base image to extend —
-//!   producing a genuinely empty rootfs is its own future increment).
+//! * **`FROM scratch` is supported**: a real, genuinely empty base (no
+//!   layers, no inherited `Config`) — matching real `docker build`/
+//!   `podman build`'s own observed behavior (checked directly, both
+//!   tools): `architecture`/`os` come from this host's own real
+//!   platform (there is no base manifest to inherit them from), and
+//!   `Config.Env` still gets seeded with the same default `PATH`
+//!   neither real tool leaves out even here. See
+//!   [`scratch_base_config`]'s own doc comment.
 //! * **`--build-arg KEY=value` (or bare `--build-arg KEY`, pulling
 //!   from `ociman`'s own process environment) is supported**,
 //!   matching real `docker build --build-arg`/`podman build
@@ -145,7 +151,7 @@ use anyhow::Context as _;
 use oci_dockerfile::{AddFlags, CopyFlags, Instruction, ShellOrExec, commit_layer, record_layer};
 use oci_spec_types::image::{
     ContainerConfig, Descriptor, ImageConfig, ImageManifest, MEDIA_TYPE_IMAGE_CONFIG,
-    MEDIA_TYPE_IMAGE_MANIFEST,
+    MEDIA_TYPE_IMAGE_MANIFEST, Platform, RootFs,
 };
 use oci_spec_types::{Digest, Reference};
 use oci_store::ImageRecord;
@@ -257,11 +263,10 @@ pub fn cmd_build(
                 );
                 (earlier.config.clone(), earlier.layers.clone(), None)
             }
+            None if stage.base_name.eq_ignore_ascii_case("scratch") => {
+                (scratch_base_config(), Vec::new(), None)
+            }
             None => {
-                anyhow::ensure!(
-                    !stage.base_name.eq_ignore_ascii_case("scratch"),
-                    "ociman build: `FROM scratch` is not yet supported (no base image to extend)"
-                );
                 let base_reference = Reference::parse(&stage.base_name).with_context(|| {
                     format!("parsing base image reference {:?}", stage.base_name)
                 })?;
@@ -346,6 +351,38 @@ pub fn cmd_build(
         println!("tagged: {tag_reference}");
     }
     Ok(())
+}
+
+/// The starting `ImageConfig` for a `FROM scratch` stage: no base
+/// image at all, so no layers and no inherited `Config` of any kind —
+/// except a default `PATH`, which real `docker build`/`podman build`
+/// both still bake in even here (checked directly: a real `FROM
+/// scratch` + one `COPY` build, both tools, `docker inspect`/`podman
+/// inspect`'s own `Config.Env` on the result — neither one leaves it
+/// empty). `architecture`/`os` are this host's own real, running
+/// platform (`Platform::host`'s own `GOARCH`/`GOOS` naming, the exact
+/// values a real local build produces, whichever host actually runs
+/// it) -- there is no base manifest to inherit them from the way every
+/// other stage's own config does.
+fn scratch_base_config() -> ImageConfig {
+    let platform = Platform::host();
+    ImageConfig {
+        architecture: Some(platform.architecture),
+        os: Some(platform.os),
+        created: None,
+        author: None,
+        config: Some(ContainerConfig {
+            env: vec![
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+            ],
+            ..Default::default()
+        }),
+        rootfs: RootFs {
+            kind: "layers".to_string(),
+            diff_ids: Vec::new(),
+        },
+        history: Vec::new(),
+    }
 }
 
 /// One stage's own final result: everything a *later* stage's own
