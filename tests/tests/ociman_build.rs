@@ -833,6 +833,127 @@ fn an_unreferenced_stage_is_pruned_and_never_built() {
     assert!(!labels.contains_key("unused"));
 }
 
+/// `--label KEY=VALUE` (repeatable) applies *after* every real
+/// Containerfile `LABEL` instruction -- overriding a same-key `LABEL`
+/// already there, adding any brand new key, and leaving every other
+/// `LABEL` untouched -- matching real `podman build --label` exactly,
+/// confirmed directly.
+#[test]
+fn label_flag_overrides_a_same_key_dockerfile_label_and_adds_a_new_one() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/label-flag-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/label-flag-base:latest\n\
+         LABEL foo=from-dockerfile\n\
+         LABEL untouched=still-here\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/label-flag-result:latest",
+            "--label",
+            "foo=from-cli",
+            "--label",
+            "brand-new=only-from-cli",
+            "--label",
+            "bareword",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/label-flag-result:latest")
+        .unwrap()
+        .unwrap();
+    let config = store.image_config(&record).unwrap();
+    let labels = config.config.unwrap().labels;
+    assert_eq!(labels.get("foo").map(String::as_str), Some("from-cli"));
+    assert_eq!(
+        labels.get("untouched").map(String::as_str),
+        Some("still-here")
+    );
+    assert_eq!(
+        labels.get("brand-new").map(String::as_str),
+        Some("only-from-cli")
+    );
+    assert_eq!(labels.get("bareword").map(String::as_str), Some(""));
+}
+
+/// No `--label` at all leaves the built image's own history exactly
+/// as it would have been without this flag at all -- no extra, empty
+/// "LABEL " history entry ever gets recorded when there's nothing to
+/// apply.
+#[test]
+fn no_label_flag_at_all_adds_no_extra_history_entry() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/no-label-flag-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/no-label-flag-base:latest\nLABEL foo=bar\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/no-label-flag-result:latest",
+        ],
+    );
+    assert!(build.status.success());
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/no-label-flag-result:latest")
+        .unwrap()
+        .unwrap();
+    let config = store.image_config(&record).unwrap();
+    let label_history_entries: Vec<&str> = config
+        .history
+        .iter()
+        .filter_map(|h| h.created_by.as_deref())
+        .filter(|created_by| created_by.starts_with("LABEL "))
+        .collect();
+    // Exactly the one real `LABEL foo=bar` from the Containerfile
+    // itself -- no second, synthetic `--label`-driven entry.
+    assert_eq!(label_history_entries, vec!["LABEL foo=bar"]);
+}
+
 /// `--target <name>` builds only that named stage (and whatever it
 /// depends on), never the stages after it in the file -- proven the
 /// same way `an_unreferenced_stage_is_pruned_and_never_built` proves

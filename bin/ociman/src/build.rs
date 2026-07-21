@@ -211,6 +211,7 @@ pub fn cmd_build(
     tls_verify: bool,
     ignorefile: Option<&Path>,
     iidfile: Option<&Path>,
+    labels: &[String],
     json: bool,
 ) -> anyhow::Result<()> {
     let tag = tag.context(
@@ -377,9 +378,28 @@ pub fn cmd_build(
         built.insert(stage_index, built_stage);
     }
 
-    let BuiltStage { config, layers, .. } = built
+    let BuiltStage {
+        mut config, layers, ..
+    } = built
         .remove(&target)
         .expect("the target stage is always included in its own stages_needed_for result");
+
+    // `--label` applies *after* every real Containerfile instruction —
+    // matching real `podman build --label` exactly, confirmed
+    // directly: it shows up as its own extra `LABEL` step at the very
+    // end of the build, so it overrides a same-key `LABEL` already in
+    // the Containerfile itself, not the other way around.
+    let labels = parse_labels(labels);
+    if !labels.is_empty() {
+        let cc = config.config.get_or_insert_with(ContainerConfig::default);
+        for (key, value) in &labels {
+            cc.labels.insert(key.clone(), value.clone());
+        }
+        oci_dockerfile::record_empty_history(
+            &mut config,
+            format!("LABEL {}", format_pairs(&labels)),
+        );
+    }
 
     let config_bytes = serde_json::to_vec(&config).context("serializing image config")?;
     let config_ingested = store
@@ -741,6 +761,33 @@ fn parse_build_args(build_args: &[String]) -> std::collections::HashMap<String, 
                     resolved.remove(arg);
                 }
             },
+        }
+    }
+    resolved
+}
+
+/// Parse `--label`'s own repeated `KEY=VALUE` (or bare `KEY`, for an
+/// empty value — matching real `podman build --label`'s own tolerant
+/// parse, confirmed directly: `--label bareword` becomes
+/// `bareword=""`, not a parse error) command-line strings into an
+/// ordered list of pairs, later duplicate keys overwriting an earlier
+/// one's own *value* in place (keeping its original position) rather
+/// than moving it to the end — unlike [`parse_build_args`], a bare
+/// `--label KEY` (no `=` at all) never falls back to this process's
+/// own environment; real `podman build --label` doesn't either.
+fn parse_labels(labels: &[String]) -> Vec<(String, String)> {
+    let mut resolved: Vec<(String, String)> = Vec::new();
+    let mut index_of: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for label in labels {
+        let (key, value) = match label.split_once('=') {
+            Some((key, value)) => (key, value),
+            None => (label.as_str(), ""),
+        };
+        if let Some(&index) = index_of.get(key) {
+            resolved[index].1 = value.to_string();
+        } else {
+            index_of.insert(key, resolved.len());
+            resolved.push((key.to_string(), value.to_string()));
         }
     }
     resolved
@@ -2509,6 +2556,43 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved.get("A").map(String::as_str), Some("1"));
         assert_eq!(resolved.get("B").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn parse_labels_uses_key_equals_value_verbatim() {
+        let resolved = parse_labels(&["foo=bar".to_string()]);
+        assert_eq!(resolved, vec![("foo".to_string(), "bar".to_string())]);
+    }
+
+    #[test]
+    fn parse_labels_a_bare_key_with_no_equals_sign_means_an_empty_value() {
+        // Confirmed directly against real `podman build --label
+        // bareword`: becomes `bareword=""`, never a parse error and
+        // never pulled from this process's own environment (unlike
+        // `parse_build_args`' own bare-`KEY` handling).
+        let resolved = parse_labels(&["bareword".to_string()]);
+        assert_eq!(resolved, vec![("bareword".to_string(), String::new())]);
+    }
+
+    #[test]
+    fn parse_labels_later_entries_for_the_same_key_overwrite_in_place() {
+        let resolved = parse_labels(&[
+            "foo=first".to_string(),
+            "bar=middle".to_string(),
+            "foo=second".to_string(),
+        ]);
+        assert_eq!(
+            resolved,
+            vec![
+                ("foo".to_string(), "second".to_string()),
+                ("bar".to_string(), "middle".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_labels_of_an_empty_list_is_empty() {
+        assert!(parse_labels(&[]).is_empty());
     }
 
     fn meta_args_and_stages(input: &str) -> (Vec<Instruction>, Vec<oci_dockerfile::Stage>) {

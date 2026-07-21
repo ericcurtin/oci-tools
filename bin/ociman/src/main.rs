@@ -206,6 +206,16 @@ enum Command {
         /// no surrounding whitespace at all).
         #[arg(long = "iidfile", value_name = "PATH")]
         iidfile: Option<PathBuf>,
+        /// Set a label on the built image: `KEY=value`, or bare `KEY`
+        /// for an empty value (repeatable) — matching real `podman
+        /// build --label` exactly (checked directly): applied *after*
+        /// every real `LABEL` instruction in the Containerfile itself,
+        /// so a `--label` overrides a same-key `LABEL` rather than the
+        /// other way around, and shows up as its own extra entry in
+        /// `ociman history`, the same way real `podman build --label`
+        /// shows it as its own extra build step.
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        label: Vec<String>,
     },
     /// List images in local storage.
     Images,
@@ -708,6 +718,7 @@ fn main() -> std::process::ExitCode {
                 tls_verify,
                 ignorefile,
                 iidfile,
+                label,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
@@ -718,6 +729,7 @@ fn main() -> std::process::ExitCode {
                 tls_verify,
                 ignorefile.as_deref(),
                 iidfile.as_deref(),
+                &label,
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),
