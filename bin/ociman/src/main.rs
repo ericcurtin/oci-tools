@@ -86,6 +86,15 @@ enum Command {
         /// Image reference, e.g. `ubuntu`, `ubuntu:24.04`, or
         /// `quay.io/foo/bar@sha256:...`.
         reference: String,
+        /// Require HTTPS and verify certificates when contacting
+        /// registries (matching real `docker pull`/`podman pull`'s
+        /// own `--tls-verify` exactly, including its own flexible
+        /// `--tls-verify`/`--tls-verify=false`/`--tls-verify false`
+        /// syntax). `--tls-verify=false` talks plain HTTP to
+        /// `reference`'s own registry host — the escape hatch a
+        /// local/private development registry commonly needs.
+        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        tls_verify: bool,
     },
     /// Push an already-stored image back to its own registry/
     /// repository/tag, matching real `docker push`/`podman push`'s
@@ -100,6 +109,11 @@ enum Command {
         /// (the same short ID `ociman images`' own `DIGEST` column
         /// prints).
         reference: String,
+        /// Require HTTPS and verify certificates when contacting the
+        /// registry — see `Command::Pull`'s own identical flag for the
+        /// exact same syntax/semantics.
+        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        tls_verify: bool,
     },
     /// Log in to a container registry, matching real `docker login`/
     /// `podman login`'s own auth-file format exactly (`--username`/
@@ -641,8 +655,14 @@ fn main() -> std::process::ExitCode {
                 "no command given; try `ociman --help` (the rest of the podman-style surface \
                  arrives with later milestones)"
             ),
-            Some(Command::Pull { reference }) => cmd_pull(&reference, cli.global.json),
-            Some(Command::Push { reference }) => cmd_push(&reference, cli.global.json),
+            Some(Command::Pull {
+                reference,
+                tls_verify,
+            }) => cmd_pull(&reference, tls_verify, cli.global.json),
+            Some(Command::Push {
+                reference,
+                tls_verify,
+            }) => cmd_push(&reference, tls_verify, cli.global.json),
             Some(Command::Login {
                 registry,
                 username,
@@ -779,11 +799,27 @@ impl ImageView {
     }
 }
 
-fn cmd_pull(reference_str: &str, json: bool) -> anyhow::Result<()> {
+/// A real registry client, talking plain HTTP (never HTTPS) to
+/// `registry_host` specifically when `tls_verify` is `false` —
+/// matching real `docker pull --tls-verify=false`/`podman pull
+/// --tls-verify=false`'s own behavior exactly: the escape hatch a
+/// local/private development registry commonly needs, scoped to just
+/// the one registry actually being talked to (not a blanket "every
+/// registry is insecure" toggle).
+fn registry_client(registry_host: &str, tls_verify: bool) -> oci_registry::Client {
+    let credentials = oci_registry::Credentials::load();
+    if tls_verify {
+        oci_registry::Client::with_credentials(credentials)
+    } else {
+        oci_registry::Client::with_options(credentials, std::iter::once(registry_host.to_string()))
+    }
+}
+
+fn cmd_pull(reference_str: &str, tls_verify: bool, json: bool) -> anyhow::Result<()> {
     let reference = Reference::parse(reference_str)
         .with_context(|| format!("parsing image reference {reference_str:?}"))?;
     let store = open_store()?;
-    let mut client = oci_registry::Client::new();
+    let mut client = registry_client(reference.registry_host(), tls_verify);
 
     let progress = oci_cli_common::progress::spinner(format!("pulling {}", reference.familiar()));
     let result = oci_registry::pull_image(&mut client, &store, &reference, &Platform::host())
@@ -809,14 +845,14 @@ struct PushResult {
     digest: String,
 }
 
-fn cmd_push(reference_str: &str, json: bool) -> anyhow::Result<()> {
+fn cmd_push(reference_str: &str, tls_verify: bool, json: bool) -> anyhow::Result<()> {
     let store = open_store()?;
     let resolved = resolve_image_by_reference_or_id(&store, reference_str)?
         .ok_or_else(|| anyhow::anyhow!("{reference_str}: no such image in local storage"))?;
     let record = resolved.record();
     let reference = Reference::parse(&record.reference)
         .with_context(|| format!("parsing image reference {:?}", record.reference))?;
-    let mut client = oci_registry::Client::new();
+    let mut client = registry_client(reference.registry_host(), tls_verify);
 
     let progress = oci_cli_common::progress::spinner(format!("pushing {}", reference.familiar()));
     let result = oci_registry::push_image(&mut client, &store, &reference, record)
