@@ -4363,3 +4363,115 @@ fn containerignore_wins_outright_over_a_dockerignore_present_at_the_same_time() 
         "/app/.containerignore\n/app/.dockerignore\n/app/Containerfile\n/app/a.txt\n"
     );
 }
+
+/// `--ignorefile <path>` reads that exact path directly, at any name
+/// or location, instead of the usual `.containerignore`-then-
+/// `.dockerignore` context-root search -- confirmed directly against
+/// real `podman build --ignorefile`.
+#[test]
+fn ignorefile_flag_reads_an_arbitrarily_named_file_at_an_arbitrary_path() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ignorefile-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("a.txt"), "a\n").unwrap();
+    std::fs::write(context_dir.path().join("b.txt"), "b\n").unwrap();
+    // Neither the default name nor the default location -- proves
+    // `--ignorefile` really does bypass the usual context-root search
+    // entirely rather than merely renaming what it looks for there.
+    let custom_ignorefile = tempfile::tempdir().unwrap();
+    let custom_ignorefile_path = custom_ignorefile.path().join("custom.ignore");
+    std::fs::write(&custom_ignorefile_path, "b.txt\n").unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/ignorefile-base:latest\n\
+         COPY . /app\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/ignorefile-result:latest",
+            "--ignorefile",
+            custom_ignorefile_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/ignorefile-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "find /app -type f | sort",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "/app/Containerfile\n/app/a.txt\n"
+    );
+}
+
+/// A nonexistent `--ignorefile` path is a real, fatal build error --
+/// never a silent "no patterns" fallback -- confirmed directly against
+/// real `podman build --ignorefile /does/not/exist`.
+#[test]
+fn ignorefile_flag_pointing_at_a_nonexistent_path_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ignorefile-missing-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("a.txt"), "a\n").unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/ignorefile-missing-base:latest\n\
+         COPY . /app\n",
+    );
+
+    let missing_path = context_dir.path().join("does-not-exist.ignore");
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/ignorefile-missing-result:latest",
+            "--ignorefile",
+            missing_path.to_str().unwrap(),
+        ],
+    );
+    assert!(!build.status.success());
+}

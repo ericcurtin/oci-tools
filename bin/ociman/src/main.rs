@@ -190,6 +190,15 @@ enum Command {
         /// the exact same syntax/semantics.
         #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         tls_verify: bool,
+        /// Path to an alternate `.dockerignore`/`.containerignore`
+        /// file, read directly instead of the usual `.containerignore`-
+        /// then-`.dockerignore` search at the context root — matching
+        /// real `podman build --ignorefile` exactly (checked directly
+        /// against real buildah's own `ContainerIgnoreFile`: an
+        /// explicit path that doesn't exist is a real, fatal build
+        /// error, not a silent "no patterns" fallback).
+        #[arg(long = "ignorefile", value_name = "PATH")]
+        ignorefile: Option<PathBuf>,
     },
     /// List images in local storage.
     Images,
@@ -690,6 +699,7 @@ fn main() -> std::process::ExitCode {
                 target,
                 no_cache,
                 tls_verify,
+                ignorefile,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
@@ -698,6 +708,7 @@ fn main() -> std::process::ExitCode {
                 target.as_deref(),
                 no_cache,
                 tls_verify,
+                ignorefile.as_deref(),
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),

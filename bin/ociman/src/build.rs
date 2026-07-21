@@ -209,6 +209,7 @@ pub fn cmd_build(
     target: Option<&str>,
     no_cache: bool,
     tls_verify: bool,
+    ignorefile: Option<&Path>,
     json: bool,
 ) -> anyhow::Result<()> {
     let tag = tag.context(
@@ -221,7 +222,7 @@ pub fn cmd_build(
     let text = std::fs::read_to_string(&dockerfile_path)
         .with_context(|| format!("reading {}", dockerfile_path.display()))?;
 
-    let dockerignore_patterns = read_ignore_patterns(context)?;
+    let dockerignore_patterns = read_ignore_patterns(context, ignorefile)?;
     let dockerignore = oci_dockerfile::DockerIgnore::compile(&dockerignore_patterns)
         .map_err(|_| anyhow::anyhow!("ociman build: invalid .dockerignore pattern"))?;
 
@@ -760,17 +761,28 @@ fn resolve_dockerfile_path(context: &Path, dockerfile: Option<&Path>) -> anyhow:
     );
 }
 
-/// Read this build's own raw `.dockerignore`-syntax pattern list from
-/// `context`'s root — `.containerignore`, if present, wins outright;
-/// `.dockerignore` is only ever consulted as a fallback when
-/// `.containerignore` doesn't exist at all; neither one present means
-/// no patterns at all (nothing ever excluded). Checked directly
-/// against real buildah's own current source (`~/git/podman/vendor/
-/// go.podman.io/buildah/pkg/parse/parse.go`'s own `ContainerIgnoreFile`,
-/// the function real `podman build`/`buildah build` actually calls —
-/// confirmed independently with two real `podman build` runs, one
-/// with only `.containerignore` present, one with both present at
-/// once) and with real `podman`/`buildah`'s own documented rationale:
+/// Read this build's own raw `.dockerignore`-syntax pattern list.
+///
+/// When `ignorefile` is `Some` (`--ignorefile <path>`), that exact
+/// path is read directly — no `.containerignore`/`.dockerignore`
+/// search at all, and a path that doesn't exist (or otherwise can't be
+/// read) is a real, fatal build error, never a silent "no patterns"
+/// fallback — matching real `podman build --ignorefile` exactly,
+/// confirmed directly: a real `podman build --ignorefile
+/// /does/not/exist` fails outright rather than proceeding as if no
+/// ignore file existed.
+///
+/// Otherwise, `context`'s root is searched: `.containerignore`, if
+/// present, wins outright; `.dockerignore` is only ever consulted as a
+/// fallback when `.containerignore` doesn't exist at all; neither one
+/// present means no patterns at all (nothing ever excluded). Checked
+/// directly against real buildah's own current source (`~/git/podman/
+/// vendor/go.podman.io/buildah/pkg/parse/parse.go`'s own
+/// `ContainerIgnoreFile`, the function real `podman build`/`buildah
+/// build` actually calls — confirmed independently with real `podman
+/// build` runs: one with only `.containerignore` present, one with
+/// both present at once, one with an explicit `--ignorefile`) and with
+/// real `podman`/`buildah`'s own documented rationale:
 /// `.containerignore` is the tool-neutral name this project (and
 /// podman/buildah) prefers, `.dockerignore` the long-established one
 /// every other build tool still emits and expects.
@@ -787,7 +799,12 @@ fn resolve_dockerfile_path(context: &Path, dockerfile: Option<&Path>) -> anyhow:
 /// project hasn't seen a real need for yet — left for a dedicated,
 /// separately-scoped future increment rather than replicating an
 /// upstream self-inconsistency without its own real justification.
-fn read_ignore_patterns(context: &Path) -> anyhow::Result<Vec<String>> {
+fn read_ignore_patterns(context: &Path, ignorefile: Option<&Path>) -> anyhow::Result<Vec<String>> {
+    if let Some(path) = ignorefile {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        return Ok(oci_dockerfile::parse_dockerignore(&text));
+    }
     let containerignore_path = context.join(".containerignore");
     match std::fs::read_to_string(&containerignore_path) {
         Ok(text) => Ok(oci_dockerfile::parse_dockerignore(&text)),
