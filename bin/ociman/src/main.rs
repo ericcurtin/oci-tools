@@ -163,8 +163,10 @@ enum Command {
     /// `target` if it already resolves to something else, same as
     /// both real tools.
     Tag {
-        /// The already-stored image to tag, exactly as it was pulled
-        /// or previously tagged.
+        /// The already-stored image to tag — a reference exactly as
+        /// it was pulled or previously tagged, or a real or short
+        /// image ID (the same short ID `ociman images`' own `DIGEST`
+        /// column prints).
         source: String,
         /// The new reference to create (or overwrite), e.g.
         /// `myrepo/myimage:v2`.
@@ -920,28 +922,34 @@ struct TagResult {
 /// already resolves to, since this project's own store is
 /// content-addressed (the same reasoning `ociman build`'s own final
 /// `store.put_image` call already relies on for its own `-t`/`--tag`).
+///
+/// `source` resolves by tag reference *or* by a real or short image
+/// ID (`resolve_image_by_reference_or_id`, 0122) — unlike `ociman
+/// rmi`'s own by-ID case (0123), tagging has no removal-ambiguity
+/// question at all (it only ever *adds* a pointer, never removes one),
+/// so there's nothing extra to check here: `podman tag <id> <new-tag>`
+/// against a real installed `podman` works exactly the same way,
+/// checked directly, no `--force` concept involved either.
 fn cmd_tag(source_str: &str, target_str: &str, json: bool) -> anyhow::Result<()> {
-    let source = Reference::parse(source_str)
-        .with_context(|| format!("parsing image reference {source_str:?}"))?;
     let target = Reference::parse(target_str)
         .with_context(|| format!("parsing image reference {target_str:?}"))?;
 
     let store = open_store()?;
-    let record = store
-        .resolve_image(&source.to_string())
-        .with_context(|| format!("looking up {source} in local storage"))?
-        .ok_or_else(|| anyhow::anyhow!("{source}: no such image in local storage"))?;
+    let record = resolve_image_by_reference_or_id(&store, source_str)?
+        .ok_or_else(|| anyhow::anyhow!("{source_str}: no such image in local storage"))?
+        .record()
+        .clone();
 
     store
         .put_image(&ImageRecord {
             reference: target.to_string(),
             manifest_digest: record.manifest_digest,
         })
-        .with_context(|| format!("tagging {source} as {target}"))?;
+        .with_context(|| format!("tagging {} as {target}", record.reference))?;
 
     if json {
         oci_cli_common::output::print_json(&TagResult {
-            source: source.to_string(),
+            source: record.reference,
             target: target.to_string(),
         })?;
     } else {

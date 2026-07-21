@@ -220,3 +220,51 @@ fn tag_json_reports_the_canonical_source_and_target() {
     assert_eq!(view["source"], "docker.io/ociman-test/tag-json:latest");
     assert_eq!(view["target"], "docker.io/library/tag-json-out:v1");
 }
+
+/// Real docker/podman rule, checked directly: `tag`'s own source
+/// resolves by image ID too, not just a tag reference -- the exact
+/// short digest `ociman images`' own `DIGEST` column already prints.
+/// Unlike `ociman rmi`'s own by-ID case, tagging has no removal-
+/// ambiguity question at all (it only ever adds a pointer).
+#[test]
+fn tag_resolves_its_own_source_by_a_real_image_id() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/tag-by-id:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let record = store
+        .resolve_image("docker.io/ociman-test/tag-by-id:latest")
+        .unwrap()
+        .unwrap();
+    let short_id = record.manifest_digest.hex()[..12].to_string();
+
+    let tag = ociman(
+        storage_dir.path(),
+        &["--json", "tag", &short_id, "tag-by-id-out:v1"],
+    );
+    assert!(
+        tag.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&tag.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&tag.stdout).unwrap();
+    // The resolved (real, canonical) reference is reported back, not
+    // the raw ID the user typed.
+    assert_eq!(view["source"], "docker.io/ociman-test/tag-by-id:latest");
+    assert_eq!(view["target"], "docker.io/library/tag-by-id-out:v1");
+
+    let new_record = store
+        .resolve_image("docker.io/library/tag-by-id-out:v1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(new_record.manifest_digest, record.manifest_digest);
+}
