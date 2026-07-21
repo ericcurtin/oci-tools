@@ -83,6 +83,7 @@ pub mod identity;
 pub mod launch;
 pub mod namespaces;
 pub mod nsenter;
+pub mod overlay;
 pub mod process;
 pub mod rlimits;
 pub mod rootfs;
