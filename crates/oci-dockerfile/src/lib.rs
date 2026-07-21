@@ -64,6 +64,7 @@
 
 mod commit;
 mod dependencies;
+mod dockerignore;
 mod download;
 mod expand_stage;
 mod glob;
@@ -76,6 +77,7 @@ pub use commit::{
     CommitLayerError, CommittedLayer, commit_layer, record_empty_history, record_layer,
 };
 pub use dependencies::{resolve_copy_from_dependencies, resolve_dependencies, stages_needed_for};
+pub use dockerignore::{DockerIgnore, parse as parse_dockerignore};
 pub use download::{DownloadError, Downloaded, download};
 pub use expand_stage::{expand_meta_args, expand_stage};
 pub use glob::{BadPattern, contains_wildcards, match_pattern};

@@ -221,6 +221,22 @@ pub fn cmd_build(
     let text = std::fs::read_to_string(&dockerfile_path)
         .with_context(|| format!("reading {}", dockerfile_path.display()))?;
 
+    // A `.dockerignore` at the context root, real `docker build`/
+    // `podman build` syntax and semantics (`oci_dockerfile::
+    // dockerignore`'s own doc comment has the exact rules, each
+    // checked directly against a real `podman build`) — no file at
+    // all means nothing is ever excluded, same as real docker/podman.
+    let dockerignore_path = context.join(".dockerignore");
+    let dockerignore_patterns = match std::fs::read_to_string(&dockerignore_path) {
+        Ok(text) => oci_dockerfile::parse_dockerignore(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading {}", dockerignore_path.display()));
+        }
+    };
+    let dockerignore = oci_dockerfile::DockerIgnore::compile(&dockerignore_patterns)
+        .map_err(|_| anyhow::anyhow!("ociman build: invalid .dockerignore pattern"))?;
+
     let instructions = oci_dockerfile::parse(&text).map_err(|e| anyhow::anyhow!(e))?;
     let (meta_args, stages) =
         oci_dockerfile::group_stages(instructions).map_err(|e| anyhow::anyhow!(e))?;
@@ -353,6 +369,7 @@ pub fn cmd_build(
         let stage_ctx = StageContext {
             stages: &stages,
             built: &built,
+            dockerignore: &dockerignore,
         };
         let force_rootfs = copy_from_targets.contains(&stage_index);
         let built_stage = build_stage(
@@ -490,6 +507,16 @@ struct BuiltStage {
 struct StageContext<'a> {
     stages: &'a [oci_dockerfile::Stage],
     built: &'a std::collections::HashMap<usize, BuiltStage>,
+    /// This build's own compiled `.dockerignore` (empty/no-op if the
+    /// context has no `.dockerignore` file at all) — carried on
+    /// `StageContext` purely so every function already threading
+    /// `stage_ctx` through (`copy_instruction`, most notably) can
+    /// reach it without yet another parameter of its own; conceptually
+    /// unrelated to the "which earlier stage's rootfs is where"
+    /// question the rest of this struct answers, but real per-build
+    /// state exactly like it (computed once in `cmd_build`, read-only
+    /// for the rest of the build).
+    dockerignore: &'a oci_dockerfile::DockerIgnore,
 }
 
 impl StageContext<'_> {
@@ -819,6 +846,7 @@ fn apply_instruction(
                 context,
                 rootfs,
                 cache_candidates,
+                stage_ctx.dockerignore,
             )?;
         }
         Instruction::From { .. } => {
@@ -1255,7 +1283,15 @@ fn copy_instruction(
             }
         },
     };
-    let sources = resolve_sources(source_root, sources, "COPY")?;
+    // `.dockerignore` is purely a build-*context* concept — real
+    // docker/podman never apply it to `--from=<stage>`/
+    // `--from=<external-image>` (neither one is "the build context"),
+    // confirmed directly against real `patternmatcher`'s own
+    // integration point (context-transfer time, upstream of any
+    // per-instruction `--from` handling entirely). `None` here simply
+    // disables every dockerignore-aware filter below.
+    let context_ignore = flags.from.is_none().then_some(stage_ctx.dockerignore);
+    let sources = resolve_sources(source_root, sources, "COPY", context_ignore)?;
     // Real Docker/BuildKit rule, checked directly (`copy.go`'s own
     // `createCopyInstruction`: `"When using COPY with more than one
     // source file, the destination must be a directory and end with a
@@ -1274,8 +1310,13 @@ fn copy_instruction(
     // Checked up front (not just implicitly by the copy loop further
     // down) so a missing source fails with a clear "does not exist"
     // error before the content-digest hash below ever tries (and
-    // fails, with a far less clear I/O error) to read it.
-    ensure_sources_exist(source_root, &sources, "COPY")?;
+    // fails, with a far less clear I/O error) to read it. An
+    // explicitly-named source excluded by `.dockerignore` fails this
+    // exact same way — matches real `podman build`, confirmed
+    // directly: it's genuinely not part of the build context, not a
+    // separate "excluded" error of its own (see `oci_dockerfile::
+    // dockerignore`'s own doc comment).
+    ensure_sources_exist(source_root, &sources, "COPY", context_ignore)?;
 
     // A real content digest of exactly what's about to be copied,
     // folded into the recorded `created_by` -- see `build_cache`'s
@@ -1343,9 +1384,14 @@ fn copy_instruction(
             dest_path.clone()
         };
 
-        copy_path_recursive(&source_path, &target, chmod, chown).with_context(|| {
-            format!("copying {} to {}", source_path.display(), target.display())
-        })?;
+        copy_path_recursive(
+            &source_path,
+            &target,
+            chmod,
+            chown,
+            context_ignore.map(|ignore| (ignore, source.as_str())),
+        )
+        .with_context(|| format!("copying {} to {}", source_path.display(), target.display()))?;
     }
     let diff = oci_layer::changes(rootfs, &before)
         .with_context(|| format!("diffing rootfs after {command_text}"))?;
@@ -1420,6 +1466,7 @@ fn add_instruction(
     context: &Path,
     rootfs: &Path,
     cache_candidates: &[crate::build_cache::CacheCandidate],
+    dockerignore: &oci_dockerfile::DockerIgnore,
 ) -> anyhow::Result<()> {
     let chown = flags
         .chown
@@ -1457,7 +1504,7 @@ fn add_instruction(
         .cloned()
         .collect();
     let url_sources: Vec<&String> = sources.iter().filter(|s| is_remote_url(s)).collect();
-    let local_sources = resolve_sources(context, &local_sources, "ADD")?;
+    let local_sources = resolve_sources(context, &local_sources, "ADD", Some(dockerignore))?;
     // Same real Docker/BuildKit rule as `copy_instruction` -- see its
     // own doc comment for the exact source checked directly (against
     // the *expanded* source count, not the number of source arguments
@@ -1480,7 +1527,7 @@ fn add_instruction(
         // Same "fail fast with a clear message, before hashing" order
         // as `copy_instruction`'s own identical check -- see its own
         // doc comment.
-        ensure_sources_exist(context, &local_sources, "ADD")?;
+        ensure_sources_exist(context, &local_sources, "ADD", Some(dockerignore))?;
         let content_digest = crate::build_cache::content_digest(context, &local_sources)
             .with_context(|| format!("hashing ADD source content for {command_text}"))?;
         let created_by = format!("{command_text} # {content_digest}");
@@ -1609,7 +1656,14 @@ fn add_instruction(
             } else {
                 dest_path.clone()
             };
-            copy_path_recursive(&source_path, &target, chmod, chown).with_context(|| {
+            copy_path_recursive(
+                &source_path,
+                &target,
+                chmod,
+                chown,
+                Some((dockerignore, source.as_str())),
+            )
+            .with_context(|| {
                 format!("copying {} to {}", source_path.display(), target.display())
             })?;
         }
@@ -1700,11 +1754,12 @@ fn resolve_sources(
     source_root: &Path,
     sources: &[String],
     instruction_name: &str,
+    context_ignore: Option<&oci_dockerfile::DockerIgnore>,
 ) -> anyhow::Result<Vec<String>> {
     let mut resolved = Vec::new();
     for source in sources {
         if oci_dockerfile::contains_wildcards(source) {
-            let matches = expand_wildcard_source(source_root, source)
+            let matches = expand_wildcard_source(source_root, source, context_ignore)
                 .with_context(|| format!("expanding {instruction_name} source {source:?}"))?;
             anyhow::ensure!(
                 !matches.is_empty(),
@@ -1727,17 +1782,25 @@ fn resolve_sources(
 /// checked up front instead so a real caller (the content-digest hash
 /// [`copy_instruction`]/`add_instruction` each compute right after
 /// this) never has to surface a confusing raw I/O error for what is
-/// simply a missing source.
+/// simply a missing source. An explicitly-named (non-wildcard)
+/// `source` excluded by `context_ignore` (when `Some` — never applies
+/// to a `COPY --from=<stage>`/`--from=<external-image>` source, see
+/// `copy_instruction`'s own doc comment) is treated exactly like a
+/// genuinely missing one, matching real `podman build`'s own behavior
+/// confirmed directly (`oci_dockerfile::dockerignore`'s own doc
+/// comment has the exact transcript).
 fn ensure_sources_exist(
     source_root: &Path,
     sources: &[String],
     instruction_name: &str,
+    context_ignore: Option<&oci_dockerfile::DockerIgnore>,
 ) -> anyhow::Result<()> {
     for source in sources {
         let source_path = safe_join(source_root, source.trim_start_matches('/'))
             .with_context(|| format!("resolving {instruction_name} source {source:?}"))?;
+        let ignored = context_ignore.is_some_and(|ignore| ignore.is_ignored(source));
         anyhow::ensure!(
-            source_path.exists(),
+            !ignored && source_path.exists(),
             "{instruction_name} source {source:?} does not exist in {}",
             source_root.display()
         );
@@ -1747,10 +1810,22 @@ fn ensure_sources_exist(
 
 /// Every real path (file or directory alike, at any depth) under
 /// `source_root` whose own path relative to `source_root` matches
-/// `pattern`, in lexical order.
-fn expand_wildcard_source(source_root: &Path, pattern: &str) -> anyhow::Result<Vec<String>> {
+/// `pattern`, in lexical order — a path excluded by `context_ignore`
+/// (when `Some`) is never even a match candidate, matching real
+/// `podman build`'s own silent (no-error) exclusion of a wildcard
+/// source's own `.dockerignore`d matches, confirmed directly.
+fn expand_wildcard_source(
+    source_root: &Path,
+    pattern: &str,
+    context_ignore: Option<&oci_dockerfile::DockerIgnore>,
+) -> anyhow::Result<Vec<String>> {
     let mut all_relative_paths = Vec::new();
-    walk_relative_paths(source_root, source_root, &mut all_relative_paths)?;
+    walk_relative_paths(
+        source_root,
+        source_root,
+        context_ignore,
+        &mut all_relative_paths,
+    )?;
     all_relative_paths.sort();
     let mut matches = Vec::new();
     for rel in all_relative_paths {
@@ -1766,8 +1841,23 @@ fn expand_wildcard_source(source_root: &Path, pattern: &str) -> anyhow::Result<V
 /// Recursively collect every entry under `dir` (starting at `root`),
 /// as each one's own path relative to `root`, using `/` as the
 /// separator regardless of host platform (matching the Dockerfile
-/// instruction syntax's own always-`/`-separated paths).
-fn walk_relative_paths(root: &Path, dir: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
+/// instruction syntax's own always-`/`-separated paths) — an entry
+/// `context_ignore` excludes is never pushed to `out` at all.
+///
+/// Never descends into a directory `context_ignore` excludes *unless*
+/// the `.dockerignore` has at least one `!`-negated pattern somewhere
+/// in it ([`oci_dockerfile::DockerIgnore::has_negation`]) — with no
+/// negation anywhere, nothing underneath an excluded directory could
+/// ever end up re-included, so walking it at all would only cost real
+/// time for zero possible effect on the result. A real, measurable
+/// saving for a large excluded directory (`node_modules`/`.git`, the
+/// overwhelmingly common real-world case).
+fn walk_relative_paths(
+    root: &Path,
+    dir: &Path,
+    context_ignore: Option<&oci_dockerfile::DockerIgnore>,
+    out: &mut Vec<String>,
+) -> anyhow::Result<()> {
     for entry in
         std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?
     {
@@ -1776,15 +1866,18 @@ fn walk_relative_paths(root: &Path, dir: &Path, out: &mut Vec<String>) -> anyhow
         let file_type = entry
             .file_type()
             .with_context(|| format!("reading file type for {}", path.display()))?;
-        if file_type.is_dir() {
-            walk_relative_paths(root, &path, out)?;
-        }
         let rel = path
             .strip_prefix(root)
             .expect("every walked path is under its own root")
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/");
-        out.push(rel);
+        let ignored = context_ignore.is_some_and(|ignore| ignore.is_ignored(&rel));
+        if file_type.is_dir() && (!ignored || context_ignore.is_some_and(|i| i.has_negation())) {
+            walk_relative_paths(root, &path, context_ignore, out)?;
+        }
+        if !ignored {
+            out.push(rel);
+        }
     }
     Ok(())
 }
@@ -1878,14 +1971,58 @@ fn write_new_file(target: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> 
 /// entirely outside the copy's own scope. `lchown` avoids that
 /// unconditionally, matching what "chown the thing `COPY` actually
 /// created here" has to mean once symlinks are preserved as such.
+///
+/// `ignore`, when `Some((matcher, rel))`, is this call's own
+/// `.dockerignore` matcher plus `src`'s own path relative to the
+/// build context root (`None` for a `COPY --from=<stage>`/
+/// `--from=<external-image>` source, which is never subject to
+/// `.dockerignore` at all — see `copy_instruction`'s own doc
+/// comment). A fully-excluded entry (a file, or a directory with no
+/// `!`-negated pattern anywhere that could ever re-include something
+/// underneath it) is skipped entirely, with no work done at all — see
+/// `walk_relative_paths`'s own doc comment for why that matters for a
+/// large excluded directory. A directory that's itself excluded but
+/// still needs walking (some negation pattern exists somewhere) never
+/// gets its own `create_dir_all`/`chmod`/`chown` here — only a
+/// surviving, individually-re-included descendant does, via its own
+/// ordinary parent-directory creation further down — matching real
+/// `podman build`'s own observed behavior exactly: an excluded
+/// directory with a re-included descendant still leaves an otherwise-
+/// empty directory behind in the built image, but never with its own
+/// source-preserved mode/ownership (confirmed directly, see
+/// `oci_dockerfile::dockerignore`'s own doc comment).
 fn copy_path_recursive(
     src: &Path,
     dest: &Path,
     chmod: Option<u32>,
     chown: Option<(u32, u32)>,
+    ignore: Option<(&oci_dockerfile::DockerIgnore, &str)>,
 ) -> anyhow::Result<()> {
     let metadata = std::fs::symlink_metadata(src)
         .with_context(|| format!("reading metadata for {}", src.display()))?;
+
+    if let Some((matcher, rel)) = ignore
+        && matcher.is_ignored(rel)
+    {
+        if metadata.is_dir() && matcher.has_negation() {
+            for entry in
+                std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))?
+            {
+                let entry = entry.with_context(|| format!("reading {}", src.display()))?;
+                let name = entry.file_name();
+                let child_rel = format!("{rel}/{}", name.to_string_lossy());
+                copy_path_recursive(
+                    &entry.path(),
+                    &dest.join(&name),
+                    chmod,
+                    chown,
+                    Some((matcher, child_rel.as_str())),
+                )?;
+            }
+        }
+        return Ok(());
+    }
+
     if metadata.is_dir() {
         std::fs::create_dir_all(dest)
             .with_context(|| format!("creating directory {}", dest.display()))?;
@@ -1897,7 +2034,18 @@ fn copy_path_recursive(
         }
         for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
             let entry = entry.with_context(|| format!("reading {}", src.display()))?;
-            copy_path_recursive(&entry.path(), &dest.join(entry.file_name()), chmod, chown)?;
+            let name = entry.file_name();
+            let child_ignore =
+                ignore.map(|(matcher, rel)| (matcher, format!("{rel}/{}", name.to_string_lossy())));
+            copy_path_recursive(
+                &entry.path(),
+                &dest.join(&name),
+                chmod,
+                chown,
+                child_ignore
+                    .as_ref()
+                    .map(|(matcher, rel)| (*matcher, rel.as_str())),
+            )?;
         }
     } else if metadata.file_type().is_symlink() {
         let link_target = std::fs::read_link(src)

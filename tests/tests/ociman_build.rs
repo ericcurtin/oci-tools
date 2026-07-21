@@ -3675,3 +3675,552 @@ fn a_change_earlier_in_the_file_busts_the_cache_for_every_later_step_too() {
     // even consider reusing.
     assert_ne!(first_manifest.layers[1], second_manifest.layers[1]);
 }
+
+fn write_dockerignore(dir: &Path, contents: &str) {
+    std::fs::write(dir.join(".dockerignore"), contents).unwrap();
+}
+
+/// `.dockerignore` excludes a named file from a whole-context `COPY .
+/// /app` -- the most common real-world use -- while an un-matched
+/// file still copies normally. Every non-obvious `.dockerignore` rule
+/// exercised across this test group was independently confirmed
+/// against a real, installed `podman build` (4.9.3) first -- see
+/// `oci_dockerfile::dockerignore`'s own doc comment for the exact
+/// transcripts.
+#[test]
+fn dockerignore_excludes_a_named_file_from_a_whole_context_copy() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/dockerignore-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("keep.txt"), "keep\n").unwrap();
+    std::fs::write(context_dir.path().join("ignored.txt"), "ignored\n").unwrap();
+    write_dockerignore(context_dir.path(), "ignored.txt\n");
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/dockerignore-base:latest\n\
+         COPY . /app\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/dockerignore-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/dockerignore-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "find /app -type f | sort",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    // Neither the Containerfile nor the `.dockerignore` itself gets
+    // any special always-included treatment either -- confirmed
+    // directly against real `podman build` -- so both show up here
+    // right alongside `keep.txt`, exactly like real podman's own
+    // output would.
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "/app/.dockerignore\n/app/Containerfile\n/app/keep.txt\n"
+    );
+}
+
+/// A bare pattern with no `**` only ever matches a *top-level* context
+/// entry -- confirmed directly against real `podman build`: a bare
+/// `*.log` pattern left a nested `subdir/nested.log` file in place.
+#[test]
+fn dockerignore_bare_pattern_only_matches_top_level_not_nested() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/dockerignore-bare-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("top.log"), "top\n").unwrap();
+    std::fs::create_dir(context_dir.path().join("subdir")).unwrap();
+    std::fs::write(
+        context_dir.path().join("subdir").join("nested.log"),
+        "nested\n",
+    )
+    .unwrap();
+    write_dockerignore(context_dir.path(), "*.log\n");
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/dockerignore-bare-base:latest\n\
+         COPY top.log /top.log.copy\n\
+         COPY subdir /app/subdir\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/dockerignore-bare-result:latest",
+        ],
+    );
+    // The explicit, top-level `COPY top.log ...` fails outright --
+    // `top.log` really is excluded, matching real `podman build`'s own
+    // "does not exist" error for exactly this case (see the dedicated
+    // test for this below); this test only cares about the *nested*
+    // file surviving, so it uses a wildcard-free `subdir` copy on its
+    // own, separately, once that's confirmed.
+    assert!(!build.status.success());
+
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/dockerignore-bare-base:latest\n\
+         COPY subdir /app/subdir\n",
+    );
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/dockerignore-bare-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/dockerignore-bare-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "find /app -type f | sort",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "/app/subdir/nested.log\n"
+    );
+}
+
+/// `**/*.log` (unlike a bare `*.log`, see above) matches at any depth
+/// -- confirmed directly against real `podman build`.
+#[test]
+fn dockerignore_double_star_prefix_matches_at_any_depth() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/dockerignore-double-star-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("top.log"), "top\n").unwrap();
+    std::fs::write(context_dir.path().join("keep.txt"), "keep\n").unwrap();
+    std::fs::create_dir(context_dir.path().join("subdir")).unwrap();
+    std::fs::write(
+        context_dir.path().join("subdir").join("nested.log"),
+        "nested\n",
+    )
+    .unwrap();
+    write_dockerignore(context_dir.path(), "**/*.log\n");
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/dockerignore-double-star-base:latest\n\
+         COPY . /app\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/dockerignore-double-star-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/dockerignore-double-star-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "find /app -type f | sort",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "/app/.dockerignore\n/app/Containerfile\n/app/keep.txt\n"
+    );
+}
+
+/// A later `!`-negated pattern re-includes one specific file even
+/// though an earlier pattern excluded its own parent directory --
+/// unlike real `.gitignore`'s own early-pruning behavior, confirmed
+/// directly against real `podman build`.
+#[test]
+fn dockerignore_negation_re_includes_one_file_under_an_excluded_directory() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/dockerignore-negation-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(context_dir.path().join("subdir")).unwrap();
+    std::fs::write(
+        context_dir.path().join("subdir").join("other.txt"),
+        "other\n",
+    )
+    .unwrap();
+    std::fs::write(context_dir.path().join("subdir").join("keep.txt"), "keep\n").unwrap();
+    write_dockerignore(context_dir.path(), "subdir\n!subdir/keep.txt\n");
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/dockerignore-negation-base:latest\n\
+         COPY . /app\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/dockerignore-negation-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/dockerignore-negation-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "find /app -type f | sort",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "/app/.dockerignore\n/app/Containerfile\n/app/subdir/keep.txt\n"
+    );
+}
+
+/// `.dockerignore` applies to `ADD`'s own local (non-URL) sources
+/// exactly the same way it does to `COPY`'s -- both read from the
+/// same build context, and `ADD`'s own `resolve_sources`/
+/// `ensure_sources_exist`/`copy_path_recursive` call sites share the
+/// exact same dockerignore-aware code `COPY`'s do (`bin/ociman/src/
+/// build.rs`'s own `add_instruction`).
+#[test]
+fn dockerignore_also_applies_to_add_local_sources() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/dockerignore-add-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("keep.txt"), "keep\n").unwrap();
+    std::fs::write(context_dir.path().join("ignored.txt"), "ignored\n").unwrap();
+    write_dockerignore(context_dir.path(), "ignored.txt\n");
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/dockerignore-add-base:latest\n\
+         ADD . /app\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/dockerignore-add-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/dockerignore-add-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "find /app -type f | sort",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "/app/.dockerignore\n/app/Containerfile\n/app/keep.txt\n"
+    );
+}
+
+/// An explicitly-named (non-wildcard) `COPY` source excluded by
+/// `.dockerignore` fails exactly the same way a genuinely missing
+/// source would -- confirmed directly against real `podman build`
+/// (its own real error: `"no items matching glob ... copied (1
+/// filtered out ...): no such file or directory"`).
+#[test]
+fn dockerignore_explicit_copy_of_an_ignored_source_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/dockerignore-explicit-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("ignored.txt"), "ignored\n").unwrap();
+    write_dockerignore(context_dir.path(), "ignored.txt\n");
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/dockerignore-explicit-base:latest\n\
+         COPY ignored.txt /app/ignored.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/dockerignore-explicit-result:latest",
+        ],
+    );
+    assert!(!build.status.success());
+    assert!(
+        String::from_utf8_lossy(&build.stderr).contains("does not exist"),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+/// A wildcard `COPY` source silently drops any `.dockerignore`d match
+/// from the expanded list (no error), as long as at least one
+/// surviving match remains -- confirmed directly against real `podman
+/// build`.
+#[test]
+fn dockerignore_wildcard_copy_silently_skips_ignored_matches() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/dockerignore-wildcard-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("a.txt"), "a\n").unwrap();
+    std::fs::write(context_dir.path().join("b.txt"), "b\n").unwrap();
+    write_dockerignore(context_dir.path(), "b.txt\n");
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/dockerignore-wildcard-base:latest\n\
+         COPY *.txt /app/\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/dockerignore-wildcard-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/dockerignore-wildcard-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "find /app -type f | sort",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "/app/a.txt\n");
+}
+
+/// `.dockerignore` is purely a build-*context* concept -- it never
+/// applies to `COPY --from=<stage>` or `COPY --from=<external-image>`
+/// (neither one is "the build context"), matching real `docker
+/// build`/`podman build` exactly: a file that would be excluded if it
+/// were read from the context copies normally when it's instead read
+/// from an earlier stage's own rootfs.
+#[test]
+fn dockerignore_does_not_apply_to_copy_from_an_earlier_stage() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/dockerignore-from-stage-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    // Matches an entry in the `.dockerignore` below by name alone --
+    // but the `builder` stage never reads it from the context at all
+    // (it's created fresh via `RUN`, entirely inside that stage's own
+    // rootfs), so `.dockerignore` has no path through which it could
+    // ever apply to it; `COPY --from=builder` then reads it from that
+    // rootfs directly, same as any other `--from=<stage>` read.
+    write_dockerignore(context_dir.path(), "ignored.txt\n");
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/dockerignore-from-stage-base:latest AS builder\n\
+         RUN echo ignored > /ignored.txt\n\
+         FROM ociman-test/dockerignore-from-stage-base:latest\n\
+         COPY --from=builder /ignored.txt /app/ignored.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/dockerignore-from-stage-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/dockerignore-from-stage-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /app/ignored.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "ignored\n");
+}
