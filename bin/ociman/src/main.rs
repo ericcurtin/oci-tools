@@ -135,6 +135,22 @@ enum Command {
     },
     /// List images in local storage.
     Images,
+    /// Remove an image from local storage, matching real `docker
+    /// rmi`/`podman rmi`. Refuses to remove an image still referenced
+    /// by any container (running or stopped) unless `--force`, which
+    /// removes those containers first (killing any still running one,
+    /// same as `ociman rm --force`).
+    Rmi {
+        /// Image reference, e.g. `ubuntu`, `ubuntu:24.04`, or
+        /// `quay.io/foo/bar@sha256:...` — exactly as it was pulled or
+        /// tagged (matching `ociman inspect`'s own image-reference
+        /// resolution).
+        reference: String,
+        /// Also remove any container still using this image (killing
+        /// it first if still running), instead of refusing.
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Print low-level JSON for a container or an image — matching
     /// real `podman inspect`/`docker inspect`'s own default
     /// resolution order: a container (by id or `--name`) is tried
@@ -549,6 +565,7 @@ fn main() -> std::process::ExitCode {
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),
+            Some(Command::Rmi { reference, force }) => cmd_rmi(&reference, force, cli.global.json),
             Some(Command::Inspect { reference }) => cmd_inspect(&reference, cli.global.json),
             Some(Command::Run {
                 image,
@@ -711,6 +728,80 @@ fn cmd_images(json: bool) -> anyhow::Result<()> {
             &short_digest[..short_digest.len().min(12)],
             view.size
         );
+    }
+    Ok(())
+}
+
+/// `ociman rmi`'s own `--json` output: the canonical reference removed,
+/// plus any container ids removed along with it (`--force` only —
+/// always empty otherwise, since a dependent container without
+/// `--force` is a hard error, not a partial success).
+#[derive(Debug, Serialize)]
+struct RmiResult {
+    reference: String,
+    removed_containers: Vec<String>,
+}
+
+/// Remove an image from local storage — see [`Command::Rmi`]'s own
+/// doc comment for the exact `--force` policy. Matches real `docker
+/// rmi`/`podman rmi`'s own refusal to remove an image a container
+/// still depends on: unlike a plain tag/reference removal, silently
+/// untagging an image out from under an existing container (even a
+/// stopped one, which real podman can still `start` again later)
+/// would leave that container's own `ociman inspect`/`ps` output
+/// pointing at nothing, matching neither tool's own documented
+/// behavior. Only removes the store's own tag/digest *pointer*
+/// ([`oci_store::Store::remove_image`]) — the underlying blobs (a
+/// manifest/config/layer another tag might still share, per this
+/// project's own content-addressed dedup) are reclaimed later by a
+/// future `gc` command, not implicitly here.
+fn cmd_rmi(reference_str: &str, force: bool, json: bool) -> anyhow::Result<()> {
+    let reference = Reference::parse(reference_str)
+        .with_context(|| format!("parsing image reference {reference_str:?}"))?;
+    let canonical = reference.to_string();
+
+    let store = open_store()?;
+    anyhow::ensure!(
+        store
+            .resolve_image(&canonical)
+            .with_context(|| format!("looking up {reference} in local storage"))?
+            .is_some(),
+        "{reference}: no such image in local storage"
+    );
+
+    let containers = open_container_store()?;
+    let dependents: Vec<String> = containers
+        .list()
+        .context("listing containers")?
+        .into_iter()
+        .filter(|state| state.annotations.get(ANNOTATION_IMAGE) == Some(&canonical))
+        .map(|state| state.id)
+        .collect();
+    if !dependents.is_empty() {
+        anyhow::ensure!(
+            force,
+            "image {reference} is in use by {} container(s) ({}); use -f/--force to remove them \
+             too, or `ociman rm` them first",
+            dependents.len(),
+            dependents.join(", ")
+        );
+        for id in &dependents {
+            remove_container(&containers, id, true)
+                .with_context(|| format!("removing dependent container {id} (--force)"))?;
+        }
+    }
+
+    store
+        .remove_image(&canonical)
+        .with_context(|| format!("removing {reference}"))?;
+
+    if json {
+        oci_cli_common::output::print_json(&RmiResult {
+            reference: canonical,
+            removed_containers: dependents,
+        })?;
+    } else {
+        println!("{canonical}");
     }
     Ok(())
 }
@@ -1379,7 +1470,21 @@ fn cmd_ps(all: bool, quiet: bool, json: bool) -> anyhow::Result<()> {
 
 fn cmd_rm(id: &str, force: bool) -> anyhow::Result<()> {
     let containers = open_container_store()?;
-    let resolved = resolve_container_id(&containers, id)?;
+    remove_container(&containers, id, force)?;
+    println!("{id}");
+    Ok(())
+}
+
+/// The actual "stop (if `force`) and remove one container's own
+/// storage" logic, factored out of [`cmd_rm`] so [`cmd_rmi`]'s own
+/// `--force` path (removing every container still using an image
+/// about to be removed) can reuse it *without* also inheriting
+/// `cmd_rm`'s own `println!` — mixing that into `ociman rmi --json`'s
+/// own machine-readable stdout output would produce invalid JSON,
+/// same reasoning as `warn_on_unused_build_args`'s own stderr-only
+/// convention in `build.rs`.
+fn remove_container(containers: &StateStore, id: &str, force: bool) -> anyhow::Result<()> {
+    let resolved = resolve_container_id(containers, id)?;
     let state = containers.load(&resolved)?;
     let status = state.effective_status();
 
@@ -1406,7 +1511,6 @@ fn cmd_rm(id: &str, force: bool) -> anyhow::Result<()> {
     }
 
     containers.remove(&resolved)?;
-    println!("{id}");
     Ok(())
 }
 
