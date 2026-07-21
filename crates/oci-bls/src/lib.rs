@@ -25,6 +25,12 @@
 //!   `sort-key`/`machine-id`/version, in that priority order; entries
 //!   without fall back to their own file name, decreasing version
 //!   order, boot-counting suffix removed.
+//! - [`cmdline`] — kernel command-line parsing and editing
+//!   ([`Cmdline`]/[`Parameter`]/[`Action`]), a direct, narrower port of
+//!   real bootc's own `bootc-kernel-cmdline` crate, cross-checked
+//!   against its own real test suite (including its own
+//!   "pathological" quoting edge cases) — the primitive a future
+//!   `ociboot kargs` subcommand needs; no CLI surface of its own yet.
 //!
 //! `ociboot grubenv` (`bin/ociboot/src/main.rs`) is the first real CLI
 //! surface built on [`grubenv`]: a generic, real, pure-Rust
@@ -39,13 +45,17 @@
 //!   ([`boot_count`] only covers the filename-suffix convention so
 //!   far) so a deployment that repeatedly fails to reach
 //!   `boot-complete.target` auto-falls-back to the previous deployment
-//! - kernel argument (kargs) editing shared by `ociboot kargs` and install
+//! - an actual `ociboot kargs` subcommand built on [`cmdline`], and a
+//!   real image's own declared kargs (a `kargs.d`-shaped config,
+//!   matching real bootc's own convention) diffed against a BLS
+//!   entry's own current `options` field
 //!
 //! External tools (`grub2-mkconfig`, `grub-install`) will be wrapped
 //! behind traits here so pure-Rust replacements can be swapped in
 //! later, matching `oci-erofs::builder`'s own `ErofsBuilder` shape.
 
 pub mod boot_count;
+pub mod cmdline;
 pub mod entry;
 pub mod grubenv;
 pub mod scan;
@@ -53,6 +63,7 @@ pub mod sort;
 pub mod version;
 
 pub use boot_count::{BootCount, parse_suffix};
+pub use cmdline::{Action, Cmdline, Parameter};
 pub use entry::Entry;
 pub use grubenv::GrubEnv;
 pub use scan::{DiscoveredEntry, scan_entries};
