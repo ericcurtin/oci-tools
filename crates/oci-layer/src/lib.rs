@@ -147,6 +147,40 @@ fn apply_tar(reader: impl Read, dest: &Path) -> Result<()> {
     // `unpackedPaths` bookkeeping in `UnpackLayer`.
     let mut written: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
+    // Parent directories this call has already created (or confirmed
+    // already exist), so a directory holding many entries (a real
+    // image's own `/bin`, commonly hundreds of hardlinked applets in
+    // exactly the shape a real busybox-based image ships) pays for
+    // `create_dir_all`'s own `mkdirat`/`statx` calls once, not once
+    // per entry — a real, measured cost (see `docs/design/0106`), not
+    // a hypothetical one: a fresh `ociman run` of a real single-layer
+    // busybox image made this same directory's own parent-creation
+    // check ~370 redundant times before this fix, one per hardlinked
+    // applet sharing the exact same `/bin` parent.
+    let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+    // Whether `dest` had *anything at all* directly in it before this
+    // call started -- if so, every entry this call is about to write
+    // is provably new (nothing from an earlier `apply` call onto this
+    // same `dest`, or anything else, could already occupy any of these
+    // paths), so `extract_entry`'s own "does something already exist
+    // here" check (a real `symlink_metadata` + conditional `remove_*`
+    // per entry) is provably unnecessary and safely skipped — see
+    // `extract_entry`'s own doc comment for the one case (this same
+    // call re-touching a path it already wrote) that still needs it
+    // even then. This is the overwhelmingly common real case: every
+    // multi-layer image's own *first* layer, and every single-layer
+    // image's own *only* layer, is always applied onto a destination
+    // a caller just created fresh (`ociman run`'s own `create_dir_all`
+    // immediately before its layer-application loop, same for `ociman
+    // build`'s own scratch rootfs) -- derived here from a real,
+    // one-time check, not asserted by (and therefore never a
+    // correctness risk if some future caller gets it wrong) any
+    // caller-supplied flag.
+    let dest_was_empty = std::fs::read_dir(dest)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false);
+
     // Entries are extracted by hand below (create_dir_all/File::create/
     // symlink/hard_link), not via `tar`'s own `Entry::unpack`, so there
     // is no built-in ownership/xattr-preservation behavior to disable —
@@ -178,9 +212,32 @@ fn apply_tar(reader: impl Read, dest: &Path) -> Result<()> {
             continue;
         }
 
-        extract_entry(&mut entry, &target, dest, &written)?;
+        extract_entry(
+            &mut entry,
+            &target,
+            dest,
+            &written,
+            &mut created_dirs,
+            dest_was_empty,
+        )?;
         written.insert(target);
     }
+    Ok(())
+}
+
+/// `std::fs::create_dir_all(dir)`, memoized in `created_dirs` for the
+/// lifetime of one [`apply_tar`] call — see its own doc comment for
+/// why this matters (many entries commonly share the exact same
+/// parent directory).
+fn ensure_dir_created(
+    dir: &Path,
+    created_dirs: &mut std::collections::HashSet<PathBuf>,
+) -> io::Result<()> {
+    if created_dirs.contains(dir) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    created_dirs.insert(dir.to_path_buf());
     Ok(())
 }
 
@@ -239,16 +296,28 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
 /// own rule: an existing entry is removed first unless *both* the
 /// existing entry and the new one are directories (those merge: only
 /// the new directory's own metadata is applied).
+///
+/// The existing-entry check itself is skipped entirely when
+/// `dest_was_empty` (nothing could possibly already be at `target`)
+/// **and** this same call hasn't already written `target` earlier in
+/// its own tar stream (`written`) — the one case `dest_was_empty`
+/// alone doesn't rule out, e.g. a malformed/unusual layer whose own
+/// tar stream repeats a path. See [`apply_tar`]'s own doc comment for
+/// why `dest_was_empty` is always safe to trust.
+#[allow(clippy::too_many_arguments)]
 fn extract_entry(
     entry: &mut tar::Entry<'_, impl Read>,
     target: &Path,
     dest: &Path,
     written: &std::collections::HashSet<PathBuf>,
+    created_dirs: &mut std::collections::HashSet<PathBuf>,
+    dest_was_empty: bool,
 ) -> Result<()> {
     let header = entry.header().clone();
     let entry_type = header.entry_type();
 
-    if let Ok(existing) = std::fs::symlink_metadata(target) {
+    let must_check_existing = !dest_was_empty || written.contains(target);
+    if must_check_existing && let Ok(existing) = std::fs::symlink_metadata(target) {
         let both_dirs = existing.is_dir() && entry_type.is_dir();
         if !both_dirs {
             remove_if_exists(target)?;
@@ -257,12 +326,12 @@ fn extract_entry(
 
     match entry_type {
         tar::EntryType::Directory => {
-            std::fs::create_dir_all(target)?;
+            ensure_dir_created(target, created_dirs)?;
             set_mode(target, header.mode()?)?;
         }
         tar::EntryType::Regular | tar::EntryType::Continuous => {
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
+                ensure_dir_created(parent, created_dirs)?;
             }
             let mut out = std::fs::File::create(target)?;
             io::copy(entry, &mut out)?;
@@ -273,9 +342,11 @@ fn extract_entry(
                 io::Error::new(io::ErrorKind::InvalidData, "symlink with no target")
             })?;
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
+                ensure_dir_created(parent, created_dirs)?;
             }
-            let _ = std::fs::remove_file(target);
+            if must_check_existing {
+                let _ = std::fs::remove_file(target);
+            }
             #[cfg(unix)]
             std::os::unix::fs::symlink(link_target, target)?;
         }
@@ -285,9 +356,11 @@ fn extract_entry(
             })?;
             let link_source = safe_join(dest, &link_name)?;
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
+                ensure_dir_created(parent, created_dirs)?;
             }
-            let _ = std::fs::remove_file(target);
+            if must_check_existing {
+                let _ = std::fs::remove_file(target);
+            }
             match std::fs::hard_link(&link_source, target) {
                 Ok(()) => {}
                 // The link target might be something this same layer
@@ -539,6 +612,58 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join("f.txt")).unwrap(),
             b"new content"
+        );
+    }
+
+    /// The real, exact shape the "skip the existing-entry check when
+    /// `dest` started this call empty" optimization (see `apply_tar`'s
+    /// own doc comment) has to keep working: a real multi-layer
+    /// image's own *second* `apply` call, onto the exact same `dest`
+    /// its own *first* call already populated (not a file pre-written
+    /// by the test itself, like `a_new_entry_replaces_a_lower_layers_
+    /// file` above, but a real, previous `apply` call) — `dest` is
+    /// provably *not* empty by the time this second call starts, so it
+    /// must take the full existing-entry-check path, the same as it
+    /// always did before that optimization existed.
+    #[test]
+    fn a_second_apply_call_still_replaces_the_first_calls_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let first = build_tar(&[Entry::File("f.txt", b"from layer one")]);
+        apply(first.as_slice(), Compression::None, dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt")).unwrap(),
+            b"from layer one"
+        );
+
+        let second = build_tar(&[Entry::File("f.txt", b"from layer two")]);
+        apply(second.as_slice(), Compression::None, dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt")).unwrap(),
+            b"from layer two"
+        );
+    }
+
+    /// The one case an empty-at-the-start `dest` alone doesn't cover:
+    /// the *same* `apply` call revisiting a path it already wrote
+    /// earlier in its own tar stream (an unusual but real-world-
+    /// possible shape for a hand-built or unusual layer) — still must
+    /// replace it correctly, not silently fail a `hard_link`/leave
+    /// stale content behind.
+    #[test]
+    fn a_duplicate_path_within_one_apply_call_onto_an_empty_dest_still_replaces_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let data = build_tar(&[
+            Entry::File("f.txt", b"first write, same call"),
+            Entry::File("f.txt", b"second write, same call"),
+        ]);
+        apply(data.as_slice(), Compression::None, dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt")).unwrap(),
+            b"second write, same call"
         );
     }
 
