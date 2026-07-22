@@ -13,10 +13,12 @@ publish = false
 flate2.workspace = true
 oci-spec-types.workspace = true
 ruzstd.workspace = true
+serde.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

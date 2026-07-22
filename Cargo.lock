@@ -779,6 +779,8 @@ dependencies = [
  "flate2",
  "oci-spec-types",
  "ruzstd",
+ "serde",
+ "serde_json",
  "tar",
  "tempfile",
  "thiserror",

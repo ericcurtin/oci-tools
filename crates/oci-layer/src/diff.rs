@@ -109,8 +109,14 @@ pub struct Change {
 /// The type-relevant part of a path's own metadata this module
 /// compares — deliberately not the raw [`fs::Metadata`] itself, so a
 /// [`Snapshot`] can be held in memory well after the underlying file
-/// might have changed again.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// might have changed again. `Serialize`/`Deserialize`: a [`Snapshot`]
+/// captured now may need comparing against much later — e.g. `ociman
+/// diff`, comparing a container's own current filesystem against a
+/// snapshot `ociman run` persisted to disk back when it first created
+/// that container (see `docs/design/0149`'s own doc comment for why a
+/// *persisted* snapshot, rather than a second, fresh extraction of
+/// the same base image, is the only correct way to do that).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct EntryMeta {
     kind: EntryKind,
     /// Permission bits only (`mode & 0o7777`), not the file-type bits
@@ -132,7 +138,7 @@ struct EntryMeta {
     symlink_target: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum EntryKind {
     Regular,
     Directory,
@@ -160,8 +166,10 @@ fn entry_kind(metadata: &fs::Metadata) -> EntryKind {
 /// tree, along with the metadata this module needs to later detect
 /// what changed — cheap enough to hold onto for the duration of, say,
 /// a build's own `RUN` step (no file contents are copied, only
-/// `lstat`-shaped metadata for each entry).
-#[derive(Debug, Clone, Default)]
+/// `lstat`-shaped metadata for each entry). Also cheap enough to
+/// serialize and persist to disk for comparing much later (`ociman
+/// diff`) — see [`EntryMeta`]'s own doc comment.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     entries: BTreeMap<PathBuf, EntryMeta>,
 }
@@ -571,6 +579,51 @@ mod tests {
                 path: PathBuf::from("x"),
                 kind: ChangeKind::Modified,
             }]
+        );
+    }
+
+    /// `Snapshot` needs to round-trip through JSON exactly (`ociman
+    /// diff`, see `docs/design/0149`, persists one to disk with
+    /// `serde_json` and loads it back much later, potentially after
+    /// this same process has long since exited): a symlink target,
+    /// a directory (whose own `mtime` is always `None`), and a plain
+    /// regular file all present in the same snapshot, comparing a
+    /// freshly re-parsed copy against the current real directory
+    /// produces the exact same (empty) diff a direct, in-memory
+    /// `Snapshot` would.
+    #[test]
+    fn snapshot_round_trips_through_json_and_still_diffs_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("a/b.txt"), b"hello");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("b.txt", dir.path().join("a/link")).unwrap();
+
+        let before = Snapshot::capture(dir.path()).unwrap();
+        let json = serde_json::to_vec(&before).unwrap();
+        let reloaded: Snapshot = serde_json::from_slice(&json).unwrap();
+
+        let result = changes(dir.path(), &reloaded).unwrap();
+        assert!(result.is_empty(), "{result:?}");
+
+        // And a real, genuine change is still detected against the
+        // reloaded copy, exactly as it would be against the original
+        // (its own parent directory "a" bubbles up too, matching the
+        // module's own already-established "any changed descendant
+        // marks its ancestors Modified too" rule).
+        write_file(&dir.path().join("a/b.txt"), b"changed");
+        let result = changes(dir.path(), &reloaded).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                Change {
+                    path: PathBuf::from("a"),
+                    kind: ChangeKind::Modified,
+                },
+                Change {
+                    path: PathBuf::from("a/b.txt"),
+                    kind: ChangeKind::Modified,
+                },
+            ]
         );
     }
 }

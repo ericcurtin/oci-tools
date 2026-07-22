@@ -682,6 +682,17 @@ enum Command {
         #[arg(long)]
         overwrite: bool,
     },
+    /// List every real, on-disk path that differs between a
+    /// container's own current filesystem and the base image it was
+    /// created from (`A`dded/`C`hanged/`D`eleted) — matching real
+    /// `docker diff`/`podman diff` exactly. Works on a running or
+    /// stopped container alike; see `cmd_diff`'s own doc comment for
+    /// the one real, checked-directly gap this shares with `ociman
+    /// cp` (a rootless-overlay-rootfs container isn't supported yet).
+    Diff {
+        /// The container's ID or `--name`.
+        id: String,
+    },
     /// Gracefully stop a running container: send it a signal (`TERM`
     /// by default) and wait up to `--time` seconds for it to exit on
     /// its own, then `KILL` it outright if it hasn't — matching real
@@ -929,6 +940,7 @@ fn main() -> std::process::ExitCode {
                 dest,
                 overwrite,
             }) => cmd_cp(&src, &dest, overwrite),
+            Some(Command::Diff { id }) => cmd_diff(&id, cli.global.json),
             Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, &signal),
             Some(Command::Kill { id, signal }) => cmd_kill(&id, &signal),
             Some(Command::Pause { id }) => cmd_pause(&id),
@@ -1844,6 +1856,34 @@ fn cmd_run(
         }
         write_etc_hosts(&write_root, &own_names, add_host).context("writing /etc/hosts")?;
 
+        // A real, persisted "before" reference for a future `ociman
+        // diff` (0149) — captured *after* every layer has been
+        // extracted and `/etc/hosts` written (so neither ever shows
+        // up as a spurious diff entry later), *before* the container
+        // itself has ever run. Only for a plain-`Extract`-mode
+        // container: an overlay-mode one's own `rootfs/` stays empty
+        // on the host's own view for its entire life (see
+        // `rootfs_setup`'s own doc comment), so a snapshot of it
+        // would never be useful — `cmd_diff`'s own `resolve_container_
+        // root` already rejects that case outright before ever
+        // needing this file. See `cmd_diff`'s own doc comment for why
+        // this needs to be a real, persisted snapshot rather than a
+        // second, independent extraction of the base image done later
+        // at `diff` time.
+        if matches!(setup, rootfs_setup::RootfsSetup::Extract) {
+            let snapshot = oci_layer::Snapshot::capture(&rootfs_dir).with_context(|| {
+                format!(
+                    "capturing base filesystem snapshot for {}",
+                    rootfs_dir.display()
+                )
+            })?;
+            let snapshot_path = bundle_dir.join(BASE_SNAPSHOT_FILENAME);
+            let snapshot_json =
+                serde_json::to_vec(&snapshot).context("serializing base filesystem snapshot")?;
+            std::fs::write(&snapshot_path, snapshot_json)
+                .with_context(|| format!("writing {}", snapshot_path.display()))?;
+        }
+
         let mut spec = synthesize_spec(
             &config,
             &container_id,
@@ -2519,12 +2559,12 @@ fn cmd_cp(src: &str, dest: &str, overwrite: bool) -> anyhow::Result<()> {
              through the host instead"
         ),
         (Some(container), None) => {
-            let root = resolve_container_root(&container)?;
+            let (root, _state) = resolve_container_root(&container, "cp")?;
             let real_src = resolve_container_path(&root, &src_path)?;
             copy_cp_path(&real_src, Path::new(&dest_path), overwrite)
         }
         (None, Some(container)) => {
-            let root = resolve_container_root(&container)?;
+            let (root, _state) = resolve_container_root(&container, "cp")?;
             let real_dest = resolve_container_path(&root, &dest_path)?;
             copy_cp_path(Path::new(&src_path), &real_dest, overwrite)
         }
@@ -2558,23 +2598,36 @@ fn parse_user_input(input: &str) -> (Option<String>, String) {
     }
 }
 
-/// The real, current root directory [`cmd_cp`] should resolve
-/// `id`'s own container-side paths against — any status at all (no
-/// cgroup/pid involved), matching real `podman cp`'s own "running or
-/// stopped" support. A clear, real error for a container using this
-/// project's own rootless-overlay rootfs optimization — see
-/// `cmd_cp`'s own doc comment for why.
-fn resolve_container_root(id: &str) -> anyhow::Result<PathBuf> {
+/// The real, current root directory a per-container-path command
+/// (`cp`/`diff`) should resolve `id`'s own container-side paths
+/// against — any status at all (no cgroup/pid involved), matching
+/// real `podman cp`/`podman diff`'s own "running or stopped" support.
+/// A clear, real error for a container using this project's own
+/// rootless-overlay rootfs optimization — see `cmd_cp`'s own doc
+/// comment for why (the same real gap applies to `cmd_diff`, for the
+/// same underlying reason: an overlay-mode container's own real
+/// writes never land in the `rootfs/` directory `state.rootfs` itself
+/// points at, only in a private `upper/` directory this project has
+/// no whiteout-aware merge logic for yet). Also returns the
+/// container's own loaded [`PersistedState`](oci_runtime_core::PersistedState)
+/// alongside the resolved root — `cmd_diff` needs its own annotations
+/// (the base image's own recorded manifest digest) too, and there is
+/// no reason to load it a second time.
+fn resolve_container_root(
+    id: &str,
+    command_name: &str,
+) -> anyhow::Result<(PathBuf, oci_runtime_core::PersistedState)> {
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)?;
     let state = containers.load(&resolved)?;
     let bundle_dir = containers.container_dir(&resolved);
     anyhow::ensure!(
         !rootfs_setup::upper_dir(&bundle_dir).exists(),
-        "ociman cp: container {id:?} uses this project's own rootless-overlay rootfs \
-         optimization, which `cp` doesn't support yet (see docs/design/0146)"
+        "ociman {command_name}: container {id:?} uses this project's own rootless-overlay \
+         rootfs optimization, which `{command_name}` doesn't support yet (see docs/design/0146)"
     );
-    Ok(PathBuf::from(state.rootfs))
+    let root = PathBuf::from(state.rootfs.clone());
+    Ok((root, state))
 }
 
 /// Join `container_relative_path` (an absolute-or-relative path as
@@ -2638,6 +2691,119 @@ fn copy_cp_path(src: &Path, dest: &Path, overwrite: bool) -> anyhow::Result<()> 
     }
 
     build::copy_path_recursive(src, &real_dest, None, None, None)
+}
+
+/// `docker diff`/`podman diff`'s own `--format json` shape exactly
+/// (checked directly, `~/git/podman/cmd/podman/diff/diff.go`'s own
+/// `ChangesReportJSON`): three separate path arrays rather than one
+/// flat `{path, kind}` list, each field omitted entirely when empty.
+#[derive(Debug, Serialize, Default)]
+struct DiffReport {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    changed: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    added: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    deleted: Vec<String>,
+}
+
+/// The file name [`cmd_run`] persists a real, captured
+/// [`oci_layer::Snapshot`] of a plain-`Extract`-mode container's own
+/// freshly-populated `rootfs/` under, right in its own bundle
+/// directory alongside `state.json`/`config.json` — [`cmd_diff`]'s
+/// own "before" reference.
+const BASE_SNAPSHOT_FILENAME: &str = "base-snapshot.json";
+
+/// `docker diff`/`podman diff`-style listing of every real path that
+/// differs between a container's own current filesystem and the
+/// base image it was created from — reuses the exact same real
+/// content/metadata diff `ociman build`'s own `RUN`/`COPY`/`ADD`
+/// commit step already relies on (`oci_layer::Snapshot::capture`/
+/// `changes`), but with the container's own *persisted* base
+/// snapshot ([`BASE_SNAPSHOT_FILENAME`], captured by `cmd_run` itself
+/// right after the container's own `rootfs/` was first populated) as
+/// the "before" reference, rather than re-extracting the base image a
+/// second time.
+///
+/// # A real, checked-directly reason this can't just re-extract the base image fresh
+///
+/// The first version of this feature tried exactly that (diffing
+/// against `oci_store::ensure_cached`'s own shared rootfs-cache
+/// directory) and found a real, false-positive-generating bug before
+/// ever committing it: `oci_layer::apply` deliberately never restores
+/// a tar entry's own original mtime (see its own doc comment — real,
+/// measured cost avoided, since nothing in this project's own
+/// extraction path has ever needed it before now), so *two
+/// independent* extractions of the exact same layer content produce
+/// *different* real mtimes for every regular file, purely from being
+/// extracted at two different wall-clock moments — `oci_layer::diff`'s
+/// own comparison (deliberately, and correctly, mtime-sensitive for
+/// its actual intended use: the *same* directory's own state across
+/// real time, exactly what `ociman build`'s own `RUN`/`COPY`/`ADD`
+/// steps need) would then report *every single regular file* as
+/// spuriously "Changed", even ones the container never touched at
+/// all — confirmed directly with a real throwaway build: a stock
+/// busybox image's own `/bin/busybox` (an ordinary, untouched
+/// hardlinked binary) showed up as `C` even though nothing in the
+/// container ever wrote to it.
+///
+/// Persisting a real snapshot of the container's own actual `rootfs/`
+/// at creation time and diffing its own *current* state against that
+/// same, unchanging reference sidesteps this entirely — it's the
+/// exact same "same directory, two points in real time" shape
+/// `oci_layer::diff` is actually designed for, matching how `ociman
+/// build`'s own commit step already uses it.
+///
+/// Works on a running *or* stopped container ([`resolve_container_
+/// root`]'s own "any status" resolution) — a real, on-disk filesystem
+/// comparison needs no live process/cgroup at all, matching real
+/// `podman diff` exactly. The same real, checked-directly gap
+/// `ociman cp` already has (0146) applies here identically: a
+/// container using this project's own rootless-overlay rootfs
+/// optimization isn't supported yet (its own `rootfs/` directory
+/// stays empty on the host's own view the whole time, so no snapshot
+/// of it would ever show anything real at all — `resolve_container_
+/// root` already rejects this case before `cmd_diff` ever gets this
+/// far).
+fn cmd_diff(id: &str, json: bool) -> anyhow::Result<()> {
+    let (root, state) = resolve_container_root(id, "diff")?;
+    let snapshot_path = Path::new(&state.bundle).join(BASE_SNAPSHOT_FILENAME);
+    let snapshot_bytes = std::fs::read(&snapshot_path).with_context(|| {
+        format!(
+            "container {id:?} has no recorded base filesystem snapshot ({}) -- created by an \
+             older version of ociman, before this existed?",
+            snapshot_path.display()
+        )
+    })?;
+    let before: oci_layer::Snapshot = serde_json::from_slice(&snapshot_bytes)
+        .with_context(|| format!("parsing {}", snapshot_path.display()))?;
+
+    let changes = oci_layer::changes(&root, &before).with_context(|| {
+        format!("diffing container {id:?}'s own filesystem against its base image")
+    })?;
+
+    if json {
+        let mut report = DiffReport::default();
+        for change in &changes {
+            let path = format!("/{}", change.path.display());
+            match change.kind {
+                oci_layer::ChangeKind::Added => report.added.push(path),
+                oci_layer::ChangeKind::Modified => report.changed.push(path),
+                oci_layer::ChangeKind::Deleted => report.deleted.push(path),
+            }
+        }
+        oci_cli_common::output::print_json(&report)?;
+        return Ok(());
+    }
+    for change in &changes {
+        let marker = match change.kind {
+            oci_layer::ChangeKind::Added => "A",
+            oci_layer::ChangeKind::Modified => "C",
+            oci_layer::ChangeKind::Deleted => "D",
+        };
+        println!("{marker} /{}", change.path.display());
+    }
+    Ok(())
 }
 
 /// The actual "stop (if `force`) and remove one container's own
