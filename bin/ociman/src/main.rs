@@ -25,7 +25,11 @@ use clap::Parser;
 use oci_runtime_core::StateStore;
 use oci_runtime_core::state::Status;
 use oci_spec_types::Reference;
-use oci_spec_types::image::{ContainerConfig, Platform};
+use oci_spec_types::image::{
+    ContainerConfig, Descriptor, ImageManifest, MEDIA_TYPE_IMAGE_CONFIG, MEDIA_TYPE_IMAGE_MANIFEST,
+    Platform,
+};
+use oci_spec_types::time::format_rfc3339_utc;
 use oci_store::{ImageRecord, ImageSummary, Store};
 use serde::Serialize;
 
@@ -717,6 +721,39 @@ enum Command {
         /// The container's ID or `--name`.
         id: String,
     },
+    /// Create a new image from a container's own changes relative to
+    /// the image it was created from — matching real `docker commit`/
+    /// `podman commit` exactly for the "one new layer, on top of the
+    /// exact same base layers" case (see `cmd_commit`'s own doc
+    /// comment for what's deliberately out of scope for now: `--pause`/
+    /// `--change`/`--config`/`--squash`/`--include-volumes`, and the
+    /// same rootless-overlay-rootfs gap `cp`/`diff` already have).
+    Commit {
+        /// The container's ID or `--name`.
+        container: String,
+        /// Tag the resulting image (`name[:tag]`) — currently
+        /// required, unlike real `podman commit`'s own optional
+        /// `IMAGE` argument (this project has no established
+        /// "untagged image" storage convention yet — same reasoning
+        /// `ociman build --tag`'s own doc comment already gives for
+        /// requiring `-t`).
+        image: String,
+        /// Set the resulting image's own top-level `author` field
+        /// (matches real `podman commit --author`/buildah's own
+        /// `SetMaintainer` exactly: the image config's `author`
+        /// field, not any one layer's history entry).
+        #[arg(short, long)]
+        author: Option<String>,
+        /// A free-form comment recorded on the new layer's own
+        /// history entry. Real `podman commit --message` sets a
+        /// Docker-format-only `Comment` field this project's own
+        /// OCI-only image config has no equivalent of; the new
+        /// layer's own per-entry `history[].comment` (a real field
+        /// the OCI spec itself defines) is the closest real
+        /// equivalent, so that's what this sets instead.
+        #[arg(short, long)]
+        message: Option<String>,
+    },
     /// Gracefully stop a running container: send it a signal (`TERM`
     /// by default) and wait up to `--time` seconds for it to exit on
     /// its own, then `KILL` it outright if it hasn't — matching real
@@ -991,6 +1028,18 @@ fn main() -> std::process::ExitCode {
                 overwrite,
             }) => cmd_cp(&src, &dest, overwrite),
             Some(Command::Diff { id }) => cmd_diff(&id, cli.global.json),
+            Some(Command::Commit {
+                container,
+                image,
+                author,
+                message,
+            }) => cmd_commit(
+                &container,
+                &image,
+                author.as_deref(),
+                message.as_deref(),
+                cli.global.json,
+            ),
             Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, &signal),
             Some(Command::Kill { id, signal }) => cmd_kill(&id, &signal),
             Some(Command::Pause { id }) => cmd_pause(&id),
@@ -1460,7 +1509,7 @@ struct HistoryEntryView {
 /// see this module's own `tests::history_layer_sizes_*` below.
 fn history_layer_sizes(
     history: &[oci_spec_types::image::HistoryEntry],
-    layers: &[oci_spec_types::image::Descriptor],
+    layers: &[Descriptor],
 ) -> Vec<u64> {
     let non_empty_count = history.iter().filter(|e| !e.empty_layer).count();
     let mut layer_index = layers.len().saturating_sub(non_empty_count);
@@ -2890,6 +2939,159 @@ fn cmd_diff(id: &str, json: bool) -> anyhow::Result<()> {
             oci_layer::ChangeKind::Deleted => "D",
         };
         println!("{marker} /{}", change.path.display());
+    }
+    Ok(())
+}
+
+/// `ociman commit`'s own `--json` output shape, matching `ociman
+/// build`'s own private `BuildResult` exactly (a new image really is
+/// the result of both, whether it came from a Containerfile or from a
+/// container's own live changes).
+#[derive(Debug, Serialize)]
+struct CommitResult {
+    reference: String,
+    digest: String,
+}
+
+/// Create a new image from a container's own changes relative to the
+/// image it was created from — matching real `docker commit`/`podman
+/// commit`'s own core effect exactly: one new layer, containing
+/// everything the container's own filesystem gained/lost/changed since
+/// it started, stacked on top of the exact same base layers/history
+/// its own source image already had.
+///
+/// Reuses exactly the same real, checked-directly-safe diffing
+/// [`cmd_diff`] already established (0149): the container's own
+/// persisted [`BASE_SNAPSHOT_FILENAME`] as the "before" reference,
+/// never a second, independent extraction of the base image (see
+/// `cmd_diff`'s own doc comment for the real false-positive bug that
+/// alternative was found to produce). The new layer itself is
+/// produced by the exact same [`oci_dockerfile::commit_layer`]/
+/// [`oci_dockerfile::record_layer`] pair `ociman build`'s own `RUN`/
+/// `COPY`/`ADD` steps already commit through — this is genuinely the
+/// same operation (turn a live rootfs's own diff against some "before"
+/// state into one new stored layer, appended to some `ImageConfig`'s
+/// own layer list/history), just with a running container's own
+/// current state standing in for a build stage's.
+///
+/// `image` is currently required, unlike real podman's own optional
+/// `IMAGE` argument (which produces a real, but untagged, image if
+/// omitted) — this project has no established "an image can exist
+/// without any tag at all" storage convention yet anywhere else in the
+/// codebase (matches `ociman build --tag`'s own identical, already-
+/// documented narrowing).
+fn cmd_commit(
+    id: &str,
+    image: &str,
+    author: Option<&str>,
+    message: Option<&str>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let (root, state) = resolve_container_root(id, "commit")?;
+    let snapshot_path = Path::new(&state.bundle).join(BASE_SNAPSHOT_FILENAME);
+    let snapshot_bytes = std::fs::read(&snapshot_path).with_context(|| {
+        format!(
+            "container {id:?} has no recorded base filesystem snapshot ({}) -- created by an \
+             older version of ociman, before this existed?",
+            snapshot_path.display()
+        )
+    })?;
+    let before: oci_layer::Snapshot = serde_json::from_slice(&snapshot_bytes)
+        .with_context(|| format!("parsing {}", snapshot_path.display()))?;
+    let changes = oci_layer::changes(&root, &before).with_context(|| {
+        format!("diffing container {id:?}'s own filesystem against its base image")
+    })?;
+
+    let store = open_store()?;
+    let base_reference = state.annotations.get(ANNOTATION_IMAGE).ok_or_else(|| {
+        anyhow::anyhow!(
+            "container {id:?} has no recorded base image reference -- created by an older \
+             version of ociman, before this existed?"
+        )
+    })?;
+    // Matched by the exact reference string the container was created
+    // with, same as `cmd_rmi`'s own identical "resolve a container's
+    // own recorded `ANNOTATION_IMAGE`" lookup — not the more general
+    // `resolve_image_by_reference_or_id` (with its own extra image-ID
+    // fallback), since this is never user input, always a full
+    // reference this same process itself wrote out in `cmd_run`.
+    let base_record = store
+        .resolve_image(base_reference)
+        .context("resolving a container's own image reference")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{base_reference}: container {id:?}'s own base image is no longer in local storage"
+            )
+        })?;
+    let base_manifest = store
+        .image_manifest(&base_record)
+        .with_context(|| format!("reading manifest for {base_reference}"))?;
+    let mut config = store
+        .image_config(&base_record)
+        .with_context(|| format!("reading config for {base_reference}"))?;
+    let mut layers = base_manifest.layers.clone();
+
+    let committed = oci_dockerfile::commit_layer(&store, &root, &changes)
+        .with_context(|| format!("committing a new layer for container {id:?}"))?;
+    oci_dockerfile::record_layer(&mut config, &mut layers, &committed, format!("commit {id}"));
+    if let Some(message) = message {
+        // The OCI image spec's own `history[].comment` field, not a
+        // top-level `Comment` -- see `Command::Commit`'s own doc
+        // comment on `message` for why (real podman/buildah's own
+        // `--message` sets a Docker-format-only config field this
+        // project's OCI-only `ImageConfig` has no equivalent of).
+        config
+            .history
+            .last_mut()
+            .expect("record_layer above always pushes exactly one new history entry")
+            .comment = Some(message.to_string());
+    }
+    if let Some(author) = author {
+        config.author = Some(author.to_string());
+    }
+    config.created = Some(format_rfc3339_utc(std::time::SystemTime::now()));
+
+    let config_bytes = serde_json::to_vec(&config).context("serializing image config")?;
+    let config_ingested = store
+        .ingest(&config_bytes[..])
+        .context("storing image config")?;
+
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: Some(MEDIA_TYPE_IMAGE_MANIFEST.to_string()),
+        config: Descriptor {
+            media_type: MEDIA_TYPE_IMAGE_CONFIG.to_string(),
+            digest: config_ingested.digest,
+            size: config_ingested.size,
+            urls: vec![],
+            annotations: std::collections::BTreeMap::new(),
+            platform: None,
+        },
+        layers,
+        annotations: std::collections::BTreeMap::new(),
+    };
+    let manifest_bytes = serde_json::to_vec(&manifest).context("serializing image manifest")?;
+    let manifest_ingested = store
+        .ingest(&manifest_bytes[..])
+        .context("storing image manifest")?;
+
+    let tag_reference =
+        Reference::parse(image).with_context(|| format!("parsing tag {image:?}"))?;
+    store
+        .put_image(&ImageRecord {
+            reference: tag_reference.to_string(),
+            manifest_digest: manifest_ingested.digest.clone(),
+        })
+        .context("recording committed image")?;
+
+    if json {
+        oci_cli_common::output::print_json(&CommitResult {
+            reference: tag_reference.to_string(),
+            digest: manifest_ingested.digest.to_string(),
+        })?;
+    } else {
+        println!("{}", manifest_ingested.digest);
+        println!("tagged: {tag_reference}");
     }
     Ok(())
 }
@@ -5000,8 +5202,8 @@ mod tests {
         }
     }
 
-    fn layer_descriptor(size: u64) -> oci_spec_types::image::Descriptor {
-        oci_spec_types::image::Descriptor {
+    fn layer_descriptor(size: u64) -> Descriptor {
+        Descriptor {
             media_type: oci_spec_types::image::MEDIA_TYPE_IMAGE_LAYER_GZIP.to_string(),
             digest: oci_spec_types::digest::sha256(size.to_string().as_bytes()),
             size,
