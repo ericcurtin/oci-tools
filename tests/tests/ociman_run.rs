@@ -2912,3 +2912,73 @@ fn run_security_opt_seccomp_unconfined_no_new_privileges_real_proc_status_value(
         "NoNewPrivs:\t1"
     );
 }
+
+/// `ociman run` with no flags at all (0191): the *default* seccomp
+/// profile is genuinely active (confirmed by also checking a syscall
+/// it blocks, in the same real container) *and* `NoNewPrivs` reads
+/// `0` — matching real `podman run`'s own identical default exactly
+/// (checked directly: a real `podman run` with no flags at all, its
+/// own default seccomp profile active, still shows `NoNewPrivs: 0`).
+///
+/// A real, previously-unnoticed bug this closes: before this fix,
+/// *every* container with an active (non-`unconfined`) seccomp filter
+/// reported `NoNewPrivs: 1` unconditionally, because this crate's own
+/// `oci_runtime_core::seccomp::apply` installed the filter via
+/// `seccompiler::apply_filter`, which unconditionally calls
+/// `prctl(PR_SET_NO_NEW_PRIVS, 1)` internally regardless of the spec's
+/// own `no_new_privileges` value. Fixed by installing the compiled BPF
+/// program via the raw `seccomp(2)` syscall directly instead, and
+/// reordering this project's own capability-drop/seccomp-application
+/// sequence to match real crun's/runc's own identical two-branch
+/// strategy exactly (seccomp applied *before* the capability drop,
+/// while `CAP_SYS_ADMIN` is still present, when `no_new_privileges` is
+/// `false` — see `oci_runtime_core::seccomp::install_bpf_program`'s
+/// own doc comment for the full citation of each reference runtime's
+/// source).
+#[test]
+fn run_default_seccomp_profile_is_active_and_no_new_privileges_is_false_together() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/default-seccomp-and-nnp:latest",
+        &busybox,
+        &["sh", "grep", "swapon"],
+        ContainerConfig::default(),
+    );
+
+    // `swapon /bin/busybox` is the same real, unambiguous, kernel-level
+    // proof `run_applies_a_default_seccomp_profile_blocking_a_real_
+    // syscall` already established: `Operation not permitted` can only
+    // come from seccomp's own `ERRNO` action for `swapon`, never from
+    // the filesystem-level "not swap-formatted" check the same command
+    // fails with when seccomp genuinely isn't applied at all.
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/default-seccomp-and-nnp:latest",
+        &[
+            "/bin/sh",
+            "-c",
+            "grep NoNewPrivs: /proc/self/status; swapon /bin/busybox",
+        ],
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("NoNewPrivs:\t0"),
+        "expected NoNewPrivs: 0 with the default seccomp profile active, matching real podman: \
+         {combined:?}"
+    );
+    assert!(
+        combined.contains("Operation not permitted"),
+        "expected the default seccomp profile to still genuinely block `swapon` with EPERM: \
+         {combined:?}"
+    );
+}

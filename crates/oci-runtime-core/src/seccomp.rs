@@ -127,6 +127,13 @@ const BPF_JMP_JA_NOOP: sock_filter = sock_filter {
 
 /// Compile `seccomp` to a BPF program and install it (via `seccomp(2)`)
 /// for the calling (single-threaded) process.
+///
+/// Installs via [`install_bpf_program`] (a direct, raw `seccomp(2)`
+/// syscall) rather than `seccompiler::apply_filter` — see that
+/// function's own doc comment for exactly why (0191): the crate's own
+/// convenience wrapper *unconditionally* calls `prctl(PR_SET_NO_NEW_
+/// PRIVS, 1)` first, which this project's own caller needs to control
+/// separately to match real crun's/runc's own identical strategy.
 pub fn apply(seccomp: &LinuxSeccomp) -> io::Result<()> {
     let arch = std::env::consts::ARCH
         .try_into()
@@ -149,7 +156,7 @@ pub fn apply(seccomp: &LinuxSeccomp) -> io::Result<()> {
         };
         let mismatch_action = action_json(&seccomp.default_action, seccomp.default_errno_ret)?;
         let program = compile_document(arch, &mismatch_action, &placeholder, &[])?;
-        return seccompiler::apply_filter(&program).map_err(|e| io::Error::other(e.to_string()));
+        return install_bpf_program(&program);
     }
 
     let mut combined: Vec<sock_filter> = Vec::new();
@@ -169,7 +176,86 @@ pub fn apply(seccomp: &LinuxSeccomp) -> io::Result<()> {
         k: u32::from(default_action),
     });
 
-    seccompiler::apply_filter(&combined).map_err(|e| io::Error::other(e.to_string()))
+    install_bpf_program(&combined)
+}
+
+/// Install `bpf_filter` as this (single-threaded) process's own
+/// seccomp-BPF filter, via the raw `seccomp(2)` syscall directly —
+/// deliberately *not* `seccompiler::apply_filter`, which internally,
+/// unconditionally calls `prctl(PR_SET_NO_NEW_PRIVS, 1)` before
+/// installing the filter (confirmed by reading `seccompiler` 0.5.0's
+/// own source, `apply_filter_with_flags`).
+///
+/// A real, previously-unnoticed gap this closes (0191, found while
+/// verifying 0190's own `no_new_privileges` fix end to end): with
+/// `seccompiler`'s own forced `prctl`, *every* container with an
+/// active (non-`unconfined`) seccomp filter reported `NoNewPrivs: 1`
+/// in `/proc/self/status` regardless of the spec's own `no_new_
+/// privileges` value or any `--security-opt no-new-privileges` —
+/// unlike real podman, which reports `0` by default even with its own
+/// default seccomp profile active.
+///
+/// Matches real crun's/runc's own identical strategy exactly (checked
+/// directly, not guessed): `~/git/crun/src/libcrun/container.c`'s own
+/// `container_init_setup`/its earlier capability-setup helper applies
+/// seccomp via the raw syscall directly, and — critically — does so
+/// *before* the container's own configured capability set is dropped
+/// (while `CAP_SYS_ADMIN` is still present from the fresh rootless
+/// user namespace's own initial full set) when `no_new_privileges` is
+/// `false`, only *after* the drop (once `no_new_privs` is already set
+/// as its own side effect) when it's `true`; `~/git/runc/libcontainer/
+/// standard_init_linux.go`'s own `Init` has the exact same two-branch
+/// structure, and even the exact same reasoning in its own comment:
+/// "Without NoNewPrivileges seccomp is a privileged operation, so we
+/// need to do this before dropping capabilities". This function itself
+/// is agnostic to *which* branch its caller is in — `oci_runtime_
+/// core::launch`'s own call site decides the ordering (see its own doc
+/// comment) — it only ever performs the raw install, matching
+/// whichever precondition (`CAP_SYS_ADMIN` still present, or
+/// `no_new_privs` already `1`) the caller has already arranged to
+/// hold. Fails with a real, surfaced `EACCES` (via the syscall's own
+/// return value) if neither precondition holds, exactly the same
+/// kernel-enforced check `seccomp(2)`'s own man page documents — never
+/// silently forced open the way `seccompiler`'s own convenience
+/// wrapper does.
+fn install_bpf_program(bpf_filter: &[sock_filter]) -> io::Result<()> {
+    // Mirrors the private `sock_fprog` struct `seccompiler` 0.5.0
+    // itself defines internally (`/usr/include/linux/filter.h`'s own
+    // `struct sock_fprog`) — not reachable from outside that crate, so
+    // redefined here identically rather than depending on it.
+    #[repr(C)]
+    struct SockFprog {
+        len: std::os::raw::c_ushort,
+        filter: *const sock_filter,
+    }
+    if bpf_filter.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "seccomp: refusing to install an empty BPF program",
+        ));
+    }
+    let prog = SockFprog {
+        len: bpf_filter.len() as std::os::raw::c_ushort,
+        filter: bpf_filter.as_ptr(),
+    };
+    // SAFETY: `prog` is a valid, live `sock_fprog`-equivalent for the
+    // entire duration of this syscall; the kernel only ever reads from
+    // it (a `copy_from_user`, never writes back through the pointer),
+    // matching `seccompiler`'s own identical safety reasoning for the
+    // exact same syscall.
+    #[allow(unsafe_code)]
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            0u64,
+            &prog as *const SockFprog,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// The real `container-libs`-style default seccomp profile a fresh

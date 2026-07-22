@@ -1115,6 +1115,39 @@ impl ChildSetup {
             }
         }
 
+        // Seccomp/capability-drop ordering (0191): matches real crun's/
+        // runc's own identical two-branch strategy exactly (checked
+        // directly against both, not guessed — see `seccomp::install_
+        // bpf_program`'s own doc comment for the full citation of
+        // each). `seccomp(2)`'s own real kernel precondition (`man 2
+        // seccomp`) is "the calling thread has `CAP_SYS_ADMIN`, *or*
+        // `no_new_privs` is already set" — this project's own
+        // `oci_runtime_core::seccomp::apply` no longer forces the
+        // latter open the way the underlying `seccompiler` crate's own
+        // convenience wrapper used to (a real, previously-unnoticed gap
+        // this closes: every container with an active seccomp filter
+        // used to report `NoNewPrivs: 1` unconditionally, unlike real
+        // podman), so this call site now has to arrange for one of the
+        // two preconditions itself, exactly like both reference
+        // runtimes do:
+        //
+        // * `no_new_privileges: false` (this spec's own request that
+        //   it *not* be set) — apply seccomp *first*, while this
+        //   process still has the fresh rootless user namespace's own
+        //   initial `CAP_SYS_ADMIN` (not yet dropped by `identity::
+        //   apply` below).
+        // * `no_new_privileges: true` — apply seccomp *after* `identity
+        //   ::apply` (which will have already set `no_new_privs` via
+        //   `prctl` as its own last step), exactly matching this call
+        //   site's own previous, single-branch behavior for this one
+        //   case.
+        if !self.no_new_privileges
+            && let Some(profile) = &self.seccomp
+            && let Err(e) = seccomp::apply(profile)
+        {
+            fail(SETUP_FAILURE_EXIT_CODE, &format!("applying seccomp: {e}"));
+        }
+
         if let Err(e) = identity::apply(
             Path::new("/proc"),
             &self.user,
@@ -1124,12 +1157,13 @@ impl ChildSetup {
             fail(SETUP_FAILURE_EXIT_CODE, &format!("applying identity: {e}"));
         }
 
-        // Last of all, right before exec: matches real crun (seccomp is
-        // applied after the uid/gid/capability drop), and means a
-        // rejected profile (see `seccomp`'s own doc comment on its
-        // scope limits) still fails loudly before the container's
-        // command ever runs, rather than running unfiltered.
-        if let Some(profile) = &self.seccomp
+        // Last of all, right before exec (only reached for the
+        // `no_new_privileges: true` branch — see above): a rejected
+        // profile (see `seccomp`'s own doc comment on its scope limits)
+        // still fails loudly before the container's command ever runs,
+        // rather than running unfiltered.
+        if self.no_new_privileges
+            && let Some(profile) = &self.seccomp
             && let Err(e) = seccomp::apply(profile)
         {
             fail(SETUP_FAILURE_EXIT_CODE, &format!("applying seccomp: {e}"));
