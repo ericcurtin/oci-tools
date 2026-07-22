@@ -884,11 +884,11 @@ enum Command {
         force: bool,
     },
     /// Copy files/directories between the local filesystem and a
-    /// container (running or stopped) — matching real `docker cp`/
-    /// `podman cp` exactly for the "one side is a container, the
-    /// other is the host" case (see `cmd_cp`'s own doc comment for
-    /// what's deliberately out of scope for now: container-to-
-    /// container, and a rootless-overlay-rootfs container).
+    /// container (running or stopped), or between two containers —
+    /// matching real `docker cp`/`podman cp` exactly (see `cmd_cp`'s
+    /// own doc comment for the one real gap this doesn't cover yet: a
+    /// container using this project's own rootless-overlay-rootfs
+    /// optimization, 0110).
     Cp {
         /// `[CONTAINER:]SRC_PATH` — exactly one of `src`/`dest` must
         /// have a `CONTAINER:` prefix.
@@ -1123,16 +1123,53 @@ enum Command {
         #[arg(long)]
         no_stream: bool,
     },
-    /// Block until a container stops, then print its exit code —
-    /// matching real `docker wait`/`podman wait`. Returns immediately
-    /// (still printing the exit code) if the container has already
+    /// Block until one or more containers stop, then print each one's
+    /// own real exit code, one per line, in the order given — matching
+    /// real `docker wait`/`podman wait` exactly. Returns immediately
+    /// (still printing the exit code) for a container that has already
     /// stopped.
     Wait {
-        /// The container's ID or `--name`.
-        id: String,
+        /// One or more container IDs/`--name`s.
+        #[arg(required = true)]
+        ids: Vec<String>,
         /// Milliseconds to sleep between polls.
         #[arg(short, long, default_value_t = 250)]
         interval: u64,
+        /// Wait for one of these statuses instead of the default
+        /// (`stopped`/`exited` — real podman's own two names for the
+        /// same thing, both accepted here too), matching real `docker
+        /// wait --condition`/`podman wait --condition` exactly:
+        /// repeatable, any *one* of the given conditions satisfies the
+        /// wait (checked directly against real podman's own
+        /// `WaitForConditionWithInterval`, which ORs every condition
+        /// together, never ANDs). Valid values:
+        /// `created`/`running`/`stopped`/`exited`/`paused` — this
+        /// project's own simpler container lifecycle has no equivalent
+        /// of real podman's own additional `configured`/`removing`/
+        /// `stopping`/`unknown` states, or its `healthy`/`unhealthy`
+        /// healthcheck conditions (`ociman healthcheck run` is a
+        /// manual, one-shot command, not a periodic scheduler a wait
+        /// condition could meaningfully block on) — any of those is a
+        /// clear, immediate error rather than a silently wrong match.
+        /// Only a real `stopped`/`exited` match ever prints a real
+        /// exit code; every other condition always prints `-1`,
+        /// matching real podman's own identical behavior (checked
+        /// directly: `podman wait --condition running` on an already-
+        /// running container prints `-1`, not any real exit code).
+        #[arg(long = "condition")]
+        condition: Vec<String>,
+        /// Print `-1` for a container that doesn't exist instead of a
+        /// hard error — matching real `docker wait --ignore`/`podman
+        /// wait --ignore` exactly. Without this, *every* given
+        /// container is resolved up front before any waiting begins at
+        /// all (checked directly against real podman: one unresolvable
+        /// name among several aborts the whole command immediately,
+        /// with no exit code printed for any of them, not even ones
+        /// that already existed) — matching that exact fail-fast
+        /// behavior rather than waiting on the valid ones first and
+        /// only then discovering the bad one.
+        #[arg(long)]
+        ignore: bool,
     },
     /// Rename an existing container — matching real `docker rename`/
     /// `podman rename`.
@@ -1554,7 +1591,12 @@ fn main() -> std::process::ExitCode {
                 VolumeCommand::Prune => cmd_volume_prune(cli.global.json),
             },
             Some(Command::Stats { id, no_stream }) => cmd_stats(&id, no_stream, cli.global.json),
-            Some(Command::Wait { id, interval }) => cmd_wait(&id, interval),
+            Some(Command::Wait {
+                ids,
+                interval,
+                condition,
+                ignore,
+            }) => cmd_wait(&ids, interval, &condition, ignore),
             Some(Command::Rename { id, name }) => cmd_rename(&id, &name),
             Some(Command::Top { id, ps_args }) => cmd_top(&id, &ps_args),
             Some(Command::Exec {
@@ -5255,35 +5297,117 @@ fn cmd_kill(id: &str, signal: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Block until a container's own `effective_status()` becomes
-/// `Stopped` (returns immediately if it already is), then print its
-/// exit code — matching real `docker wait`/`podman wait` exactly
-/// (`~/git/podman/cmd/podman/containers/wait.go`: block, then print a
-/// bare exit-code integer per container, nothing else). The exit code
-/// itself is whatever `cmd_run`'s own foreground wait already recorded
-/// in [`ANNOTATION_EXIT_CODE`] (see its own doc comment) — `wait`
-/// needs no new state of its own at all, only a poll loop over
-/// already-persisted state. Prints `-1` in the (should not happen in
-/// practice) case the annotation is somehow missing once the
-/// container is genuinely stopped, rather than failing outright: the
-/// container really has stopped by then, so `wait` itself succeeding
-/// is still the more useful answer than an error.
-fn cmd_wait(id: &str, interval_ms: u64) -> anyhow::Result<()> {
-    let containers = open_container_store()?;
-    let resolved = resolve_container_id(&containers, id)?;
-    loop {
-        let state = containers.load(&resolved)?;
-        if state.effective_status() == Status::Stopped {
-            let exit_code: i32 = state
-                .annotations
-                .get(ANNOTATION_EXIT_CODE)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(-1);
-            println!("{exit_code}");
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+/// Parse one `--condition` value into the [`Status`] it should match,
+/// matching real `docker wait --condition`/`podman wait --condition`'s
+/// own accepted vocabulary as far as this project's own simpler
+/// container lifecycle has a real equivalent for — see `Command::
+/// Wait`'s own doc comment for exactly which real podman values (its
+/// own separate `configured`/`removing`/`stopping`/`unknown` states,
+/// and `healthy`/`unhealthy` healthcheck conditions) have no
+/// equivalent here at all, and are a clear, immediate error rather
+/// than silently mapped to something plausible-but-wrong.
+fn parse_wait_condition(condition: &str) -> anyhow::Result<Status> {
+    match condition {
+        "created" => Ok(Status::Created),
+        "running" => Ok(Status::Running),
+        // Real podman itself treats these as pure synonyms (both mean
+        // "block until the container's own process has really
+        // exited") -- checked directly, `~/git/podman/libpod/
+        // container_api.go`'s own `WaitForConditionWithInterval`.
+        "stopped" | "exited" => Ok(Status::Stopped),
+        "paused" => Ok(Status::Paused),
+        other => anyhow::bail!(
+            "unsupported wait condition {other:?} (supported: created, running, stopped, \
+             exited, paused)"
+        ),
     }
+}
+
+/// Block until one or more containers each reach one of `conditions`
+/// (`Status::Stopped` alone if none given, matching real `docker
+/// wait`/`podman wait`'s own identical default — checked directly,
+/// `~/git/podman/pkg/domain/infra/abi/containers.go`'s own
+/// `ContainerWait`), printing each one's own real exit code (or `-1`
+/// for any condition other than `stopped`/`exited`, matching real
+/// podman's own identical behavior there too — checked directly:
+/// `podman wait --condition running` on an already-running container
+/// prints `-1`, never a real exit code) on its own line, in the exact
+/// order given.
+///
+/// Every `id` is resolved *before* any waiting begins at all — matching
+/// real podman's own checked-directly fail-fast behavior exactly: one
+/// unresolvable name among several aborts the whole command
+/// immediately, with nothing printed for any container at all, not
+/// even ones that already existed and would otherwise have resolved
+/// fine. `ignore` (real `--ignore`) turns an unresolvable name into a
+/// `-1` placeholder instead of a hard error, exactly like real
+/// `docker/podman wait --ignore`.
+///
+/// The real exit code itself is whatever `cmd_run`'s own foreground
+/// wait already recorded in [`ANNOTATION_EXIT_CODE`] (see its own doc
+/// comment) — `wait` needs no new state of its own at all, only a poll
+/// loop over already-persisted state. Prints `-1` in the (should not
+/// happen in practice) case the annotation is somehow missing once
+/// the container is genuinely stopped, rather than failing outright:
+/// the container really has stopped by then, so `wait` itself
+/// succeeding is still the more useful answer than an error.
+fn cmd_wait(
+    ids: &[String],
+    interval_ms: u64,
+    condition: &[String],
+    ignore: bool,
+) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+
+    let wanted: Vec<Status> = if condition.is_empty() {
+        vec![Status::Stopped]
+    } else {
+        condition
+            .iter()
+            .map(|c| parse_wait_condition(c))
+            .collect::<anyhow::Result<Vec<_>>>()?
+    };
+
+    // Resolve every container up front (fail-fast, matching real
+    // podman exactly — see this function's own doc comment): `None`
+    // stands in for "doesn't exist, but `--ignore` says that's fine".
+    let mut resolved = Vec::with_capacity(ids.len());
+    for id in ids {
+        match resolve_container_id(&containers, id) {
+            Ok(r) => resolved.push(Some(r)),
+            Err(e) if ignore => {
+                let _ = e;
+                resolved.push(None);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    for r in resolved {
+        let Some(resolved_id) = r else {
+            println!("-1");
+            continue;
+        };
+        loop {
+            let state = containers.load(&resolved_id)?;
+            let status = display_status(&state);
+            if wanted.contains(&status) {
+                let exit_code: i32 = if status == Status::Stopped {
+                    state
+                        .annotations
+                        .get(ANNOTATION_EXIT_CODE)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(-1)
+                } else {
+                    -1
+                };
+                println!("{exit_code}");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+        }
+    }
+    Ok(())
 }
 
 /// Rename an existing container: rewrite its own [`ANNOTATION_NAME`]

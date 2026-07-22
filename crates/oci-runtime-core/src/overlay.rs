@@ -5,15 +5,18 @@
 //! against real `podman` on a large, real-world image (see
 //! `docs/design/0107`/`0108`).
 //!
-//! **This module is a pure, read-only capability check — nothing in
-//! any existing container's own creation path calls it yet, and no
-//! existing behavior changes because it exists.** It exists on its own
-//! first, ahead of actually wiring it into `ociman run`'s own image-
-//! based rootfs setup, matching this project's own long-established
-//! pattern of landing a groundwork primitive as its own increment
-//! before a later one wires it in (e.g. 0039-0049's parser/diff/
-//! export/commit primitives, wired into `ociman build` for the first
-//! time only at 0050).
+//! **This module started as a pure, read-only capability check with
+//! nothing calling it yet** — matching this project's own long-
+//! established pattern of landing a groundwork primitive as its own
+//! increment before a later one wires it in (e.g. 0039-0049's parser/
+//! diff/export/commit primitives, wired into `ociman build` for the
+//! first time only at 0050). That wiring landed at 0110: `ociman`'s
+//! own `rootfs_setup::rootless_overlay_supported_cached` (cached
+//! across invocations, since a real `fork`+`unshare` probe isn't free)
+//! calls this exact function to decide whether a given `ociman run`
+//! gets the overlay-rootfs optimization at all — see that function's
+//! own doc comment for the caching layer, and `docs/design/0110` for
+//! how it's wired into `ociman run`'s own image-based rootfs setup.
 //!
 //! # What it checks, and why a real probe rather than a kernel-version guess
 //!
@@ -66,10 +69,14 @@
 //! moment of `fork()` staying locked forever in the child). Testing
 //! this for real needs a genuinely fresh, single-threaded process — a
 //! freshly exec'd binary, the same shape every other fork+`unshare`
-//! path in this crate already requires; this module doesn't wire
-//! itself into a CLI command yet (see this module's own top doc
-//! comment), so that real end-to-end test is deferred to whichever
-//! future increment actually does.
+//! path in this crate already requires; no dedicated end-to-end test
+//! of this exact function exists in *this* crate for that reason, but
+//! `ociman run` (0110) exercises it for real on every invocation
+//! through `ociman`'s own freshly-exec'd process, and `tests/tests/
+//! ociman_run.rs`'s own real, running-binary tests cover the result
+//! indirectly (a `.rootless-overlay-supported` marker file lets tests
+//! force the answer either way rather than depend on this probe's own
+//! real, environment-dependent result).
 
 use std::path::Path;
 
