@@ -5025,3 +5025,238 @@ fn build_never_commits_a_synthesized_etc_hosts_into_any_layer() {
          the (never-committed) synthesized hosts file: {paths:?}"
     );
 }
+
+/// A small, real shell-compatible script that proves whether *it*
+/// (rather than real `/bin/sh`) actually ran: writes a fixed marker
+/// file first, then hands off to real `/bin/sh -c` with the same
+/// command text a real shell-form `RUN` step always passes as its own
+/// second argument, so the command's own real effect still happens
+/// exactly like it would have under the real default shell.
+const CUSTOM_SHELL_SCRIPT: &str =
+    "#!/bin/sh\necho marker > /shell-was-used\nexec /bin/sh -c \"$2\"\n";
+
+/// `SHELL` genuinely changes what a later shell-form `RUN` in the
+/// *same* stage actually gets invoked with -- checked directly against
+/// a real `podman build` during this feature's own design (`docs/
+/// design/0175`): a `SHELL ["/some/script", "-c"]` instruction really
+/// does make a later `RUN`'s shell-form command run through that
+/// script instead of `/bin/sh`. Verified two ways here: the custom
+/// script's own marker file exists (proving it, not real `/bin/sh`,
+/// was the process actually launched), and the `RUN` step's own
+/// intended real effect (writing `/output.txt`) still happened
+/// correctly (proving the script's own `exec /bin/sh -c "$2"`
+/// hand-off preserved the command text exactly).
+#[test]
+fn shell_instruction_changes_what_a_later_run_step_actually_gets_invoked_with() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/shell-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("myshell"), CUSTOM_SHELL_SCRIPT).unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/shell-base:latest\n\
+         COPY --chmod=0755 myshell /myshell\n\
+         SHELL [\"/myshell\", \"-c\"]\n\
+         RUN echo hi > /output.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/shell-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/shell-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /shell-was-used /output.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "marker\nhi\n",
+        "the custom SHELL should have actually run (marker) and the RUN step's own real \
+         command should still have taken effect (hi)"
+    );
+}
+
+/// A `SHELL` instruction has **no** effect on `CMD`/`ENTRYPOINT`'s own
+/// shell-form wrapping -- both always keep the fixed `/bin/sh -c`
+/// default regardless, matching real `podman build` exactly (checked
+/// directly during this feature's own design: real Docker's own
+/// documentation claims `SHELL` affects `RUN`/`CMD`/`ENTRYPOINT`
+/// alike, but a real `podman build`/buildah only ever actually applies
+/// it to `RUN`; podman is this project's own primary reference
+/// implementation throughout, so that's the behavior matched here —
+/// see `docs/design/0175`).
+#[test]
+fn shell_instruction_never_affects_cmds_own_shell_form_wrapping() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/shell-cmd-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("myshell"), CUSTOM_SHELL_SCRIPT).unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/shell-cmd-base:latest\n\
+         COPY --chmod=0755 myshell /myshell\n\
+         SHELL [\"/myshell\", \"-c\"]\n\
+         CMD echo hi\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/shell-cmd-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let normalized = oci_spec_types::Reference::parse("ociman-test/shell-cmd-result:latest")
+        .unwrap()
+        .to_string();
+    let record = store.resolve_image(&normalized).unwrap().unwrap();
+    let config = store.image_config(&record).unwrap();
+    assert_eq!(
+        config.config.unwrap().cmd,
+        Some(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo hi".to_string()
+        ]),
+        "CMD's own shell-form wrapping should always use the fixed default, never the active \
+         SHELL"
+    );
+}
+
+/// `SHELL` is scoped to the stage it appears in: a later, separate
+/// stage (its own fresh `FROM`) starts with the real default shell
+/// again, completely unaffected by an earlier stage's own `SHELL` --
+/// checked directly against a real `podman build` (see `docs/design/
+/// 0175`). Stage two's own custom shell script is never even copied
+/// into its own rootfs, so if `SHELL` incorrectly persisted across
+/// stages, this build would fail outright (the script wouldn't exist
+/// to exec at all) rather than merely behaving subtly wrong --
+/// confirmed here by checking for a real, successful build first, then
+/// directly confirming the marker file the custom script alone ever
+/// writes is genuinely absent from the final image.
+#[test]
+fn shell_instruction_resets_at_the_start_of_each_new_stage() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/shell-stage-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("myshell"), CUSTOM_SHELL_SCRIPT).unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/shell-stage-base:latest AS stage1\n\
+         COPY --chmod=0755 myshell /myshell\n\
+         SHELL [\"/myshell\", \"-c\"]\n\
+         RUN echo from-stage1 > /stage1-marker.txt\n\
+         \n\
+         FROM ociman-test/shell-stage-base:latest AS stage2\n\
+         COPY --from=stage1 /stage1-marker.txt /copied-marker.txt\n\
+         RUN echo from-stage2 > /stage2-marker.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/shell-stage-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/shell-stage-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /copied-marker.txt /stage2-marker.txt; \
+             test -e /shell-was-used && echo LEAKED || echo clean",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "from-stage1\nfrom-stage2\nclean\n",
+        "stage2's own RUN must have used the real default shell, not stage1's custom one \
+         leaking across the stage boundary"
+    );
+}

@@ -700,6 +700,19 @@ fn build_stage(
     // explicitly re-declares it, the same real distinction real
     // Docker makes.
     let mut current_args: Vec<(String, String)> = Vec::new();
+    // The shell a shell-form `RUN` in *this stage* actually gets
+    // wrapped with -- real `/bin/sh -c` until a `SHELL` instruction
+    // changes it, reset fresh for every stage (checked directly
+    // against real `podman build`: a `SHELL` in one stage has no
+    // effect at all on a later, separate stage). See
+    // `apply_instruction`'s own `Instruction::Shell` arm and
+    // `args_for_run`'s own doc comment for the one further real,
+    // checked-directly narrowing this project's own implementation
+    // matches: real podman/buildah's `SHELL` only ever affects `RUN`,
+    // never `CMD`/`ENTRYPOINT` (both keep using the fixed default
+    // regardless), despite Docker's own documentation claiming all
+    // three.
+    let mut current_shell: Vec<String> = default_shell();
     for instruction in &stage.instructions {
         apply_instruction(
             instruction,
@@ -711,6 +724,7 @@ fn build_stage(
             stage_ctx,
             cache_candidates,
             &mut current_args,
+            &mut current_shell,
             tls_verify,
             pull_policy,
         )?;
@@ -938,6 +952,7 @@ fn apply_instruction(
     stage_ctx: &StageContext<'_>,
     cache_candidates: &[crate::build_cache::CacheCandidate],
     current_args: &mut Vec<(String, String)>,
+    current_shell: &mut Vec<String>,
     tls_verify: bool,
     pull_policy: crate::PullPolicy,
 ) -> anyhow::Result<()> {
@@ -954,6 +969,7 @@ fn apply_instruction(
                 rootfs,
                 cache_candidates,
                 current_args,
+                current_shell,
             )?;
         }
         Instruction::Copy {
@@ -1003,9 +1019,19 @@ fn apply_instruction(
         Instruction::From { .. } => {
             unreachable!("a stage's own instructions never include the FROM that started it")
         }
-        // `SHELL` only affects a future shell-form `RUN`, which isn't
-        // supported yet either -- no config effect of its own.
-        Instruction::Shell(_) => {}
+        // Changes what shell a *later* shell-form `RUN` in this same
+        // stage gets wrapped with (see `current_shell`'s own doc
+        // comment at its declaration site) -- no image-config effect
+        // of its own (matches every other metadata instruction here:
+        // `record_empty_history`, no `rootfs.diff_ids` entry), and
+        // real podman/buildah's own checked-directly text convention
+        // for the history entry itself, same simpler space-joined
+        // style already used for `ENTRYPOINT`/`CMD` below rather than
+        // Docker's own bracketed/quoted JSON-array text.
+        Instruction::Shell(words) => {
+            *current_shell = words.clone();
+            oci_dockerfile::record_empty_history(config, format!("SHELL {}", words.join(" ")));
+        }
         // No config effect of its own -- `expand_stage` already fully
         // resolved every name's own value (override, inline default,
         // or inherited meta-arg). Tracked in `current_args` (not
@@ -1117,6 +1143,7 @@ fn apply_instruction(
 /// which forwards a container's own exit code as its own, a failed
 /// build step is *always* an error here, never a "successful build of
 /// a container that happened to exit nonzero".
+#[allow(clippy::too_many_arguments)]
 fn run_instruction(
     shell_or_exec: &ShellOrExec,
     config: &mut ImageConfig,
@@ -1125,8 +1152,9 @@ fn run_instruction(
     rootfs: &Path,
     cache_candidates: &[crate::build_cache::CacheCandidate],
     current_args: &[(String, String)],
+    current_shell: &[String],
 ) -> anyhow::Result<()> {
-    let args = args_for(shell_or_exec);
+    let args = args_for_run(shell_or_exec, current_shell);
     let command_text = args.join(" ");
 
     // Every currently-declared `ARG` whose name isn't *already* a real
@@ -2392,10 +2420,56 @@ fn chown_recursive(root: &Path, uid: u32, gid: u32) {
 /// `docker`/`podman build`'s own shell-form wrapping: a shell-form
 /// `RUN`/`CMD`/`ENTRYPOINT` argument becomes `/bin/sh -c "<text>"`
 /// when actually run; exec/JSON form is used verbatim.
+///
+/// Always the fixed default, never `current_shell` — matching real
+/// `podman build` exactly (checked directly, see `args_for_run`'s own
+/// doc comment): a `SHELL` instruction changes `RUN`'s own shell-form
+/// wrapping, but `CMD`/`ENTRYPOINT` keep this fixed default
+/// regardless. Also the one `args_for` any non-`RUN` shell-form
+/// caller needs — `ociman commit --change`'s own `apply_change_
+/// instruction` (`bin/ociman/src/main.rs`) reuses this exact function
+/// for `CMD`/`ENTRYPOINT`, where there is no build-time `SHELL`
+/// instruction/stage to have changed anything in the first place.
 pub(crate) fn args_for(value: &ShellOrExec) -> Vec<String> {
     match value {
         ShellOrExec::Shell(command) => {
-            vec!["/bin/sh".to_string(), "-c".to_string(), command.clone()]
+            let mut args = default_shell();
+            args.push(command.clone());
+            args
+        }
+        ShellOrExec::Exec(args) => args.clone(),
+    }
+}
+
+/// `/bin/sh -c` — the default shell every stage starts with, until a
+/// `SHELL` instruction in that same stage changes it (see `build_
+/// stage`'s own `current_shell` doc comment).
+pub(crate) fn default_shell() -> Vec<String> {
+    vec!["/bin/sh".to_string(), "-c".to_string()]
+}
+
+/// Like [`args_for`], but for a `RUN` instruction specifically:
+/// shell-form wraps with `current_shell` (whatever the most recent
+/// `SHELL` instruction in this same stage set it to, or [`default_
+/// shell`] if none has run yet) instead of always the fixed default.
+///
+/// Checked directly against a real `podman build`: a `SHELL
+/// ["/bin/sh", "-x", "-c"]` instruction genuinely changes what a
+/// later shell-form `RUN` in the same stage gets invoked with (the
+/// real container process really does run with `-x`, confirmed by
+/// its own trace output appearing) — but has **no** effect at all on
+/// a later shell-form `CMD`/`ENTRYPOINT`, which real podman/buildah
+/// still always wraps with the fixed `/bin/sh -c` default regardless
+/// (contradicting Docker's own documentation, which claims `SHELL`
+/// affects all three) — real podman/buildah is this project's own
+/// primary reference implementation throughout, so that's the
+/// behavior matched here, not the documentation.
+pub(crate) fn args_for_run(value: &ShellOrExec, current_shell: &[String]) -> Vec<String> {
+    match value {
+        ShellOrExec::Shell(command) => {
+            let mut args = current_shell.to_vec();
+            args.push(command.clone());
+            args
         }
         ShellOrExec::Exec(args) => args.clone(),
     }
@@ -2504,6 +2578,50 @@ mod tests {
             "symbolic mode not supported yet"
         );
         assert!(chmod_mode("").is_err());
+    }
+
+    #[test]
+    fn args_for_shell_form_always_uses_the_fixed_default_shell() {
+        assert_eq!(
+            args_for(&ShellOrExec::Shell("echo hi".to_string())),
+            vec!["/bin/sh", "-c", "echo hi"]
+        );
+    }
+
+    #[test]
+    fn args_for_exec_form_is_used_verbatim() {
+        assert_eq!(
+            args_for(&ShellOrExec::Exec(vec![
+                "/bin/busybox".to_string(),
+                "echo".to_string()
+            ])),
+            vec!["/bin/busybox", "echo"]
+        );
+    }
+
+    #[test]
+    fn args_for_run_shell_form_uses_current_shell_not_the_fixed_default() {
+        let current_shell = vec!["/bin/sh".to_string(), "-x".to_string(), "-c".to_string()];
+        assert_eq!(
+            args_for_run(&ShellOrExec::Shell("echo hi".to_string()), &current_shell),
+            vec!["/bin/sh", "-x", "-c", "echo hi"]
+        );
+    }
+
+    #[test]
+    fn args_for_run_with_the_default_current_shell_matches_args_for() {
+        let shell_form = ShellOrExec::Shell("echo hi".to_string());
+        assert_eq!(
+            args_for_run(&shell_form, &default_shell()),
+            args_for(&shell_form)
+        );
+    }
+
+    #[test]
+    fn args_for_run_exec_form_ignores_current_shell_entirely() {
+        let current_shell = vec!["/bin/bash".to_string(), "-c".to_string()];
+        let exec_form = ShellOrExec::Exec(vec!["/bin/true".to_string()]);
+        assert_eq!(args_for_run(&exec_form, &current_shell), vec!["/bin/true"]);
     }
 
     #[test]
