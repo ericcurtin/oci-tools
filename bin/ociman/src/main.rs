@@ -622,6 +622,26 @@ enum Command {
         /// site).
         #[arg(long = "add-host", value_name = "HOST:IP")]
         add_host: Vec<String>,
+        /// Fold every layer *this build's own target stage* adds
+        /// (however many separate `RUN`/`COPY`/`ADD` instructions
+        /// produced them) into exactly one new layer, on top of the
+        /// base image's own layers untouched — matching real `podman
+        /// build --squash` exactly (checked directly): only the target
+        /// stage is affected (an earlier stage feeding it via `COPY
+        /// --from=` still builds completely normally), the base's own
+        /// layers are never folded in too (unlike `ociman commit
+        /// --squash`, which flattens the base in as well), and every
+        /// instruction's own history entry still shows up afterward
+        /// (`ociman history`), just with only the very last one
+        /// carrying the one new combined layer's own real weight — see
+        /// `build_stage`'s own doc comment for the exact algorithm.
+        /// Disables the build cache for the whole build, matching real
+        /// `podman build --squash`'s own identical, checked-directly
+        /// behavior (a squashed build's own per-instruction layers are
+        /// never stored as independently reusable layers to begin
+        /// with).
+        #[arg(long)]
+        squash: bool,
     },
     /// List images in local storage.
     Images,
@@ -1357,6 +1377,7 @@ fn main() -> std::process::ExitCode {
                 annotation,
                 pull,
                 add_host,
+                squash,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
@@ -1371,6 +1392,7 @@ fn main() -> std::process::ExitCode {
                 &annotation,
                 pull,
                 &add_host,
+                squash,
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),

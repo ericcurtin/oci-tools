@@ -5260,3 +5260,406 @@ fn shell_instruction_resets_at_the_start_of_each_new_stage() {
          leaking across the stage boundary"
     );
 }
+
+/// `--squash` folds every layer the target stage itself adds into
+/// exactly one new layer on top of the base -- matching real `podman
+/// build --squash` exactly (checked directly during this feature's
+/// own design, see `docs/design/0177`): the manifest ends up with
+/// exactly one more layer than the base image had, every real change
+/// (two separate `RUN`s plus a `LABEL`) survives in the flattened
+/// result, and the full per-instruction history is still there
+/// afterward (unlike `ociman commit --squash`, which collapses history
+/// down to one entry) -- only the very last entry keeps a non-empty
+/// layer; every earlier one this same build added shows up as an
+/// `empty_layer` history-only entry, its own real content already
+/// folded into that final combined layer instead.
+#[test]
+fn build_squash_folds_every_added_layer_into_one_on_top_of_the_base() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/squash-build-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+    let base_record = store
+        .resolve_image("docker.io/ociman-test/squash-build-base:latest")
+        .unwrap()
+        .unwrap();
+    let base_manifest = store.image_manifest(&base_record).unwrap();
+    let base_history_len = store.image_config(&base_record).unwrap().history.len();
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/squash-build-base:latest\n\
+         RUN echo one > /one.txt\n\
+         RUN echo two > /two.txt\n\
+         LABEL foo=bar\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--squash",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/squash-build-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/squash-build-result:latest")
+        .unwrap()
+        .unwrap();
+    let manifest = store.image_manifest(&record).unwrap();
+    assert_eq!(
+        manifest.layers.len(),
+        base_manifest.layers.len() + 1,
+        "squash should add exactly one new layer, regardless of how many RUN/COPY/ADD steps \
+         this build itself had: {manifest:?}"
+    );
+
+    let config = store.image_config(&record).unwrap();
+    assert_eq!(
+        config.rootfs.diff_ids.len(),
+        manifest.layers.len(),
+        "diff_ids must stay in lockstep with the manifest's own layer list"
+    );
+    // Every history entry this build added is still there (three new
+    // ones: RUN one, RUN two, LABEL) -- squash never removes history,
+    // only re-attributes which of them carries a real layer.
+    assert_eq!(config.history.len(), base_history_len + 3);
+    let this_build_history = &config.history[base_history_len..];
+    assert!(
+        this_build_history[..2].iter().all(|h| h.empty_layer),
+        "every entry but the last should show up as history-only now that its own real \
+         content has been folded into the one combined layer: {this_build_history:?}"
+    );
+    assert!(
+        !this_build_history[2].empty_layer,
+        "only the very last entry should carry the one new combined layer's own real weight: \
+         {this_build_history:?}"
+    );
+
+    // Real content check: both RUN steps' own files really did survive
+    // being folded together into one layer.
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/squash-build-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /one.txt /two.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "one\ntwo\n");
+}
+
+/// `--squash` only ever affects the target stage itself -- an earlier
+/// stage a later one reads from via `COPY --from=` still builds
+/// completely normally, with its own real per-instruction layers,
+/// exactly as if `--squash` had never been passed at all (checked
+/// directly against a real `podman build --squash` on an identically-
+/// shaped multi-stage Containerfile).
+#[test]
+fn build_squash_only_affects_the_target_stage_not_an_earlier_one() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/squash-multi-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+    let base_record = store
+        .resolve_image("docker.io/ociman-test/squash-multi-base:latest")
+        .unwrap()
+        .unwrap();
+    let base_manifest = store.image_manifest(&base_record).unwrap();
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/squash-multi-base:latest AS builder\n\
+         RUN echo builder-content > /builder.txt\n\
+         \n\
+         FROM ociman-test/squash-multi-base:latest\n\
+         COPY --from=builder /builder.txt /builder.txt\n\
+         RUN echo final-content > /final.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--squash",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/squash-multi-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/squash-multi-result:latest")
+        .unwrap()
+        .unwrap();
+    let manifest = store.image_manifest(&record).unwrap();
+    assert_eq!(
+        manifest.layers.len(),
+        base_manifest.layers.len() + 1,
+        "the final (target) stage's own COPY --from= plus RUN should still fold into just one \
+         new layer: {manifest:?}"
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/squash-multi-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /builder.txt /final.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "builder-content\nfinal-content\n"
+    );
+}
+
+/// `--squash` on a stage whose own instructions never touch the
+/// filesystem at all (just a `LABEL`) still adds one new, real (if
+/// empty) layer -- matching `commit_layer`'s own already-established
+/// "an empty diff still commits a real layer" convention, and checked
+/// directly against a real `podman build --squash` doing the exact
+/// same thing.
+#[test]
+fn build_squash_on_a_metadata_only_stage_still_adds_one_real_empty_layer() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/squash-noop-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let base_record = store
+        .resolve_image("docker.io/ociman-test/squash-noop-base:latest")
+        .unwrap()
+        .unwrap();
+    let base_manifest = store.image_manifest(&base_record).unwrap();
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/squash-noop-base:latest\nLABEL foo=bar\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--squash",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/squash-noop-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/squash-noop-result:latest")
+        .unwrap()
+        .unwrap();
+    let manifest = store.image_manifest(&record).unwrap();
+    assert_eq!(manifest.layers.len(), base_manifest.layers.len() + 1);
+}
+
+/// `--squash` on a Containerfile with *no* instructions beyond the
+/// `FROM` itself is a true no-op -- matching real `podman build
+/// --squash`'s own observed behavior exactly: no new layer, no new
+/// history entry, nothing to squash at all since this build added
+/// nothing.
+#[test]
+fn build_squash_with_no_instructions_at_all_is_a_true_no_op() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/squash-barefrom-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let base_record = store
+        .resolve_image("docker.io/ociman-test/squash-barefrom-base:latest")
+        .unwrap()
+        .unwrap();
+    let base_manifest = store.image_manifest(&base_record).unwrap();
+    let base_config = store.image_config(&base_record).unwrap();
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/squash-barefrom-base:latest\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--squash",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/squash-barefrom-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/squash-barefrom-result:latest")
+        .unwrap()
+        .unwrap();
+    let manifest = store.image_manifest(&record).unwrap();
+    let config = store.image_config(&record).unwrap();
+    assert_eq!(manifest.layers, base_manifest.layers);
+    assert_eq!(config.history.len(), base_config.history.len());
+}
+
+/// `--squash` disables the build cache for the whole build -- matching
+/// real `podman build --squash`'s own identical, checked-directly
+/// behavior: re-running an otherwise-identical `--squash` build a
+/// second time still re-executes every `RUN`, never reusing a cached
+/// layer, since a squashed build's own per-instruction layers are
+/// never stored as independently reusable layers to begin with.
+/// Verified here by a real, observable side effect rather than
+/// inspecting internal cache state directly: a `RUN` that appends to a
+/// counter file produces a *different* result the second time only if
+/// it genuinely re-executed.
+#[test]
+fn build_squash_disables_the_build_cache() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/squash-cache-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/squash-cache-base:latest\n\
+         RUN cat /proc/sys/kernel/random/uuid > /marker.txt\n",
+    );
+
+    let first = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--squash",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/squash-cache-result:latest",
+        ],
+    );
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_digest = String::from_utf8_lossy(&first.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let second = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--squash",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/squash-cache-result2:latest",
+        ],
+    );
+    assert!(
+        second.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_digest = String::from_utf8_lossy(&second.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+
+    assert_ne!(
+        first_digest, second_digest,
+        "a second --squash build should have genuinely re-executed RUN (producing a different \
+         nanosecond-timestamped marker file), not reused a cached layer from the first"
+    );
+}

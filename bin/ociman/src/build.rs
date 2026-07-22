@@ -215,6 +215,7 @@ pub fn cmd_build(
     annotations: &[String],
     pull_policy: crate::PullPolicy,
     add_host: &[String],
+    squash: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let tag = tag.context(
@@ -279,8 +280,15 @@ pub fn cmd_build(
     // Loaded once, up front -- see `build_cache`'s own doc comment for
     // why re-reading it per instruction is unnecessary (nothing about
     // local storage changes mid-build) and `--no-cache` simply means
-    // "act as if local storage had no images at all yet".
-    let cache_candidates = if no_cache {
+    // "act as if local storage had no images at all yet". `--squash`
+    // disables the cache the exact same way -- checked directly
+    // against a real `podman build --squash`: re-running an otherwise
+    // identical, already-built `--squash` Containerfile still
+    // re-executes every `RUN` instead of reusing a cached layer, since
+    // a squashed build's own per-instruction layers never get stored
+    // as real, independently-addressable layers a future build could
+    // ever match against in the first place.
+    let cache_candidates = if no_cache || squash {
         Vec::new()
     } else {
         crate::build_cache::load_candidates(&store)
@@ -367,6 +375,13 @@ pub fn cmd_build(
             dockerignore: &dockerignore,
         };
         let force_rootfs = copy_from_targets.contains(&stage_index);
+        // `--squash` only ever applies to the target stage itself --
+        // checked directly against a real `podman build --squash` on a
+        // multi-stage Containerfile: an earlier stage feeding a later
+        // one via `COPY --from=` is built completely normally, with its
+        // own real per-instruction layers, exactly as if `--squash`
+        // had never been passed at all; only the target's own newly
+        // added layers ever get folded into one.
         let built_stage = build_stage(
             &store,
             context,
@@ -380,6 +395,7 @@ pub fn cmd_build(
             tls_verify,
             pull_policy,
             add_host,
+            squash && stage_index == target,
         )?;
         built.insert(stage_index, built_stage);
     }
@@ -606,17 +622,32 @@ fn build_stage(
     tls_verify: bool,
     pull_policy: crate::PullPolicy,
     add_host: &[String],
+    squash: bool,
 ) -> anyhow::Result<BuiltStage> {
     let mut config = base_config;
     let mut layers = base_layers;
+    let base_layer_count = layers.len();
+    let base_history_count = config.history.len();
 
-    let needs_rootfs = force_rootfs
-        || stage.instructions.iter().any(|instruction| {
-            matches!(
-                instruction,
-                Instruction::Run(_) | Instruction::Copy { .. } | Instruction::Add { .. }
-            )
-        });
+    let has_fs_instructions = stage.instructions.iter().any(|instruction| {
+        matches!(
+            instruction,
+            Instruction::Run(_) | Instruction::Copy { .. } | Instruction::Add { .. }
+        )
+    });
+    // `--squash` needs a real rootfs to diff even for a stage whose own
+    // instructions never touch the filesystem at all (e.g. just
+    // `LABEL`) -- checked directly against a real `podman build
+    // --squash`: such a stage still gets one new, real (if empty)
+    // squashed layer, matching `commit_layer`'s own already-established
+    // "an empty diff still commits a real layer" convention. A stage
+    // with *no* instructions at all (a bare `FROM`) is different again
+    // -- see this function's own squash post-processing below for why
+    // that case forces nothing and adds no layer either, matching real
+    // podman's own observed "nothing to build, just tag the base"
+    // no-op for that specific shape.
+    let needs_rootfs =
+        force_rootfs || has_fs_instructions || (squash && !stage.instructions.is_empty());
     let build_dir = if needs_rootfs {
         let scratch_root = build_scratch_root(store);
         std::fs::create_dir_all(&scratch_root)
@@ -687,6 +718,23 @@ fn build_stage(
         None
     };
     let rootfs_dir = build_dir.as_ref().map(|dir| dir.join("rootfs"));
+    // Captured right where every individual instruction's own "before"
+    // snapshot would otherwise start from (same point `run_instruction`
+    // itself snapshots from for its own single-instruction diff) --
+    // `--squash` needs the exact same baseline, just diffed against
+    // once at the very end instead of once per instruction. `None`
+    // whenever `--squash` isn't in play, or this stage has no rootfs at
+    // all yet (never dereferenced in that case either -- see the
+    // squash post-processing below).
+    let before_stage_snapshot = if squash {
+        rootfs_dir
+            .as_deref()
+            .map(oci_layer::Snapshot::capture)
+            .transpose()
+            .context("capturing the target stage's own pre-instruction filesystem state")?
+    } else {
+        None
+    };
 
     // Every stage-local `ARG` declared *so far* (with its own already-
     // fully-resolved value -- override, inline default, or inherited
@@ -728,6 +776,51 @@ fn build_stage(
             tls_verify,
             pull_policy,
         )?;
+    }
+
+    // `--squash`: fold every layer *this stage itself* just added
+    // (however many separate `RUN`/`COPY`/`ADD` steps produced them)
+    // into exactly one new layer on top of the base -- matching real
+    // `podman build --squash` exactly (checked directly): the base
+    // image's own layers are left completely untouched (unlike `ociman
+    // commit --squash`, which flattens the base in too), only the
+    // layers *this build* would otherwise have added get combined.
+    // Skipped entirely when this stage added no history of its own at
+    // all (a bare `FROM` with nothing else) -- real `podman build
+    // --squash` is a true no-op for that shape too (the built image's
+    // own ID comes back identical to the base's), so there is nothing
+    // to squash and no new layer to add either.
+    if squash && config.history.len() > base_history_count {
+        let rootfs_dir_ref = rootfs_dir
+            .as_deref()
+            .expect("squash always forces a real rootfs whenever this stage added any history");
+        let before = before_stage_snapshot
+            .as_ref()
+            .expect("squash always captures a before-snapshot in lockstep with the rootfs above");
+        let squash_diff = oci_layer::changes(rootfs_dir_ref, before)
+            .context("diffing the target stage's own filesystem for --squash")?;
+        let committed = commit_layer(store, rootfs_dir_ref, &squash_diff)
+            .context("committing the squashed layer")?;
+
+        layers.truncate(base_layer_count);
+        layers.push(committed.descriptor);
+        config.rootfs.diff_ids.truncate(base_layer_count);
+        config.rootfs.diff_ids.push(committed.diff_id);
+
+        // Every history entry *this stage* added stays, in place, with
+        // its own original text -- matching real `podman build
+        // --squash`'s own `podman history` output exactly (checked
+        // directly): every one of them shows up with a real "size" of
+        // `0`/`empty_layer: true` except the very last, which alone
+        // carries the one new combined layer's own real weight.
+        let this_stage_history = &mut config.history[base_history_count..];
+        let last = this_stage_history
+            .len()
+            .checked_sub(1)
+            .expect("just checked config.history.len() > base_history_count above");
+        for (index, entry) in this_stage_history.iter_mut().enumerate() {
+            entry.empty_layer = index != last;
+        }
     }
 
     Ok(BuiltStage {
