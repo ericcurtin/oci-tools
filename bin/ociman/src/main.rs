@@ -868,13 +868,14 @@ enum Command {
     Commit {
         /// The container's ID or `--name`.
         container: String,
-        /// Tag the resulting image (`name[:tag]`) — currently
-        /// required, unlike real `podman commit`'s own optional
-        /// `IMAGE` argument (this project has no established
-        /// "untagged image" storage convention yet — same reasoning
-        /// `ociman build --tag`'s own doc comment already gives for
-        /// requiring `-t`).
-        image: String,
+        /// Tag the resulting image (`name[:tag]`) — optional, matching
+        /// real `podman commit`'s own optional `IMAGE` argument
+        /// exactly: with none given, the image is still fully usable
+        /// by ID, recorded under this project's own internal untagged-
+        /// image sentinel reference instead of a real tag (the same
+        /// convention `ociman build --tag`'s own identical optional
+        /// flag already established — see `docs/design/0179`/`0180`).
+        image: Option<String>,
         /// Set the resulting image's own top-level `author` field
         /// (matches real `podman commit --author`/buildah's own
         /// `SetMaintainer` exactly: the image config's `author`
@@ -1426,7 +1427,7 @@ fn main() -> std::process::ExitCode {
                 squash,
             }) => cmd_commit(
                 &container,
-                &image,
+                image.as_deref(),
                 author.as_deref(),
                 message.as_deref(),
                 pause,
@@ -4069,7 +4070,9 @@ fn cmd_export(id: &str, output: Option<&Path>) -> anyhow::Result<()> {
 /// container's own live changes).
 #[derive(Debug, Serialize)]
 struct CommitResult {
-    reference: String,
+    /// `None` for an untagged commit (see [`untagged_reference`]) --
+    /// never the internal sentinel string itself.
+    reference: Option<String>,
     digest: String,
 }
 
@@ -4094,17 +4097,16 @@ struct CommitResult {
 /// own layer list/history), just with a running container's own
 /// current state standing in for a build stage's.
 ///
-/// `image` is currently still required, unlike real podman's own
-/// optional `IMAGE` argument (which produces a real, but untagged,
-/// image if omitted) — `ociman build`'s own identical `-t` flag
-/// already gained this (0179, `crate::untagged_reference`'s own
-/// sentinel-reference convention), but wiring the same convention
-/// through `commit` is a separate, not-yet-done increment of its own,
-/// not a fundamental gap in the store anymore.
+/// `image` is optional, matching real podman's own optional `IMAGE`
+/// argument exactly: with none given, the committed image is still
+/// fully usable by ID, recorded under [`untagged_reference`]'s own
+/// sentinel reference instead of a real tag — the same convention
+/// `ociman build --tag`'s own identical optional flag already
+/// established (0179).
 #[allow(clippy::too_many_arguments)]
 fn cmd_commit(
     id: &str,
-    image: &str,
+    image: Option<&str>,
     author: Option<&str>,
     message: Option<&str>,
     pause: bool,
@@ -4177,7 +4179,7 @@ fn cmd_commit(
 #[allow(clippy::too_many_arguments)]
 fn commit_inner(
     id: &str,
-    image: &str,
+    image: Option<&str>,
     author: Option<&str>,
     message: Option<&str>,
     change: &[oci_dockerfile::Instruction],
@@ -4299,23 +4301,33 @@ fn commit_inner(
         .ingest(&manifest_bytes[..])
         .context("storing image manifest")?;
 
-    let tag_reference =
-        Reference::parse(image).with_context(|| format!("parsing tag {image:?}"))?;
+    let tag_reference = image
+        .map(|image| Reference::parse(image).with_context(|| format!("parsing tag {image:?}")))
+        .transpose()?;
+    let recorded_reference = match &tag_reference {
+        Some(tag_reference) => tag_reference.to_string(),
+        None => untagged_reference(&manifest_ingested.digest),
+    };
     store
         .put_image(&ImageRecord {
-            reference: tag_reference.to_string(),
+            reference: recorded_reference,
             manifest_digest: manifest_ingested.digest.clone(),
         })
         .context("recording committed image")?;
 
     if json {
         oci_cli_common::output::print_json(&CommitResult {
-            reference: tag_reference.to_string(),
+            reference: tag_reference.as_ref().map(Reference::to_string),
             digest: manifest_ingested.digest.to_string(),
         })?;
     } else {
         println!("{}", manifest_ingested.digest);
-        println!("tagged: {tag_reference}");
+        // Matches real `podman commit` with no `IMAGE` at all: just
+        // the digest, no "tagged: ..." line -- there is no tag to
+        // report.
+        if let Some(tag_reference) = &tag_reference {
+            println!("tagged: {tag_reference}");
+        }
     }
     Ok(())
 }

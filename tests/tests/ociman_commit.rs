@@ -250,6 +250,69 @@ fn commit_requires_the_image_argument_to_parse_as_a_reference() {
     assert!(!commit.status.success());
 }
 
+/// `IMAGE` is optional, matching real `podman commit` with no `IMAGE`
+/// at all: the committed image is still fully usable by ID, recorded
+/// under this project's own internal untagged-image sentinel instead
+/// of a real tag (the same convention `ociman build --tag`'s own
+/// identical optional flag already established, 0179/0180).
+#[test]
+fn commit_with_no_image_argument_records_an_untagged_image() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/commit-untagged-base:latest",
+        "echo hi > /new-file.txt; exit 0",
+    );
+
+    let commit = ociman(storage_dir.path(), &["commit", &id]);
+    assert!(
+        commit.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&commit.stdout);
+    assert!(
+        !stdout.contains("tagged:"),
+        "an untagged commit should never print a \"tagged: ...\" line: {stdout:?}"
+    );
+    let digest = stdout.trim().to_string();
+    assert!(digest.starts_with("sha256:"), "{stdout:?}");
+
+    let commit_json = ociman(storage_dir.path(), &["commit", "--json", &id]);
+    assert!(commit_json.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&commit_json.stdout).unwrap();
+    assert_eq!(view["reference"], serde_json::Value::Null);
+    let second_digest = view["digest"].as_str().unwrap().to_string();
+
+    // Findable by ID afterward -- 0122's own existing ID fallback
+    // needs no changes at all to already work here.
+    let short_id = &second_digest.trim_start_matches("sha256:")[..12];
+    let inspect = ociman(storage_dir.path(), &["inspect", short_id]);
+    assert!(
+        inspect.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+
+    // Shown as `<none>`, never this project's own internal sentinel
+    // string, matching real `docker images`/`podman images`'s own
+    // identical convention for an untagged image.
+    let images = ociman(storage_dir.path(), &["images", "--json"]);
+    assert!(images.status.success());
+    let views: serde_json::Value = serde_json::from_slice(&images.stdout).unwrap();
+    let untagged = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["digest"] == second_digest)
+        .expect("the untagged committed image should still show up in the listing");
+    assert_eq!(untagged["reference"], serde_json::Value::Null);
+}
+
 #[test]
 fn commit_of_an_unknown_container_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();
