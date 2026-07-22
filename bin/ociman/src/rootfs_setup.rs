@@ -125,6 +125,23 @@ pub(crate) fn cache_root(store: &Store) -> PathBuf {
     store.root().join("rootfs-cache")
 }
 
+/// A container's own private, writable overlay upper directory —
+/// only ever meaningful for a container actually using
+/// [`RootfsSetup::Overlay`] (this same path is unconditionally
+/// created by [`prepare_overlay`] below), but computable from just
+/// `bundle_dir` alone with no `RootfsSetup` value in hand, which is
+/// exactly what `main.rs`'s own `cmd_cp` (detecting whether a given
+/// container even used this layout at all, by this same directory's
+/// own presence) and `cmd_run` (choosing where a container-specific
+/// file — e.g. `/etc/hosts` — created *before* the container starts
+/// actually needs to live, so a later overlay merge shows it) both
+/// need — one shared source of truth for this path rather than two
+/// independent `.join("upper")` calls silently drifting apart if this
+/// ever changes.
+pub(crate) fn upper_dir(bundle_dir: &Path) -> PathBuf {
+    bundle_dir.join("upper")
+}
+
 fn prepare_overlay(
     store: &Store,
     bundle_dir: &Path,
@@ -135,7 +152,7 @@ fn prepare_overlay(
     let cache_dir = oci_store::ensure_cached(store, &cache_root, manifest_digest, layers)
         .context("building/reusing the rootfs cache")?;
 
-    let upper = bundle_dir.join("upper");
+    let upper = upper_dir(bundle_dir);
     let work = bundle_dir.join("work");
     std::fs::create_dir_all(&upper).with_context(|| format!("creating {}", upper.display()))?;
     std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;

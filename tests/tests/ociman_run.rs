@@ -622,6 +622,168 @@ fn run_without_hostname_flag_defaults_to_the_containers_own_id() {
     );
 }
 
+/// Every real container gets a synthesized `/etc/hosts` (see
+/// `docs/design/0147`): `127.0.0.1`/`::1 localhost`, plus the
+/// container's own hostname and `--name` mapped to `127.0.0.1` — even
+/// with no `--add-host` at all, matching real podman's own
+/// `--network=none` default (this project sets up no container
+/// networking of its own yet, so every container behaves like that
+/// case).
+#[test]
+fn run_writes_a_default_etc_hosts_with_no_add_host_flag_at_all() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/hosts-default:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--name", "hosts-default-test"])
+        .args(["ociman-test/hosts-default:latest"])
+        .args(["/bin/cat", "/etc/hosts"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hosts = String::from_utf8_lossy(&out.stdout);
+    assert!(hosts.contains("127.0.0.1\tlocalhost"), "hosts: {hosts:?}");
+    assert!(hosts.contains("::1\tlocalhost"), "hosts: {hosts:?}");
+    assert!(hosts.contains("hosts-default-test"), "hosts: {hosts:?}");
+}
+
+/// `--add-host name[;name2]:IP` (repeatable) adds a real, extra
+/// `/etc/hosts` entry, taking precedence over (able to suppress) the
+/// built-in `localhost` entries when it reuses that same name.
+#[test]
+fn run_add_host_flag_adds_a_real_extra_hosts_entry() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-host:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "--add-host",
+            "foo.example;bar.example:10.0.0.5",
+        ])
+        .args(["ociman-test/add-host:latest"])
+        .args(["/bin/cat", "/etc/hosts"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hosts = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        hosts.contains("10.0.0.5\tfoo.example bar.example"),
+        "hosts: {hosts:?}"
+    );
+}
+
+/// A user `--add-host localhost:...` genuinely takes precedence:
+/// both built-in `localhost` lines (`127.0.0.1`/`::1`) are suppressed
+/// entirely, matching real podman's own exact behavior (checked
+/// directly, see `write_etc_hosts`'s own doc comment).
+#[test]
+fn run_add_host_overriding_localhost_suppresses_the_builtin_localhost_entries() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-host-localhost:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--add-host", "localhost:9.9.9.9"])
+        .args(["ociman-test/add-host-localhost:latest"])
+        .args(["/bin/cat", "/etc/hosts"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hosts = String::from_utf8_lossy(&out.stdout);
+    assert!(hosts.contains("9.9.9.9\tlocalhost"), "hosts: {hosts:?}");
+    assert!(!hosts.contains("127.0.0.1\tlocalhost"), "hosts: {hosts:?}");
+    assert!(!hosts.contains("::1\tlocalhost"), "hosts: {hosts:?}");
+}
+
+/// `--add-host` with the `host-gateway` IP keyword is a clear, real
+/// error — this project sets up no container networking of its own
+/// yet, so there is no real host-reachable gateway address to
+/// resolve it to (see `docs/design/0147`'s own "what this doesn't do
+/// yet").
+#[test]
+fn run_add_host_rejects_the_host_gateway_keyword() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-host-gateway:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--add-host", "foo:host-gateway"])
+        .args(["ociman-test/add-host-gateway:latest"])
+        .args(["/bin/true"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("host-gateway"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `-w`/`--workdir` overrides the image's own default `WORKDIR`,
 /// matching real `docker run -w`/`podman run -w` exactly -- checked
 /// the most direct way available: printing the real, current working
