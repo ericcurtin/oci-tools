@@ -10,7 +10,8 @@
 //! actually supports.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use oci_spec_types::image::ContainerConfig;
 use oci_store::Store;
@@ -298,4 +299,292 @@ fn commit_is_a_clear_error_for_a_rootless_overlay_rootfs_container() {
             String::from_utf8_lossy(&commit.stderr)
         );
     }
+}
+
+/// Same real, reachable-`systemd --user`-session probe
+/// `ociman_pause.rs`/`ociman_top.rs` already use: `--pause`'s own real
+/// freeze effect only ever exists through the systemd cgroup driver.
+fn systemd_user_session_available() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-system-running"])
+        .output()
+        .is_ok_and(|out| !out.stdout.is_empty())
+}
+
+fn ociman_run_detached(
+    storage_root: &Path,
+    image: &str,
+    container_args: &[&str],
+) -> std::process::Child {
+    Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_root)
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", image])
+        .args(container_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run")
+}
+
+fn only_container_id(storage_root: &Path, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = ociman(storage_root, &["ps", "-a", "-q"]);
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !id.is_empty() || Instant::now() >= deadline {
+            return id;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_container_status(
+    storage_root: &Path,
+    id: &str,
+    want: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = ociman(storage_root, &["inspect", id, "--json"]);
+        if out.status.success()
+            && let Ok(view) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        {
+            let status = view["status"].as_str().unwrap_or_default().to_string();
+            if status == want || Instant::now() >= deadline {
+                return status;
+            }
+        } else if Instant::now() >= deadline {
+            return String::new();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The real pid `ociman top`'s own table shows for the container's
+/// actual init process, same as `ociman_pause.rs`'s own identical
+/// helper.
+fn container_init_pid(storage_root: &Path, id: &str) -> i32 {
+    let top = ociman(storage_root, &["top", id]);
+    assert!(top.status.success());
+    let stdout = String::from_utf8_lossy(&top.stdout);
+    let last_line = stdout.lines().next_back().expect("at least one pid line");
+    last_line
+        .split_whitespace()
+        .nth(1)
+        .expect("a PID column")
+        .parse()
+        .expect("a real numeric pid")
+}
+
+/// The real cgroup directory a running container's own init process is
+/// actually in right now, same as `ociman_pause.rs`'s own identical
+/// helper.
+fn real_cgroup_dir(pid: i32) -> std::path::PathBuf {
+    let contents = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    let relative = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .expect("a real cgroup v2 (\"0::\") entry");
+    Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'))
+}
+
+fn cgroup_is_frozen(cgroup_dir: &Path) -> bool {
+    std::fs::read_to_string(cgroup_dir.join("cgroup.freeze"))
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// `--pause` (real podman's own default): the container's own real
+/// cgroup v2 freezer must actually engage for the real duration of the
+/// commit, and be lifted again afterward -- not just "the CLI call
+/// succeeded and the container still looks fine from the outside
+/// afterward". Verified the same real, direct way `ociman_pause.rs`'s
+/// own tests already verify the freezer itself: reading
+/// `cgroup.freeze` straight from `/sys/fs/cgroup`, independently of
+/// `ociman`'s own implementation. `ociman commit` runs as a spawned
+/// (not `.output()`-blocked) child specifically so this test can
+/// busy-poll `cgroup.freeze` concurrently while it's still running,
+/// rather than only being able to check before/after.
+#[test]
+fn commit_pauses_a_running_container_and_unpauses_it_afterward() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/commit-pause:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/commit-pause:latest",
+        &["/bin/sh", "-c", "i=0; while true; do i=$((i+1)); done"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+    let pid = container_init_pid(storage_dir.path(), &id);
+    let cgroup_dir = real_cgroup_dir(pid);
+    assert!(
+        !cgroup_is_frozen(&cgroup_dir),
+        "must not already be frozen before commit even starts"
+    );
+
+    let mut commit_child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["commit", &id, "ociman-test/commit-pause-result:latest"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman commit");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut observed_frozen = false;
+    loop {
+        if cgroup_is_frozen(&cgroup_dir) {
+            observed_frozen = true;
+            break;
+        }
+        if let Ok(Some(_)) = commit_child.try_wait() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    let status = commit_child
+        .wait()
+        .expect("waiting for ociman commit to finish");
+    assert!(status.success(), "ociman commit exited with {status:?}");
+    assert!(
+        observed_frozen,
+        "commit --pause (the real podman default) should have frozen the container's own \
+         cgroup at some point while committing"
+    );
+    assert!(
+        !cgroup_is_frozen(&cgroup_dir),
+        "commit should unpause the container again once it's done"
+    );
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running",
+        "the container should be genuinely running again afterward, not stuck paused"
+    );
+
+    ociman(storage_dir.path(), &["stop", "--time", "0", &id]);
+    ociman(storage_dir.path(), &["rm", "-f", &id]);
+    let _ = run.kill();
+    let _ = run.wait();
+}
+
+/// `--pause=false`: the container must never be frozen at all,
+/// matching real `podman commit --pause=false` exactly.
+#[test]
+fn commit_with_pause_false_never_freezes_a_running_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/commit-nopause:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/commit-nopause:latest",
+        &["/bin/sh", "-c", "i=0; while true; do i=$((i+1)); done"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+    let pid = container_init_pid(storage_dir.path(), &id);
+    let cgroup_dir = real_cgroup_dir(pid);
+
+    let mut commit_child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "commit",
+            "--pause=false",
+            &id,
+            "ociman-test/commit-nopause-result:latest",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman commit");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut observed_frozen = false;
+    loop {
+        if cgroup_is_frozen(&cgroup_dir) {
+            observed_frozen = true;
+            break;
+        }
+        if let Ok(Some(_)) = commit_child.try_wait() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    let status = commit_child
+        .wait()
+        .expect("waiting for ociman commit to finish");
+    assert!(status.success(), "ociman commit exited with {status:?}");
+    assert!(
+        !observed_frozen,
+        "commit --pause=false should never freeze the container at all"
+    );
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    ociman(storage_dir.path(), &["stop", "--time", "0", &id]);
+    ociman(storage_dir.path(), &["rm", "-f", &id]);
+    let _ = run.kill();
+    let _ = run.wait();
 }

@@ -725,9 +725,9 @@ enum Command {
     /// the image it was created from — matching real `docker commit`/
     /// `podman commit` exactly for the "one new layer, on top of the
     /// exact same base layers" case (see `cmd_commit`'s own doc
-    /// comment for what's deliberately out of scope for now: `--pause`/
-    /// `--change`/`--config`/`--squash`/`--include-volumes`, and the
-    /// same rootless-overlay-rootfs gap `cp`/`diff` already have).
+    /// comment for what's deliberately out of scope for now: `--change`/
+    /// `--config`/`--squash`/`--include-volumes`, and the same
+    /// rootless-overlay-rootfs gap `cp`/`diff` already have).
     Commit {
         /// The container's ID or `--name`.
         container: String,
@@ -753,6 +753,20 @@ enum Command {
         /// equivalent, so that's what this sets instead.
         #[arg(short, long)]
         message: Option<String>,
+        /// Pause the container (via the real cgroup v2 freezer, same
+        /// mechanism `ociman pause` itself uses) while its filesystem
+        /// is diffed/committed, then unpause it again afterward —
+        /// matching real `podman commit --pause`'s own default of
+        /// `true` exactly (checked directly,
+        /// `~/git/podman/libpod/container_commit.go`: only takes
+        /// effect for a container that's actually running; a already-
+        /// stopped one has nothing left to race against, so this is
+        /// silently skipped for one either way). `--pause=false` skips
+        /// this for a still-running container, at the same real risk
+        /// of an inconsistent snapshot real podman itself accepts
+        /// with the same flag.
+        #[arg(short, long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        pause: bool,
     },
     /// Gracefully stop a running container: send it a signal (`TERM`
     /// by default) and wait up to `--time` seconds for it to exit on
@@ -1033,11 +1047,13 @@ fn main() -> std::process::ExitCode {
                 image,
                 author,
                 message,
+                pause,
             }) => cmd_commit(
                 &container,
                 &image,
                 author.as_deref(),
                 message.as_deref(),
+                pause,
                 cli.global.json,
             ),
             Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, &signal),
@@ -2985,9 +3001,52 @@ fn cmd_commit(
     image: &str,
     author: Option<&str>,
     message: Option<&str>,
+    pause: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let (root, state) = resolve_container_root(id, "commit")?;
+
+    // Real podman's own default (checked directly,
+    // `~/git/podman/libpod/container_commit.go`): pause only ever
+    // takes effect for a container that's genuinely still running --
+    // an already-stopped one has no live process left to race
+    // against, so this is silently skipped for one either way, not an
+    // error, matching `--pause`'s own real semantics exactly.
+    let paused_here = pause && state.effective_status() == Status::Running;
+    if paused_here {
+        let cgroup_dir = resolve_running_container_cgroup(id)?;
+        oci_runtime_core::cgroups::set_frozen(&cgroup_dir, true)
+            .with_context(|| format!("pausing container {id:?} for commit"))?;
+    }
+    let result = commit_inner(id, image, author, message, json, &root, &state);
+    if paused_here {
+        // Best-effort: always attempt to unpause, even if the commit
+        // itself failed partway through -- matches real podman's own
+        // `defer unpause()` (runs regardless of the wrapped call's own
+        // outcome). A failure to unpause here is a real, but separate,
+        // problem `ociman unpause` can resolve afterward; it must
+        // never mask the commit's own actual error/success.
+        if let Ok(cgroup_dir) = resolve_running_container_cgroup(id) {
+            let _ = oci_runtime_core::cgroups::set_frozen(&cgroup_dir, false);
+        }
+    }
+    result
+}
+
+/// The actual diff-into-a-new-layer-and-image logic [`cmd_commit`]
+/// wraps with its own pause/unpause bracket -- split out only so that
+/// bracket can wrap one single expression cleanly, not because this
+/// is reused anywhere else.
+#[allow(clippy::too_many_arguments)]
+fn commit_inner(
+    id: &str,
+    image: &str,
+    author: Option<&str>,
+    message: Option<&str>,
+    json: bool,
+    root: &Path,
+    state: &oci_runtime_core::PersistedState,
+) -> anyhow::Result<()> {
     let snapshot_path = Path::new(&state.bundle).join(BASE_SNAPSHOT_FILENAME);
     let snapshot_bytes = std::fs::read(&snapshot_path).with_context(|| {
         format!(
@@ -2998,7 +3057,7 @@ fn cmd_commit(
     })?;
     let before: oci_layer::Snapshot = serde_json::from_slice(&snapshot_bytes)
         .with_context(|| format!("parsing {}", snapshot_path.display()))?;
-    let changes = oci_layer::changes(&root, &before).with_context(|| {
+    let changes = oci_layer::changes(root, &before).with_context(|| {
         format!("diffing container {id:?}'s own filesystem against its base image")
     })?;
 
@@ -3031,7 +3090,7 @@ fn cmd_commit(
         .with_context(|| format!("reading config for {base_reference}"))?;
     let mut layers = base_manifest.layers.clone();
 
-    let committed = oci_dockerfile::commit_layer(&store, &root, &changes)
+    let committed = oci_dockerfile::commit_layer(&store, root, &changes)
         .with_context(|| format!("committing a new layer for container {id:?}"))?;
     oci_dockerfile::record_layer(&mut config, &mut layers, &committed, format!("commit {id}"));
     if let Some(message) = message {
