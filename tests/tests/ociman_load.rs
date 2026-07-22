@@ -205,3 +205,123 @@ fn load_with_json_prints_the_reference_and_digest() {
     );
     assert_eq!(parsed["digest"], source_record.manifest_digest.to_string());
 }
+
+/// An untagged image (0179) round-trips through `save`/`load`
+/// correctly: no bogus reference gets embedded in the archive (which
+/// would otherwise `Reference::parse` this project's own internal
+/// sentinel string into a nonsense tag on the far end), `load` reports
+/// zero references (matching real `podman load`'s own "no tag"
+/// output), and the destination store still records it, findable by
+/// ID and shown as `<none>` by `ociman images`, exactly like the
+/// source did -- not silently dropped/orphaned.
+#[test]
+fn save_then_load_round_trips_an_untagged_image_still_untagged() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_store = Store::open(source_dir.path()).unwrap();
+    seed_image(
+        &source_store,
+        "ociman-test/untagged-load-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/untagged-load-base:latest\nRUN echo hi > /hi.txt\n",
+    )
+    .unwrap();
+    let build = ociman(
+        source_dir.path(),
+        &["build", context_dir.path().to_str().unwrap()],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let digest = String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    let short_id = &digest.trim_start_matches("sha256:")[..12];
+
+    let archive_path = source_dir.path().join("untagged.tar");
+    let save = ociman(
+        source_dir.path(),
+        &["save", "-o", archive_path.to_str().unwrap(), short_id],
+    );
+    assert!(
+        save.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&save.stderr)
+    );
+
+    let dest_dir = tempfile::tempdir().unwrap();
+    let load = ociman(
+        dest_dir.path(),
+        &["load", "-i", archive_path.to_str().unwrap(), "--json"],
+    );
+    assert!(
+        load.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&load.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&load.stdout).unwrap();
+    assert_eq!(
+        parsed["references"],
+        serde_json::json!([]),
+        "an untagged image should still report zero real references after loading"
+    );
+    assert_eq!(parsed["digest"], digest);
+
+    let images = ociman(dest_dir.path(), &["images", "--json"]);
+    assert!(images.status.success());
+    let views: serde_json::Value = serde_json::from_slice(&images.stdout).unwrap();
+    let loaded = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["digest"] == digest)
+        .expect("the untagged image should still show up in the destination store's listing");
+    assert_eq!(loaded["reference"], serde_json::Value::Null);
+
+    // `ociman run` has no image-by-ID resolution of its own (a
+    // separate, pre-existing gap, unrelated to 0179 -- `ociman tag`/
+    // `inspect`/`rmi`/`push`/`save` all already do via 0122's own
+    // `resolve_image_by_reference_or_id`, `run` never has), so
+    // runnability is checked here via a real tag applied to the
+    // already-loaded, still-untagged image first.
+    let short_id = &digest.trim_start_matches("sha256:")[..12];
+    let tag = ociman(
+        dest_dir.path(),
+        &["tag", short_id, "ociman-test/untagged-load-result:latest"],
+    );
+    assert!(
+        tag.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&tag.stderr)
+    );
+    let run = ociman(
+        dest_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/untagged-load-result:latest",
+            "cat",
+            "/hi.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "hi\n");
+}

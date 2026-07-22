@@ -527,8 +527,10 @@ enum Command {
         /// preference).
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
-        /// Tag the built image (`name[:tag]`) — currently required
-        /// (see the `build` module's own doc comment for why).
+        /// Tag the built image (`name[:tag]`) — optional, matching
+        /// real `docker build`/`podman build` with no `-t` at all:
+        /// the image is still fully usable by ID, it just has no tag
+        /// pointing at it (see `docs/design/0179`).
         #[arg(short = 't', long = "tag")]
         tag: Option<String>,
         /// Override an `ARG`'s own value: `KEY=value`, or bare `KEY`
@@ -1543,7 +1545,9 @@ fn open_volume_store() -> anyhow::Result<volume::VolumeStore> {
 /// JSON/table view of a stored image, shared by `pull` and `images`.
 #[derive(Debug, Serialize)]
 struct ImageView {
-    reference: String,
+    /// `None` for an untagged image (see [`untagged_reference`]) --
+    /// never the internal sentinel string itself.
+    reference: Option<String>,
     digest: String,
     size: u64,
     architecture: Option<String>,
@@ -1552,8 +1556,9 @@ struct ImageView {
 
 impl ImageView {
     fn from_summary(summary: ImageSummary) -> Self {
+        let reference = (!is_untagged_reference(&summary.reference)).then_some(summary.reference);
         ImageView {
-            reference: summary.reference,
+            reference,
             digest: summary.manifest_digest.to_string(),
             size: summary.size,
             architecture: summary.architecture,
@@ -1613,6 +1618,21 @@ fn cmd_push(reference_str: &str, tls_verify: bool, json: bool) -> anyhow::Result
     let resolved = resolve_image_by_reference_or_id(&store, reference_str)?
         .ok_or_else(|| anyhow::anyhow!("{reference_str}: no such image in local storage"))?;
     let record = resolved.record();
+    // `ociman push` (unlike real `podman push`) always pushes back to
+    // the exact reference an image is already stored under -- no
+    // separate `DESTINATION` argument at all (see `Command::Push`'s
+    // own doc comment, 0127). An untagged image has no such reference
+    // to push to in the first place -- a real, clear error here,
+    // *before* ever attempting `Reference::parse` on the internal
+    // sentinel (which would otherwise silently "succeed" with a
+    // nonsense `docker.io/library/sha256:<hex>` destination, checked
+    // directly: `is_untagged_reference`'s own bare-digest sentinel has
+    // no `/`, so it hits `Reference::parse`'s own no-domain fallback
+    // and is happily misparsed as repository `sha256`, tag `<hex>`).
+    anyhow::ensure!(
+        !is_untagged_reference(&record.reference),
+        "{reference_str}: cannot push an untagged image -- tag it first with `ociman tag`"
+    );
     let reference = Reference::parse(&record.reference)
         .with_context(|| format!("parsing image reference {:?}", record.reference))?;
     let mut client = registry_client(reference.registry_host(), tls_verify);
@@ -2178,9 +2198,14 @@ fn cmd_images(json: bool) -> anyhow::Result<()> {
     println!("{:<50} {:<15} {:>12}", "REFERENCE", "DIGEST", "SIZE");
     for view in &views {
         let short_digest = view.digest.strip_prefix("sha256:").unwrap_or(&view.digest);
+        // Matches real `docker images`/`podman images`'s own `<none>`
+        // convention for an untagged image's `REPOSITORY`/`TAG`
+        // columns (this project's own single, narrower `REFERENCE`
+        // column shows the same placeholder instead).
+        let reference = view.reference.as_deref().unwrap_or("<none>");
         println!(
             "{:<50} {:<15} {:>12}",
-            view.reference,
+            reference,
             &short_digest[..short_digest.len().min(12)],
             view.size
         );
@@ -3352,6 +3377,30 @@ fn validate_container_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The synthetic `reference` this project's own store records an
+/// untagged image under (`ociman build`/`ociman load` with no real,
+/// user-visible tag at all) — the image's own manifest digest,
+/// verbatim (e.g. `sha256:<hex>`). `oci_store::ImageRecord` has no
+/// separate "this image has no tag" concept of its own (see
+/// `docs/design/0179`'s own doc comment for why none was needed): a
+/// bare digest string is used as `ImageRecord::reference` instead,
+/// safe because it can never collide with a real one — every real,
+/// `Reference::parse`-derived reference's own `Display` always writes
+/// `<registry>/<repository>...` (checked directly against
+/// `Reference`'s own `Display` impl), so it always contains at least
+/// one `/`, which a bare digest string never does.
+pub(crate) fn untagged_reference(digest: &oci_spec_types::Digest) -> String {
+    digest.to_string()
+}
+
+/// Whether `reference` (an `ImageRecord`'s own field) is
+/// [`untagged_reference`]'s own sentinel rather than a real tag — see
+/// its own doc comment for why a bare digest string (no `/` at all)
+/// can never be a real one.
+pub(crate) fn is_untagged_reference(reference: &str) -> bool {
+    !reference.contains('/')
+}
+
 /// Resolve `spec` to a stored image record: first as an ordinary tag
 /// reference (the overwhelmingly common case, and the only thing
 /// `ociman` supported resolving an image by before this), then, if
@@ -3419,9 +3468,30 @@ fn resolve_image_by_reference_or_id(
         std::collections::HashMap::new();
     for record in store.list_images().context("listing local images")? {
         if record.manifest_digest.hex().starts_with(&candidate) {
-            by_digest
-                .entry(record.manifest_digest.hex().to_string())
-                .or_insert(record);
+            // When the exact same image has more than one record
+            // (real tags, or this project's own untagged sentinel,
+            // see `untagged_reference`/0179), a real tag always wins
+            // over the sentinel here, deterministically -- callers
+            // like `cmd_push`'s own "no real reference to push"
+            // refusal read `.reference` off whichever record this
+            // returns, so an image that's *also* been given a real
+            // tag (`ociman tag <id> ...`) alongside its own original
+            // untagged record must never have that guard trip just
+            // because `list_images`'s own iteration order happened to
+            // visit the sentinel first.
+            let hex = record.manifest_digest.hex().to_string();
+            match by_digest.entry(hex) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(record);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if is_untagged_reference(&entry.get().reference)
+                        && !is_untagged_reference(&record.reference)
+                    {
+                        entry.insert(record);
+                    }
+                }
+            }
         }
     }
     match by_digest.len() {
@@ -4024,12 +4094,13 @@ struct CommitResult {
 /// own layer list/history), just with a running container's own
 /// current state standing in for a build stage's.
 ///
-/// `image` is currently required, unlike real podman's own optional
-/// `IMAGE` argument (which produces a real, but untagged, image if
-/// omitted) — this project has no established "an image can exist
-/// without any tag at all" storage convention yet anywhere else in the
-/// codebase (matches `ociman build --tag`'s own identical, already-
-/// documented narrowing).
+/// `image` is currently still required, unlike real podman's own
+/// optional `IMAGE` argument (which produces a real, but untagged,
+/// image if omitted) — `ociman build`'s own identical `-t` flag
+/// already gained this (0179, `crate::untagged_reference`'s own
+/// sentinel-reference convention), but wiring the same convention
+/// through `commit` is a separate, not-yet-done increment of its own,
+/// not a fundamental gap in the store anymore.
 #[allow(clippy::too_many_arguments)]
 fn cmd_commit(
     id: &str,
@@ -6544,6 +6615,32 @@ mod tests {
     // one function has no process/filesystem/namespace involvement at
     // all, so an ordinary in-process unit test is both possible and
     // the most direct way to check it.
+    #[test]
+    fn untagged_reference_is_recognized_by_is_untagged_reference() {
+        let digest = oci_spec_types::digest::sha256(b"hello");
+        let sentinel = untagged_reference(&digest);
+        assert_eq!(sentinel, digest.to_string());
+        assert!(is_untagged_reference(&sentinel));
+    }
+
+    #[test]
+    fn is_untagged_reference_rejects_every_real_parsed_reference() {
+        for spec in [
+            "ubuntu",
+            "ubuntu:24.04",
+            "myuser/myrepo",
+            "docker.io/library/ubuntu:latest",
+            "localhost/foo",
+            "quay.io/foo/bar@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ] {
+            let reference = Reference::parse(spec).unwrap();
+            assert!(
+                !is_untagged_reference(&reference.to_string()),
+                "a real reference {reference} should never look like the untagged sentinel"
+            );
+        }
+    }
+
     #[test]
     fn parse_entrypoint_parses_a_json_array() {
         assert_eq!(

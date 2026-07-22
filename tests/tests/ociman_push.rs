@@ -10,7 +10,10 @@
 use std::path::Path;
 use std::process::Command;
 
-use oci_tools_tests::bin_path;
+use oci_spec_types::image::ContainerConfig;
+use oci_store::Store;
+
+use oci_tools_tests::{bin_path, busybox_path, seed_image};
 
 fn ociman(storage_root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin_path("ociman"))
@@ -46,4 +49,55 @@ fn push_of_an_unknown_image_id_is_a_clear_error() {
         "{}",
         String::from_utf8_lossy(&push.stderr)
     );
+}
+
+/// `ociman push` (unlike real `podman push`) always pushes back to
+/// the exact reference an image is already stored under -- there is
+/// no separate `DESTINATION` argument at all. An untagged image (0179)
+/// has no such reference to push to in the first place: a real, clear
+/// error, not a silent attempt to push to some nonsense destination
+/// derived from this project's own internal sentinel string.
+#[test]
+fn push_of_an_untagged_image_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/push-untagged-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/push-untagged-base:latest\nLABEL foo=bar\n",
+    )
+    .unwrap();
+
+    let build = ociman(
+        storage_dir.path(),
+        &["build", context_dir.path().to_str().unwrap()],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let digest = String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    let short_id = &digest.trim_start_matches("sha256:")[..12];
+
+    let push = ociman(storage_dir.path(), &["push", short_id]);
+    assert!(!push.status.success());
+    let stderr = String::from_utf8_lossy(&push.stderr);
+    assert!(stderr.contains("cannot push an untagged image"), "{stderr}");
 }

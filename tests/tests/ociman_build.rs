@@ -1312,19 +1312,90 @@ fn from_scratch_with_no_filesystem_touching_instructions_still_builds_a_real_emp
     );
 }
 
+/// `-t`/`--tag` is optional — matching real `docker build`/`podman
+/// build` with no `-t` at all: the build still succeeds, the image is
+/// still fully usable (by ID), it just has no tag pointing at it (see
+/// `docs/design/0179`). The human-readable output shows only the
+/// digest, with no "tagged: ..." line at all (nothing to report);
+/// `--json` shows `"reference": null`, never this project's own
+/// internal untagged-sentinel string.
 #[test]
-fn requires_a_tag() {
+fn build_with_no_tag_at_all_still_succeeds_and_records_an_untagged_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
     let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/untagged-build-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
     let context_dir = tempfile::tempdir().unwrap();
-    write_containerfile(context_dir.path(), "FROM busybox\n");
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/untagged-build-base:latest\nRUN echo hi > /hi.txt\n",
+    );
 
     let build = ociman(
         storage_dir.path(),
         &["build", context_dir.path().to_str().unwrap()],
     );
-    assert!(!build.status.success());
-    let stderr = String::from_utf8_lossy(&build.stderr);
-    assert!(stderr.contains("-t/--tag is required"), "{stderr}");
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&build.stdout);
+    assert!(
+        !stdout.contains("tagged:"),
+        "an untagged build should never print a \"tagged: ...\" line: {stdout:?}"
+    );
+    let digest = stdout.trim().to_string();
+    assert!(digest.starts_with("sha256:"), "{stdout:?}");
+
+    let json_build = ociman(
+        storage_dir.path(),
+        &["build", "--json", context_dir.path().to_str().unwrap()],
+    );
+    assert!(json_build.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&json_build.stdout).unwrap();
+    assert_eq!(view["reference"], serde_json::Value::Null);
+
+    // Findable by ID afterward -- `inspect`'s own existing ID fallback
+    // (0122) needs no changes at all to already work here.
+    let short_id = &digest.trim_start_matches("sha256:")[..12];
+    let inspect = ociman(storage_dir.path(), &["inspect", short_id]);
+    assert!(
+        inspect.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+
+    // `ociman images` shows the real, honest "<none>" placeholder,
+    // never this project's own internal sentinel string, matching
+    // real `docker images`/`podman images`'s own identical convention
+    // for an untagged image.
+    let images = ociman(storage_dir.path(), &["images"]);
+    assert!(images.status.success());
+    let stdout = String::from_utf8_lossy(&images.stdout);
+    assert!(stdout.contains("<none>"), "{stdout}");
+    assert!(!stdout.contains("sha256:"), "{stdout}");
+
+    let images_json = ociman(storage_dir.path(), &["images", "--json"]);
+    assert!(images_json.status.success());
+    let views: serde_json::Value = serde_json::from_slice(&images_json.stdout).unwrap();
+    let untagged = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["digest"] == digest)
+        .expect("the untagged image should still show up in the listing");
+    assert_eq!(untagged["reference"], serde_json::Value::Null);
 }
 
 #[test]

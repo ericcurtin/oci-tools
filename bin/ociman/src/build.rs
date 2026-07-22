@@ -136,12 +136,12 @@
 //!   same name) — matching real `docker build`/`podman build`
 //!   exactly, checked directly (real BuildKit's own `dispatchRun`) —
 //!   see `run_step_spec`'s own doc comment and `docs/design/0119`.
-//! * **`-t`/`--tag` is required.** A real, taggable image needs a
-//!   reference to store it under; this project's `oci_store::Store`
-//!   has no "anonymous image, addressable only by ID" concept yet
-//!   (unlike real `podman build` without `-t`, which still records an
-//!   untagged, ID-only image) — clear error instead of inventing that
-//!   plumbing here.
+//! * **`-t`/`--tag` is optional.** With no `-t` at all, the built
+//!   image is still recorded and fully usable by ID, just under
+//!   `crate::untagged_reference`'s own internal sentinel reference
+//!   rather than a real, user-visible tag — matching real `docker
+//!   build`/`podman build` without `-t` exactly (see `docs/design/
+//!   0179`).
 //! * **A real local build cache is on by default** (`--no-cache`
 //!   disables it) — every `RUN`/`COPY`/`ADD` step is first checked
 //!   against every image already in local storage
@@ -191,15 +191,20 @@ use serde::Serialize;
 
 #[derive(Debug, Serialize)]
 struct BuildResult {
-    reference: String,
+    /// `None` for an untagged build (see [`crate::untagged_reference`]) —
+    /// never the internal sentinel string itself.
+    reference: Option<String>,
     digest: String,
 }
 
 /// Build an image from `dockerfile` (or the context directory's own
 /// `Containerfile`/`Dockerfile`, checked in that order — matching real
 /// `podman build`'s own default preference), tagging the result as
-/// `tag`. See this module's own doc comment for exactly what's
-/// supported so far.
+/// `tag` — or, when `tag` is `None`, recording it untagged (matching
+/// real `docker build`/`podman build` with no `-t` at all: the image
+/// is still fully usable by ID, just with no tag pointing at it —
+/// see `docs/design/0179`). See this module's own doc comment for
+/// exactly what's supported so far.
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_build(
     context: &Path,
@@ -218,10 +223,9 @@ pub fn cmd_build(
     squash: bool,
     json: bool,
 ) -> anyhow::Result<()> {
-    let tag = tag.context(
-        "ociman build: -t/--tag is required (untagged, ID-only builds are not yet supported)",
-    )?;
-    let tag_reference = Reference::parse(tag).with_context(|| format!("parsing tag {tag:?}"))?;
+    let tag_reference = tag
+        .map(|tag| Reference::parse(tag).with_context(|| format!("parsing tag {tag:?}")))
+        .transpose()?;
     let build_args = parse_build_args(build_args);
 
     let dockerfile_path = resolve_dockerfile_path(context, dockerfile)?;
@@ -455,9 +459,13 @@ pub fn cmd_build(
         .ingest(&manifest_bytes[..])
         .context("storing image manifest")?;
 
+    let recorded_reference = match &tag_reference {
+        Some(tag_reference) => tag_reference.to_string(),
+        None => crate::untagged_reference(&manifest_ingested.digest),
+    };
     store
         .put_image(&ImageRecord {
-            reference: tag_reference.to_string(),
+            reference: recorded_reference,
             manifest_digest: manifest_ingested.digest.clone(),
         })
         .context("recording built image")?;
@@ -474,12 +482,17 @@ pub fn cmd_build(
 
     if json {
         oci_cli_common::output::print_json(&BuildResult {
-            reference: tag_reference.to_string(),
+            reference: tag_reference.as_ref().map(Reference::to_string),
             digest: manifest_ingested.digest.to_string(),
         })?;
     } else {
         println!("{}", manifest_ingested.digest);
-        println!("tagged: {tag_reference}");
+        // Matches real `docker build`/`podman build` with no `-t`:
+        // just the digest, no "tagged: ..." line at all -- there is
+        // no tag to report.
+        if let Some(tag_reference) = &tag_reference {
+            println!("tagged: {tag_reference}");
+        }
     }
     Ok(())
 }

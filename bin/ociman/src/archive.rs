@@ -107,8 +107,17 @@ pub(crate) fn save_oci_archive(
             .with_context(|| format!("writing layer blob {}", layer.digest))?;
     }
 
+    // An untagged image (`crate::is_untagged_reference`, 0179) has no
+    // real reference to embed here at all -- omitting the annotation
+    // entirely (rather than writing the internal sentinel string
+    // verbatim) matches this format's own already-established "no
+    // annotation at all" convention for an untagged/by-digest save,
+    // the same shape `load_archive`'s own `LoadedImage.references`
+    // already tolerates being empty for.
     let mut annotations = BTreeMap::new();
-    annotations.insert(ANNOTATION_REF_NAME.to_string(), record.reference.clone());
+    if !crate::is_untagged_reference(&record.reference) {
+        annotations.insert(ANNOTATION_REF_NAME.to_string(), record.reference.clone());
+    }
     let index = ImageIndex {
         schema_version: 2,
         // Real `oci-archive` output has no top-level `mediaType` on
@@ -214,9 +223,19 @@ pub(crate) fn save_docker_archive(
         layer_names.push(name);
     }
 
+    // Same untagged handling as `save_oci_archive` -- an empty
+    // `RepoTags` (never the internal sentinel string) matches real
+    // `podman save`'s own output for an untagged/by-digest image,
+    // already tolerated on the read side by this same struct's own
+    // `#[serde(default)]`.
+    let repo_tags = if crate::is_untagged_reference(&record.reference) {
+        Vec::new()
+    } else {
+        vec![record.reference.clone()]
+    };
     let manifest_item = DockerArchiveManifestItem {
         config: config_name,
-        repo_tags: vec![record.reference.clone()],
+        repo_tags,
         layers: layer_names,
     };
     let manifest_json = serde_json::to_vec(&vec![manifest_item])
@@ -622,7 +641,26 @@ fn load_oci_archive_index(
                 .context("recording loaded image's tag")?;
             vec![normalized]
         }
-        None => Vec::new(),
+        None => {
+            // No real, user-visible tag at all -- still recorded, now
+            // under the internal untagged sentinel (0179) rather than
+            // no pointer at all: findable by ID (`ociman inspect`/
+            // `ociman rmi`/`ociman tag`), shown (as `<none>`) by
+            // `ociman images`, and immune to being silently swept by
+            // the very next `ociman prune` the way a genuinely
+            // pointer-less manifest would be. `references` itself
+            // still reports empty -- matches real `podman load`'s own
+            // "Loaded image: ..." output for exactly this case (no
+            // real tag to report), and this crate's own `LoadedImage`
+            // doc comment above, both unchanged by this.
+            store
+                .put_image(&ImageRecord {
+                    reference: crate::untagged_reference(&descriptor.digest),
+                    manifest_digest: descriptor.digest.clone(),
+                })
+                .context("recording loaded untagged image")?;
+            Vec::new()
+        }
     };
 
     Ok(LoadedImage {
@@ -718,6 +756,19 @@ fn load_docker_archive_manifest(
             })
             .context("recording loaded image's tag")?;
         references.push(normalized);
+    }
+    if item.repo_tags.is_empty() {
+        // Same untagged handling as the `oci-archive` load path above
+        // -- an empty `RepoTags` (real `podman save`'s own output for
+        // an untagged/by-digest image, see `save_docker_archive`)
+        // still gets recorded, under the internal untagged sentinel,
+        // rather than no pointer at all.
+        store
+            .put_image(&ImageRecord {
+                reference: crate::untagged_reference(&manifest_digest),
+                manifest_digest: manifest_digest.clone(),
+            })
+            .context("recording loaded untagged image")?;
     }
 
     Ok(LoadedImage {
@@ -933,9 +984,10 @@ mod tests {
 
     /// An archive with no `org.opencontainers.image.ref.name`
     /// annotation still loads successfully -- every blob is ingested
-    /// and the manifest digest is returned -- it just doesn't record
-    /// any tag pointer, matching real `podman load`'s own handling of
-    /// an untagged/by-digest-only archive.
+    /// and the manifest digest is returned, `references` reports none
+    /// (matching real `podman load`'s own handling of an untagged/
+    /// by-digest-only archive) -- but it's still recorded, findable by
+    /// ID (0179), rather than left with no pointer at all.
     #[test]
     fn load_with_no_ref_name_annotation_ingests_everything_but_records_no_tag() {
         let source_dir = tempfile::tempdir().unwrap();
@@ -988,7 +1040,18 @@ mod tests {
         assert!(loaded.references.is_empty());
         assert_eq!(loaded.manifest_digest, record.manifest_digest);
         assert!(dest_store.has_blob(&record.manifest_digest));
-        assert!(dest_store.list_images().unwrap().is_empty());
+        let images = dest_store.list_images().unwrap();
+        assert_eq!(
+            images.len(),
+            1,
+            "should be recorded under the untagged sentinel: {images:?}"
+        );
+        assert_eq!(images[0].manifest_digest, record.manifest_digest);
+        assert!(
+            crate::is_untagged_reference(&images[0].reference),
+            "should not be a real, user-visible tag: {:?}",
+            images[0].reference
+        );
     }
 
     /// A real, previously-caught bug (found via manual interop testing
