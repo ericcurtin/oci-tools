@@ -981,6 +981,14 @@ enum Command {
         #[arg(long = "cpuset-mems")]
         cpuset_mems: Option<String>,
     },
+    /// Manage container health checks — matching real `podman
+    /// healthcheck`'s own two-level command shape (`podman healthcheck
+    /// run CONTAINER`, no other subcommands real podman itself has
+    /// either).
+    Healthcheck {
+        #[command(subcommand)]
+        command: HealthcheckCommand,
+    },
     /// A single, one-shot resource-usage sample for a running
     /// container's own real cgroup — matching real `podman stats
     /// --no-stream`'s own single-call semantics exactly (see the
@@ -1205,6 +1213,33 @@ enum Command {
     Info,
 }
 
+/// `ociman healthcheck`'s own subcommands — matching real `podman
+/// healthcheck`'s own identical shape, which today has exactly one:
+/// `run`.
+#[derive(Debug, clap::Subcommand)]
+enum HealthcheckCommand {
+    /// Run a container's own image-declared `HEALTHCHECK` test once,
+    /// right now — matching real `podman healthcheck run` for a real,
+    /// deliberately narrower scope: see `cmd_healthcheck_run`'s own
+    /// doc comment for exactly what's deferred (no persisted health
+    /// log/state, no startup-healthcheck distinction, no on-failure
+    /// actions, and — the one real, honestly-flagged gap — the
+    /// configured `Timeout` isn't enforced yet, so a genuinely hung
+    /// check currently blocks this command itself rather than being
+    /// killed and reported `unhealthy`).
+    Run {
+        /// The container's ID or `--name`.
+        id: String,
+        /// Exit `0` regardless of the healthcheck's own result (or if
+        /// the container isn't running) — matching real `podman
+        /// healthcheck run --ignore-result` exactly. The real result
+        /// (`unhealthy`/`stopped`) is still printed either way; only
+        /// the *exit code* changes.
+        #[arg(long = "ignore-result")]
+        ignore_result: bool,
+    },
+}
+
 fn main() -> std::process::ExitCode {
     oci_cli_common::run_main(|| {
         let cli = Cli::parse();
@@ -1319,6 +1354,11 @@ fn main() -> std::process::ExitCode {
                 cpuset_cpus.as_deref(),
                 cpuset_mems.as_deref(),
             ),
+            Some(Command::Healthcheck { command }) => match command {
+                HealthcheckCommand::Run { id, ignore_result } => {
+                    cmd_healthcheck_run(&id, ignore_result)
+                }
+            },
             Some(Command::Stats { id, no_stream }) => cmd_stats(&id, no_stream, cli.global.json),
             Some(Command::Wait { id, interval }) => cmd_wait(&id, interval),
             Some(Command::Rename { id, name }) => cmd_rename(&id, &name),
@@ -4751,6 +4791,140 @@ fn cmd_update(
     Ok(())
 }
 
+/// Translate a real `HEALTHCHECK`-shaped `Test` field (`["NONE"]`,
+/// `["CMD", ...]`, or `["CMD-SHELL", "<command>"]` — the exact three
+/// shapes `oci_dockerfile::instruction::parse_healthcheck` itself
+/// produces) into the real exec-form args to actually run, or `None`
+/// if there's nothing to run at all (`NONE`, an empty `Test`, or an
+/// unrecognized first element — matching real moby's own identical
+/// `getProbe` fallback, `~/git/moby/daemon/health.go`: an unrecognized
+/// type just means no healthcheck, not a hard error). `CMD-SHELL`
+/// wraps the one command string in `/bin/sh -c`, matching real
+/// moby/podman's own default shell on Linux exactly (a real, separate
+/// per-image `Config.Shell` override real docker also honors here
+/// doesn't exist in this project's own `ContainerConfig` at all yet).
+fn healthcheck_exec_args(test: &[String]) -> Option<Vec<String>> {
+    match test.split_first()? {
+        (kind, _) if kind == "NONE" => None,
+        (kind, [command, ..]) if kind == "CMD-SHELL" => Some(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            command.clone(),
+        ]),
+        (kind, rest) if kind == "CMD" => Some(rest.to_vec()),
+        _ => None,
+    }
+}
+
+/// Run a container's own image-declared `HEALTHCHECK` test once,
+/// right now — matching real `podman healthcheck run`'s own core
+/// effect: resolves the container's own base image (via its already-
+/// recorded `ANNOTATION_IMAGE`, the same lookup `cmd_diff`/
+/// `cmd_commit` already use — a frozen snapshot of what the image said
+/// at container-creation time, not a live re-read of a possibly-since-
+/// changed image, matching real podman's own "the container's own
+/// config is what's authoritative" model), execs the test inside the
+/// container's own existing namespaces (reusing `cmd_exec`'s own
+/// `ExecRequest` plumbing directly, joining the *same* namespaces/
+/// user/capabilities/cwd/env the container's own init process has, no
+/// per-invocation overrides — a healthcheck test always runs exactly
+/// the way the container's own main process does), and reports
+/// `healthy` (nothing printed, exit `0`) or `unhealthy` (printed,
+/// exit `1` unless `--ignore-result`) based on its real exit code.
+///
+/// Deliberately narrower than real `podman healthcheck run`: no
+/// persisted health-check log/state at all (real podman's own
+/// `processHealthCheckStatus` — a separate, much larger feature: a
+/// real per-container log file, retry-streak tracking, and `--health-
+/// on-failure` actions), no startup-healthcheck distinction (this
+/// project's own `HealthcheckConfig` has no separate startup variant
+/// at all), and — the one real, honestly-flagged gap, not silently
+/// dropped — the configured `Timeout` is not enforced: a genuinely
+/// hung test currently blocks this command itself rather than being
+/// killed and reported `unhealthy` (see `docs/design/0172`).
+fn cmd_healthcheck_run(id: &str, ignore_result: bool) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let resolved = resolve_container_id(&containers, id)?;
+    let state = containers.load(&resolved)?;
+
+    if state.effective_status() != Status::Running {
+        println!("stopped");
+        if !ignore_result {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    let store = open_store()?;
+    let base_reference = state
+        .annotations
+        .get(ANNOTATION_IMAGE)
+        .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded base image reference"))?;
+    let base_record = store
+        .resolve_image(base_reference)
+        .context("resolving container's own image reference")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{base_reference}: container {id:?}'s own base image is no longer in local storage"
+            )
+        })?;
+    let image_config = store
+        .image_config(&base_record)
+        .with_context(|| format!("reading config for {base_reference}"))?;
+    let test_args = image_config
+        .config
+        .as_ref()
+        .and_then(|c| c.healthcheck.as_ref())
+        .and_then(|hc| healthcheck_exec_args(&hc.test));
+    let Some(test_args) = test_args else {
+        anyhow::bail!("container {id:?} has no healthcheck defined");
+    };
+
+    let pid = state
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
+    let bundle = oci_runtime_core::Bundle::load(Path::new(&state.bundle))
+        .with_context(|| format!("loading bundle from {}", state.bundle))?;
+    let process_spec = bundle
+        .spec
+        .process
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("bundle at {} has no process section", state.bundle))?;
+    let namespaces: Vec<_> = bundle
+        .spec
+        .linux
+        .as_ref()
+        .map_or(&[][..], |l| &l.namespaces)
+        .iter()
+        .map(|ns| ns.kind)
+        .collect();
+
+    let request = oci_runtime_core::exec::ExecRequest {
+        namespaces,
+        user: process_spec.user.clone(),
+        capabilities: process_spec.capabilities.clone(),
+        no_new_privileges: process_spec.no_new_privileges,
+        cwd: process_spec.cwd.clone(),
+        env: process_spec.env.clone(),
+        args: test_args,
+    };
+
+    // SAFETY: `ociman`'s own process has not spawned any additional
+    // threads by this point, same as `cmd_exec`'s own safety note.
+    #[allow(unsafe_code)]
+    let exit_code =
+        unsafe { oci_runtime_core::exec::exec(pid, request) }.context("running healthcheck")?;
+
+    if exit_code == 0 {
+        return Ok(());
+    }
+    println!("unhealthy");
+    if !ignore_result {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 /// `docker stats`/`podman stats`-style one-shot resource-usage sample
 /// for one container, straight from its own real cgroup v2 accounting
 /// files.
@@ -6126,6 +6300,55 @@ mod tests {
         assert!(parse_memory_limit("not-a-number").is_err());
         assert!(parse_memory_limit("128x").is_err());
         assert!(parse_memory_limit("99999999999999999999999t").is_err());
+    }
+
+    #[test]
+    fn healthcheck_exec_args_is_none_for_an_empty_test() {
+        assert_eq!(healthcheck_exec_args(&[]), None);
+    }
+
+    #[test]
+    fn healthcheck_exec_args_is_none_for_explicit_none() {
+        assert_eq!(healthcheck_exec_args(&[String::from("NONE")]), None);
+    }
+
+    #[test]
+    fn healthcheck_exec_args_is_none_for_an_unrecognized_kind() {
+        assert_eq!(
+            healthcheck_exec_args(&[String::from("BOGUS"), String::from("x")]),
+            None
+        );
+    }
+
+    #[test]
+    fn healthcheck_exec_args_cmd_form_is_the_remaining_args_verbatim() {
+        assert_eq!(
+            healthcheck_exec_args(&strings(&["CMD", "curl", "-f", "http://localhost/"])),
+            Some(strings(&["curl", "-f", "http://localhost/"]))
+        );
+    }
+
+    #[test]
+    fn healthcheck_exec_args_cmd_form_with_no_command_at_all_is_an_empty_exec() {
+        // A real, if pathological, `["CMD"]` with nothing after it --
+        // still "has a healthcheck", just one that execs nothing;
+        // matches real docker/podman's own equally permissive parse
+        // side (this project's own `oci_dockerfile::parse_healthcheck`
+        // doesn't reject it as invalid either).
+        assert_eq!(healthcheck_exec_args(&strings(&["CMD"])), Some(vec![]));
+    }
+
+    #[test]
+    fn healthcheck_exec_args_cmd_shell_form_wraps_in_bin_sh_dash_c() {
+        assert_eq!(
+            healthcheck_exec_args(&strings(&["CMD-SHELL", "curl -f http://localhost/"])),
+            Some(strings(&["/bin/sh", "-c", "curl -f http://localhost/"]))
+        );
+    }
+
+    #[test]
+    fn healthcheck_exec_args_cmd_shell_form_with_no_command_string_is_none() {
+        assert_eq!(healthcheck_exec_args(&strings(&["CMD-SHELL"])), None);
     }
 
     #[test]
