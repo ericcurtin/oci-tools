@@ -18,6 +18,7 @@ mod build;
 mod build_cache;
 mod rootfs_setup;
 mod user_resolve;
+mod volume;
 
 use std::path::{Path, PathBuf};
 
@@ -989,6 +990,15 @@ enum Command {
         #[command(subcommand)]
         command: HealthcheckCommand,
     },
+    /// Manage named volumes — matching real `docker volume`/`podman
+    /// volume`'s own real "local directory" driver exactly (see the
+    /// `volume` module's own doc comment): a real, persistent
+    /// directory under this project's own storage root, distinct from
+    /// a plain `--volume /host/path:/container/path` bind mount.
+    Volume {
+        #[command(subcommand)]
+        command: VolumeCommand,
+    },
     /// A single, one-shot resource-usage sample for a running
     /// container's own real cgroup — matching real `podman stats
     /// --no-stream`'s own single-call semantics exactly (see the
@@ -1240,6 +1250,57 @@ enum HealthcheckCommand {
     },
 }
 
+/// `ociman volume`'s own subcommands — matching real `docker volume`/
+/// `podman volume`'s own real subset this project implements (`ls`/
+/// `create`/`inspect`/`rm`/`prune`; real podman's own further
+/// subcommands, `export`/`import`/`mount`/`unmount`/`reload`, are out
+/// of scope for now, see `docs/design/0173`).
+#[derive(Debug, clap::Subcommand)]
+enum VolumeCommand {
+    /// Create a new named volume — matching real `docker volume
+    /// create`/`podman volume create` exactly, including creating an
+    /// already-existing volume of the same name being a real,
+    /// idempotent success (not an error) and a bare invocation with no
+    /// name at all generating a random one.
+    Create {
+        /// The volume's own name — random (this project's own usual
+        /// short hex id) if omitted, matching real `docker volume
+        /// create`/`podman volume create` with no `NAME` argument
+        /// exactly.
+        name: Option<String>,
+    },
+    /// List every real, currently-existing volume — matching real
+    /// `docker volume ls`/`podman volume ls`.
+    Ls,
+    /// Print low-level JSON for a named volume — matching real
+    /// `docker volume inspect`/`podman volume inspect`'s own general
+    /// shape, deliberately narrower (see `VolumeInspectView`'s own
+    /// doc comment for exactly which fields).
+    Inspect {
+        /// The volume's own name.
+        name: String,
+    },
+    /// Remove a named volume — matching real `docker volume rm`/
+    /// `podman volume rm`. Refuses a volume any container (running or
+    /// stopped) still references via a `--volume name:...` mount,
+    /// unless `--force` (which does *not* remove those containers
+    /// themselves, only the volume — matching real `podman volume rm
+    /// --force`'s own identical "detach, don't cascade-delete
+    /// containers" behavior, unlike `ociman rmi --force`'s own
+    /// different image-removal convention).
+    Rm {
+        /// The volume's own name.
+        name: String,
+        /// Remove it even if a container still references it.
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Remove every real volume not currently referenced by any
+    /// container (running or stopped) — matching real `docker volume
+    /// prune`/`podman volume prune`.
+    Prune,
+}
+
 fn main() -> std::process::ExitCode {
     oci_cli_common::run_main(|| {
         let cli = Cli::parse();
@@ -1359,6 +1420,15 @@ fn main() -> std::process::ExitCode {
                     cmd_healthcheck_run(&id, ignore_result)
                 }
             },
+            Some(Command::Volume { command }) => match command {
+                VolumeCommand::Create { name } => {
+                    cmd_volume_create(name.as_deref(), cli.global.json)
+                }
+                VolumeCommand::Ls => cmd_volume_ls(cli.global.json),
+                VolumeCommand::Inspect { name } => cmd_volume_inspect(&name, cli.global.json),
+                VolumeCommand::Rm { name, force } => cmd_volume_rm(&name, force),
+                VolumeCommand::Prune => cmd_volume_prune(cli.global.json),
+            },
             Some(Command::Stats { id, no_stream }) => cmd_stats(&id, no_stream, cli.global.json),
             Some(Command::Wait { id, interval }) => cmd_wait(&id, interval),
             Some(Command::Rename { id, name }) => cmd_rename(&id, &name),
@@ -1419,6 +1489,17 @@ fn open_container_store() -> anyhow::Result<StateStore> {
     let root = oci_cli_common::storage::default_root().join("containers");
     StateStore::open(&root)
         .with_context(|| format!("opening container storage at {}", root.display()))
+}
+
+/// Where named volumes (see the [`volume`] module) live: a `volumes`
+/// subdirectory of the same storage root images/containers already
+/// share, for the same reason `open_container_store`'s own doc
+/// comment already gives — everything under one real root that
+/// survives (or gets wiped) together.
+fn open_volume_store() -> anyhow::Result<volume::VolumeStore> {
+    let root = oci_cli_common::storage::default_root().join("volumes");
+    volume::VolumeStore::open(&root)
+        .with_context(|| format!("opening volume storage at {}", root.display()))
 }
 
 /// JSON/table view of a stored image, shared by `pull` and `images`.
@@ -2612,28 +2693,30 @@ struct PreparedContainer {
 #[allow(clippy::too_many_arguments)]
 fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
     let entrypoint = args.entrypoint.as_deref().map(parse_entrypoint);
-    let volumes = args
+    let volume_specs = args
         .volume
         .iter()
         .map(|v| parse_volume(v))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    // The host side of a bind mount is a real, separate side effect
-    // (creating something on the *caller's* own filesystem, not the
-    // container's), so it happens here rather than inside
-    // `synthesize_spec`, which otherwise only ever builds a `Spec`
-    // value without touching the host filesystem at all. Matches real
-    // `docker`'s own long-documented default for a missing bind-mount
-    // source: create it as a directory (a file source that doesn't
-    // exist yet is a real, surfaced error instead — there is no
-    // sensible "default content" for a file the way an empty directory
-    // is the sensible default for a directory).
-    for volume in &volumes {
-        let path = Path::new(&volume.host);
-        if !path.exists() {
-            std::fs::create_dir_all(path)
-                .with_context(|| format!("creating host volume directory {:?}", volume.host))?;
-        }
-    }
+    // Resolving a volume's own host side is a real, separate side
+    // effect (creating something on the *caller's* own filesystem, or
+    // in this project's own volume store, not the container's), so it
+    // happens here rather than inside `synthesize_spec`, which
+    // otherwise only ever builds a `Spec` value without touching the
+    // host filesystem at all — see `resolve_volume_host`'s own doc
+    // comment for exactly what each of a bind-mount path/named volume
+    // resolves to.
+    let volume_store = open_volume_store()?;
+    let volumes = volume_specs
+        .iter()
+        .map(|v| {
+            Ok(ParsedVolume {
+                host: resolve_volume_host(&volume_store, &v.host)?,
+                container: v.container.clone(),
+                read_only: v.read_only,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let seccomp = resolve_seccomp(&args.security_opt, args.privileged)?;
     let base_capabilities = if args.privileged {
         oci_runtime_core::identity::ALL_CAPABILITY_NAMES
@@ -4925,6 +5008,173 @@ fn cmd_healthcheck_run(id: &str, ignore_result: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `ociman volume create`'s own `--json` output (also reused, one
+/// entry per volume, by `ls`).
+#[derive(Debug, Serialize)]
+struct VolumeView {
+    name: String,
+    driver: String,
+    mountpoint: String,
+    created_at: String,
+}
+
+impl VolumeView {
+    fn from_record(store: &volume::VolumeStore, record: &volume::VolumeRecord) -> Self {
+        VolumeView {
+            name: record.name.clone(),
+            driver: "local".to_string(),
+            mountpoint: store.data_dir(&record.name).to_string_lossy().into_owned(),
+            created_at: record.created_at.clone(),
+        }
+    }
+}
+
+fn cmd_volume_create(name: Option<&str>, json: bool) -> anyhow::Result<()> {
+    let name = match name {
+        Some(name) => {
+            anyhow::ensure!(
+                volume::is_valid_volume_name(name),
+                "invalid volume name {name:?}: names must match [a-zA-Z0-9][a-zA-Z0-9_.-]* \
+                 (matching real podman's own volume-name rule)"
+            );
+            name.to_string()
+        }
+        None => short_id(),
+    };
+    let store = open_volume_store()?;
+    let record = store
+        .get_or_create(&name)
+        .with_context(|| format!("creating volume {name:?}"))?;
+    if json {
+        oci_cli_common::output::print_json(&VolumeView::from_record(&store, &record))?;
+    } else {
+        println!("{}", record.name);
+    }
+    Ok(())
+}
+
+fn cmd_volume_ls(json: bool) -> anyhow::Result<()> {
+    let store = open_volume_store()?;
+    let records = store.list().context("listing volumes")?;
+    if json {
+        let views: Vec<_> = records
+            .iter()
+            .map(|r| VolumeView::from_record(&store, r))
+            .collect();
+        oci_cli_common::output::print_json(&views)?;
+        return Ok(());
+    }
+    // Real `podman volume ls` prints nothing at all (not even the
+    // header) with zero volumes -- checked directly. This project's
+    // own established convention for every other list command
+    // (`ociman images`'s own "no images", `ociman ps`'s own "no
+    // containers") is a friendly empty-state message instead; matched
+    // here too, for internal consistency, rather than podman's own
+    // silent-table behavior for this one specific subcommand.
+    if records.is_empty() {
+        println!("no volumes");
+        return Ok(());
+    }
+    println!("{:<12}VOLUME NAME", "DRIVER");
+    for record in &records {
+        println!("{:<12}{}", "local", record.name);
+    }
+    Ok(())
+}
+
+fn cmd_volume_inspect(name: &str, json: bool) -> anyhow::Result<()> {
+    let store = open_volume_store()?;
+    let record = store
+        .get(name)
+        .with_context(|| format!("looking up volume {name:?}"))?
+        .ok_or_else(|| anyhow::anyhow!("no volume with name {name:?} found"))?;
+    let view = VolumeView::from_record(&store, &record);
+    if json {
+        oci_cli_common::output::print_json(&view)?;
+    } else {
+        println!("{}", serde_json::to_string_pretty(&view)?);
+    }
+    Ok(())
+}
+
+/// Every container (running or stopped) whose own bundle actually
+/// mounts `volume_name`'s own real `_data` directory — checked
+/// directly against each container's own already-persisted
+/// `config.json` mounts (this project's own `-v name:/path` support,
+/// 0173, resolves a named volume to that real directory before
+/// `synthesize_spec` ever runs, so this is the exact same real path a
+/// dependent container's own bundle already recorded, not a separate,
+/// possibly-drifting parallel record of "which containers use which
+/// volume").
+fn containers_using_volume(
+    containers: &StateStore,
+    volume_store: &volume::VolumeStore,
+    volume_name: &str,
+) -> anyhow::Result<Vec<String>> {
+    let data_dir = volume_store.data_dir(volume_name);
+    let mut dependents = Vec::new();
+    for state in containers.list().context("listing containers")? {
+        let Ok(bundle) = oci_runtime_core::Bundle::load(Path::new(&state.bundle)) else {
+            continue;
+        };
+        let uses_volume = bundle
+            .spec
+            .mounts
+            .iter()
+            .any(|m| m.source.as_deref() == Some(data_dir.to_string_lossy().as_ref()));
+        if uses_volume {
+            dependents.push(state.id);
+        }
+    }
+    Ok(dependents)
+}
+
+fn cmd_volume_rm(name: &str, force: bool) -> anyhow::Result<()> {
+    let store = open_volume_store()?;
+    anyhow::ensure!(
+        store.exists(name),
+        "no volume with name {name:?} found: no such volume"
+    );
+    let containers = open_container_store()?;
+    let dependents = containers_using_volume(&containers, &store, name)?;
+    if !dependents.is_empty() {
+        anyhow::ensure!(
+            force,
+            "volume {name:?} is in use by {} container(s) ({}); use -f/--force to remove it \
+             anyway (the container(s) themselves are left untouched)",
+            dependents.len(),
+            dependents.join(", ")
+        );
+    }
+    store
+        .remove(name)
+        .with_context(|| format!("removing volume {name:?}"))?;
+    println!("{name}");
+    Ok(())
+}
+
+fn cmd_volume_prune(json: bool) -> anyhow::Result<()> {
+    let store = open_volume_store()?;
+    let containers = open_container_store()?;
+    let mut removed = Vec::new();
+    for record in store.list().context("listing volumes")? {
+        if containers_using_volume(&containers, &store, &record.name)?.is_empty() {
+            store
+                .remove(&record.name)
+                .with_context(|| format!("removing volume {:?}", record.name))?;
+            removed.push(record.name);
+        }
+    }
+    if json {
+        oci_cli_common::output::print_json(&removed)?;
+    } else {
+        for name in &removed {
+            println!("{name}");
+        }
+    }
+    Ok(())
+}
+
 /// `docker stats`/`podman stats`-style one-shot resource-usage sample
 /// for one container, straight from its own real cgroup v2 accounting
 /// files.
@@ -5846,45 +6096,87 @@ fn parse_entrypoint(value: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(value).unwrap_or_else(|_| vec![value.to_string()])
 }
 
-/// A parsed `-v`/`--volume` bind-mount specification.
+/// What a `--volume`'s own first field (before the first `:`) refers
+/// to — resolved to a real host directory by [`resolve_volume_host`]
+/// before a container ever launches, but not yet at parse time
+/// (parsing needs no store/filesystem access at all, matching this
+/// project's own established "parsing is pure" convention elsewhere,
+/// e.g. `parse_memory_limit`).
+enum VolumeHost {
+    /// An already-absolute host path — a plain bind mount, matching
+    /// real `docker run -v /host:/container`/`podman run -v
+    /// /host:/container` exactly.
+    Path(String),
+    /// A named volume — matching real `docker run -v name:/container`/
+    /// `podman run -v name:/container`'s own identical shorthand,
+    /// auto-created on first reference if it doesn't already exist.
+    Named(String),
+}
+
+/// A parsed `-v`/`--volume` specification, before its own host side
+/// has been resolved to a real directory (see [`VolumeHost`]/
+/// [`resolve_volume_host`]).
+struct VolumeSpec {
+    host: VolumeHost,
+    container: String,
+    read_only: bool,
+}
+
+/// A parsed and fully **resolved** `-v`/`--volume` bind mount — unlike
+/// [`VolumeSpec`], `host` here is always a real, already-existing host
+/// directory, ready for `synthesize_spec` to mount verbatim (whether
+/// it came from a plain bind-mount path or a named volume's own real
+/// `_data` directory makes no difference from this point on).
 struct ParsedVolume {
     host: String,
     container: String,
     read_only: bool,
 }
 
-/// Parse a `--volume` value: `HOST-DIR:CONTAINER-DIR[:ro]`, matching
-/// real `docker run -v`/`podman run -v`'s own bind-mount form — both
-/// paths must be absolute (a bare container-only path, real docker/
-/// podman's own "anonymous volume" shorthand, and a name that isn't an
-/// absolute path at all, their own "named volume" shorthand, are both
-/// real features of a volume-management subsystem this project simply
-/// doesn't have, so both are rejected with a clear error rather than
-/// silently misinterpreted as something else). The only supported
-/// third field is `ro` (or, explicitly, `rw`, the default) — no
-/// propagation modes, no SELinux relabeling (`Z`/`z`, moot: this
-/// project doesn't implement SELinux at all), matching this project's
-/// own established "narrow, checked-directly first increment" pattern
-/// for every other multi-option flag.
-fn parse_volume(spec: &str) -> anyhow::Result<ParsedVolume> {
+/// Parse a `--volume` value: `HOST-DIR:CONTAINER-DIR[:ro]` (a plain
+/// bind mount, matching real `docker run -v`/`podman run -v` exactly)
+/// or `NAME:CONTAINER-DIR[:ro]` (a named volume, matching their own
+/// identical shorthand — `NAME` must pass
+/// [`volume::is_valid_volume_name`], the same real docker/podman
+/// naming rule, or this is a clear error rather than a silent
+/// misinterpretation as a relative bind-mount path, which neither
+/// real tool accepts either). A bare container-only path (real
+/// docker/podman's own *anonymous* volume shorthand) is still not
+/// supported — a real, separate feature (an unnamed volume this
+/// project's own `volume::VolumeStore` has no natural place to record
+/// under at all without inventing a name for it anyway) — and is
+/// still a clear, named error. The only supported third field is `ro`
+/// (or, explicitly, `rw`, the default) — no propagation modes, no
+/// SELinux relabeling (`Z`/`z`, moot: this project doesn't implement
+/// SELinux at all), matching this project's own established "narrow,
+/// checked-directly first increment" pattern for every other multi-
+/// option flag.
+fn parse_volume(spec: &str) -> anyhow::Result<VolumeSpec> {
     let mut parts = spec.splitn(3, ':');
     let host = parts.next().filter(|s| !s.is_empty());
     let container = parts.next().filter(|s| !s.is_empty());
     let (host, container) = match (host, container) {
         (Some(host), Some(container)) => (host, container),
         _ => anyhow::bail!(
-            "--volume {spec:?}: expected HOST-DIR:CONTAINER-DIR[:ro] -- named/anonymous \
-             volumes are not supported yet, only a real host path bind mount"
+            "--volume {spec:?}: expected HOST-DIR:CONTAINER-DIR[:ro] or NAME:CONTAINER-DIR[:ro] \
+             -- an anonymous (container-path-only) volume is not supported yet"
         ),
     };
-    anyhow::ensure!(
-        host.starts_with('/'),
-        "--volume {spec:?}: the host path must be absolute"
-    );
     anyhow::ensure!(
         container.starts_with('/'),
         "--volume {spec:?}: the container path must be absolute"
     );
+    let host = if host.starts_with('/') {
+        VolumeHost::Path(host.to_string())
+    } else if volume::is_valid_volume_name(host) {
+        VolumeHost::Named(host.to_string())
+    } else {
+        anyhow::bail!(
+            "--volume {spec:?}: {host:?} is neither an absolute host path nor a valid volume \
+             name (names must match [a-zA-Z0-9][a-zA-Z0-9_.-]*, matching real podman's own \
+             volume-name rule)"
+        );
+    };
     let read_only = match parts.next() {
         None | Some("rw") => false,
         Some("ro") => true,
@@ -5892,11 +6184,44 @@ fn parse_volume(spec: &str) -> anyhow::Result<ParsedVolume> {
             "--volume {spec:?}: unsupported option {other:?} (only \"ro\"/\"rw\" are supported)"
         ),
     };
-    Ok(ParsedVolume {
-        host: host.to_string(),
+    Ok(VolumeSpec {
+        host,
         container: container.to_string(),
         read_only,
     })
+}
+
+/// Resolve a [`VolumeSpec`]'s own host side into a real, already-
+/// existing host directory: a plain [`VolumeHost::Path`] is created if
+/// it doesn't exist yet (matching real `docker`'s own long-documented
+/// default for a missing bind-mount source — a file source that
+/// doesn't exist yet is still a real, surfaced error instead, since
+/// there is no sensible "default content" for a file the way an empty
+/// directory is the sensible default for a directory); a
+/// [`VolumeHost::Named`] volume is auto-created on first reference via
+/// `volume_store.get_or_create` (matching real `docker run -v name:/
+/// path`/`podman run -v name:/path`'s own identical convention) and
+/// resolves to its own real `_data` directory.
+fn resolve_volume_host(
+    volume_store: &volume::VolumeStore,
+    host: &VolumeHost,
+) -> anyhow::Result<String> {
+    match host {
+        VolumeHost::Path(path) => {
+            let p = Path::new(path);
+            if !p.exists() {
+                std::fs::create_dir_all(p)
+                    .with_context(|| format!("creating host volume directory {path:?}"))?;
+            }
+            Ok(path.clone())
+        }
+        VolumeHost::Named(name) => {
+            volume_store
+                .get_or_create(name)
+                .with_context(|| format!("creating named volume {name:?}"))?;
+            Ok(volume_store.data_dir(name).to_string_lossy().into_owned())
+        }
+    }
 }
 
 /// One `--add-host` entry, parsed: real podman's own `name[;name2
@@ -6168,7 +6493,7 @@ mod tests {
     #[test]
     fn parse_volume_two_field_form_defaults_to_read_write() {
         let v = parse_volume("/host/data:/container/data").unwrap();
-        assert_eq!(v.host, "/host/data");
+        assert!(matches!(v.host, VolumeHost::Path(ref p) if p == "/host/data"));
         assert_eq!(v.container, "/container/data");
         assert!(!v.read_only);
     }
@@ -6187,9 +6512,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_volume_rejects_a_relative_host_or_container_path() {
-        assert!(parse_volume("relative:/container").is_err());
+    fn parse_volume_a_name_instead_of_an_absolute_host_path_is_a_named_volume() {
+        let v = parse_volume("myvol:/container").unwrap();
+        assert!(matches!(v.host, VolumeHost::Named(ref n) if n == "myvol"));
+        assert_eq!(v.container, "/container");
+    }
+
+    #[test]
+    fn parse_volume_rejects_a_host_side_that_is_neither_an_absolute_path_nor_a_valid_name() {
+        assert!(parse_volume("bad name:/container").is_err());
+        assert!(parse_volume("a/b:/container").is_err());
+    }
+
+    #[test]
+    fn parse_volume_rejects_a_relative_container_path() {
         assert!(parse_volume("/host:relative").is_err());
+        assert!(parse_volume("myvol:relative").is_err());
     }
 
     #[test]
