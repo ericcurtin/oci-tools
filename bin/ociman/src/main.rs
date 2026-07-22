@@ -1054,6 +1054,25 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SaveFormat::OciArchive)]
         format: SaveFormat,
     },
+    /// Load an image from a real archive file previously written by
+    /// `ociman save`/`podman save`/`docker save` — matching real
+    /// `podman load`/`docker load`. Only the `oci-archive` format is
+    /// understood so far (real `docker-archive` archives, and
+    /// multi-manifest/multi-platform `oci-archive` archives, are a
+    /// clear, named error rather than a silent partial load — see the
+    /// `archive` module's own `load_oci_archive` doc comment for
+    /// exactly what's checked). Every blob is verified against its own
+    /// claimed digest while being ingested, the same defense a real
+    /// registry pull already applies, so a corrupt or hostile archive
+    /// can never poison local storage.
+    Load {
+        /// Read the archive from this file instead of standard input
+        /// (real `podman load`/`docker load`'s own default — `ociman
+        /// load < out.tar` works exactly like `podman load <
+        /// out.tar`).
+        #[arg(short, long, value_name = "PATH")]
+        input: Option<PathBuf>,
+    },
     /// Display detailed version information, matching real `docker
     /// version`/`podman version` exactly for the "no remote server, no
     /// `Server:` section" case a real rootless `podman version`
@@ -1194,6 +1213,7 @@ fn main() -> std::process::ExitCode {
                 output,
                 format,
             }) => cmd_save(&reference, output.as_deref(), format, cli.global.json),
+            Some(Command::Load { input }) => cmd_load(input.as_deref(), cli.global.json),
             Some(Command::Version) => cmd_version(cli.global.json),
             Some(Command::Info) => cmd_info(cli.global.json),
         }
@@ -1384,6 +1404,45 @@ fn write_archive(
     match format {
         SaveFormat::OciArchive => archive::save_oci_archive(store, record, writer),
     }
+}
+
+/// `ociman load`'s own `--json` output.
+#[derive(Debug, Serialize)]
+struct LoadResult {
+    reference: Option<String>,
+    digest: String,
+}
+
+fn cmd_load(input: Option<&Path>, json: bool) -> anyhow::Result<()> {
+    let store = open_store()?;
+
+    let progress = oci_cli_common::progress::spinner("loading image".to_string());
+    let result = match input {
+        Some(path) => (|| -> anyhow::Result<archive::LoadedImage> {
+            let file =
+                std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+            archive::load_oci_archive(&store, std::io::BufReader::new(file))
+        })(),
+        None => {
+            let stdin = std::io::stdin();
+            archive::load_oci_archive(&store, std::io::BufReader::new(stdin.lock()))
+        }
+    };
+    progress.finish_and_clear();
+    let loaded = result.context("loading image archive")?;
+
+    if json {
+        oci_cli_common::output::print_json(&LoadResult {
+            reference: loaded.reference.clone(),
+            digest: loaded.manifest_digest.to_string(),
+        })?;
+    } else {
+        match &loaded.reference {
+            Some(reference) => println!("Loaded image: {reference}"),
+            None => println!("Loaded image: {}", loaded.manifest_digest),
+        }
+    }
+    Ok(())
 }
 
 /// The real, default auth-file *write* path — deliberately **not**
