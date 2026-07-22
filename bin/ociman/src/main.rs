@@ -664,6 +664,18 @@ enum Command {
         #[arg(short, long, default_value = "KILL")]
         signal: String,
     },
+    /// Pause all processes in a running container via the real cgroup
+    /// v2 freezer — matching real `podman pause` exactly.
+    Pause {
+        /// The container's ID or `--name`.
+        id: String,
+    },
+    /// Unpause a container previously frozen by `pause` — matching
+    /// real `podman unpause` exactly.
+    Unpause {
+        /// The container's ID or `--name`.
+        id: String,
+    },
     /// Block until a container stops, then print its exit code —
     /// matching real `docker wait`/`podman wait`. Returns immediately
     /// (still printing the exit code) if the container has already
@@ -848,6 +860,8 @@ fn main() -> std::process::ExitCode {
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
             Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, &signal),
             Some(Command::Kill { id, signal }) => cmd_kill(&id, &signal),
+            Some(Command::Pause { id }) => cmd_pause(&id),
+            Some(Command::Unpause { id }) => cmd_unpause(&id),
             Some(Command::Wait { id, interval }) => cmd_wait(&id, interval),
             Some(Command::Rename { id, name }) => cmd_rename(&id, &name),
             Some(Command::Top { id, ps_args }) => cmd_top(&id, &ps_args),
@@ -2558,26 +2572,20 @@ fn cmd_rename(id: &str, new_name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Display the real processes running inside a container: every pid
-/// in its own real, *current* cgroup (see `oci_runtime_core::cgroups::
-/// cgroup_dir_for_running_pid`/`all_pids`), filtered into the real
-/// host `ps` binary's own table output — matches real `docker top`/
-/// `podman top`'s own `ps(1)`-passthrough mode. Real podman also
-/// supports a custom AIX-style format-descriptor engine
-/// (`podman top ctrID pid seccomp args %C`, no real `ps` invocation at
-/// all); not implemented here — a deliberately narrower first slice,
-/// same reasoning as every other "narrow first increment" this
-/// project's own design notes already establish (see
-/// `docs/design/0095`).
+/// Resolve `id` to a *running* container's own real, current cgroup
+/// directory — shared by `cmd_top`/`cmd_pause`/`cmd_unpause` so there
+/// is exactly one implementation of "find this running container's
+/// own cgroup", not three near-identical copies.
 ///
-/// Unlike `ocirun ps` (which re-loads a bundle's own `cgroupsPath`
-/// from `config.json`), `ociman`'s own containers get their cgroup
-/// from the *systemd* driver, whose real path is only known at
-/// container-creation time and isn't persisted anywhere — so this
-/// re-derives the real, current cgroup directly from `/proc/<pid>/
-/// cgroup` instead (works correctly regardless of which driver
-/// actually placed the pid there).
-fn cmd_top(id: &str, ps_args: &[String]) -> anyhow::Result<()> {
+/// Unlike `ocirun ps`/`ocirun update` (which re-load a bundle's own
+/// `cgroupsPath` from `config.json`), `ociman`'s own containers get
+/// their cgroup from the *systemd* driver, whose real path is only
+/// known at container-creation time and isn't persisted anywhere —
+/// so this re-derives the real, current cgroup directly from
+/// `/proc/<pid>/cgroup` instead (`cgroup_dir_for_running_pid`, works
+/// correctly regardless of which driver actually placed the pid
+/// there).
+fn resolve_running_container_cgroup(id: &str) -> anyhow::Result<PathBuf> {
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)?;
     let state = containers.load(&resolved)?;
@@ -2587,13 +2595,59 @@ fn cmd_top(id: &str, ps_args: &[String]) -> anyhow::Result<()> {
     let pid = state
         .pid
         .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
+    oci_runtime_core::cgroups::cgroup_dir_for_running_pid(Path::new("/sys/fs/cgroup"), pid)
+        .with_context(|| format!("resolving cgroup for container {id:?}"))
+}
 
-    let cgroup_dir =
-        oci_runtime_core::cgroups::cgroup_dir_for_running_pid(Path::new("/sys/fs/cgroup"), pid)
-            .with_context(|| format!("resolving cgroup for container {id:?}"))?;
+/// Display the real processes running inside a container: every pid
+/// in its own real, *current* cgroup (see [`resolve_running_container_
+/// cgroup`]/`oci_runtime_core::cgroups::all_pids`), filtered into the
+/// real host `ps` binary's own table output — matches real `docker
+/// top`/`podman top`'s own `ps(1)`-passthrough mode. Real podman also
+/// supports a custom AIX-style format-descriptor engine
+/// (`podman top ctrID pid seccomp args %C`, no real `ps` invocation at
+/// all); not implemented here — a deliberately narrower first slice,
+/// same reasoning as every other "narrow first increment" this
+/// project's own design notes already establish (see
+/// `docs/design/0095`).
+fn cmd_top(id: &str, ps_args: &[String]) -> anyhow::Result<()> {
+    let cgroup_dir = resolve_running_container_cgroup(id)?;
     let pids = oci_runtime_core::cgroups::all_pids(&cgroup_dir)
         .with_context(|| format!("listing processes in {}", cgroup_dir.display()))?;
     oci_runtime_core::cgroups::print_ps_table(&pids, ps_args).context("printing ps table")
+}
+
+/// Pause every process in a running container via the real cgroup v2
+/// freezer — matching real `podman pause` exactly, including its own
+/// checked-directly requirement that the container actually be
+/// `running` first (confirmed directly: real `podman pause` on a
+/// merely `created` container errors, unlike real `runc pause`'s own
+/// more permissive `Created`-or-`Running` check — see `ocirun pause`'s
+/// own doc comment for that one). Prints `id` back, matching real
+/// `podman pause`'s own output exactly.
+fn cmd_pause(id: &str) -> anyhow::Result<()> {
+    let cgroup_dir = resolve_running_container_cgroup(id)?;
+    oci_runtime_core::cgroups::set_frozen(&cgroup_dir, true)
+        .with_context(|| format!("pausing container {id:?}"))?;
+    println!("{id}");
+    Ok(())
+}
+
+/// Unpause a container previously frozen by `pause` — matching real
+/// `podman unpause`'s own core effect. Real `podman unpause` requires
+/// the container to be tracked as specifically `paused`; this project
+/// has no separate `Paused` status of its own yet (see `ocirun
+/// resume`'s own doc comment for why), so this instead requires
+/// `running` — already covers the "was already paused, cgroup-wise"
+/// case, since thawing an already-thawed cgroup is itself a harmless,
+/// idempotent no-op at the kernel level. Prints `id` back, matching
+/// real `podman unpause`'s own output exactly.
+fn cmd_unpause(id: &str) -> anyhow::Result<()> {
+    let cgroup_dir = resolve_running_container_cgroup(id)?;
+    oci_runtime_core::cgroups::set_frozen(&cgroup_dir, false)
+        .with_context(|| format!("unpausing container {id:?}"))?;
+    println!("{id}");
+    Ok(())
 }
 
 /// Print a container's captured output (see `docs/design/0025`):
