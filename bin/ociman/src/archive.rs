@@ -18,24 +18,18 @@
 //! through unchanged (whatever compression it already has, gzip in
 //! every real case this project produces or pulls).
 //!
-//! # `docker-archive` (real `podman save`'s own default format) is not
-//! implemented yet
+//! # `docker-archive` (real `podman save`'s own default format)
 //!
-//! `docker-archive` needs every layer *decompressed* first (the format
-//! wants a plain, uncompressed tar per layer, unlike this project's
-//! own gzip'd blobs — checked directly against
-//! `go.podman.io/image/v5/docker/internal/tarfile/dest.go`'s own
-//! `DesiredLayerCompression: types.Decompress`) plus a synthesized
-//! legacy `repositories` file and a `manifest.json`. Real, separate
-//! scope for a follow-up increment — see `docs/design/0165` for the
-//! rest of what's deferred. `--format` therefore only accepts
-//! `oci-archive` for now; `ociman save`'s CLI enum has no
-//! `docker-archive` variant to select in the first place, so an
-//! attempt to use one is clap's own "invalid value" error, not a
-//! silent fallback to the wrong format.
+//! See [`save_docker_archive`]'s own doc comment for the exact format
+//! (`manifest.json` + flat, decompressed layer/config files) and what
+//! remains deliberately out of scope (a legacy `repositories` file and
+//! per-layer legacy-chain-ID subdirectories, neither of which real
+//! `docker load`'s own loader path actually reads — see `docs/design/
+//! 0167`). This is `ociman save`'s own default format, matching real
+//! `podman save`/`docker save`'s own default exactly.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
@@ -74,6 +68,7 @@ pub(crate) fn save_oci_archive(
         &mut builder,
         "oci-layout",
         mtime,
+        0o644,
         br#"{"imageLayoutVersion":"1.0.0"}"#,
     )?;
 
@@ -119,10 +114,156 @@ pub(crate) fn save_oci_archive(
     };
     let index_bytes =
         serde_json::to_vec(&index).context("serializing index.json for oci-archive")?;
-    append_regular(&mut builder, "index.json", mtime, &index_bytes)?;
+    append_regular(&mut builder, "index.json", mtime, 0o644, &index_bytes)?;
 
     let mut writer = builder.into_inner().context("finishing oci-archive tar")?;
     writer.flush().context("flushing oci-archive tar")
+}
+
+/// `docker-archive`'s own single top-level `manifest.json` entry —
+/// checked directly against `go.podman.io/image/v5/docker/internal/
+/// tarfile/types.go`'s own `ManifestItem`: `Config`/`RepoTags`/
+/// `Layers` are the load-critical fields real `docker load`/`podman
+/// load`'s own `ChooseManifestItem` actually reads (`reader.go`);
+/// `Parent`/`LayerSources` (both `omitempty` there) are never written
+/// here at all, matching what an image saved standalone (not as part
+/// of a build's own parent chain) already looks like from real
+/// `podman save` too.
+#[derive(Debug, serde::Serialize)]
+struct DockerArchiveManifestItem {
+    #[serde(rename = "Config")]
+    config: String,
+    #[serde(rename = "RepoTags")]
+    repo_tags: Vec<String>,
+    #[serde(rename = "Layers")]
+    layers: Vec<String>,
+}
+
+/// Write `record`'s image to `writer` as a real `docker-archive:`-
+/// format tar — checked directly against `go.podman.io/image/v5/
+/// docker/internal/tarfile/writer.go`+`dest.go`:
+///
+/// ```text
+/// manifest.json                 [ {"Config": "<hex>.json", "RepoTags": [...], "Layers": [...]} ]
+/// <config-digest-hex>.json      the image config blob, verbatim (unchanged: the OCI and Docker
+///                                config schemas are the same wire format for this blob)
+/// <layer-digest-hex>.tar        each layer, DECOMPRESSED (unlike oci-archive, this format wants
+///                                plain tar), named by its own real uncompressed digest
+/// ```
+///
+/// Deliberately narrower than real `podman save --format docker-
+/// archive`'s own output: no `repositories` file and no per-layer
+/// legacy-chain-ID subdirectories (`<id>/VERSION`, `<id>/json`,
+/// `<id>/layer.tar`) — checked directly, real `docker load`'s own
+/// `ChooseManifestItem` (`docker/internal/tarfile/reader.go`) never
+/// reads either of those at all, only `manifest.json` and the flat
+/// files it names, so this is a real, load-critical-only subset, not
+/// a partial/broken implementation (see this module's own top-level
+/// doc comment for the rest of what's deferred).
+pub(crate) fn save_docker_archive(
+    store: &Store,
+    record: &ImageRecord,
+    writer: impl Write,
+) -> anyhow::Result<()> {
+    let manifest_bytes = store
+        .read_blob(&record.manifest_digest)
+        .with_context(|| format!("reading manifest blob {}", record.manifest_digest))?;
+    let manifest: ImageManifest = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("parsing manifest blob {}", record.manifest_digest))?;
+    let config_bytes = store
+        .read_blob(&manifest.config.digest)
+        .with_context(|| format!("reading config blob {}", manifest.config.digest))?;
+
+    // Real `docker save`'s own tar entries all carry a fixed epoch
+    // mtime and read-only mode (checked directly: `tar -tvf` on a
+    // real `podman save`-produced `docker-archive` shows every entry
+    // as `-r--r--r-- 0/0 ... 1970-01-01`) -- matched here too, rather
+    // than `save_oci_archive`'s own current-time/0644 choice (real
+    // `oci-archive` output uses those instead — the two real formats
+    // genuinely differ here, not a project-specific inconsistency).
+    const MTIME: u64 = 0;
+    const MODE: u32 = 0o444;
+
+    let mut builder = tar::Builder::new(writer);
+
+    let config_name = format!("{}.json", manifest.config.digest.hex());
+    append_regular(&mut builder, &config_name, MTIME, MODE, &config_bytes)?;
+
+    let mut layer_names = Vec::with_capacity(manifest.layers.len());
+    for layer in &manifest.layers {
+        let name = append_layer_decompressed(store, &mut builder, layer, MTIME, MODE)
+            .with_context(|| format!("writing layer {}", layer.digest))?;
+        layer_names.push(name);
+    }
+
+    let manifest_item = DockerArchiveManifestItem {
+        config: config_name,
+        repo_tags: vec![record.reference.clone()],
+        layers: layer_names,
+    };
+    let manifest_json = serde_json::to_vec(&vec![manifest_item])
+        .context("serializing manifest.json for docker-archive")?;
+    append_regular(&mut builder, "manifest.json", MTIME, MODE, &manifest_json)?;
+
+    let mut writer = builder
+        .into_inner()
+        .context("finishing docker-archive tar")?;
+    writer.flush().context("flushing docker-archive tar")
+}
+
+/// Decompress one already-stored layer blob into a real scratch file
+/// (so its true size is known before the tar entry's own header is
+/// written, and so a large layer is never held fully in memory),
+/// computing its own real uncompressed digest as it goes (never
+/// trusting the config's own `rootfs.diff_ids` blindly — see
+/// [`oci_layer::decompress_verifying`]'s own doc comment), then
+/// streams that scratch file into the archive as `<digest-hex>.tar`.
+/// Returns the filename written, for `manifest.json`'s own `Layers`
+/// list.
+fn append_layer_decompressed(
+    store: &Store,
+    builder: &mut tar::Builder<impl Write>,
+    layer: &Descriptor,
+    mtime: u64,
+    mode: u32,
+) -> anyhow::Result<String> {
+    let compression =
+        oci_layer::compression_for_media_type(&layer.media_type).with_context(|| {
+            format!(
+                "layer has an unrecognized media type {:?}",
+                layer.media_type
+            )
+        })?;
+    let source = store
+        .open_blob(&layer.digest)
+        .with_context(|| format!("opening blob {}", layer.digest))?;
+
+    let mut scratch =
+        tempfile::NamedTempFile::new().context("creating a scratch file to decompress a layer")?;
+    let digest = oci_layer::decompress_verifying(source, compression, scratch.as_file_mut())
+        .context("decompressing layer")?;
+    let size = scratch
+        .as_file()
+        .metadata()
+        .context("statting decompressed layer scratch file")?
+        .len();
+    scratch
+        .as_file_mut()
+        .seek(std::io::SeekFrom::Start(0))
+        .context("rewinding decompressed layer scratch file")?;
+
+    let name = format!("{}.tar", digest.hex());
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_mode(mode);
+    header.set_size(size);
+    header.set_mtime(mtime);
+    header.set_uid(0);
+    header.set_gid(0);
+    builder
+        .append_data(&mut header, &name, scratch.as_file_mut())
+        .with_context(|| format!("writing layer entry {name:?}"))?;
+    Ok(name)
 }
 
 fn append_dir(
@@ -146,11 +287,12 @@ fn append_regular(
     builder: &mut tar::Builder<impl Write>,
     path: &str,
     mtime: u64,
+    mode: u32,
     content: &[u8],
 ) -> anyhow::Result<()> {
     let mut header = tar::Header::new_gnu();
     header.set_entry_type(tar::EntryType::Regular);
-    header.set_mode(0o644);
+    header.set_mode(mode);
     header.set_size(content.len() as u64);
     header.set_mtime(mtime);
     header.set_uid(0);
@@ -179,6 +321,7 @@ fn append_blob_bytes(
         builder,
         &format!("blobs/sha256/{}", digest.hex()),
         mtime,
+        0o644,
         content,
     )
 }
@@ -624,6 +767,7 @@ mod tests {
                 &mut builder,
                 "oci-layout",
                 0,
+                0o644,
                 br#"{"imageLayoutVersion":"1.0.0"}"#,
             )
             .unwrap();
@@ -646,6 +790,7 @@ mod tests {
                 &mut builder,
                 &format!("blobs/sha256/{}", fake_digest.hex()),
                 0,
+                0o644,
                 b"not the real content at all",
             )
             .unwrap();

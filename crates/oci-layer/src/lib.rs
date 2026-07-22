@@ -79,7 +79,7 @@ mod export;
 pub use export::export;
 
 mod compress;
-pub use compress::compress_for_storage;
+pub use compress::{compress_for_storage, decompress_verifying};
 
 mod detect;
 pub use detect::detect_archive;

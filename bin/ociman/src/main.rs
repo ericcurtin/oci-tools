@@ -149,17 +149,18 @@ enum PullPolicy {
     Newer,
 }
 
-/// `ociman save --format`'s own archive format — only `oci-archive`
-/// so far (see [`archive`]'s own doc comment for exactly why real
-/// `podman save`'s own default, `docker-archive`, isn't implemented
-/// yet: a real, separate format needing every layer decompressed
-/// first, deferred to a follow-up increment rather than attempted
-/// half-right here). No `DockerArchive` variant exists to select in
-/// the first place, so `--format docker-archive` is clap's own clear
-/// "invalid value" error, not a silent wrong-format fallback.
+/// `ociman save --format`'s own archive format. `OciArchive` (0165) is
+/// still the *default* (see `Command::Save::format`'s own doc comment
+/// for why, even though real `podman save`/`docker save` themselves
+/// default to `DockerArchive`); `DockerArchive` (0167) can be selected
+/// explicitly. See [`archive`]'s own doc comment for exactly what each
+/// format writes and what's still deliberately out of scope (a
+/// `repositories` file/legacy per-layer subdirectories for
+/// `DockerArchive`; `-m`/`--multi-image-archive` for either).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum SaveFormat {
     OciArchive,
+    DockerArchive,
 }
 
 /// Shared by [`Command::Run`] and [`Command::Create`] (0157) -- every
@@ -1029,11 +1030,13 @@ enum Command {
         tail: Option<usize>,
     },
     /// Save an already-stored image to a real, self-contained archive
-    /// file — matching real `podman save`/`docker save`, for the
-    /// `oci-archive` format only so far (see the `archive` module's
-    /// own doc comment for exactly why `docker-archive`, real
-    /// podman's own default, is deferred to a follow-up increment).
-    /// Only a single `IMAGE` is supported (real podman's own
+    /// file — matching real `podman save`/`docker save`, for both the
+    /// `oci-archive` and `docker-archive` formats (see the `archive`
+    /// module's own doc comment for exactly what each writes, and
+    /// what's still deliberately out of scope for each; see
+    /// `format`'s own doc comment for why `oci-archive`, not real
+    /// podman/docker's own `docker-archive`, is still the default
+    /// here). Only a single `IMAGE` is supported (real podman's own
     /// `-m`/`--multi-image-archive` for several images in one archive
     /// is out of scope for now too).
     Save {
@@ -1051,6 +1054,17 @@ enum Command {
         output: Option<PathBuf>,
         /// Which real archive format to write — see `SaveFormat`'s
         /// own doc comment for exactly what's implemented so far.
+        /// Defaults to `oci-archive`, **not** real podman/docker's own
+        /// `docker-archive` default: `ociman load` doesn't read
+        /// `docker-archive` yet (see `docs/design/0167`), so
+        /// defaulting `save` to it would break this project's own
+        /// `ociman save | ociman load` round trip out of the box — a
+        /// real, self-inflicted regression this project won't accept
+        /// just to match a default value real interop with other
+        /// tools doesn't actually depend on to begin with (a real
+        /// `podman`/`docker` already defaults to `docker-archive`
+        /// regardless of what `ociman`'s own default is). Revisit
+        /// once `ociman load` also reads `docker-archive`.
         #[arg(long, value_enum, default_value_t = SaveFormat::OciArchive)]
         format: SaveFormat,
     },
@@ -1403,6 +1417,7 @@ fn write_archive(
 ) -> anyhow::Result<()> {
     match format {
         SaveFormat::OciArchive => archive::save_oci_archive(store, record, writer),
+        SaveFormat::DockerArchive => archive::save_docker_archive(store, record, writer),
     }
 }
 
