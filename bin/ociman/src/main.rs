@@ -260,6 +260,20 @@ enum Command {
         /// build --pull` with no value, which pulls unconditionally).
         #[arg(long, value_enum, default_value_t = PullPolicy::Missing, num_args = 0..=1, default_missing_value = "always")]
         pull: PullPolicy,
+        /// Add an extra `/etc/hosts` entry visible to every `RUN`
+        /// step: `name[;name2...]:IP`, repeatable — matching real
+        /// `podman build --add-host` exactly (checked directly
+        /// against `~/git/podman/vendor/go.podman.io/buildah`'s own
+        /// `CommonBuildOpts.AddHost`, consumed by the very same
+        /// `etchosts` package `ociman run --add-host` already ports —
+        /// see `docs/design/0147`-`0148`). Never visible in the built
+        /// image itself, matching real buildah's own transient,
+        /// bind-mounted (never committed) build-time `/etc/hosts`
+        /// exactly, though by an entirely different mechanism of this
+        /// project's own (see `write_etc_hosts`'s own `build.rs` call
+        /// site).
+        #[arg(long = "add-host", value_name = "HOST:IP")]
+        add_host: Vec<String>,
     },
     /// List images in local storage.
     Images,
@@ -834,6 +848,7 @@ fn main() -> std::process::ExitCode {
                 label,
                 annotation,
                 pull,
+                add_host,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
@@ -847,6 +862,7 @@ fn main() -> std::process::ExitCode {
                 &label,
                 &annotation,
                 pull,
+                &add_host,
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),
@@ -1820,13 +1836,13 @@ fn cmd_run(
             rootfs_setup::RootfsSetup::Extract => rootfs_dir.clone(),
             rootfs_setup::RootfsSetup::Overlay { .. } => rootfs_setup::upper_dir(&bundle_dir),
         };
-        write_etc_hosts(
-            &write_root,
-            hostname.unwrap_or(&container_id),
-            name.unwrap_or(&container_id),
-            add_host,
-        )
-        .context("writing /etc/hosts")?;
+        let effective_hostname = hostname.unwrap_or(&container_id);
+        let effective_name = name.unwrap_or(&container_id);
+        let mut own_names = vec![effective_hostname];
+        if effective_name != effective_hostname {
+            own_names.push(effective_name);
+        }
+        write_etc_hosts(&write_root, &own_names, add_host).context("writing /etc/hosts")?;
 
         let mut spec = synthesize_spec(
             &config,
@@ -3786,26 +3802,30 @@ fn parse_extra_host(entry: &str) -> anyhow::Result<(Vec<String>, String)> {
 /// base image didn't already ship one (common for a minimal image —
 /// even a bare `busybox` rootfs may have no `/etc` directory at all).
 ///
+/// `own_names` are this container's own identity names, mapped to
+/// `127.0.0.1` (empty for a build container — see `build.rs`'s own
+/// call site, which has no single, fixed identity the way a real
+/// running container's own hostname/`--name` does).
+///
 /// Entries, in the same order real podman's own `etchosts.New`
 /// writes them (`~/git/container-libs/common/libnetwork/etchosts/
 /// hosts.go`): `add_host`'s own entries first (so a user-given
 /// override for e.g. `localhost` genuinely takes precedence), then
-/// the built-in `127.0.0.1`/`::1 localhost` and hostname/container-
-/// name entries — each only added for a name not already claimed by
-/// an earlier entry, matching real podman's own `addEntriesIfNotExists`
-/// exactly, rather than ever overwriting a user's own explicit
-/// `--add-host` entry.
+/// the built-in `127.0.0.1`/`::1 localhost` and `own_names` entries —
+/// each only added for a name not already claimed by an earlier
+/// entry, matching real podman's own `addEntriesIfNotExists` exactly,
+/// rather than ever overwriting a user's own explicit `--add-host`
+/// entry.
 ///
 /// This project sets up no container networking of its own at all
 /// yet (no bridge/pasta/CNI), so every container's own synthesized
 /// `/etc/hosts` always matches real podman's own `--network=none`
-/// case specifically: the hostname/container-name entries map to
-/// `127.0.0.1`, the same address a real `--network=none` podman
-/// container's own loopback-only view would resolve them to.
-fn write_etc_hosts(
+/// case specifically: `own_names` map to `127.0.0.1`, the same
+/// address a real `--network=none` podman container's own loopback-
+/// only view would resolve them to.
+pub(crate) fn write_etc_hosts(
     root: &Path,
-    hostname: &str,
-    container_name: &str,
+    own_names: &[&str],
     add_host: &[String],
 ) -> anyhow::Result<()> {
     let mut claimed_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3838,11 +3858,7 @@ fn write_etc_hosts(
     };
     write_builtin(&mut lines, "127.0.0.1", &["localhost"]);
     write_builtin(&mut lines, "::1", &["localhost"]);
-    let mut own_names = vec![hostname];
-    if container_name != hostname {
-        own_names.push(container_name);
-    }
-    write_builtin(&mut lines, "127.0.0.1", &own_names);
+    write_builtin(&mut lines, "127.0.0.1", own_names);
 
     let etc_dir = root.join("etc");
     std::fs::create_dir_all(&etc_dir).with_context(|| format!("creating {}", etc_dir.display()))?;
@@ -4630,7 +4646,7 @@ mod tests {
     #[test]
     fn write_etc_hosts_default_entries_with_no_add_host_at_all() {
         let dir = tempfile::tempdir().unwrap();
-        write_etc_hosts(dir.path(), "myhost", "myhost", &[]).unwrap();
+        write_etc_hosts(dir.path(), &["myhost"], &[]).unwrap();
         let content = std::fs::read_to_string(dir.path().join("etc/hosts")).unwrap();
         assert_eq!(
             content,
@@ -4639,20 +4655,20 @@ mod tests {
     }
 
     #[test]
-    fn write_etc_hosts_dedupes_identical_hostname_and_container_name() {
+    fn write_etc_hosts_with_no_own_names_at_all_still_writes_the_localhost_entries() {
+        // The shape `build.rs`'s own call site uses: no single,
+        // fixed identity the way a real running container's own
+        // hostname/`--name` does.
         let dir = tempfile::tempdir().unwrap();
-        write_etc_hosts(dir.path(), "same", "same", &[]).unwrap();
+        write_etc_hosts(dir.path(), &[], &[]).unwrap();
         let content = std::fs::read_to_string(dir.path().join("etc/hosts")).unwrap();
-        assert_eq!(
-            content,
-            "127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.0.1\tsame\n"
-        );
+        assert_eq!(content, "127.0.0.1\tlocalhost\n::1\tlocalhost\n");
     }
 
     #[test]
     fn write_etc_hosts_keeps_hostname_and_container_name_both_when_distinct() {
         let dir = tempfile::tempdir().unwrap();
-        write_etc_hosts(dir.path(), "myhost", "mycontainer", &[]).unwrap();
+        write_etc_hosts(dir.path(), &["myhost", "mycontainer"], &[]).unwrap();
         let content = std::fs::read_to_string(dir.path().join("etc/hosts")).unwrap();
         assert_eq!(
             content,
@@ -4663,13 +4679,7 @@ mod tests {
     #[test]
     fn write_etc_hosts_add_host_entries_come_first() {
         let dir = tempfile::tempdir().unwrap();
-        write_etc_hosts(
-            dir.path(),
-            "myhost",
-            "myhost",
-            &["foo;bar:10.0.0.5".to_string()],
-        )
-        .unwrap();
+        write_etc_hosts(dir.path(), &["myhost"], &["foo;bar:10.0.0.5".to_string()]).unwrap();
         let content = std::fs::read_to_string(dir.path().join("etc/hosts")).unwrap();
         assert_eq!(
             content,
@@ -4681,13 +4691,7 @@ mod tests {
     fn write_etc_hosts_a_user_add_host_overriding_localhost_suppresses_both_builtin_localhost_lines()
      {
         let dir = tempfile::tempdir().unwrap();
-        write_etc_hosts(
-            dir.path(),
-            "myhost",
-            "myhost",
-            &["localhost:9.9.9.9".to_string()],
-        )
-        .unwrap();
+        write_etc_hosts(dir.path(), &["myhost"], &["localhost:9.9.9.9".to_string()]).unwrap();
         let content = std::fs::read_to_string(dir.path().join("etc/hosts")).unwrap();
         // Matches real podman's own `addEntriesIfNotExists` exactly:
         // both the `127.0.0.1 localhost` *and* `::1 localhost`
@@ -4700,15 +4704,14 @@ mod tests {
     fn write_etc_hosts_creates_a_missing_etc_directory() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!dir.path().join("etc").exists());
-        write_etc_hosts(dir.path(), "myhost", "myhost", &[]).unwrap();
+        write_etc_hosts(dir.path(), &["myhost"], &[]).unwrap();
         assert!(dir.path().join("etc").is_dir());
     }
 
     #[test]
     fn write_etc_hosts_surfaces_a_real_add_host_parse_error() {
         let dir = tempfile::tempdir().unwrap();
-        let err =
-            write_etc_hosts(dir.path(), "myhost", "myhost", &["bad".to_string()]).unwrap_err();
+        let err = write_etc_hosts(dir.path(), &["myhost"], &["bad".to_string()]).unwrap_err();
         assert!(err.to_string().contains("--add-host"));
     }
 }

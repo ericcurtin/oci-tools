@@ -4867,3 +4867,161 @@ fn iidfile_flag_writes_the_built_images_own_digest_with_no_trailing_newline() {
         .unwrap();
     assert_eq!(written, record.manifest_digest.to_string());
 }
+
+/// Every real, stored tar entry path across *every* layer of `store`'s
+/// own `reference` — used to confirm a build-time-only file (e.g. the
+/// synthesized `/etc/hosts`, see `docs/design/0148`) never actually
+/// landed in any committed layer, not just the last one.
+fn all_layer_tar_paths(store: &Store, reference: &str) -> Vec<String> {
+    let normalized = oci_spec_types::Reference::parse(reference)
+        .unwrap()
+        .to_string();
+    let record = store.resolve_image(&normalized).unwrap().unwrap();
+    let manifest = store.image_manifest(&record).unwrap();
+    let mut paths = Vec::new();
+    for layer in &manifest.layers {
+        let blob = store.open_blob(&layer.digest).unwrap();
+        let decoder = flate2::read::GzDecoder::new(blob);
+        let mut archive = tar::Archive::new(decoder);
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            paths.push(entry.path().unwrap().to_string_lossy().into_owned());
+        }
+    }
+    paths
+}
+
+/// `ociman build --add-host` makes a real, extra `/etc/hosts` entry
+/// visible to every `RUN` step's own process — verified by having a
+/// `RUN` step itself capture `/etc/hosts` into a file, then reading
+/// that file's own content back out of the built image's real,
+/// committed layer content directly (*not* via `ociman run` against
+/// the built image, which would always synthesize its own fresh
+/// `/etc/hosts` for the running container regardless of what the
+/// image itself contains — seeing the entry in the file the `RUN`
+/// step itself wrote is what actually proves `--add-host` reached the
+/// build).
+#[test]
+fn build_add_host_flag_is_visible_during_run_steps() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-add-host-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-add-host-base:latest\n\
+         RUN cat /etc/hosts > /hosts-snapshot.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-add-host-result:latest",
+            "--add-host",
+            "foo.example;bar.example:10.0.0.5",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let normalized = oci_spec_types::Reference::parse("ociman-test/build-add-host-result:latest")
+        .unwrap()
+        .to_string();
+    let record = store.resolve_image(&normalized).unwrap().unwrap();
+    let manifest = store.image_manifest(&record).unwrap();
+    let digest = &manifest.layers.last().unwrap().digest;
+    let blob = store.open_blob(digest).unwrap();
+    let decoder = flate2::read::GzDecoder::new(blob);
+    let mut archive = tar::Archive::new(decoder);
+    let mut snapshot = String::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap().to_string_lossy() == "hosts-snapshot.txt" {
+            std::io::Read::read_to_string(&mut entry, &mut snapshot).unwrap();
+        }
+    }
+    assert!(
+        snapshot.contains("10.0.0.5\tfoo.example bar.example"),
+        "snapshot: {snapshot:?}"
+    );
+}
+
+/// The synthesized `/etc/hosts` (localhost, plus any `--add-host`
+/// entries) a build container's own `RUN` steps see is never actually
+/// committed into any real layer of the built image — matching real
+/// buildah's own transient, bind-mounted (never committed) build-time
+/// `/etc/hosts` exactly, though by an entirely different mechanism of
+/// this project's own (see `docs/design/0148`).
+#[test]
+fn build_never_commits_a_synthesized_etc_hosts_into_any_layer() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-no-host-leak-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-no-host-leak-base:latest\n\
+         RUN cat /etc/hosts\n\
+         RUN echo hi > /marker.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-no-host-leak-result:latest",
+            "--add-host",
+            "foo.example:10.0.0.5",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let paths = all_layer_tar_paths(&store, "ociman-test/build-no-host-leak-result:latest");
+    assert!(
+        paths.iter().any(|p| p == "marker.txt"),
+        "sanity check that layer inspection itself works: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains("hosts")),
+        "no layer should ever contain a synthesized /etc/hosts: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p == "etc" || p == "etc/"),
+        "no layer should even contain the /etc directory this project creates just to hold \
+         the (never-committed) synthesized hosts file: {paths:?}"
+    );
+}

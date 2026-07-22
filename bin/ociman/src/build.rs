@@ -214,6 +214,7 @@ pub fn cmd_build(
     labels: &[String],
     annotations: &[String],
     pull_policy: crate::PullPolicy,
+    add_host: &[String],
     json: bool,
 ) -> anyhow::Result<()> {
     let tag = tag.context(
@@ -378,6 +379,7 @@ pub fn cmd_build(
             &cache_candidates,
             tls_verify,
             pull_policy,
+            add_host,
         )?;
         built.insert(stage_index, built_stage);
     }
@@ -603,6 +605,7 @@ fn build_stage(
     cache_candidates: &[crate::build_cache::CacheCandidate],
     tls_verify: bool,
     pull_policy: crate::PullPolicy,
+    add_host: &[String],
 ) -> anyhow::Result<BuiltStage> {
     let mut config = base_config;
     let mut layers = base_layers;
@@ -659,6 +662,26 @@ fn build_stage(
                 }
             }
         }
+        // A real `/etc/hosts` (localhost, plus any `--add-host`
+        // entries), visible to every `RUN` step's own process — but
+        // never visible in the built image itself: written *before*
+        // any instruction's own `oci_layer::Snapshot::capture`
+        // baseline is ever taken (the very next thing to happen after
+        // this, in `apply_instruction`'s own `run_instruction`/`copy_
+        // instruction`/`add_instruction`), so it's already part of
+        // every one of their "before" snapshots and never registers
+        // as a change in any of their own diffs/commits — the exact
+        // same real, checked-directly transient-and-never-committed
+        // behavior real buildah's own bind-mounted build-time
+        // `/etc/hosts` has, achieved here by an entirely different
+        // (and much simpler) mechanism: no explicit save/restore/
+        // cleanup of any kind is needed at all. No `own_names` (unlike
+        // `ociman run`'s own call site): a build has no single, fixed
+        // hostname/container-name identity of its own the way a real
+        // running container does.
+        crate::write_etc_hosts(&rootfs_dir, &[], add_host)
+            .context("writing /etc/hosts for the build container")?;
+
         Some(dir)
     } else {
         None
