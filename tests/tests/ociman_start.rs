@@ -17,8 +17,9 @@
 //! third_time` below reproduced this quite reliably (well over half of
 //! repeated runs) before the fix.
 
+use std::io::Write as _;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use oci_spec_types::image::ContainerConfig;
@@ -572,5 +573,224 @@ fn restart_does_not_auto_remove_a_rm_container_but_a_later_real_stop_still_does(
         wait_until_removed(storage_dir.path(), &id, Duration::from_secs(3)),
         "a real, final stop on a --rm container should still auto-remove it, restarted or not \
          -- and quickly (0159), not after a multi-second stall"
+    );
+}
+
+/// Spawn `ociman` with `args`, write `stdin_input` to its own real
+/// stdin, and return the captured output — used by every `--interactive`
+/// test below, which needs a genuinely piped stdin (unlike every other
+/// helper in this file, which uses plain `.output()` -- that closes
+/// stdin by default, which would silently mask exactly the behavior
+/// these tests exist to check).
+fn ociman_with_stdin(
+    storage_root: &Path,
+    args: &[&str],
+    stdin_input: &[u8],
+) -> std::process::Output {
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_root)
+        .env_remove("OCI_TOOLS_LOG")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman");
+    child.stdin.take().unwrap().write_all(stdin_input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// A container whose own command reads (or fails to read) one line of
+/// real stdin within a short timeout, reporting which — used by every
+/// `--interactive`/`ANNOTATION_INTERACTIVE` test below.
+fn seed_stdin_probe_image(store: &Store, reference: &str, busybox: &Path) {
+    seed_image(
+        store,
+        reference,
+        busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "if read -t 3 line; then echo GOT:$line; else echo NOINPUT; fi".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+}
+
+/// `ociman start --attach` on a container `create -i`'d (0188): real
+/// stdin must be forwarded, even though `ociman start` has no `-i` of
+/// its own at all — matching real `podman start -i -a`'s own checked-
+/// directly behavior exactly (confirmed directly against a real
+/// `podman`: whether stdin is ever forwarded at all is decided once,
+/// at `create` time, never re-decided by a later `start`'s own flags).
+#[test]
+fn start_attach_forwards_stdin_for_a_container_created_with_interactive() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_stdin_probe_image(&store, "ociman-test/start-interactive:latest", &busybox);
+
+    let create = ociman_with_stdin(
+        storage_dir.path(),
+        &[
+            "create",
+            "--interactive",
+            "ociman-test/start-interactive:latest",
+        ],
+        b"",
+    );
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    assert!(!id.is_empty());
+
+    let start = ociman_with_stdin(
+        storage_dir.path(),
+        &["start", "--attach", &id],
+        b"hello-from-host\n",
+    );
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&start.stdout).trim(),
+        "GOT:hello-from-host",
+        "a container created with --interactive should still have its real stdin forwarded \
+         by a later `start --attach`, even though `start` itself has no -i of its own"
+    );
+
+    ociman_with_stdin(storage_dir.path(), &["rm", &id], b"");
+}
+
+/// The default, un-annotated case: `ociman start --attach` on a
+/// container `create`d with no `--interactive` at all must never
+/// forward real stdin — matching real `podman start -a`'s own
+/// identical default exactly.
+#[test]
+fn start_attach_never_forwards_stdin_for_a_container_created_without_interactive() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_stdin_probe_image(&store, "ociman-test/start-noninteractive:latest", &busybox);
+
+    let create = ociman_with_stdin(
+        storage_dir.path(),
+        &["create", "ociman-test/start-noninteractive:latest"],
+        b"",
+    );
+    assert!(create.status.success());
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    assert!(!id.is_empty());
+
+    let start = ociman_with_stdin(
+        storage_dir.path(),
+        &["start", "--attach", &id],
+        b"hello-from-host\n",
+    );
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&start.stdout).trim(),
+        "NOINPUT",
+        "a container created without --interactive should never have real stdin forwarded"
+    );
+
+    ociman_with_stdin(storage_dir.path(), &["rm", &id], b"");
+}
+
+/// A container `run -i`'d in the foreground once, then later re-`start
+/// --attach`'d: real stdin must be forwarded again on the *second*
+/// launch too, with no `-i` given to `start` at all — matching real
+/// `podman run -i` followed by a real `podman start -a`'s own checked-
+/// directly behavior exactly (the "interactive" setting survives a
+/// restart, it is not re-decided per launch).
+#[test]
+fn restarting_a_container_originally_run_interactive_still_forwards_stdin() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_stdin_probe_image(
+        &store,
+        "ociman-test/run-then-start-interactive:latest",
+        &busybox,
+    );
+
+    let run = ociman_with_stdin(
+        storage_dir.path(),
+        &[
+            "run",
+            "--interactive",
+            "--name",
+            "run-then-start-interactive",
+            "ociman-test/run-then-start-interactive:latest",
+        ],
+        b"first-input\n",
+    );
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).trim(),
+        "GOT:first-input"
+    );
+
+    let start = ociman_with_stdin(
+        storage_dir.path(),
+        &["start", "--attach", "run-then-start-interactive"],
+        b"second-input\n",
+    );
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&start.stdout).contains("GOT:second-input"),
+        "the second, restarted launch should still have real stdin forwarded, with no -i \
+         given to `start` at all: {:?}",
+        start.stdout
+    );
+
+    ociman_with_stdin(
+        storage_dir.path(),
+        &["rm", "run-then-start-interactive"],
+        b"",
     );
 }

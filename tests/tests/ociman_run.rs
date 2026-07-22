@@ -2632,3 +2632,56 @@ fn run_interactive_forwards_real_stdin() {
         "--interactive should forward this process's own real stdin to the container"
     );
 }
+
+/// `ociman run -d --rm` on a container whose own command exits almost
+/// instantly (0189): a real, previously-hit race, found by hand (a
+/// tight, zero-delay shell loop of this exact invocation, not a
+/// hypothesis) -- roughly 30-50% of repeated invocations failed with
+/// "container ... failed to start (setup failed before it ever
+/// reported a real pid)" before the fix, even though the container
+/// itself genuinely ran to completion successfully every time: its
+/// own record (via `--rm`'s auto-removal) could disappear so fast that
+/// the *caller's* very first poll already found nothing at all,
+/// indistinguishable from a genuine setup failure (which also removes
+/// the record). Confirmed directly that a real `podman run -d --rm
+/// busybox /bin/true`, hammered the exact same way, never fails this
+/// way at all. Repeated well beyond the failure rate observed by hand
+/// before the fix, to make a regression here very unlikely to go
+/// unnoticed.
+#[test]
+fn run_detached_rm_with_an_instantly_exiting_command_never_races_its_own_startup_check() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/instant-detach-rm:latest",
+        &busybox,
+        &["true"],
+        ContainerConfig {
+            cmd: Some(vec!["/bin/true".to_string()]),
+            ..Default::default()
+        },
+    );
+
+    for i in 0..40 {
+        let out = ociman_run(
+            storage_dir.path(),
+            "ociman-test/instant-detach-rm:latest",
+            &["-d", "--rm"],
+        );
+        assert!(
+            out.status.success(),
+            "iteration {i}: stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

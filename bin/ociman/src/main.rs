@@ -70,6 +70,22 @@ const ANNOTATION_NAME: &str = "io.oci-tools.name";
 /// the exact same container does remove it (see `run_and_finalize`'s
 /// own doc comment for the exact mechanism this enables).
 const ANNOTATION_AUTO_REMOVE: &str = "io.oci-tools.auto-remove";
+/// Whether this container's own stdin should ever be forwarded real
+/// host input at all — a persisted, create-time property, exactly
+/// like [`ANNOTATION_AUTO_REMOVE`], not something a later `ociman
+/// start` can override with a flag of its own (0187/0188): checked
+/// directly against real podman, `podman start -i`/`-a` on a
+/// container originally *created* without `-i` never forwards real
+/// stdin, no matter what flags that later `start` itself is given,
+/// while a container originally `run`/`create`d *with* `-i` still
+/// forwards it on every later `start --attach`, even one given no
+/// `-i` of its own -- the underlying OCI runtime's own stdio setup is
+/// fixed once, at creation, matching this project's own architecture
+/// (a fresh `fork`/`exec` reads this same persisted annotation back
+/// every single launch, rather than a long-lived `conmon`-equivalent
+/// process holding a real pipe open across restarts the way real
+/// podman's own implementation does it internally).
+const ANNOTATION_INTERACTIVE: &str = "io.oci-tools.interactive";
 /// A fresh, short, unique-enough string (see [`short_id`]) generated
 /// once per real *launch* of a container (not once per container id),
 /// folded into that launch's own transient systemd scope name
@@ -770,10 +786,19 @@ enum Command {
         /// this, the container's own stdin is always closed —
         /// `/dev/null` — regardless of whatever stdin `ociman` itself
         /// was given, never a silent pass-through of it). Has no
-        /// effect with `--detach` (a detached container's own stdin
-        /// is always closed either way, real `docker run -d -i`'s own
-        /// "leave stdin open for a later `attach`" behavior is a
-        /// separate, still-deferred gap).
+        /// immediate effect with `--detach` (a detached launch's own
+        /// stdin is always closed either way, real `docker run -d
+        /// -i`'s own "leave stdin open for a later `attach`" behavior
+        /// is a separate, still-deferred gap — this project has no
+        /// `attach`-to-an-already-running-container command at all
+        /// yet). Still persisted either way (0188), exactly like
+        /// `--rm`/[`ANNOTATION_AUTO_REMOVE`]: real docker/podman's own
+        /// "interactive" setting is decided once, at creation, not
+        /// re-decided by a later `start`'s own flags (checked directly:
+        /// a container `run -i`/`create -i`'d once still forwards real
+        /// stdin on every later `ociman start --attach`, with no `-i`
+        /// of its own, since `ociman start` doesn't have one at all —
+        /// see [`ANNOTATION_INTERACTIVE`]'s own doc comment for why).
         #[arg(short, long)]
         interactive: bool,
     },
@@ -798,6 +823,12 @@ enum Command {
         /// to actually honor — 0158).
         #[arg(long)]
         rm: bool,
+        /// See `Command::Run`'s own identical flag (0188) — persisted
+        /// for a later `ociman start --attach` to honor, exactly like
+        /// `--rm`, since `create` itself never launches anything at
+        /// all yet to forward stdin to.
+        #[arg(short, long)]
+        interactive: bool,
     },
     /// List containers.
     Ps {
@@ -1453,7 +1484,11 @@ fn main() -> std::process::ExitCode {
                 detach,
                 interactive,
             }) => cmd_run(args, rm, detach, interactive),
-            Some(Command::Create { args, rm }) => cmd_create(args, rm),
+            Some(Command::Create {
+                args,
+                rm,
+                interactive,
+            }) => cmd_create(args, rm, interactive),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Start { id, attach }) => cmd_start(&id, attach),
             Some(Command::Restart { id, time }) => cmd_restart(&id, time),
@@ -3111,6 +3146,19 @@ fn cmd_run(args: RunArgs, rm: bool, detach: bool, interactive: bool) -> anyhow::
             .insert(ANNOTATION_AUTO_REMOVE.to_string(), "true".to_string());
         containers.write(&state)?;
     }
+    if interactive {
+        // Same reasoning, same mechanism, as `rm` just above — see
+        // `ANNOTATION_INTERACTIVE`'s own doc comment (0188): a later
+        // `ociman start --attach` needs this to still forward real
+        // stdin, exactly matching real docker/podman's own checked-
+        // directly behavior (a container `run -i`'d once keeps
+        // forwarding real stdin on every later `start`, with no `-i`
+        // of that later `start`'s own at all).
+        state
+            .annotations
+            .insert(ANNOTATION_INTERACTIVE.to_string(), "true".to_string());
+        containers.write(&state)?;
+    }
 
     if detach {
         // SAFETY: `ociman`'s own process has not spawned any additional
@@ -3176,7 +3224,9 @@ fn cmd_run(args: RunArgs, rm: bool, detach: bool, interactive: bool) -> anyhow::
 /// itself never launches anything at all, so there is no exit of its
 /// own to react to yet) — a later, separate `ociman start` reads it
 /// back to correctly auto-remove once *that* run finally exits.
-fn cmd_create(args: RunArgs, rm: bool) -> anyhow::Result<()> {
+/// `interactive` (0188): same reasoning, persisted as
+/// [`ANNOTATION_INTERACTIVE`] instead — see its own doc comment.
+fn cmd_create(args: RunArgs, rm: bool, interactive: bool) -> anyhow::Result<()> {
     let PreparedContainer {
         container_id,
         mut state,
@@ -3188,6 +3238,11 @@ fn cmd_create(args: RunArgs, rm: bool) -> anyhow::Result<()> {
         state
             .annotations
             .insert(ANNOTATION_AUTO_REMOVE.to_string(), "true".to_string());
+    }
+    if interactive {
+        state
+            .annotations
+            .insert(ANNOTATION_INTERACTIVE.to_string(), "true".to_string());
     }
     containers.write(&state)?;
     println!("{container_id}");
@@ -3263,14 +3318,55 @@ unsafe fn launch_detached_and_confirm(
                 .write(true)
                 .open("/dev/null");
             if let Ok(devnull) = devnull {
-                let _ = rustix::stdio::dup2_stdin(&devnull);
+                // Stdin (0188): a real, previously-hit bug found by
+                // hand while first verifying `interactive` end to
+                // end -- this keeper is always the *direct* parent of
+                // the container's own eventual process, so whatever
+                // its own fd 0 already is at this exact point is the
+                // only thing `run_and_finalize`'s own later
+                // `close_stdin: false` (interactive) path could ever
+                // inherit, regardless of what it's told: the original
+                // foreground `ociman start`/`ociman run -d`
+                // invocation's own real stdin is a completely
+                // separate, still-open file description from this
+                // keeper's own copy of it (an ordinary `fork` property,
+                // not something `setsid` changes), but unconditionally
+                // `dup2`ing this copy to `/dev/null` right here, before
+                // `run_and_finalize` ever runs, threw that away for
+                // every detached launch regardless of `interactive` --
+                // discovered by observing real piped input never
+                // reaching the container even from a `create -i`'d one.
+                // Skipping just this one `dup2` when `interactive` is
+                // set (stdout/stderr are still always silenced here
+                // either way, matching real `docker run -d`'s own
+                // unconditional "no live output" convention) is exactly
+                // the real, conmon-analogous mechanism this project's
+                // own architecture needs: a long-lived process (the
+                // keeper, here) holding the real stdin open across the
+                // detach, for a later `start --attach` on the *very
+                // next* launch to actually use.
+                if !interactive {
+                    let _ = rustix::stdio::dup2_stdin(&devnull);
+                }
                 let _ = rustix::stdio::dup2_stdout(&devnull);
                 let _ = rustix::stdio::dup2_stderr(&devnull);
             }
             let Ok(containers) = open_container_store() else {
                 std::process::exit(1);
             };
-            let _ = run_and_finalize(
+            // A real, distinguishing exit code (0189) -- not `let _ =
+            // ...` discarding it, which used to make this keeper
+            // always report success regardless of what actually
+            // happened inside. See `wait_for_detached_container_to_
+            // start`'s own doc comment for exactly why this matters:
+            // a genuinely instantaneous container (e.g. `--rm
+            // /bin/true`) can run to completion and self-remove its
+            // own record so fast that the *caller's* very first poll
+            // already sees it gone -- this keeper's own real exit
+            // code is the only way left to tell that apart from a
+            // genuine setup failure once the record itself is gone
+            // either way.
+            let code = match run_and_finalize(
                 &container_id_for_keeper,
                 &bundle,
                 &rootfs,
@@ -3279,8 +3375,11 @@ unsafe fn launch_detached_and_confirm(
                 &log_path,
                 rm,
                 interactive,
-            );
-            std::process::exit(0);
+            ) {
+                Ok(_) => 0,
+                Err(_) => oci_runtime_core::launch::SETUP_FAILURE_EXIT_CODE,
+            };
+            std::process::exit(code);
         })
     }
     .context("detaching container")?;
@@ -3457,6 +3556,24 @@ fn run_and_finalize(
 /// IPC of its own — matching `docs/design/0023`'s own "a concurrent
 /// invocation sees something real" reasoning, just applied to the
 /// detaching invocation itself rather than an unrelated one.
+///
+/// A real, previously-hit race (0189), found by hand (a tight,
+/// zero-delay loop of `ociman run -d --rm busybox /bin/true`, not a
+/// hypothetical): a `--rm` container whose own command exits almost
+/// instantly can run to completion and have its *entire* record
+/// (including the exit-code annotation this function's own caller
+/// would otherwise have read back) already gone by the time this
+/// function's very first poll runs at all -- indistinguishable, from
+/// the state store alone, from a genuine setup failure (which also
+/// removes the record, via `run_and_finalize`'s own `Err` branch).
+/// The one remaining signal that *can* tell them apart: the keeper's
+/// own real exit code (0 for success, [`oci_runtime_core::launch::
+/// SETUP_FAILURE_EXIT_CODE`] for a genuine failure -- see
+/// `launch_detached_and_confirm`'s own keeper closure), reaped here
+/// via a real, blocking `waitpid` rather than treating `NotFound` as
+/// an unconditional hard failure the way this used to. Confirmed
+/// directly that real `podman run -d --rm busybox /bin/true`, hammered
+/// the exact same way, never fails this way at all.
 fn wait_for_detached_container_to_start(
     containers: &StateStore,
     container_id: &str,
@@ -3468,9 +3585,20 @@ fn wait_for_detached_container_to_start(
             Ok(state) if state.status != Status::Creating => return Ok(()),
             Ok(_) => {}
             Err(oci_runtime_core::StateError::NotFound(_)) => {
+                // The keeper is either still running (in which case
+                // this blocks briefly until it isn't) or has already
+                // exited and is sitting as a zombie (in which case
+                // this returns immediately) -- nothing else ever reaps
+                // this specific child, so this can't observe a stale
+                // exit code left over from an unrelated process.
+                let status = oci_runtime_core::process::wait(keeper_pid)?;
+                let code = oci_runtime_core::process::exit_code_from_wait_status(status);
+                if code == 0 {
+                    return Ok(());
+                }
                 anyhow::bail!(
-                    "container {container_id:?} failed to start (setup failed before it \
-                     ever reported a real pid)"
+                    "container {container_id:?} failed to start (its own detached setup \
+                     failed, exit code {code})"
                 );
             }
             Err(e) => return Err(e.into()),
@@ -4833,10 +4961,22 @@ fn stop_container(id: &str, time_secs: u64, signal: &str, reset_scope: bool) -> 
 /// which this project's own simpler two-name split maps onto as
 /// `Created`/`Stopped`, `ErrCtrStateRunning` otherwise).
 ///
-/// What this doesn't do yet: `-i`/`--interactive` (forwarding this
-/// process's own stdin into the container) — a real, separate gap,
-/// deferred to a future increment; real podman's own `-a` alone
-/// (this function's own newly-supported mode) never needs it either.
+/// Stdin (0188): whether real stdin is ever forwarded at all doesn't
+/// depend on any flag of `start`'s own — there isn't one — only on
+/// whether this container was originally `run`/`create`d with `-i`
+/// (`ANNOTATION_INTERACTIVE`), matching real podman's own checked-
+/// directly behavior exactly (confirmed directly: `podman start -i
+/// -a` on a container *created* without `-i` still never forwards
+/// real stdin, while a plain `podman start -a`, no `-i` at all, on one
+/// *created* with `-i` still does).
+///
+/// What this doesn't do yet: real terminal/pty allocation
+/// (`-t`/`--tty`) is a wholly separate, unstarted gap; a `-d -i`
+/// container's own "leave stdin open for a later `attach`" real
+/// behavior doesn't apply here either — this project has no
+/// `attach`-to-an-already-running-container command at all yet, only
+/// this function's own `--attach`, which only ever applies to an
+/// already-`Stopped`/`Created` container.
 fn cmd_start(id: &str, attach: bool) -> anyhow::Result<()> {
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)?;
@@ -4876,6 +5016,14 @@ fn cmd_start(id: &str, attach: bool) -> anyhow::Result<()> {
     // invocation of `cmd_start` has no CLI flag of its own to consult,
     // only whatever the container's own annotations already say.
     let rm = state.annotations.contains_key(ANNOTATION_AUTO_REMOVE);
+    // Same reasoning, same mechanism, for whether this container's
+    // own stdin should ever be forwarded real host input at all
+    // (0188) — `ociman start` has no `-i`/`--interactive` flag of its
+    // own at all (checked directly against real podman: a later
+    // `start`'s own flags don't decide this anyway, only whatever the
+    // container was originally `run`/`create`d with does — see
+    // `ANNOTATION_INTERACTIVE`'s own doc comment).
+    let interactive = state.annotations.contains_key(ANNOTATION_INTERACTIVE);
 
     // Matches `cmd_run`'s own initial `Creating` status: the shared
     // `wait_for_detached_container_to_start` this reuses waits for
@@ -4902,10 +5050,7 @@ fn cmd_start(id: &str, attach: bool) -> anyhow::Result<()> {
             state,
             rm,
             !attach,
-            // `ociman start` has no `-i`/`--interactive` of its own
-            // yet — see `cmd_start`'s own doc comment for this real,
-            // still-deferred gap.
-            false,
+            interactive,
         )?;
     }
     if attach {
