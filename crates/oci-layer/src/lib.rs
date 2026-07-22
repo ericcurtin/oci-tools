@@ -76,7 +76,7 @@ mod diff;
 pub use diff::{Change, ChangeKind, Snapshot, changes};
 
 mod export;
-pub use export::export;
+pub use export::{export, export_tree};
 
 mod compress;
 pub use compress::{compress_for_storage, decompress_verifying};

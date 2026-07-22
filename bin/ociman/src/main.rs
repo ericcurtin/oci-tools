@@ -27,8 +27,8 @@ use oci_runtime_core::StateStore;
 use oci_runtime_core::state::Status;
 use oci_spec_types::Reference;
 use oci_spec_types::image::{
-    ContainerConfig, Descriptor, ImageConfig, ImageManifest, MEDIA_TYPE_IMAGE_CONFIG,
-    MEDIA_TYPE_IMAGE_MANIFEST, Platform,
+    ContainerConfig, Descriptor, HistoryEntry, ImageConfig, ImageManifest, MEDIA_TYPE_IMAGE_CONFIG,
+    MEDIA_TYPE_IMAGE_LAYER_GZIP, MEDIA_TYPE_IMAGE_MANIFEST, Platform, RootFs,
 };
 use oci_spec_types::time::format_rfc3339_utc;
 use oci_store::{ImageRecord, ImageSummary, Store};
@@ -816,6 +816,24 @@ enum Command {
         /// The container's ID or `--name`.
         id: String,
     },
+    /// Write a container's entire current filesystem out as a real,
+    /// flat tar — matching real `docker export`/`podman export`
+    /// exactly: the whole current tree, verbatim, no whiteouts, no
+    /// layer/base-image semantics at all (unlike `ociman diff`/
+    /// `ociman commit`, which both only ever look at what changed).
+    /// Works on a running or stopped container alike; shares `cp`/
+    /// `diff`/`commit`'s own rootless-overlay-rootfs gap (see
+    /// `cmd_export`'s own doc comment).
+    Export {
+        /// The container's ID or `--name`.
+        id: String,
+        /// Write the archive here instead of standard output (real
+        /// `podman export`'s own default — `ociman export ctr >
+        /// out.tar` works exactly like `podman export ctr > out.tar`
+        /// does).
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
     /// Create a new image from a container's own changes relative to
     /// the image it was created from — matching real `docker commit`/
     /// `podman commit` exactly for the "one new layer, on top of the
@@ -1081,6 +1099,45 @@ enum Command {
         #[arg(short, long, value_name = "PATH")]
         input: Option<PathBuf>,
     },
+    /// Create a new, single-layer image straight from a plain tar
+    /// (e.g. one `ociman export`, `tar cf`, or real `docker export`
+    /// itself produced) — matching real `docker import`/`podman
+    /// import` exactly: no base image, no history beyond this one
+    /// import step, `--change` applies the same 10 Dockerfile-
+    /// instruction-style config overrides `ociman commit --change`
+    /// already supports (see `cmd_import`'s own doc comment for
+    /// what's out of scope: a remote URL `PATH`, any compression
+    /// beyond gzip, and real `podman import --variant`, which sets a
+    /// config-level field this project's own `ImageConfig` doesn't
+    /// model at all yet).
+    Import {
+        /// Path to the tar file to import, or `-` to read from
+        /// standard input (matching real `podman import -`/`docker
+        /// import -` exactly).
+        path: String,
+        /// Tag the imported image (`name[:tag]`) — optional, matching
+        /// real `podman import`'s own optional trailing `REFERENCE`
+        /// (an untagged import is a real, supported case, the same as
+        /// an untagged `ociman load`).
+        reference: Option<String>,
+        /// Set the imported image's own commit message (the one
+        /// history entry's own `comment`).
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+        /// Apply a Dockerfile-instruction-style config override —
+        /// see `ociman commit --change`'s own identical flag for
+        /// exactly which 10 instructions are accepted.
+        #[arg(short = 'c', long = "change", value_name = "INSTRUCTION")]
+        change: Vec<String>,
+        /// Override the imported image's own OS (default: this
+        /// host's).
+        #[arg(long)]
+        os: Option<String>,
+        /// Override the imported image's own architecture (default:
+        /// this host's, `GOARCH`-style).
+        #[arg(long)]
+        arch: Option<String>,
+    },
     /// Display detailed version information, matching real `docker
     /// version`/`podman version` exactly for the "no remote server, no
     /// `Server:` section" case a real rootless `podman version`
@@ -1184,6 +1241,7 @@ fn main() -> std::process::ExitCode {
                 overwrite,
             }) => cmd_cp(&src, &dest, overwrite),
             Some(Command::Diff { id }) => cmd_diff(&id, cli.global.json),
+            Some(Command::Export { id, output }) => cmd_export(&id, output.as_deref()),
             Some(Command::Commit {
                 container,
                 image,
@@ -1222,6 +1280,22 @@ fn main() -> std::process::ExitCode {
                 format,
             }) => cmd_save(&reference, output.as_deref(), format, cli.global.json),
             Some(Command::Load { input }) => cmd_load(input.as_deref(), cli.global.json),
+            Some(Command::Import {
+                path,
+                reference,
+                message,
+                change,
+                os,
+                arch,
+            }) => cmd_import(
+                &path,
+                reference.as_deref(),
+                message.as_deref(),
+                &change,
+                os.as_deref(),
+                arch.as_deref(),
+                cli.global.json,
+            ),
             Some(Command::Version) => cmd_version(cli.global.json),
             Some(Command::Info) => cmd_info(cli.global.json),
         }
@@ -1453,6 +1527,182 @@ fn cmd_load(input: Option<&Path>, json: bool) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `ociman import`: creates a brand-new, single-layer image straight
+/// from a plain tar, matching real `docker import`/`podman import`.
+/// Unlike `oci-archive`/`docker-archive` (`ociman load`), the input
+/// here is *just* a tar of file content, not a real image archive
+/// with any manifest/config of its own at all — this command
+/// synthesizes a fresh `ImageConfig`/`ImageManifest` around it, the
+/// same way `archive::load_docker_archive_manifest` synthesizes one
+/// for a `docker-archive` that also has none.
+///
+/// The input is normalized through two real scratch files (never held
+/// fully in memory): first decompressed (if gzip -- detected from the
+/// first two bytes read, the only compression this command
+/// recognizes; anything else is assumed to already be a plain tar)
+/// into a canonical plain-tar scratch file via
+/// [`oci_layer::decompress_verifying`], which also yields the layer's
+/// own real `diff_id`; then re-compressed via
+/// [`oci_layer::compress_for_storage`] into this project's own
+/// standard gzip encoding for storage. A real, deliberate two-copy
+/// trade-off for simplicity/robustness (this is a one-shot command,
+/// not a hot path `run`/`rm` benchmark cares about) — see this
+/// crate's own two-tempfile precedent in `archive.rs`'s
+/// `append_layer_decompressed`/`ingest_docker_archive_layer` for the
+/// same shape used elsewhere.
+fn cmd_import(
+    path: &str,
+    reference: Option<&str>,
+    message: Option<&str>,
+    change: &[String],
+    os: Option<&str>,
+    arch: Option<&str>,
+    json: bool,
+) -> anyhow::Result<()> {
+    use std::io::{Read as _, Seek as _};
+
+    // Parse and validate --change up front (fail fast, matching
+    // `ociman commit --change`'s own identical convention), before
+    // reading any input at all.
+    let instructions = change
+        .iter()
+        .map(|c| oci_dockerfile::parse_change(c).map_err(|e| anyhow::anyhow!("{e}")))
+        .collect::<anyhow::Result<Vec<oci_dockerfile::Instruction>>>()?;
+
+    let store = open_store()?;
+
+    let mut reader: Box<dyn std::io::Read> = if path == "-" {
+        Box::new(std::io::stdin())
+    } else {
+        Box::new(std::fs::File::open(path).with_context(|| format!("opening {path}"))?)
+    };
+    let mut peek = [0u8; 2];
+    let peeked = reader.read(&mut peek).context("reading input")?;
+    let compression = if peeked == 2 && peek == [0x1f, 0x8b] {
+        oci_layer::Compression::Gzip
+    } else {
+        oci_layer::Compression::None
+    };
+    let chained = std::io::Cursor::new(peek[..peeked].to_vec()).chain(reader);
+
+    let progress = oci_cli_common::progress::spinner("importing".to_string());
+    let result = (|| -> anyhow::Result<(oci_spec_types::Digest, oci_store::Ingested)> {
+        let mut plain = tempfile::NamedTempFile::new()
+            .context("creating a scratch file to normalize the imported tar")?;
+        let diff_id = oci_layer::decompress_verifying(chained, compression, plain.as_file_mut())
+            .context("reading the imported tar")?;
+        plain
+            .as_file_mut()
+            .seek(std::io::SeekFrom::Start(0))
+            .context("rewinding scratch file")?;
+
+        let mut compressed = tempfile::NamedTempFile::new()
+            .context("creating a scratch file to compress the imported layer")?;
+        oci_layer::compress_for_storage(plain.as_file_mut(), compressed.as_file_mut())
+            .context("compressing the imported layer")?;
+        compressed
+            .as_file_mut()
+            .seek(std::io::SeekFrom::Start(0))
+            .context("rewinding scratch file")?;
+        let ingested = store
+            .ingest(compressed.as_file_mut())
+            .context("storing the imported layer")?;
+        Ok((diff_id, ingested))
+    })();
+    progress.finish_and_clear();
+    let (diff_id, layer) = result.with_context(|| format!("importing {path}"))?;
+
+    let platform = Platform::host();
+    let now = format_rfc3339_utc(std::time::SystemTime::now());
+    let mut config = ImageConfig {
+        architecture: Some(arch.map(str::to_string).unwrap_or(platform.architecture)),
+        os: Some(os.map(str::to_string).unwrap_or(platform.os)),
+        created: Some(now.clone()),
+        author: None,
+        config: None,
+        rootfs: RootFs {
+            kind: "layers".to_string(),
+            diff_ids: vec![diff_id],
+        },
+        history: vec![HistoryEntry {
+            created: Some(now),
+            created_by: Some("ociman import".to_string()),
+            author: None,
+            comment: message.map(str::to_string),
+            empty_layer: false,
+        }],
+    };
+    for instruction in &instructions {
+        apply_change_instruction(&mut config, instruction)?;
+    }
+
+    let config_bytes =
+        serde_json::to_vec(&config).context("serializing the imported image's config")?;
+    let config_ingested = store
+        .ingest(&config_bytes[..])
+        .context("storing the imported image's config")?;
+
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: Some(MEDIA_TYPE_IMAGE_MANIFEST.to_string()),
+        config: Descriptor {
+            media_type: MEDIA_TYPE_IMAGE_CONFIG.to_string(),
+            digest: config_ingested.digest,
+            size: config_bytes.len() as u64,
+            urls: Vec::new(),
+            annotations: std::collections::BTreeMap::new(),
+            platform: None,
+        },
+        layers: vec![Descriptor {
+            media_type: MEDIA_TYPE_IMAGE_LAYER_GZIP.to_string(),
+            digest: layer.digest,
+            size: layer.size,
+            urls: Vec::new(),
+            annotations: std::collections::BTreeMap::new(),
+            platform: None,
+        }],
+        annotations: std::collections::BTreeMap::new(),
+    };
+    let manifest_bytes =
+        serde_json::to_vec(&manifest).context("serializing the imported image's manifest")?;
+    let manifest_ingested = store
+        .ingest(&manifest_bytes[..])
+        .context("storing the imported image's manifest")?;
+
+    let normalized_reference = match reference {
+        Some(raw) => {
+            let parsed =
+                Reference::parse(raw).with_context(|| format!("parsing reference {raw:?}"))?;
+            let normalized = parsed.to_string();
+            store
+                .put_image(&ImageRecord {
+                    reference: normalized.clone(),
+                    manifest_digest: manifest_ingested.digest.clone(),
+                })
+                .context("recording the imported image's tag")?;
+            Some(normalized)
+        }
+        None => None,
+    };
+
+    if json {
+        oci_cli_common::output::print_json(&ImportResult {
+            reference: normalized_reference,
+            digest: manifest_ingested.digest.to_string(),
+        })?;
+    } else {
+        println!("{}", manifest_ingested.digest);
+    }
+    Ok(())
+}
+
+/// `ociman import`'s own `--json` output.
+#[derive(Debug, Serialize)]
+struct ImportResult {
+    reference: Option<String>,
+    digest: String,
 }
 
 /// The real, default auth-file *write* path — deliberately **not**
@@ -1942,10 +2192,7 @@ struct HistoryEntryView {
 /// store/reference resolution of its own) specifically so this
 /// alignment logic has a direct, real-store-independent unit test —
 /// see this module's own `tests::history_layer_sizes_*` below.
-fn history_layer_sizes(
-    history: &[oci_spec_types::image::HistoryEntry],
-    layers: &[Descriptor],
-) -> Vec<u64> {
+fn history_layer_sizes(history: &[HistoryEntry], layers: &[Descriptor]) -> Vec<u64> {
     let non_empty_count = history.iter().filter(|e| !e.empty_layer).count();
     let mut layer_index = layers.len().saturating_sub(non_empty_count);
     history
@@ -3513,6 +3760,35 @@ fn cmd_diff(id: &str, json: bool) -> anyhow::Result<()> {
         println!("{marker} /{}", change.path.display());
     }
     Ok(())
+}
+
+/// `ociman export`: writes `id`'s own entire current filesystem to
+/// `output` (or standard output, matching real `podman export`'s own
+/// default) as a real, flat tar via `oci_layer::export_tree` — no
+/// whiteouts, no layer semantics, the whole live tree verbatim. Shares
+/// `cmd_diff`'s/`cmd_cp`'s own `resolve_container_root`, so the same
+/// rootless-overlay-rootfs gap (`docs/design/0146`) applies here too.
+fn cmd_export(id: &str, output: Option<&Path>) -> anyhow::Result<()> {
+    let (root, _state) = resolve_container_root(id, "export")?;
+
+    use std::io::Write as _;
+    match output {
+        Some(path) => {
+            let file = std::fs::File::create(path)
+                .with_context(|| format!("creating {}", path.display()))?;
+            let mut writer = std::io::BufWriter::new(file);
+            oci_layer::export_tree(&root, &mut writer)
+                .with_context(|| format!("exporting container {id:?}"))?;
+            writer.flush().context("flushing archive file")
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut writer = std::io::BufWriter::new(stdout.lock());
+            oci_layer::export_tree(&root, &mut writer)
+                .with_context(|| format!("exporting container {id:?}"))?;
+            writer.flush().context("flushing archive to stdout")
+        }
+    }
 }
 
 /// `ociman commit`'s own `--json` output shape, matching `ociman
@@ -6027,8 +6303,8 @@ mod tests {
         assert_eq!(result, strings(&["CAP_CHOWN", "CAP_FOWNER"]));
     }
 
-    fn history_entry(empty_layer: bool) -> oci_spec_types::image::HistoryEntry {
-        oci_spec_types::image::HistoryEntry {
+    fn history_entry(empty_layer: bool) -> HistoryEntry {
+        HistoryEntry {
             created: None,
             created_by: None,
             author: None,
@@ -6039,7 +6315,7 @@ mod tests {
 
     fn layer_descriptor(size: u64) -> Descriptor {
         Descriptor {
-            media_type: oci_spec_types::image::MEDIA_TYPE_IMAGE_LAYER_GZIP.to_string(),
+            media_type: MEDIA_TYPE_IMAGE_LAYER_GZIP.to_string(),
             digest: oci_spec_types::digest::sha256(size.to_string().as_bytes()),
             size,
             urls: vec![],
