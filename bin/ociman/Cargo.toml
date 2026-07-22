@@ -23,6 +23,7 @@ rustix = { workspace = true, features = ["fs", "process", "stdio"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tar.workspace = true
 tempfile.workspace = true
 tracing.workspace = true
 

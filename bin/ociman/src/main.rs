@@ -13,6 +13,7 @@
 //! its current, deliberately narrow scope), then the full podman-style
 //! v1 command set.
 
+mod archive;
 mod build;
 mod build_cache;
 mod rootfs_setup;
@@ -146,6 +147,19 @@ enum PullPolicy {
     Missing,
     Never,
     Newer,
+}
+
+/// `ociman save --format`'s own archive format — only `oci-archive`
+/// so far (see [`archive`]'s own doc comment for exactly why real
+/// `podman save`'s own default, `docker-archive`, isn't implemented
+/// yet: a real, separate format needing every layer decompressed
+/// first, deferred to a follow-up increment rather than attempted
+/// half-right here). No `DockerArchive` variant exists to select in
+/// the first place, so `--format docker-archive` is clap's own clear
+/// "invalid value" error, not a silent wrong-format fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SaveFormat {
+    OciArchive,
 }
 
 /// Shared by [`Command::Run`] and [`Command::Create`] (0157) -- every
@@ -1014,6 +1028,32 @@ enum Command {
         #[arg(long)]
         tail: Option<usize>,
     },
+    /// Save an already-stored image to a real, self-contained archive
+    /// file — matching real `podman save`/`docker save`, for the
+    /// `oci-archive` format only so far (see the `archive` module's
+    /// own doc comment for exactly why `docker-archive`, real
+    /// podman's own default, is deferred to a follow-up increment).
+    /// Only a single `IMAGE` is supported (real podman's own
+    /// `-m`/`--multi-image-archive` for several images in one archive
+    /// is out of scope for now too).
+    Save {
+        /// The already-stored image to save — a reference exactly as
+        /// it was pulled/built/tagged, or a real or short image ID
+        /// (the same short ID `ociman images`' own `DIGEST` column
+        /// prints).
+        reference: String,
+        /// Write the archive here instead of standard output (real
+        /// `podman save`'s own default, which requires stdout be
+        /// redirected to something other than a terminal — matched
+        /// here too: `ociman save image > out.tar` works exactly like
+        /// real `podman save image > out.tar` does).
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// Which real archive format to write — see `SaveFormat`'s
+        /// own doc comment for exactly what's implemented so far.
+        #[arg(long, value_enum, default_value_t = SaveFormat::OciArchive)]
+        format: SaveFormat,
+    },
     /// Display detailed version information, matching real `docker
     /// version`/`podman version` exactly for the "no remote server, no
     /// `Server:` section" case a real rootless `podman version`
@@ -1149,6 +1189,11 @@ fn main() -> std::process::ExitCode {
                 args,
             }) => cmd_exec(&id, user.as_deref(), cwd.as_deref(), &env, &args),
             Some(Command::Logs { id, follow, tail }) => cmd_logs(&id, follow, tail),
+            Some(Command::Save {
+                reference,
+                output,
+                format,
+            }) => cmd_save(&reference, output.as_deref(), format, cli.global.json),
             Some(Command::Version) => cmd_version(cli.global.json),
             Some(Command::Info) => cmd_info(cli.global.json),
         }
@@ -1269,6 +1314,76 @@ fn cmd_push(reference_str: &str, tls_verify: bool, json: bool) -> anyhow::Result
         println!("{}", record.manifest_digest);
     }
     Ok(())
+}
+
+/// `ociman save`'s own `--json` output — only ever printed when
+/// `--output` names a real file: when no `--output` is given, the
+/// archive itself goes to standard output, and printing anything else
+/// there too would corrupt it, exactly the same reasoning real
+/// `podman save`'s own no-`--quiet`-by-default *progress* output
+/// already goes to stderr, never stdout, for exactly this reason.
+#[derive(Debug, Serialize)]
+struct SaveResult {
+    reference: String,
+    digest: String,
+}
+
+fn cmd_save(
+    reference_str: &str,
+    output: Option<&Path>,
+    format: SaveFormat,
+    json: bool,
+) -> anyhow::Result<()> {
+    let store = open_store()?;
+    let resolved = resolve_image_by_reference_or_id(&store, reference_str)?
+        .ok_or_else(|| anyhow::anyhow!("{reference_str}: no such image in local storage"))?;
+    let record = resolved.record();
+
+    use std::io::Write as _;
+
+    let progress = oci_cli_common::progress::spinner(format!("saving {reference_str}"));
+    let result = match output {
+        Some(path) => (|| -> anyhow::Result<()> {
+            let file = std::fs::File::create(path)
+                .with_context(|| format!("creating {}", path.display()))?;
+            let mut writer = std::io::BufWriter::new(file);
+            write_archive(&store, record, format, &mut writer)?;
+            writer.flush().context("flushing archive file")
+        })(),
+        None => (|| -> anyhow::Result<()> {
+            let stdout = std::io::stdout();
+            let mut writer = std::io::BufWriter::new(stdout.lock());
+            write_archive(&store, record, format, &mut writer)?;
+            writer.flush().context("flushing archive to stdout")
+        })(),
+    };
+    progress.finish_and_clear();
+    result.with_context(|| format!("saving {reference_str}"))?;
+
+    // Nothing else is ever printed to stdout when the archive itself
+    // just went there (see `SaveResult`'s own doc comment).
+    if output.is_some() {
+        if json {
+            oci_cli_common::output::print_json(&SaveResult {
+                reference: record.reference.clone(),
+                digest: record.manifest_digest.to_string(),
+            })?;
+        } else {
+            println!("{}", record.manifest_digest);
+        }
+    }
+    Ok(())
+}
+
+fn write_archive(
+    store: &Store,
+    record: &ImageRecord,
+    format: SaveFormat,
+    writer: impl std::io::Write,
+) -> anyhow::Result<()> {
+    match format {
+        SaveFormat::OciArchive => archive::save_oci_archive(store, record, writer),
+    }
 }
 
 /// The real, default auth-file *write* path — deliberately **not**
