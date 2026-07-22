@@ -237,6 +237,7 @@ fn expand_instruction(
             flags: AddFlags {
                 chown: expand_opt(&flags.chown, env)?,
                 chmod: expand_opt(&flags.chmod, env)?,
+                checksum: expand_opt(&flags.checksum, env)?,
             },
             sources: expand_all(sources, env)?,
             dest: expand(dest, env)?,
@@ -419,6 +420,27 @@ mod tests {
                     chmod: None,
                 },
                 sources: vec!["".to_string()],
+                dest: "/app".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn add_expands_checksum_flag_too() {
+        let (global_args, stages) = stages_for(
+            "FROM scratch\nARG SUM=deadbeef\nADD --checksum=sha256:${SUM} https://example.com/f /app\n",
+            &no_overrides(),
+        );
+        let stage = expand_stage(&global_args, &no_overrides(), &stages[0]).unwrap();
+        assert_eq!(
+            stage.instructions[1],
+            Instruction::Add {
+                flags: AddFlags {
+                    chown: None,
+                    chmod: None,
+                    checksum: Some("sha256:deadbeef".to_string()),
+                },
+                sources: vec!["https://example.com/f".to_string()],
                 dest: "/app".to_string(),
             }
         );

@@ -9,11 +9,14 @@
 //! **Deliberately not handled yet** (see the crate's own doc comment
 //! for the reasoning): heredocs (`<<EOF ... EOF`), `ARG`/`ENV`
 //! variable substitution/interpolation within other instructions' own
-//! arguments, and every BuildKit-only flag (`RUN --mount=`/
+//! arguments, and every other BuildKit-only flag (`RUN --mount=`/
 //! `--network=`/`--security=`/`--device=`, `COPY --link`/`--parents`/
-//! `--exclude=`, `ADD --link`/`--keep-git-dir`/`--checksum=`/
-//! `--unpack`) — a Containerfile using any of these is rejected with a
-//! clear error, not silently misparsed.
+//! `--exclude=`, `ADD --link`/`--keep-git-dir`/`--unpack`) — a
+//! Containerfile using any of these is rejected with a clear error,
+//! not silently misparsed. `ADD --checksum=` *is* now parsed (see
+//! [`AddFlags::checksum`]) — its own real syntax/algorithm validation
+//! and enforcement live in `bin/ociman/src/build.rs`'s own
+//! `add_instruction`, not here.
 
 use crate::lexer::LogicalLine;
 
@@ -52,6 +55,15 @@ pub struct AddFlags {
     pub chown: Option<String>,
     /// Permission mode to `chmod` the added files to.
     pub chmod: Option<String>,
+    /// Raw `<algorithm>:<hex>` text for a remote-URL source's own
+    /// expected content digest — unvalidated here (this crate doesn't
+    /// depend on `oci-spec-types`'s own `Digest`/algorithm-support
+    /// rules at all), matching how `chmod`'s own raw octal string is
+    /// handled identically: real syntax/algorithm validation, and
+    /// which source kinds it's even legal to combine with, both
+    /// happen at the point of use instead — see `bin/ociman/src/
+    /// build.rs`'s own `add_instruction`.
+    pub checksum: Option<String>,
 }
 
 /// A `HEALTHCHECK` instruction's own parsed value — see
@@ -402,6 +414,7 @@ fn parse_add(rest: &str) -> Result<Instruction, String> {
         match name.as_str() {
             "chown" => flags.chown = Some(value),
             "chmod" => flags.chmod = Some(value),
+            "checksum" => flags.checksum = Some(value),
             other => return Err(format!("ADD: unsupported flag --{other}")),
         }
     }
@@ -896,6 +909,41 @@ mod tests {
             text: "ADD --from=builder a b".to_string(),
         };
         assert!(parse_instruction(&line).is_err());
+    }
+
+    #[test]
+    fn add_checksum_flag_parses_into_add_flags() {
+        assert_eq!(
+            parse("ADD --checksum=sha256:deadbeef https://example.com/f /dest"),
+            Instruction::Add {
+                flags: AddFlags {
+                    chown: None,
+                    chmod: None,
+                    checksum: Some("sha256:deadbeef".to_string()),
+                },
+                sources: vec!["https://example.com/f".to_string()],
+                dest: "/dest".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn add_checksum_combines_with_chown_and_chmod() {
+        assert_eq!(
+            parse(
+                "ADD --chown=1000:1000 --chmod=0644 --checksum=sha256:deadbeef \
+                 https://example.com/f /dest"
+            ),
+            Instruction::Add {
+                flags: AddFlags {
+                    chown: Some("1000:1000".to_string()),
+                    chmod: Some("0644".to_string()),
+                    checksum: Some("sha256:deadbeef".to_string()),
+                },
+                sources: vec!["https://example.com/f".to_string()],
+                dest: "/dest".to_string(),
+            }
+        );
     }
 
     #[test]

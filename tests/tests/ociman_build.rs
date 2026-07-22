@@ -2748,6 +2748,312 @@ fn add_from_remote_url_with_no_derivable_filename_into_a_directory_is_an_error()
     );
 }
 
+/// `ADD --checksum=sha256:<hex>` on a remote-URL source: a matching
+/// checksum lets the build succeed exactly like it would without
+/// `--checksum` at all.
+#[test]
+fn add_checksum_matching_the_real_content_succeeds() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-checksum-ok-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let addr = serve_one_response(
+        "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nhello world!",
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!(
+            "FROM ociman-test/add-checksum-ok-base:latest\n\
+             ADD --checksum=sha256:7509e5bda0c762d2bac7f90d758b5b2263fa01ccbc542ab5e3df163be08e6ca9 \
+             http://{addr}/greeting.txt /downloaded.txt\n"
+        ),
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/add-checksum-ok-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/add-checksum-ok-result:latest",
+            "--",
+            "/bin/cat",
+            "/downloaded.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "hello world!");
+}
+
+/// `ADD --checksum=` on a remote-URL source whose real content doesn't
+/// match is a hard build error -- no partial write, no layer
+/// committed, no image tagged -- matching real buildah's own identical
+/// all-or-nothing behavior (checked directly against `~/git/podman/
+/// vendor/go.podman.io/buildah/add.go`'s own `getURL`).
+#[test]
+fn add_checksum_mismatch_is_a_clear_error_and_taints_nothing() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-checksum-bad-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let addr = serve_one_response(
+        "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nhello world!",
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!(
+            "FROM ociman-test/add-checksum-bad-base:latest\n\
+             ADD --checksum=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+             http://{addr}/greeting.txt /downloaded.txt\n"
+        ),
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/add-checksum-bad-result:latest",
+        ],
+    );
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(stderr.contains("checksum mismatch"), "{stderr}");
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/add-checksum-bad-result:latest")
+            .unwrap()
+            .is_none(),
+        "a failed checksum must not leave a partial image tagged"
+    );
+}
+
+/// `--checksum` is only ever legal for exactly one, remote-URL source
+/// -- combined with a local build-context source, it's a clear,
+/// structural build error raised before anything is even downloaded,
+/// matching real BuildKit's own `dispatchCopy` (`~/git/moby/vendor/
+/// github.com/moby/buildkit/dockerfile2llb/convert_copy.go`).
+#[test]
+fn add_checksum_with_a_local_source_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-checksum-local-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("local.txt"), "local content").unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/add-checksum-local-base:latest\n\
+         ADD --checksum=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+         local.txt /dest.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/add-checksum-local-result:latest",
+        ],
+    );
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("can only be specified for a single, remote-URL source"),
+        "{stderr}"
+    );
+}
+
+/// `--checksum` combined with more than one remote-URL source is the
+/// same structural error, not silently applied to just the first one.
+#[test]
+fn add_checksum_with_multiple_sources_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-checksum-multi-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let addr1 =
+        serve_one_response("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\na");
+    let addr2 =
+        serve_one_response("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nb");
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!(
+            "FROM ociman-test/add-checksum-multi-base:latest\n\
+             ADD --checksum=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+             http://{addr1}/a.txt http://{addr2}/b.txt /dest/\n"
+        ),
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/add-checksum-multi-result:latest",
+        ],
+    );
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("can only be specified for a single, remote-URL source"),
+        "{stderr}"
+    );
+}
+
+/// A malformed `--checksum` value fails fast, before any network
+/// access at all (only one mock server started, and it's never even
+/// contacted if the flag itself is bad).
+#[test]
+fn add_checksum_with_bad_syntax_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-checksum-badsyntax-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/add-checksum-badsyntax-base:latest\n\
+         ADD --checksum=not-a-real-digest http://example.invalid/f /dest.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/add-checksum-badsyntax-result:latest",
+        ],
+    );
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(stderr.contains("--checksum"), "{stderr}");
+}
+
+/// `--checksum=sha512:...` is structurally a valid digest (`Digest::
+/// parse` accepts it) but this project's own `oci_spec_types::digest`
+/// deliberately never produces a `sha512` hash at all -- matching real
+/// Docker's own public documentation, which states `--checksum`
+/// "currently only" supports `sha256`, this is a clear, immediate
+/// error rather than a silently-unenforceable checksum.
+#[test]
+fn add_checksum_sha512_is_a_clear_unsupported_algorithm_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-checksum-sha512-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!(
+            "FROM ociman-test/add-checksum-sha512-base:latest\n\
+             ADD --checksum=sha512:{} http://example.invalid/f /dest.txt\n",
+            "0".repeat(128)
+        ),
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/add-checksum-sha512-result:latest",
+        ],
+    );
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(stderr.contains("only sha256 is supported"), "{stderr}");
+}
+
 /// `ADD` shares `COPY`'s own multi-source support exactly, by design
 /// (see `bin/ociman/src/build.rs`'s own module doc comment): multiple
 /// explicit sources, each landing under the destination by its own

@@ -185,7 +185,7 @@ use oci_spec_types::image::{
     ContainerConfig, Descriptor, ImageConfig, ImageManifest, MEDIA_TYPE_IMAGE_CONFIG,
     MEDIA_TYPE_IMAGE_MANIFEST, Platform, RootFs,
 };
-use oci_spec_types::{Digest, Reference};
+use oci_spec_types::{Algorithm, Digest, Reference};
 use oci_store::ImageRecord;
 use serde::Serialize;
 
@@ -1789,6 +1789,39 @@ fn add_instruction(
          a directory and end with a / ({dest:?})"
     );
 
+    // `--checksum` — checked directly against real BuildKit's own
+    // `dispatchCopy` (`~/git/moby/vendor/github.com/moby/buildkit/
+    // dockerfile2llb/convert_copy.go`): only ever legal for exactly
+    // one, remote-URL source, never a local build-context source and
+    // never combined with any other source at all — structural
+    // validation happens *before* anything is downloaded, matching
+    // BuildKit's own fail-fast ordering. Parsed and validated eagerly
+    // too (bad syntax is a build error before ever touching the
+    // network), and restricted to `sha256` specifically — real
+    // Docker's own public documentation states `--checksum` "currently
+    // only" supports `sha256`, even though a bare `Digest::parse`
+    // would otherwise also accept a structurally valid `sha512:...`
+    // this crate has no hasher for (`oci_spec_types::digest`'s own doc
+    // comment: "oci-tools never *produces*" `sha512`).
+    let expected_checksum = flags
+        .checksum
+        .as_deref()
+        .map(|checksum| -> anyhow::Result<Digest> {
+            anyhow::ensure!(
+                url_sources.len() == 1 && local_sources.is_empty(),
+                "ociman build: ADD --checksum can only be specified for a single, remote-URL \
+                 source"
+            );
+            let digest = Digest::parse(checksum)
+                .with_context(|| format!("ociman build: ADD --checksum={checksum:?}"))?;
+            anyhow::ensure!(
+                digest.algorithm() == Algorithm::Sha256,
+                "ociman build: ADD --checksum={checksum:?}: only sha256 is supported"
+            );
+            Ok(digest)
+        })
+        .transpose()?;
+
     // A cache lookup needs a real content digest of what's about to
     // be copied (see `copy_instruction`'s own identical handling) --
     // deliberately skipped whenever a remote URL source is present
@@ -1830,6 +1863,19 @@ fn add_instruction(
     for url in &url_sources {
         let downloaded =
             oci_dockerfile::download(url).with_context(|| format!("ADD: downloading {url:?}"))?;
+        if let Some(expected) = &expected_checksum {
+            // Hashed over the exact same raw bytes real buildah's own
+            // `getURL` tees its digester over — the downloaded body
+            // verbatim, before any archive-detection/extraction ever
+            // touches it. A mismatch aborts the whole instruction: no
+            // partial write, no layer ever committed, matching
+            // buildah's own identical all-or-nothing behavior.
+            let actual = oci_spec_types::digest::sha256(&downloaded.bytes);
+            anyhow::ensure!(
+                &actual == expected,
+                "ociman build: ADD: checksum mismatch for {url:?}: got {actual}, want {expected}"
+            );
+        }
         let target = if dest.ends_with('/') || dest_path.is_dir() {
             let file_name = downloaded.suggested_file_name.with_context(|| {
                 format!(

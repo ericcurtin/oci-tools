@@ -46,11 +46,12 @@
 //!
 //! **Deliberately not implemented yet** in this crate, each a
 //! separate, later increment of its own:
-//! - Heredocs (`<<EOF ... EOF`), and every BuildKit-only flag (`RUN
-//!   --mount=`, `COPY --link`/`--parents`/`--exclude=`, `ADD --link`/
-//!   `--keep-git-dir`/`--checksum=`/`--unpack`) — a Containerfile
-//!   using any of these fails to parse with a clear error, rather
-//!   than being silently misparsed.
+//! - Heredocs (`<<EOF ... EOF`), and every other BuildKit-only flag
+//!   (`RUN --mount=`, `COPY --link`/`--parents`/`--exclude=`, `ADD
+//!   --link`/`--keep-git-dir`/`--unpack`) — a Containerfile using any
+//!   of these fails to parse with a clear error, rather than being
+//!   silently misparsed. `ADD --checksum=` is now parsed here and
+//!   enforced by `bin/ociman/src/build.rs`.
 //! - `--build-arg`'s own CLI-string parsing (`KEY=value`/bare `KEY`
 //!   pulled from the calling process's own environment, matching real
 //!   `docker build --build-arg`/`podman build --build-arg`) is
