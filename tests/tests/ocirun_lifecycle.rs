@@ -592,3 +592,210 @@ fn create_start_kill_delete_removes_the_cgroup_directory() {
         cgroup_dir.display()
     );
 }
+
+/// Read a cgroup's own real `cpu.stat`'s own `usage_usec` field —
+/// the exact real, kernel-reported "how much CPU time has this cgroup
+/// ever consumed" counter this test uses to confirm a real freeze
+/// (the counter must not move *at all* while frozen) and a real
+/// resume (it must start moving again).
+fn read_cpu_usage_usec(cgroup_dir: &Path) -> u64 {
+    let content = std::fs::read_to_string(cgroup_dir.join("cpu.stat")).unwrap();
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix("usage_usec "))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// `ocirun pause`/`ocirun resume` against a real, running, CPU-
+/// burning container: pausing must make the cgroup's own real
+/// `cpu.stat`'s `usage_usec` counter stop moving *entirely* (not just
+/// slow down) for a real, measured wall-clock interval, and resuming
+/// must make it start moving again — the actual, real kernel-level
+/// effect this command exists for, not just that the CLI command
+/// itself exits successfully. Same real delegated-cgroup carrier-scope
+/// setup as `create_start_kill_delete_removes_the_cgroup_directory`
+/// above (only `create` needs it — `pause`/`resume` only ever write to
+/// a single file already owned by this uid, no cross-cgroup migration
+/// at all, so no carrier is needed for them either, confirmed directly
+/// while manually verifying this same real behavior before writing
+/// this test).
+#[test]
+fn pause_freezes_and_resume_thaws_a_real_running_containers_own_cpu_usage() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_scope_available() {
+        eprintln!(
+            "skipping: no reachable `systemd --user` session (systemd-run --user --scope failed)"
+        );
+        return;
+    }
+
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(
+        bundle_dir.path(),
+        &busybox,
+        &["/bin/sh", "-c", "i=0; while true; do i=$((i+1)); done"],
+    );
+
+    let config_path = bundle_dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    let uid = rustix::process::getuid().as_raw();
+    let target = format!(
+        "/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/ocirun-pause-test-{}",
+        std::process::id()
+    );
+    config["linux"]["cgroupsPath"] = serde_json::json!(target);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let cgroup_dir = Path::new("/sys/fs/cgroup").join(target.trim_start_matches('/'));
+
+    let carrier_unit = format!("ocirun-pause-test-carrier-{}.scope", std::process::id());
+    let create = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--slice=app.slice",
+            &format!("--unit={carrier_unit}"),
+            "--",
+        ])
+        .arg(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args(["create", "pause-test", "--bundle"])
+        .arg(bundle_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .expect("failed to spawn systemd-run");
+    assert!(
+        create.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let start = ocirun(root_dir.path(), &["start", "pause-test"]);
+    assert!(
+        start.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert_eq!(state_status(root_dir.path(), "pause-test"), "running");
+
+    // Let it genuinely burn some real CPU before pausing.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let pause = ocirun(root_dir.path(), &["pause", "pause-test"]);
+    assert!(
+        pause.status.success(),
+        "pause failed: {}",
+        String::from_utf8_lossy(&pause.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("cgroup.freeze"))
+            .unwrap()
+            .trim(),
+        "1",
+        "cgroup.freeze should read back \"1\" after a real pause"
+    );
+
+    let usage_just_after_pause = read_cpu_usage_usec(&cgroup_dir);
+    std::thread::sleep(Duration::from_millis(500));
+    let usage_after_waiting_while_frozen = read_cpu_usage_usec(&cgroup_dir);
+    assert_eq!(
+        usage_just_after_pause, usage_after_waiting_while_frozen,
+        "a real frozen container must not consume any more CPU at all while paused"
+    );
+
+    let resume = ocirun(root_dir.path(), &["resume", "pause-test"]);
+    assert!(
+        resume.status.success(),
+        "resume failed: {}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("cgroup.freeze"))
+            .unwrap()
+            .trim(),
+        "0",
+        "cgroup.freeze should read back \"0\" after a real resume"
+    );
+
+    std::thread::sleep(Duration::from_millis(300));
+    let usage_after_resume = read_cpu_usage_usec(&cgroup_dir);
+    assert!(
+        usage_after_resume > usage_after_waiting_while_frozen,
+        "a real resumed container must start consuming CPU again \
+         (frozen: {usage_after_waiting_while_frozen}, after resume: {usage_after_resume})"
+    );
+
+    let kill = ocirun(root_dir.path(), &["kill", "pause-test", "KILL"]);
+    assert!(kill.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "pause-test",
+            "stopped",
+            Duration::from_secs(5)
+        ),
+        "stopped"
+    );
+    let delete = ocirun(root_dir.path(), &["delete", "pause-test"]);
+    assert!(
+        delete.status.success(),
+        "delete failed: {}",
+        String::from_utf8_lossy(&delete.stderr)
+    );
+}
+
+/// `pause`/`resume` against a container that has already stopped is a
+/// clear, real error, not a silent no-op or a confusing raw I/O
+/// failure — matching real `runc pause`/`resume`'s own "not running"
+/// rejection.
+#[test]
+fn pause_and_resume_on_a_stopped_container_are_clear_errors() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(dir.path(), &busybox, &["/bin/true"]);
+    let root = tempfile::tempdir().unwrap();
+
+    let create = ocirun_create(root.path(), dir.path(), "pause-stopped-test");
+    assert!(create.status.success());
+    let start = ocirun(root.path(), &["start", "pause-stopped-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root.path(),
+            "pause-stopped-test",
+            "stopped",
+            Duration::from_secs(5)
+        ),
+        "stopped"
+    );
+
+    let pause = ocirun(root.path(), &["pause", "pause-stopped-test"]);
+    assert!(!pause.status.success());
+    assert!(
+        String::from_utf8_lossy(&pause.stderr).contains("cannot pause"),
+        "stderr: {}",
+        String::from_utf8_lossy(&pause.stderr)
+    );
+
+    let resume = ocirun(root.path(), &["resume", "pause-stopped-test"]);
+    assert!(!resume.status.success());
+    assert!(
+        String::from_utf8_lossy(&resume.stderr).contains("cannot resume"),
+        "stderr: {}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+}

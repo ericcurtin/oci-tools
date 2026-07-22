@@ -288,7 +288,7 @@ fn update_without_a_cgroup_is_a_clear_error() {
     );
     assert!(!update.status.success());
     let stderr = String::from_utf8_lossy(&update.stderr);
-    assert!(stderr.contains("no cgroup to update"), "{stderr}");
+    assert!(stderr.contains("has no cgroup"), "{stderr}");
 
     let kill = ocirun(root_dir.path(), &["kill", "no-cgroup-update-test", "KILL"]);
     assert!(kill.status.success());

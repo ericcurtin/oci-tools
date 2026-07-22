@@ -203,6 +203,23 @@ enum Command {
         #[arg(short, long)]
         resources: PathBuf,
     },
+    /// Freeze every process in a running container via the real
+    /// cgroup v2 freezer (`cgroup.freeze`) — matching real `runc
+    /// pause`'s own core effect exactly (see `docs/design/0142` for
+    /// this increment's own deliberately narrower scope: this
+    /// genuinely freezes the container, but `ocirun state`/`ocirun
+    /// list` don't yet report a separate `paused` status the way real
+    /// runc's own does).
+    Pause {
+        /// The container's ID.
+        id: String,
+    },
+    /// Thaw a container previously frozen by `pause`, matching real
+    /// `runc resume`'s own core effect exactly.
+    Resume {
+        /// The container's ID.
+        id: String,
+    },
 }
 
 /// Parse a `runc exec --user`-style `<uid>[:<gid>]` string: `uid` is
@@ -274,6 +291,8 @@ fn main() -> std::process::ExitCode {
                 ps_args,
             }) => cmd_ps(&root, &id, &format, &ps_args),
             Some(Command::Update { id, resources }) => cmd_update(&root, &id, &resources),
+            Some(Command::Pause { id }) => cmd_pause(&root, &id),
+            Some(Command::Resume { id }) => cmd_resume(&root, &id),
         }
     })
 }
@@ -662,6 +681,27 @@ fn cmd_ps(root: &Path, id: &str, format: &str, ps_args: &[String]) -> anyhow::Re
     }
 }
 
+/// Load `id`'s own persisted state and bundle, then resolve its real
+/// cgroup v2 directory — shared by `cmd_update`/`cmd_pause`/
+/// `cmd_resume` so there is exactly one implementation of "find this
+/// container's own cgroup", not three near-identical copies.
+fn resolve_cgroup_dir(root: &Path, id: &str) -> anyhow::Result<PathBuf> {
+    let store = StateStore::open(root)
+        .with_context(|| format!("opening container state root {}", root.display()))?;
+    let state = store.load(id)?;
+    let bundle = oci_runtime_core::Bundle::load(&state.bundle)
+        .with_context(|| format!("loading bundle from {}", state.bundle))?;
+    oci_runtime_core::cgroups::directory_for(
+        Path::new("/sys/fs/cgroup"),
+        bundle
+            .spec
+            .linux
+            .as_ref()
+            .and_then(|l| l.cgroups_path.as_deref()),
+    )?
+    .ok_or_else(|| anyhow::anyhow!("container {id:?} has no cgroup (no cgroupsPath set)"))
+}
+
 /// Update a running container's real cgroup resource limits — matches
 /// real `runc update --resources=<file>` exactly (`~/git/runc/
 /// update.go`): `plan_resources` only ever emits a write for a field
@@ -677,23 +717,7 @@ fn cmd_ps(root: &Path, id: &str, format: &str, ps_args: &[String]) -> anyhow::Re
 /// rewritten to reflect the change (a later `ocirun state` still shows
 /// the limits it was *created* with) — see `docs/design/0099`.
 fn cmd_update(root: &Path, id: &str, resources_path: &Path) -> anyhow::Result<()> {
-    let store = StateStore::open(root)
-        .with_context(|| format!("opening container state root {}", root.display()))?;
-    let state = store.load(id)?;
-
-    let bundle = oci_runtime_core::Bundle::load(&state.bundle)
-        .with_context(|| format!("loading bundle from {}", state.bundle))?;
-    let cgroup_dir = oci_runtime_core::cgroups::directory_for(
-        Path::new("/sys/fs/cgroup"),
-        bundle
-            .spec
-            .linux
-            .as_ref()
-            .and_then(|l| l.cgroups_path.as_deref()),
-    )?
-    .ok_or_else(|| {
-        anyhow::anyhow!("container {id:?} has no cgroup to update (no cgroupsPath set)")
-    })?;
+    let cgroup_dir = resolve_cgroup_dir(root, id)?;
 
     let resources: oci_spec_types::runtime::LinuxResources = if resources_path == Path::new("-") {
         serde_json::from_reader(std::io::stdin()).context("reading resources JSON from stdin")?
@@ -708,6 +732,48 @@ fn cmd_update(root: &Path, id: &str, resources_path: &Path) -> anyhow::Result<()
     oci_runtime_core::cgroups::apply(&cgroup_dir, &writes)
         .with_context(|| format!("applying updated resources to {}", cgroup_dir.display()))?;
     Ok(())
+}
+
+/// Matches real runc's own `Pause`: allowed for a container that's
+/// `Created` or `Running` (checked directly against `~/git/runc/
+/// libcontainer/container_linux.go`'s own `Pause`); anything else
+/// (most notably `Stopped`) is a clear error. Freezing an
+/// already-frozen cgroup is itself a real, harmless no-op at the
+/// kernel level (this project doesn't yet track a separate `Paused`
+/// status of its own to short-circuit on first — see this command's
+/// own doc comment in `main.rs`), so no extra check is needed for
+/// "already paused" specifically.
+fn cmd_pause(root: &Path, id: &str) -> anyhow::Result<()> {
+    let store = StateStore::open(root)
+        .with_context(|| format!("opening container state root {}", root.display()))?;
+    let state = store.load(id)?;
+    let status = state.effective_status();
+    if !matches!(status, Status::Created | Status::Running) {
+        anyhow::bail!("cannot pause a container in the {status} state");
+    }
+    let cgroup_dir = resolve_cgroup_dir(root, id)?;
+    oci_runtime_core::cgroups::set_frozen(&cgroup_dir, true)
+        .with_context(|| format!("freezing {}", cgroup_dir.display()))
+}
+
+/// Matches real runc's own `Resume`: allowed for the same `Created`/
+/// `Running` states `pause` itself accepts — this project has no
+/// separate `Paused` status of its own to require instead (real
+/// runc's own `Resume` requires exactly `Paused`; seeing `Running`
+/// here already covers the "was already paused, cgroup-wise" case,
+/// since this project reports pause/resume state via the real cgroup
+/// freezer directly, not a separate persisted status field).
+fn cmd_resume(root: &Path, id: &str) -> anyhow::Result<()> {
+    let store = StateStore::open(root)
+        .with_context(|| format!("opening container state root {}", root.display()))?;
+    let state = store.load(id)?;
+    let status = state.effective_status();
+    if !matches!(status, Status::Created | Status::Running) {
+        anyhow::bail!("cannot resume a container in the {status} state");
+    }
+    let cgroup_dir = resolve_cgroup_dir(root, id)?;
+    oci_runtime_core::cgroups::set_frozen(&cgroup_dir, false)
+        .with_context(|| format!("thawing {}", cgroup_dir.display()))
 }
 
 fn cmd_exec(

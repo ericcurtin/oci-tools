@@ -358,6 +358,78 @@ pub fn remove(cgroup_dir: &Path) -> io::Result<()> {
     unreachable!("the loop above always returns on its last attempt")
 }
 
+/// Freeze (`frozen = true`) or thaw (`frozen = false`) every process in
+/// `cgroup_dir` via the real cgroup v2 freezer (`cgroup.freeze`) — a
+/// direct port of runc's own `fs2` freezer driver (`~/git/runc/vendor/
+/// github.com/opencontainers/cgroups/fs2/freezer.go`, read directly):
+/// write `"1"` to freeze, `"0"` to thaw.
+///
+/// Thawing returns as soon as the write succeeds — releasing already-
+/// frozen tasks back to the scheduler doesn't take any real time the
+/// way stopping every one of them does, confirmed directly against the
+/// real source (`readFreezer` only ever polls when the state it just
+/// read back is `"1"`, never `"0"`). Freezing instead polls
+/// `cgroup.events` for a real `frozen 1` line — the kernel's own
+/// authoritative "every task in this cgroup has actually stopped"
+/// signal, since writing `"1"` to `cgroup.freeze` only *requests* a
+/// freeze, asynchronously — for up to ten seconds (`10ms` per attempt,
+/// `1000` attempts, matching runc's own exact constants), erroring with
+/// a clear timeout if the kernel never confirms it.
+pub fn set_frozen(cgroup_dir: &Path, frozen: bool) -> io::Result<()> {
+    std::fs::write(
+        cgroup_dir.join("cgroup.freeze"),
+        if frozen { "1" } else { "0" },
+    )?;
+    if frozen {
+        wait_frozen(cgroup_dir, std::time::Duration::from_millis(10), 1000)?;
+    }
+    Ok(())
+}
+
+/// Whether `cgroup_dir`'s own real cgroup v2 freezer currently reports
+/// the cgroup as frozen (`cgroup.freeze` reads back `"1"`).
+pub fn is_frozen(cgroup_dir: &Path) -> io::Result<bool> {
+    let content = std::fs::read_to_string(cgroup_dir.join("cgroup.freeze"))?;
+    Ok(content.trim() == "1")
+}
+
+/// Poll `cgroup_dir`'s own `cgroup.events` file (`interval` between
+/// attempts, up to `max_attempts` of them) until it reports a real
+/// `frozen 1` line, matching runc's own `waitFrozen` exactly (down to
+/// its own default `10ms`/`1000`-attempt budget, used unconditionally
+/// by the public, non-test-only [`set_frozen`] — separated out from it
+/// only so a real test below can use a far smaller, fast budget
+/// instead of really waiting up to ten seconds for a synthetic
+/// "never actually freezes" case).
+fn wait_frozen(
+    cgroup_dir: &Path,
+    interval: std::time::Duration,
+    max_attempts: u32,
+) -> io::Result<()> {
+    let events_path = cgroup_dir.join("cgroup.events");
+    for attempt in 0..max_attempts {
+        let content = std::fs::read_to_string(&events_path)?;
+        let reported_frozen = content
+            .lines()
+            .find_map(|line| line.strip_prefix("frozen "))
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false);
+        if reported_frozen {
+            return Ok(());
+        }
+        if attempt + 1 < max_attempts {
+            std::thread::sleep(interval);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "timed out waiting for {} to report a real \"frozen 1\"",
+            events_path.display()
+        ),
+    ))
+}
+
 /// Every real pid currently in `cgroup_dir`'s own `cgroup.procs`, plus
 /// every pid in any (recursively nested) sub-cgroup underneath it —
 /// matches real runc/crun's own `cgroups.GetAllPids` exactly (ported
@@ -899,6 +971,69 @@ mod tests {
         remove(&dir).unwrap();
         remover.join().unwrap();
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn set_frozen_false_writes_zero_and_returns_immediately_with_no_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `cgroup.events` file at all -- thawing must never look at
+        // it, matching real runc's own `readFreezer`, which only ever
+        // polls when the state it just wrote/read back is `"1"`.
+        set_frozen(dir.path(), false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("cgroup.freeze")).unwrap(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn is_frozen_reads_back_exactly_what_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.freeze"), "1").unwrap();
+        assert!(is_frozen(dir.path()).unwrap());
+        std::fs::write(dir.path().join("cgroup.freeze"), "0").unwrap();
+        assert!(!is_frozen(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn wait_frozen_returns_as_soon_as_a_real_frozen_1_line_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
+        wait_frozen(dir.path(), std::time::Duration::from_millis(1), 5).unwrap();
+    }
+
+    #[test]
+    fn wait_frozen_keeps_polling_until_a_background_writer_reports_frozen() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("cgroup.events");
+        std::fs::write(&events_path, "populated 1\nfrozen 0\n").unwrap();
+
+        let events_path_clone = events_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::fs::write(&events_path_clone, "populated 1\nfrozen 1\n").unwrap();
+        });
+        wait_frozen(dir.path(), std::time::Duration::from_millis(5), 100).unwrap();
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn wait_frozen_times_out_clearly_if_the_kernel_never_confirms_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        let err = wait_frozen(dir.path(), std::time::Duration::from_millis(1), 3).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn set_frozen_true_waits_for_a_real_frozen_1_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
+        set_frozen(dir.path(), true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("cgroup.freeze")).unwrap(),
+            "1"
+        );
     }
 
     #[test]
