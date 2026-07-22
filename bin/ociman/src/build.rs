@@ -221,8 +221,18 @@ pub fn cmd_build(
     pull_policy: crate::PullPolicy,
     add_host: &[String],
     squash: bool,
+    squash_all: bool,
     json: bool,
 ) -> anyhow::Result<()> {
+    // Matches real `podman build`'s own identical refusal (checked
+    // directly: `Error: cannot specify --squash with --layers and
+    // --squash-all with --squash`) -- the two are two different
+    // answers to the same question ("does the base get folded in
+    // too?"), never both at once.
+    anyhow::ensure!(
+        !(squash && squash_all),
+        "ociman build: --squash and --squash-all cannot be used together"
+    );
     let tag_reference = tag
         .map(|tag| Reference::parse(tag).with_context(|| format!("parsing tag {tag:?}")))
         .transpose()?;
@@ -284,15 +294,16 @@ pub fn cmd_build(
     // Loaded once, up front -- see `build_cache`'s own doc comment for
     // why re-reading it per instruction is unnecessary (nothing about
     // local storage changes mid-build) and `--no-cache` simply means
-    // "act as if local storage had no images at all yet". `--squash`
-    // disables the cache the exact same way -- checked directly
-    // against a real `podman build --squash`: re-running an otherwise
-    // identical, already-built `--squash` Containerfile still
-    // re-executes every `RUN` instead of reusing a cached layer, since
-    // a squashed build's own per-instruction layers never get stored
-    // as real, independently-addressable layers a future build could
-    // ever match against in the first place.
-    let cache_candidates = if no_cache || squash {
+    // "act as if local storage had no images at all yet". `--squash`/
+    // `--squash-all` both disable the cache the exact same way --
+    // checked directly against a real `podman build --squash`: re-
+    // running an otherwise identical, already-built `--squash`
+    // Containerfile still re-executes every `RUN` instead of reusing a
+    // cached layer, since a squashed build's own per-instruction
+    // layers never get stored as real, independently-addressable
+    // layers a future build could ever match against in the first
+    // place.
+    let cache_candidates = if no_cache || squash || squash_all {
         Vec::new()
     } else {
         crate::build_cache::load_candidates(&store)
@@ -379,13 +390,15 @@ pub fn cmd_build(
             dockerignore: &dockerignore,
         };
         let force_rootfs = copy_from_targets.contains(&stage_index);
-        // `--squash` only ever applies to the target stage itself --
-        // checked directly against a real `podman build --squash` on a
-        // multi-stage Containerfile: an earlier stage feeding a later
-        // one via `COPY --from=` is built completely normally, with its
-        // own real per-instruction layers, exactly as if `--squash`
-        // had never been passed at all; only the target's own newly
-        // added layers ever get folded into one.
+        // `--squash`/`--squash-all` only ever apply to the target
+        // stage itself -- checked directly against a real `podman
+        // build --squash`/`--squash-all` on a multi-stage
+        // Containerfile: an earlier stage feeding a later one via
+        // `COPY --from=` is built completely normally, with its own
+        // real per-instruction layers, exactly as if neither flag had
+        // ever been passed at all; only the target's own final result
+        // ever gets folded into one layer.
+        let is_target = stage_index == target;
         let built_stage = build_stage(
             &store,
             context,
@@ -399,7 +412,8 @@ pub fn cmd_build(
             tls_verify,
             pull_policy,
             add_host,
-            squash && stage_index == target,
+            squash && is_target,
+            squash_all && is_target,
         )?;
         built.insert(stage_index, built_stage);
     }
@@ -636,9 +650,21 @@ fn build_stage(
     pull_policy: crate::PullPolicy,
     add_host: &[String],
     squash: bool,
+    squash_all: bool,
 ) -> anyhow::Result<BuiltStage> {
     let mut config = base_config;
     let mut layers = base_layers;
+    // `base_layer_count`/`base_history_count` are captured *before*
+    // `--squash-all` ever discards anything -- `layers` (and the base
+    // manifest digest computed from it) still has to describe the
+    // real base layers a couple of lines down, when the rootfs itself
+    // gets populated by extracting/cloning exactly them. Only the
+    // post-loop squash step below (once that population has already
+    // happened) actually discards the base's own contribution to
+    // `layers`/`config.rootfs.diff_ids`/`config.history` for
+    // `--squash-all` -- seeded from these two counts, same as
+    // `--squash`'s own identical "which suffix is this stage's own"
+    // bookkeeping.
     let base_layer_count = layers.len();
     let base_history_count = config.history.len();
 
@@ -658,9 +684,15 @@ fn build_stage(
     // -- see this function's own squash post-processing below for why
     // that case forces nothing and adds no layer either, matching real
     // podman's own observed "nothing to build, just tag the base"
-    // no-op for that specific shape.
-    let needs_rootfs =
-        force_rootfs || has_fs_instructions || (squash && !stage.instructions.is_empty());
+    // no-op for that specific shape. `--squash-all` is different again
+    // from *that*: checked directly, it forces a rootfs (and produces
+    // one new, freshly-recompressed layer) even for a bare `FROM` --
+    // there is no cheap "byte-identical to the base" shortcut available
+    // once the base itself is being folded in too.
+    let needs_rootfs = force_rootfs
+        || has_fs_instructions
+        || (squash && !stage.instructions.is_empty())
+        || squash_all;
     let build_dir = if needs_rootfs {
         let scratch_root = build_scratch_root(store);
         std::fs::create_dir_all(&scratch_root)
@@ -803,36 +835,90 @@ fn build_stage(
     // --squash` is a true no-op for that shape too (the built image's
     // own ID comes back identical to the base's), so there is nothing
     // to squash and no new layer to add either.
-    if squash && config.history.len() > base_history_count {
+    //
+    // `--squash-all` always runs this block instead (never skipped,
+    // even for a bare `FROM` with zero history of its own -- checked
+    // directly, see `needs_rootfs`'s own doc comment above) -- unlike
+    // `--squash`, which only ever discards *this stage's own* layers/
+    // history (keeping the base's own untouched), `--squash-all`
+    // discards the base's own contribution too, right here, only
+    // *after* the rootfs has already been populated from it above (see
+    // `base_layer_count`/`base_history_count`'s own doc comment for
+    // why that ordering matters).
+    if squash_all || (squash && config.history.len() > base_history_count) {
         let rootfs_dir_ref = rootfs_dir
             .as_deref()
-            .expect("squash always forces a real rootfs whenever this stage added any history");
-        let before = before_stage_snapshot
-            .as_ref()
-            .expect("squash always captures a before-snapshot in lockstep with the rootfs above");
-        let squash_diff = oci_layer::changes(rootfs_dir_ref, before)
-            .context("diffing the target stage's own filesystem for --squash")?;
-        let committed = commit_layer(store, rootfs_dir_ref, &squash_diff)
-            .context("committing the squashed layer")?;
+            .expect("squash/squash-all always force a real rootfs whenever this block runs");
+        let committed = if squash_all {
+            // Whole current tree, no base to diff against at all --
+            // the exact same primitive `ociman commit --squash`
+            // already established (0174) for the identical "flatten
+            // everything, no base layers referenced" operation.
+            oci_dockerfile::squash_layer(store, rootfs_dir_ref).with_context(|| {
+                "squashing the target stage's own entire filesystem for --squash-all".to_string()
+            })?
+        } else {
+            let before = before_stage_snapshot.as_ref().expect(
+                "squash always captures a before-snapshot in lockstep with the rootfs above",
+            );
+            let squash_diff = oci_layer::changes(rootfs_dir_ref, before)
+                .context("diffing the target stage's own filesystem for --squash")?;
+            commit_layer(store, rootfs_dir_ref, &squash_diff)
+                .context("committing the squashed layer")?
+        };
 
-        layers.truncate(base_layer_count);
+        // `--squash` keeps the base's own layers (truncates back down
+        // to just them, `base_layer_count`); `--squash-all` discards
+        // them too (truncates to nothing at all) -- either way, then
+        // append the one new combined layer.
+        let kept_layer_count = if squash_all { 0 } else { base_layer_count };
+        layers.truncate(kept_layer_count);
         layers.push(committed.descriptor);
-        config.rootfs.diff_ids.truncate(base_layer_count);
+        config.rootfs.diff_ids.truncate(kept_layer_count);
         config.rootfs.diff_ids.push(committed.diff_id);
 
-        // Every history entry *this stage* added stays, in place, with
-        // its own original text -- matching real `podman build
-        // --squash`'s own `podman history` output exactly (checked
-        // directly): every one of them shows up with a real "size" of
-        // `0`/`empty_layer: true` except the very last, which alone
-        // carries the one new combined layer's own real weight.
-        let this_stage_history = &mut config.history[base_history_count..];
-        let last = this_stage_history
-            .len()
-            .checked_sub(1)
-            .expect("just checked config.history.len() > base_history_count above");
-        for (index, entry) in this_stage_history.iter_mut().enumerate() {
-            entry.empty_layer = index != last;
+        // Same idea for history: `--squash-all` drops the base's own
+        // *inherited* entries entirely (`base_history_count` of them,
+        // right at the front) before deciding what's left, where
+        // `--squash` never touches them at all.
+        if squash_all {
+            config.history.drain(..base_history_count);
+        }
+        let kept_history_count = if squash_all { 0 } else { base_history_count };
+        if config.history.len() > kept_history_count {
+            // Every history entry *this stage* added stays, in place,
+            // with its own original text -- matching real `podman
+            // build --squash`/`--squash-all`'s own `podman history`
+            // output exactly (checked directly): every one of them
+            // shows up with a real "size" of `0`/`empty_layer: true`
+            // except the very last, which alone carries the one new
+            // combined layer's own real weight.
+            let this_stage_history = &mut config.history[kept_history_count..];
+            let last = this_stage_history.len() - 1;
+            for (index, entry) in this_stage_history.iter_mut().enumerate() {
+                entry.empty_layer = index != last;
+            }
+        } else {
+            // Only reachable for `--squash-all` on a bare `FROM` (zero
+            // instructions of its own to repurpose an entry from, and
+            // the base's own inherited history was already discarded
+            // above) -- still needs exactly one real history entry,
+            // checked directly against a real `podman build
+            // --squash-all` producing exactly one there too. This
+            // project's own reasonable text, not an attempt at real
+            // buildah's own exact wording (matches this project's
+            // already-established "functional correctness over exact
+            // string content" convention, same as `--squash`'s own
+            // identical choice not to name the base in its text).
+            config.history.push(oci_spec_types::image::HistoryEntry {
+                created: Some(oci_spec_types::time::format_rfc3339_utc(
+                    std::time::SystemTime::now(),
+                )),
+                created_by: Some("ociman build --squash-all".to_string()),
+                author: None,
+                comment: None,
+                empty_layer: false,
+            });
         }
     }
 
@@ -2435,6 +2521,37 @@ pub(crate) fn copy_path_recursive(
 /// runs as already has the right ownership without this function
 /// doing anything about it.
 fn clone_cache_tree(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    let mut seen_inodes = std::collections::HashMap::new();
+    clone_cache_tree_inner(src, dest, &mut seen_inodes)
+}
+
+/// The actual recursive work [`clone_cache_tree`] wraps, threading a
+/// `(dev, ino) -> already-cloned destination path` map through the
+/// recursion -- real busybox-style images ship ~380 applets all
+/// hardlinked to one real binary; without this, every single one of
+/// them would be written out as its own full, independent copy
+/// instead (a real bug found and fixed here, surfaced by `--squash-
+/// all`'s own whole-tree export needing to walk this exact tree for
+/// the first time: `oci_layer::write_entry`'s own hardlink dedup,
+/// already established and tested since 0169, only has anything to
+/// deduplicate at all if the files it's walking are still genuinely
+/// hardlinked on disk in the first place — this function's own prior,
+/// plain `std::fs::copy`-only implementation silently broke that
+/// apart on every single clone, real busybox images ballooning from
+/// ~4-5MB to ~465MB in the process). This also directly contradicts
+/// this function's own doc comment above ("the exact same result
+/// `oci_layer::apply` would have produced" — which *does* preserve
+/// hardlinks for a real `Link`-type tar entry, unchanged since 0169) —
+/// not just a `--squash-all`-specific problem, but a real, silent
+/// extra disk-space cost this same function was *already* paying on
+/// every single build using a hardlink-heavy base image, squash or
+/// not, before this fix.
+fn clone_cache_tree_inner(
+    src: &Path,
+    dest: &Path,
+    seen_inodes: &mut std::collections::HashMap<(u64, u64), PathBuf>,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::fs::PermissionsExt as _;
 
     let metadata = std::fs::symlink_metadata(src)
@@ -2445,7 +2562,7 @@ fn clone_cache_tree(src: &Path, dest: &Path) -> anyhow::Result<()> {
         set_mode(dest, metadata.permissions().mode())?;
         for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
             let entry = entry.with_context(|| format!("reading {}", src.display()))?;
-            clone_cache_tree(&entry.path(), &dest.join(entry.file_name()))?;
+            clone_cache_tree_inner(&entry.path(), &dest.join(entry.file_name()), seen_inodes)?;
         }
     } else if metadata.file_type().is_symlink() {
         let link_target = std::fs::read_link(src)
@@ -2463,10 +2580,35 @@ fn clone_cache_tree(src: &Path, dest: &Path) -> anyhow::Result<()> {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&link_target, dest)
             .with_context(|| format!("creating symlink {}", dest.display()))?;
+    } else if metadata.nlink() > 1 {
+        // A real hardlink in the source cache tree -- if an earlier
+        // entry in this same clone already wrote out this exact
+        // `(dev, ino)`, hardlink to *that* destination path instead of
+        // copying the content again, preserving the source's own
+        // deduplication instead of silently exploding it back apart
+        // (see this function's own doc comment above for why that
+        // matters).
+        let key = (metadata.dev(), metadata.ino());
+        match seen_inodes.get(&key) {
+            Some(first_dest) => {
+                std::fs::hard_link(first_dest, dest).with_context(|| {
+                    format!(
+                        "hard-linking {} to {}",
+                        dest.display(),
+                        first_dest.display()
+                    )
+                })?;
+            }
+            None => {
+                std::fs::copy(src, dest)
+                    .with_context(|| format!("copying {} to {}", src.display(), dest.display()))?;
+                seen_inodes.insert(key, dest.to_path_buf());
+            }
+        }
     } else {
         // `std::fs::copy` already preserves a plain file's own
         // permission bits (documented behavior on Unix), so there is
-        // nothing more to do for the common case here.
+        // nothing more to do for the common (`nlink == 1`) case here.
         std::fs::copy(src, dest)
             .with_context(|| format!("copying {} to {}", src.display(), dest.display()))?;
     }
@@ -3024,5 +3166,48 @@ mod tests {
             "must stay a real symlink, not get dereferenced into a plain file copy"
         );
         assert_eq!(std::fs::read_link(&cloned_link).unwrap(), Path::new("real"));
+    }
+
+    /// A real, previously-latent bug (found via `--squash-all`'s own
+    /// whole-tree export needing to walk a cloned cache tree for the
+    /// first time, see `clone_cache_tree_inner`'s own doc comment): a
+    /// hardlinked source file must be cloned as a real hardlink too,
+    /// not silently exploded into an independent full copy -- a real
+    /// busybox-style base image ships ~380 applets all hardlinked to
+    /// one real binary, and copying each one independently instead
+    /// both wastes real disk space on every single build (squash or
+    /// not) and defeats `oci_layer::write_entry`'s own hardlink dedup
+    /// (0169) for any later whole-tree export of the cloned tree.
+    #[test]
+    fn clone_cache_tree_preserves_a_real_hardlink_not_an_independent_copy() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let first = src.path().join("first");
+        std::fs::write(&first, b"shared content").unwrap();
+        let second = src.path().join("second");
+        std::fs::hard_link(&first, &second).unwrap();
+        assert_eq!(
+            std::fs::metadata(&first).unwrap().nlink(),
+            2,
+            "sanity check: the source fixture itself must be a real hardlink"
+        );
+
+        let dest_root = dest.path().join("rootfs");
+        clone_cache_tree(src.path(), &dest_root).unwrap();
+
+        let cloned_first = dest_root.join("first");
+        let cloned_second = dest_root.join("second");
+        let first_meta = std::fs::metadata(&cloned_first).unwrap();
+        let second_meta = std::fs::metadata(&cloned_second).unwrap();
+        assert_eq!(
+            (first_meta.dev(), first_meta.ino()),
+            (second_meta.dev(), second_meta.ino()),
+            "the two cloned files should be the exact same real inode, not two independent \
+             copies that merely happen to share content"
+        );
+        assert_eq!(first_meta.nlink(), 2);
+        assert_eq!(std::fs::read(&cloned_second).unwrap(), b"shared content");
     }
 }

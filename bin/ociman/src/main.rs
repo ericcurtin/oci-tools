@@ -644,6 +644,20 @@ enum Command {
         /// with).
         #[arg(long)]
         squash: bool,
+        /// Like `--squash`, but folds the base image's own layers in
+        /// too — matching real `podman build --squash-all` exactly
+        /// (checked directly): the built image has exactly one layer
+        /// total, never referencing the base at all (the same "whole
+        /// current tree, no base layers" operation `ociman commit
+        /// --squash` already does, reused here directly), and — unlike
+        /// `--squash` — this happens even for a target stage with no
+        /// instructions of its own at all (a bare `FROM`), which
+        /// `--squash` treats as a true no-op instead. Mutually
+        /// exclusive with `--squash` (a clear error if both are
+        /// given), matching real `podman build`'s own identical
+        /// refusal.
+        #[arg(long)]
+        squash_all: bool,
     },
     /// List images in local storage.
     Images,
@@ -1386,6 +1400,7 @@ fn main() -> std::process::ExitCode {
                 pull,
                 add_host,
                 squash,
+                squash_all,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
@@ -1401,6 +1416,7 @@ fn main() -> std::process::ExitCode {
                 pull,
                 &add_host,
                 squash,
+                squash_all,
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),
