@@ -815,6 +815,14 @@ enum Command {
     Logs {
         /// The container's ID or `--name`.
         id: String,
+        /// Keep following the log as the container keeps producing
+        /// more output, matching real `docker logs -f`/`podman
+        /// logs -f` exactly: stops automatically once the container
+        /// itself exits (also matching a plain, non-`-f` `logs`'
+        /// own existing behavior against an already-stopped
+        /// container — nothing new to wait for).
+        #[arg(short, long)]
+        follow: bool,
     },
 }
 
@@ -956,7 +964,7 @@ fn main() -> std::process::ExitCode {
                 env,
                 args,
             }) => cmd_exec(&id, user.as_deref(), cwd.as_deref(), &env, &args),
-            Some(Command::Logs { id }) => cmd_logs(&id),
+            Some(Command::Logs { id, follow }) => cmd_logs(&id, follow),
         }
     })
 }
@@ -3273,34 +3281,114 @@ fn human_size(bytes: u64) -> String {
 
 /// Print a container's captured output (see `docs/design/0025`):
 /// everything its process has written to stdout/stderr since `run`
-/// started it, combined in the order it was produced. Doesn't yet
-/// support `-f`/`--follow` (tailing a still-running container's
-/// output live) — only ever prints what's been captured so far and
-/// exits, matching real `podman logs`/`docker logs`'s own *default*
-/// (non-`-f`) behavior.
+/// started it, combined in the order it was produced.
+///
+/// `follow` (`-f`/`--follow`) keeps polling the same, still-growing
+/// log file for new content (the log-tee thread `oci_runtime_core::
+/// launch::run_reporting_pid` spawns writes straight through an
+/// unbuffered `std::fs::File`, so new bytes are visible to any other
+/// process re-reading the file immediately, no artificial delay of
+/// this project's own making) until the container itself stops —
+/// matching real `docker logs -f`/`podman logs -f` exactly, including
+/// their own real "stop following automatically once the container
+/// exits" behavior (not "run forever until the user interrupts it",
+/// a real, checked-directly distinction: confirmed against a real
+/// `podman logs -f` on a container that then exits on its own,
+/// which returns control to the shell right away rather than hanging
+/// forever). Against an already-stopped container, `follow` has no
+/// effect at all — there's nothing left to wait for, so this behaves
+/// exactly like a plain, non-`-f` `logs` already did.
 ///
 /// A container that exists but has no log file yet (e.g. `rm --force`
 /// killed it before it produced any output, or it predates this
 /// feature) prints nothing rather than erroring — only an unknown
 /// container ID itself is an error, via the same `containers.load`
 /// every other subcommand already uses.
-fn cmd_logs(id: &str) -> anyhow::Result<()> {
+fn cmd_logs(id: &str, follow: bool) -> anyhow::Result<()> {
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)
         .with_context(|| format!("looking up container {id:?}"))?;
 
     let log_path = containers.container_dir(&resolved).join("container.log");
-    match std::fs::read(&log_path) {
-        Ok(bytes) => {
-            use std::io::Write as _;
-            std::io::stdout()
-                .write_all(&bytes)
-                .context("writing logs to stdout")?;
+    let mut file = loop {
+        match std::fs::File::open(&log_path) {
+            Ok(file) => break file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A container `ociman run`/`ociman run -d` only just
+                // created doesn't have a real `container.log` file at
+                // all yet (the log-tee thread creates it lazily, once
+                // the container's own process is actually about to
+                // start) -- with `follow`, that's not "nothing to
+                // show", it's "nothing *yet*": wait for it to appear
+                // as long as the container itself might still produce
+                // one (anything short of already `Stopped`), rather
+                // than racing a container that was simply too new to
+                // have a log file the very instant this command
+                // happened to run (a real bug this project's own
+                // tests caught directly: a detached `ociman run -d`
+                // immediately followed by `ociman logs -f` lost the
+                // container's entire real output this way before this
+                // fix).
+                if !follow {
+                    return Ok(());
+                }
+                let still_pending = containers
+                    .load(&resolved)
+                    .map(|s| s.effective_status() != Status::Stopped)
+                    .unwrap_or(false);
+                if !still_pending {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading {}", log_path.display()));
+            }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(e).with_context(|| format!("reading {}", log_path.display()));
+    };
+
+    print_new_log_bytes(&mut file)?;
+    if !follow {
+        return Ok(());
+    }
+
+    loop {
+        let still_running = containers
+            .load(&resolved)
+            .map(|s| s.effective_status() == Status::Running)
+            .unwrap_or(false);
+        if !still_running {
+            // One final read to catch anything written between the
+            // container's own last status transition and this check,
+            // then stop -- matches real `docker logs -f`/`podman
+            // logs -f`'s own "stop following once the container
+            // exits" behavior, rather than following forever.
+            print_new_log_bytes(&mut file)?;
+            break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        print_new_log_bytes(&mut file)?;
+    }
+    Ok(())
+}
+
+/// Read (and print to stdout) whatever real bytes have been appended
+/// to `file` since the last time this was called against it — plain
+/// `Read::read_to_end` from the file's own current position, which
+/// (unlike a pipe/FIFO) returns immediately once it hits the real,
+/// current end of an ordinary regular file rather than blocking for
+/// more, exactly the "read what's available right now" semantics
+/// [`cmd_logs`]'s own polling loop needs.
+fn print_new_log_bytes(file: &mut std::fs::File) -> anyhow::Result<()> {
+    use std::io::Read as _;
+    use std::io::Write as _;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .context("reading container log")?;
+    if !buf.is_empty() {
+        std::io::stdout()
+            .write_all(&buf)
+            .context("writing logs to stdout")?;
     }
     Ok(())
 }

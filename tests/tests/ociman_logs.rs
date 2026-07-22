@@ -179,3 +179,121 @@ fn logs_rejects_an_unknown_container_id() {
         "logs should refuse an unknown container id"
     );
 }
+
+/// `-f`/`--follow` streams a still-running container's own output as
+/// it's produced, and — matching real `docker logs -f`/`podman
+/// logs -f` exactly — returns on its own once the container stops,
+/// rather than hanging forever waiting to be interrupted.
+#[test]
+fn logs_follow_streams_a_running_containers_output_and_stops_when_it_exits() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/logs-follow:latest",
+        &busybox,
+        &["sh", "sleep", "echo"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/logs-follow:latest",
+        &[
+            "/bin/sh",
+            "-c",
+            "for i in 1 2 3; do echo line$i; sleep 0.2; done",
+        ],
+    );
+
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+
+    let start = Instant::now();
+    let logs = ociman(storage_dir.path(), &["logs", "-f", &id]);
+    let elapsed = start.elapsed();
+    assert!(
+        logs.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&logs.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&logs.stdout).into_owned();
+    assert!(stdout.contains("line1"), "got: {stdout:?}");
+    assert!(stdout.contains("line2"), "got: {stdout:?}");
+    assert!(stdout.contains("line3"), "got: {stdout:?}");
+    // It genuinely followed for a real duration (the container takes
+    // ~600ms to produce all three lines)...
+    assert!(
+        elapsed >= Duration::from_millis(400),
+        "returned suspiciously fast, {elapsed:?} -- did it actually follow at all?"
+    );
+    // ...but also returned on its own well before any reasonable test
+    // timeout, rather than hanging forever.
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "took too long: {elapsed:?}"
+    );
+
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "--force", &id]);
+}
+
+/// `-f` against an already-*stopped* container behaves exactly like a
+/// plain, non-`-f` `logs` -- there's nothing left to follow, so it
+/// must return immediately rather than blocking at all.
+#[test]
+fn logs_follow_on_an_already_stopped_container_returns_immediately() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/logs-follow-stopped:latest",
+        &busybox,
+        &["sh", "echo"],
+        ContainerConfig::default(),
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "ociman-test/logs-follow-stopped:latest",
+            "/bin/sh",
+            "-c",
+            "echo already-done",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+
+    let start = Instant::now();
+    let logs = ociman(storage_dir.path(), &["logs", "-f", &id]);
+    let elapsed = start.elapsed();
+    assert!(
+        logs.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&logs.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&logs.stdout).contains("already-done"),
+        "got: {:?}",
+        String::from_utf8_lossy(&logs.stdout)
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "-f against an already-stopped container should return immediately, took {elapsed:?}"
+    );
+}
