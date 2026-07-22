@@ -108,6 +108,294 @@ enum PullPolicy {
     Newer,
 }
 
+/// Shared by [`Command::Run`] and [`Command::Create`] (0157) -- every
+/// flag `run` itself understands beyond `--rm`/`--detach` (which only
+/// `run` has: `create` never launches at all, so "detach" is
+/// meaningless, and `--rm`'s own "auto-remove once it eventually runs
+/// and exits" needs new persisted state this project doesn't have yet
+/// to honor correctly from a *later*, separate `ociman start` -- see
+/// `cmd_create`'s own doc comment). Flattened via `#[command(flatten)]`
+/// rather than duplicated: both subcommands' own argument parsing and
+/// every one of these flags' own documentation/behavior live in
+/// exactly one place, matching this project's own "one implementation
+/// per function" design pillar just as much as any shared `crates/`
+/// code does.
+#[derive(Debug, clap::Args)]
+struct RunArgs {
+    /// Image reference to run.
+    image: String,
+    /// Command and arguments to run instead of the image's own
+    /// `ENTRYPOINT`/`CMD` default.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
+    /// A human-chosen name, usable anywhere the generated short id
+    /// is (`ps`/`rm`/`stop`/`exec`/`logs`) — matches real `docker
+    /// run --name`/`podman run --name`. Must be unique among
+    /// existing containers (stopped ones still hold their name
+    /// until removed) and start with a letter or digit, containing
+    /// only letters, digits, `_`, `.`, or `-` afterward. If not
+    /// given, the container is only addressable by its generated
+    /// id (no auto-generated fun name like real `docker`/`podman`
+    /// assign — see `docs/design/0032`'s own "what's still not
+    /// here").
+    #[arg(long)]
+    name: Option<String>,
+    /// Maximum memory the container's own cgroup may use, e.g.
+    /// `128m`/`1g` (binary units: `k`/`m`/`g`/`t` mean
+    /// 2^10/2^20/2^30/2^40 bytes, matching real `docker run
+    /// --memory`/`podman run --memory`) or a plain byte count with
+    /// no suffix. Exceeding it gets the container's own process
+    /// killed by the kernel's own cgroup v2 OOM killer, same as
+    /// real `docker`/`podman`.
+    #[arg(long)]
+    memory: Option<String>,
+    /// Total memory **+ swap** the container's own cgroup may use
+    /// (same units as `--memory`), matching real `docker run
+    /// --memory-swap`/`podman run --memory-swap`: a combined cap,
+    /// not a swap-only one. `-1` means unlimited swap. Requires
+    /// `--memory` to also be given (there is nothing to convert a
+    /// combined memory+swap figure relative to otherwise) —
+    /// matches real `docker`'s own validation
+    /// (`daemon/daemon_unix.go`'s `verifyPlatformContainerResources`).
+    /// If `--memory` is given but `--memory-swap` isn't, the
+    /// default is twice the memory limit (real `docker`'s own
+    /// default, `adaptContainerSettings`), unchanged from before
+    /// this flag existed. `allow_hyphen_values` so `-1` is
+    /// accepted as this flag's own value rather than misread as
+    /// an unrecognized flag of its own — see `--pids-limit`'s own
+    /// doc comment for why this matters.
+    #[arg(long = "memory-swap", allow_hyphen_values = true)]
+    memory_swap: Option<String>,
+    /// Maximum number of CPUs the container's own cgroup may use
+    /// (may be fractional, e.g. `1.5`), matching real `docker run
+    /// --cpus`/`podman run --cpus`. Translated to a CPU-time quota
+    /// over a fixed 100ms period (`quota = cpus * 100_000`,
+    /// microseconds) — checked directly against real `moby`'s own
+    /// `NanoCPUs`-to-`cpu.quota` conversion
+    /// (`daemon/daemon_unix.go`).
+    #[arg(long)]
+    cpus: Option<f64>,
+    /// Maximum number of processes/threads the container's own
+    /// cgroup may create, matching real `docker run
+    /// --pids-limit`/`podman run --pids-limit`. `0` or negative
+    /// means unlimited — matches real `docker`'s own convention
+    /// (`daemon/daemon_unix.go`'s `getPidsLimit`), not a plain
+    /// pass-through of whatever value is given.
+    ///
+    /// `allow_hyphen_values`: without it, clap treats `--pids-limit
+    /// -1` as an unrecognized `-1` *flag* rather than this flag's
+    /// own negative value (clap's default for any option whose
+    /// value merely *looks* like another flag) — caught by hand
+    /// running the exact real invocation real `docker run
+    /// --pids-limit -1`/`podman run --pids-limit -1` both accept
+    /// today, which this project's own CLI silently rejected
+    /// before this fix, a real drop-in-compatibility gap now
+    /// closed.
+    #[arg(long = "pids-limit", allow_hyphen_values = true)]
+    pids_limit: Option<i64>,
+    /// Which CPUs the container's own cgroup may run on
+    /// (`cpuset.cpus`-style range list, e.g. `0-2` or `0,2`),
+    /// matching real `docker run --cpuset-cpus`/`podman run
+    /// --cpuset-cpus`. No syntax validation is done here — same as
+    /// real `docker`, which passes this straight through to the
+    /// runtime spec and lets the kernel reject a malformed value —
+    /// an unparseable string is silently skipped rather than
+    /// applied (see `oci_runtime_core::systemd_cgroup`'s own
+    /// `AllowedCPUs` translation).
+    ///
+    /// **Known limitation, found by hand, not assumed**: on a
+    /// typical rootless host, real `systemd --user` does not
+    /// reliably delegate the `cpuset` controller down to this
+    /// container's own scope the way it does for `--memory`/
+    /// `--cpus` (`man systemd.resource-control` itself warns
+    /// `AllowedCPUs=` "may be limited by parent units") — the
+    /// property is still set correctly, but real kernel-level CPU
+    /// pinning may not actually take effect. See `docs/design/0056`.
+    #[arg(long = "cpuset-cpus")]
+    cpuset_cpus: Option<String>,
+    /// Which NUMA memory nodes the container's own cgroup may use
+    /// (`cpuset.mems`-style range list), matching real `docker run
+    /// --cpuset-mems`/`podman run --cpuset-mems`. Same "no syntax
+    /// validation, kernel/translation-layer rejects a bad value",
+    /// and the same rootless delegation caveat, as `--cpuset-cpus`.
+    #[arg(long = "cpuset-mems")]
+    cpuset_mems: Option<String>,
+    /// Override the container's own seccomp confinement, matching
+    /// real `docker run --security-opt seccomp=<value>`/`podman
+    /// run --security-opt seccomp=<value>` (repeatable, like real
+    /// `docker`/`podman`, though only the `seccomp=` key is
+    /// implemented so far — any other key, e.g. real `docker`/
+    /// `podman`'s own `apparmor=`/`label=`/`no-new-privileges`,
+    /// is rejected with a clear error rather than silently
+    /// ignored). `seccomp=unconfined` disables seccomp entirely;
+    /// `seccomp=<path>` reads a JSON seccomp profile (the same
+    /// `{"defaultAction": ..., "syscalls": [...]}` shape real
+    /// `docker`'s own default profile uses) from `<path>` and uses
+    /// it verbatim instead of this project's own bundled default
+    /// (0044) — unlike the bundled default, a custom profile is
+    /// never filtered down to this build's own supported syscall
+    /// set first: an unknown syscall name in a file the caller
+    /// explicitly supplied is a real, surfaced error (from
+    /// `oci_runtime_core::seccomp::apply`'s own existing strict
+    /// validation), not something to silently drop. `--privileged`
+    /// (its own separate flag, see below) also disables seccomp,
+    /// but only when no `--security-opt seccomp=` was explicitly
+    /// given at all — an explicit choice here always wins.
+    #[arg(long = "security-opt")]
+    security_opt: Vec<String>,
+    /// Grant additional capabilities beyond this project's own
+    /// `podman`-default set, matching real `docker run
+    /// --cap-add`/`podman run --cap-add`. A bare name (`net_admin`)
+    /// or an already-`CAP_`-prefixed one (`CAP_NET_ADMIN`) both
+    /// work, case-insensitively — matching real `docker`/`podman`'s
+    /// own normalization (checked directly against
+    /// `~/git/container-libs/common/pkg/capabilities/
+    /// capabilities.go`'s own `NormalizeCapabilities`). The special
+    /// value `all` grants every capability this build recognizes.
+    /// Repeatable, and a single use may also be a comma-separated
+    /// list (`--cap-add=net_admin,sys_time`), matching real
+    /// `docker`/`podman`'s own flag (a `pflag.StringSlice`, which
+    /// supports both shapes at once).
+    #[arg(long = "cap-add", value_delimiter = ',')]
+    cap_add: Vec<String>,
+    /// Remove capabilities from this project's own `podman`-default
+    /// set, matching real `docker run --cap-drop`/`podman run
+    /// --cap-drop`. Same name normalization and `all` special value
+    /// as `--cap-add` (`--cap-drop=all` starts from an empty set
+    /// instead of the usual default, keeping only whatever
+    /// `--cap-add` separately grants — matching real `docker`/
+    /// `podman`'s own `MergeCapabilities` exactly). Giving the same
+    /// capability to both `--cap-add` and `--cap-drop` is a real,
+    /// surfaced error, not silently resolved one way or the other.
+    #[arg(long = "cap-drop", value_delimiter = ',')]
+    cap_drop: Vec<String>,
+    /// Grant the container every capability this build recognizes
+    /// and disable seccomp confinement entirely, matching real
+    /// `docker run --privileged`/`podman run --privileged`'s own
+    /// two best-checked effects (`~/git/container-libs`'s own
+    /// vendored `runtime-tools/generate/generate.go`'s
+    /// `SetupPrivileged` grants every known capability;
+    /// `pkg/specgen/generate/security_linux.go` forces seccomp to
+    /// `unconfined` unless a *different* `--security-opt seccomp=`
+    /// value was explicitly given, in which case the explicit
+    /// choice wins). `--cap-add`/`--cap-drop` still apply on top
+    /// of the all-capabilities base, same as they would on top of
+    /// the ordinary default. **Narrower than real `docker`/
+    /// `podman`'s own `--privileged`**: does not mount every host
+    /// device, disable the device-cgroup restriction, or touch
+    /// SELinux/AppArmor labeling — none of which this project
+    /// implements at all yet (device access and SELinux/AppArmor
+    /// are both still-open gaps, not silently-ignored `--privileged`
+    /// specifics).
+    #[arg(long)]
+    privileged: bool,
+    /// Mount the container's own rootfs read-only, matching real
+    /// `docker run --read-only`/`podman run --read-only` exactly
+    /// (both default to a writable rootfs, only this flag makes it
+    /// read-only). See `synthesize_spec`'s own doc comment for why
+    /// the default is writable.
+    #[arg(long = "read-only")]
+    read_only: bool,
+    /// Set an additional environment variable, `KEY=value`, or
+    /// pull one from `ociman`'s own process environment by bare
+    /// name (`KEY`, dropped entirely if unset there) — matching
+    /// real `docker run -e`/`podman run -e` exactly, including the
+    /// bare-name pass-through (same convention `--build-arg`
+    /// already uses). Repeatable; overrides an image's own default
+    /// value for the same name rather than adding a second,
+    /// shadowed entry (see `apply_env_overrides`'s own doc
+    /// comment for why that distinction is real, not cosmetic).
+    #[arg(short, long = "env")]
+    env: Vec<String>,
+    /// Set the container's own UTS hostname, matching real
+    /// `docker run --hostname`/`podman run --hostname` exactly.
+    /// Defaults to the container's own generated id (real
+    /// `podman`'s own documented default too — checked directly
+    /// against `container-libs`'s own vendored `pkg/specgen/
+    /// specgen.go`: "will be set to the container ID" when unset
+    /// and the UTS namespace is private, which it always is here).
+    /// No format validation — passed straight through to the
+    /// kernel's own `sethostname(2)`, which rejects a genuinely
+    /// invalid value itself, same as every other pass-through flag
+    /// this project's own CLI already has (`--cpuset-cpus`/
+    /// `--cpuset-mems`).
+    #[arg(long)]
+    hostname: Option<String>,
+    /// Add an extra `/etc/hosts` entry: `name[;name2...]:IP`,
+    /// repeatable — matching real `docker run --add-host`/
+    /// `podman run --add-host` exactly (checked directly against
+    /// `~/git/container-libs/common/libnetwork/etchosts`'s own
+    /// `parseExtraHosts`). This project sets up no container
+    /// networking of its own at all yet, so a container's
+    /// synthesized `/etc/hosts` otherwise always matches real
+    /// podman's own `--network=none` case exactly (`127.0.0.1`/
+    /// `::1 localhost`, plus the container's own hostname/name
+    /// mapped to `127.0.0.1`) — see `write_etc_hosts`'s own doc
+    /// comment for the one real gap this narrows: the special
+    /// `host-gateway` IP keyword isn't supported (there is no
+    /// real host-reachable gateway address to resolve it to
+    /// without a real network setup of this project's own).
+    #[arg(long = "add-host", value_name = "HOST:IP")]
+    add_host: Vec<String>,
+    /// Override the working directory the container's own process
+    /// starts in, matching real `docker run -w`/`podman run -w`
+    /// exactly. Defaults to the image's own `WORKDIR` config (or
+    /// `/` if the image sets none), same as `ociman exec --cwd`'s
+    /// own analogous override for an already-running container.
+    #[arg(short = 'w', long = "workdir")]
+    workdir: Option<String>,
+    /// Override the image's own `ENTRYPOINT`, matching real
+    /// `docker run --entrypoint`/`podman run --entrypoint`
+    /// exactly: a JSON string array (`'["a", "b"]'`), or, if that
+    /// fails to parse, the whole value as one literal argument —
+    /// checked directly against real podman's own exact fallback
+    /// rule (`specgenutil::specgen`'s own `Entrypoint` handling).
+    /// Unlike the image's own default `ENTRYPOINT`, an override
+    /// also suppresses the image's own default `CMD` fallback
+    /// entirely when no trailing command is given on the command
+    /// line too (checked directly against real podman's own
+    /// `makeCommand`, `pkg/specgen/generate/oci.go` — see
+    /// `command_for`'s own doc comment for the exact rule). An
+    /// empty value (`--entrypoint ""`) clears `ENTRYPOINT`
+    /// entirely, real docker/podman's own documented convention.
+    #[arg(long)]
+    entrypoint: Option<String>,
+    /// Bind-mount a real host path into the container:
+    /// `HOST-DIR:CONTAINER-DIR[:ro]`, matching real `docker run
+    /// -v`/`podman run -v`'s own bind-mount form exactly (both
+    /// paths absolute; `ro` is the only supported third field —
+    /// this project has no volume-management subsystem of its own
+    /// at all, so a bare container-only path or a named-volume
+    /// name, both real `docker`/`podman` features for volumes this
+    /// project doesn't have, are rejected with a clear error
+    /// rather than silently misinterpreted). Repeatable. The host
+    /// path is created as a directory if it doesn't already exist
+    /// (matching real `docker`'s own long-documented default for a
+    /// missing bind-mount source). See `docs/design/0086` for the
+    /// real rootless-uid-mapping caveat this shares with every
+    /// other path in the container's own rootfs: a host file/
+    /// directory not owned by the user actually running `ociman`
+    /// appears with an unmapped (`nobody`-like) owner inside the
+    /// container, not a bug specific to `-v`.
+    #[arg(short, long = "volume", value_name = "HOST:CONTAINER[:ro]")]
+    volume: Vec<String>,
+    /// Require HTTPS and verify certificates when pulling `image`
+    /// (only consulted if it isn't already present in local
+    /// storage) — see `Command::Pull`'s own identical flag for the
+    /// exact same syntax/semantics.
+    #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    tls_verify: bool,
+    /// Image-pull policy — matching real `podman run --pull`
+    /// exactly, including a real, checked-directly quirk of its
+    /// own: unlike `Command::Build`'s identical flag, this one
+    /// has no default-missing-value at all, so a bare `--pull`
+    /// with no explicit value is a real, immediate CLI parse
+    /// error here (confirmed directly against a real `podman
+    /// run --pull` with no value), not a silent `always`.
+    #[arg(long, value_enum, default_value_t = PullPolicy::Missing)]
+    pull: PullPolicy,
+}
+
 #[derive(Debug, clap::Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Command {
@@ -368,12 +656,8 @@ enum Command {
     /// removable via `rm`) after it exits unless `--rm` is given,
     /// matching real `docker run`/`podman run`.
     Run {
-        /// Image reference to run.
-        image: String,
-        /// Command and arguments to run instead of the image's own
-        /// `ENTRYPOINT`/`CMD` default.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        #[command(flatten)]
+        args: RunArgs,
         /// Remove the container's storage automatically once it exits.
         #[arg(long)]
         rm: bool,
@@ -383,272 +667,18 @@ enum Command {
         /// fully captured (`ociman logs`), just never shown live.
         #[arg(short, long)]
         detach: bool,
-        /// A human-chosen name, usable anywhere the generated short id
-        /// is (`ps`/`rm`/`stop`/`exec`/`logs`) — matches real `docker
-        /// run --name`/`podman run --name`. Must be unique among
-        /// existing containers (stopped ones still hold their name
-        /// until removed) and start with a letter or digit, containing
-        /// only letters, digits, `_`, `.`, or `-` afterward. If not
-        /// given, the container is only addressable by its generated
-        /// id (no auto-generated fun name like real `docker`/`podman`
-        /// assign — see `docs/design/0032`'s own "what's still not
-        /// here").
-        #[arg(long)]
-        name: Option<String>,
-        /// Maximum memory the container's own cgroup may use, e.g.
-        /// `128m`/`1g` (binary units: `k`/`m`/`g`/`t` mean
-        /// 2^10/2^20/2^30/2^40 bytes, matching real `docker run
-        /// --memory`/`podman run --memory`) or a plain byte count with
-        /// no suffix. Exceeding it gets the container's own process
-        /// killed by the kernel's own cgroup v2 OOM killer, same as
-        /// real `docker`/`podman`.
-        #[arg(long)]
-        memory: Option<String>,
-        /// Total memory **+ swap** the container's own cgroup may use
-        /// (same units as `--memory`), matching real `docker run
-        /// --memory-swap`/`podman run --memory-swap`: a combined cap,
-        /// not a swap-only one. `-1` means unlimited swap. Requires
-        /// `--memory` to also be given (there is nothing to convert a
-        /// combined memory+swap figure relative to otherwise) —
-        /// matches real `docker`'s own validation
-        /// (`daemon/daemon_unix.go`'s `verifyPlatformContainerResources`).
-        /// If `--memory` is given but `--memory-swap` isn't, the
-        /// default is twice the memory limit (real `docker`'s own
-        /// default, `adaptContainerSettings`), unchanged from before
-        /// this flag existed. `allow_hyphen_values` so `-1` is
-        /// accepted as this flag's own value rather than misread as
-        /// an unrecognized flag of its own — see `--pids-limit`'s own
-        /// doc comment for why this matters.
-        #[arg(long = "memory-swap", allow_hyphen_values = true)]
-        memory_swap: Option<String>,
-        /// Maximum number of CPUs the container's own cgroup may use
-        /// (may be fractional, e.g. `1.5`), matching real `docker run
-        /// --cpus`/`podman run --cpus`. Translated to a CPU-time quota
-        /// over a fixed 100ms period (`quota = cpus * 100_000`,
-        /// microseconds) — checked directly against real `moby`'s own
-        /// `NanoCPUs`-to-`cpu.quota` conversion
-        /// (`daemon/daemon_unix.go`).
-        #[arg(long)]
-        cpus: Option<f64>,
-        /// Maximum number of processes/threads the container's own
-        /// cgroup may create, matching real `docker run
-        /// --pids-limit`/`podman run --pids-limit`. `0` or negative
-        /// means unlimited — matches real `docker`'s own convention
-        /// (`daemon/daemon_unix.go`'s `getPidsLimit`), not a plain
-        /// pass-through of whatever value is given.
-        ///
-        /// `allow_hyphen_values`: without it, clap treats `--pids-limit
-        /// -1` as an unrecognized `-1` *flag* rather than this flag's
-        /// own negative value (clap's default for any option whose
-        /// value merely *looks* like another flag) — caught by hand
-        /// running the exact real invocation real `docker run
-        /// --pids-limit -1`/`podman run --pids-limit -1` both accept
-        /// today, which this project's own CLI silently rejected
-        /// before this fix, a real drop-in-compatibility gap now
-        /// closed.
-        #[arg(long = "pids-limit", allow_hyphen_values = true)]
-        pids_limit: Option<i64>,
-        /// Which CPUs the container's own cgroup may run on
-        /// (`cpuset.cpus`-style range list, e.g. `0-2` or `0,2`),
-        /// matching real `docker run --cpuset-cpus`/`podman run
-        /// --cpuset-cpus`. No syntax validation is done here — same as
-        /// real `docker`, which passes this straight through to the
-        /// runtime spec and lets the kernel reject a malformed value —
-        /// an unparseable string is silently skipped rather than
-        /// applied (see `oci_runtime_core::systemd_cgroup`'s own
-        /// `AllowedCPUs` translation).
-        ///
-        /// **Known limitation, found by hand, not assumed**: on a
-        /// typical rootless host, real `systemd --user` does not
-        /// reliably delegate the `cpuset` controller down to this
-        /// container's own scope the way it does for `--memory`/
-        /// `--cpus` (`man systemd.resource-control` itself warns
-        /// `AllowedCPUs=` "may be limited by parent units") — the
-        /// property is still set correctly, but real kernel-level CPU
-        /// pinning may not actually take effect. See `docs/design/0056`.
-        #[arg(long = "cpuset-cpus")]
-        cpuset_cpus: Option<String>,
-        /// Which NUMA memory nodes the container's own cgroup may use
-        /// (`cpuset.mems`-style range list), matching real `docker run
-        /// --cpuset-mems`/`podman run --cpuset-mems`. Same "no syntax
-        /// validation, kernel/translation-layer rejects a bad value",
-        /// and the same rootless delegation caveat, as `--cpuset-cpus`.
-        #[arg(long = "cpuset-mems")]
-        cpuset_mems: Option<String>,
-        /// Override the container's own seccomp confinement, matching
-        /// real `docker run --security-opt seccomp=<value>`/`podman
-        /// run --security-opt seccomp=<value>` (repeatable, like real
-        /// `docker`/`podman`, though only the `seccomp=` key is
-        /// implemented so far — any other key, e.g. real `docker`/
-        /// `podman`'s own `apparmor=`/`label=`/`no-new-privileges`,
-        /// is rejected with a clear error rather than silently
-        /// ignored). `seccomp=unconfined` disables seccomp entirely;
-        /// `seccomp=<path>` reads a JSON seccomp profile (the same
-        /// `{"defaultAction": ..., "syscalls": [...]}` shape real
-        /// `docker`'s own default profile uses) from `<path>` and uses
-        /// it verbatim instead of this project's own bundled default
-        /// (0044) — unlike the bundled default, a custom profile is
-        /// never filtered down to this build's own supported syscall
-        /// set first: an unknown syscall name in a file the caller
-        /// explicitly supplied is a real, surfaced error (from
-        /// `oci_runtime_core::seccomp::apply`'s own existing strict
-        /// validation), not something to silently drop. `--privileged`
-        /// (its own separate flag, see below) also disables seccomp,
-        /// but only when no `--security-opt seccomp=` was explicitly
-        /// given at all — an explicit choice here always wins.
-        #[arg(long = "security-opt")]
-        security_opt: Vec<String>,
-        /// Grant additional capabilities beyond this project's own
-        /// `podman`-default set, matching real `docker run
-        /// --cap-add`/`podman run --cap-add`. A bare name (`net_admin`)
-        /// or an already-`CAP_`-prefixed one (`CAP_NET_ADMIN`) both
-        /// work, case-insensitively — matching real `docker`/`podman`'s
-        /// own normalization (checked directly against
-        /// `~/git/container-libs/common/pkg/capabilities/
-        /// capabilities.go`'s own `NormalizeCapabilities`). The special
-        /// value `all` grants every capability this build recognizes.
-        /// Repeatable, and a single use may also be a comma-separated
-        /// list (`--cap-add=net_admin,sys_time`), matching real
-        /// `docker`/`podman`'s own flag (a `pflag.StringSlice`, which
-        /// supports both shapes at once).
-        #[arg(long = "cap-add", value_delimiter = ',')]
-        cap_add: Vec<String>,
-        /// Remove capabilities from this project's own `podman`-default
-        /// set, matching real `docker run --cap-drop`/`podman run
-        /// --cap-drop`. Same name normalization and `all` special value
-        /// as `--cap-add` (`--cap-drop=all` starts from an empty set
-        /// instead of the usual default, keeping only whatever
-        /// `--cap-add` separately grants — matching real `docker`/
-        /// `podman`'s own `MergeCapabilities` exactly). Giving the same
-        /// capability to both `--cap-add` and `--cap-drop` is a real,
-        /// surfaced error, not silently resolved one way or the other.
-        #[arg(long = "cap-drop", value_delimiter = ',')]
-        cap_drop: Vec<String>,
-        /// Grant the container every capability this build recognizes
-        /// and disable seccomp confinement entirely, matching real
-        /// `docker run --privileged`/`podman run --privileged`'s own
-        /// two best-checked effects (`~/git/container-libs`'s own
-        /// vendored `runtime-tools/generate/generate.go`'s
-        /// `SetupPrivileged` grants every known capability;
-        /// `pkg/specgen/generate/security_linux.go` forces seccomp to
-        /// `unconfined` unless a *different* `--security-opt seccomp=`
-        /// value was explicitly given, in which case the explicit
-        /// choice wins). `--cap-add`/`--cap-drop` still apply on top
-        /// of the all-capabilities base, same as they would on top of
-        /// the ordinary default. **Narrower than real `docker`/
-        /// `podman`'s own `--privileged`**: does not mount every host
-        /// device, disable the device-cgroup restriction, or touch
-        /// SELinux/AppArmor labeling — none of which this project
-        /// implements at all yet (device access and SELinux/AppArmor
-        /// are both still-open gaps, not silently-ignored `--privileged`
-        /// specifics).
-        #[arg(long)]
-        privileged: bool,
-        /// Mount the container's own rootfs read-only, matching real
-        /// `docker run --read-only`/`podman run --read-only` exactly
-        /// (both default to a writable rootfs, only this flag makes it
-        /// read-only). See `synthesize_spec`'s own doc comment for why
-        /// the default is writable.
-        #[arg(long = "read-only")]
-        read_only: bool,
-        /// Set an additional environment variable, `KEY=value`, or
-        /// pull one from `ociman`'s own process environment by bare
-        /// name (`KEY`, dropped entirely if unset there) — matching
-        /// real `docker run -e`/`podman run -e` exactly, including the
-        /// bare-name pass-through (same convention `--build-arg`
-        /// already uses). Repeatable; overrides an image's own default
-        /// value for the same name rather than adding a second,
-        /// shadowed entry (see `apply_env_overrides`'s own doc
-        /// comment for why that distinction is real, not cosmetic).
-        #[arg(short, long = "env")]
-        env: Vec<String>,
-        /// Set the container's own UTS hostname, matching real
-        /// `docker run --hostname`/`podman run --hostname` exactly.
-        /// Defaults to the container's own generated id (real
-        /// `podman`'s own documented default too — checked directly
-        /// against `container-libs`'s own vendored `pkg/specgen/
-        /// specgen.go`: "will be set to the container ID" when unset
-        /// and the UTS namespace is private, which it always is here).
-        /// No format validation — passed straight through to the
-        /// kernel's own `sethostname(2)`, which rejects a genuinely
-        /// invalid value itself, same as every other pass-through flag
-        /// this project's own CLI already has (`--cpuset-cpus`/
-        /// `--cpuset-mems`).
-        #[arg(long)]
-        hostname: Option<String>,
-        /// Add an extra `/etc/hosts` entry: `name[;name2...]:IP`,
-        /// repeatable — matching real `docker run --add-host`/
-        /// `podman run --add-host` exactly (checked directly against
-        /// `~/git/container-libs/common/libnetwork/etchosts`'s own
-        /// `parseExtraHosts`). This project sets up no container
-        /// networking of its own at all yet, so a container's
-        /// synthesized `/etc/hosts` otherwise always matches real
-        /// podman's own `--network=none` case exactly (`127.0.0.1`/
-        /// `::1 localhost`, plus the container's own hostname/name
-        /// mapped to `127.0.0.1`) — see `write_etc_hosts`'s own doc
-        /// comment for the one real gap this narrows: the special
-        /// `host-gateway` IP keyword isn't supported (there is no
-        /// real host-reachable gateway address to resolve it to
-        /// without a real network setup of this project's own).
-        #[arg(long = "add-host", value_name = "HOST:IP")]
-        add_host: Vec<String>,
-        /// Override the working directory the container's own process
-        /// starts in, matching real `docker run -w`/`podman run -w`
-        /// exactly. Defaults to the image's own `WORKDIR` config (or
-        /// `/` if the image sets none), same as `ociman exec --cwd`'s
-        /// own analogous override for an already-running container.
-        #[arg(short = 'w', long = "workdir")]
-        workdir: Option<String>,
-        /// Override the image's own `ENTRYPOINT`, matching real
-        /// `docker run --entrypoint`/`podman run --entrypoint`
-        /// exactly: a JSON string array (`'["a", "b"]'`), or, if that
-        /// fails to parse, the whole value as one literal argument —
-        /// checked directly against real podman's own exact fallback
-        /// rule (`specgenutil::specgen`'s own `Entrypoint` handling).
-        /// Unlike the image's own default `ENTRYPOINT`, an override
-        /// also suppresses the image's own default `CMD` fallback
-        /// entirely when no trailing command is given on the command
-        /// line too (checked directly against real podman's own
-        /// `makeCommand`, `pkg/specgen/generate/oci.go` — see
-        /// `command_for`'s own doc comment for the exact rule). An
-        /// empty value (`--entrypoint ""`) clears `ENTRYPOINT`
-        /// entirely, real docker/podman's own documented convention.
-        #[arg(long)]
-        entrypoint: Option<String>,
-        /// Bind-mount a real host path into the container:
-        /// `HOST-DIR:CONTAINER-DIR[:ro]`, matching real `docker run
-        /// -v`/`podman run -v`'s own bind-mount form exactly (both
-        /// paths absolute; `ro` is the only supported third field —
-        /// this project has no volume-management subsystem of its own
-        /// at all, so a bare container-only path or a named-volume
-        /// name, both real `docker`/`podman` features for volumes this
-        /// project doesn't have, are rejected with a clear error
-        /// rather than silently misinterpreted). Repeatable. The host
-        /// path is created as a directory if it doesn't already exist
-        /// (matching real `docker`'s own long-documented default for a
-        /// missing bind-mount source). See `docs/design/0086` for the
-        /// real rootless-uid-mapping caveat this shares with every
-        /// other path in the container's own rootfs: a host file/
-        /// directory not owned by the user actually running `ociman`
-        /// appears with an unmapped (`nobody`-like) owner inside the
-        /// container, not a bug specific to `-v`.
-        #[arg(short, long = "volume", value_name = "HOST:CONTAINER[:ro]")]
-        volume: Vec<String>,
-        /// Require HTTPS and verify certificates when pulling `image`
-        /// (only consulted if it isn't already present in local
-        /// storage) — see `Command::Pull`'s own identical flag for the
-        /// exact same syntax/semantics.
-        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
-        tls_verify: bool,
-        /// Image-pull policy — matching real `podman run --pull`
-        /// exactly, including a real, checked-directly quirk of its
-        /// own: unlike `Command::Build`'s identical flag, this one
-        /// has no default-missing-value at all, so a bare `--pull`
-        /// with no explicit value is a real, immediate CLI parse
-        /// error here (confirmed directly against a real `podman
-        /// run --pull` with no value), not a silent `always`.
-        #[arg(long, value_enum, default_value_t = PullPolicy::Missing)]
-        pull: PullPolicy,
+    },
+    /// Pull (if not already present) and extract an image's container,
+    /// same as `run`, but never launch it -- matching real `docker
+    /// create`/`podman create` exactly: the container is left in a real
+    /// `created` state (`ocirun`'s own separate `create`/`start`
+    /// lifecycle, milestone 3, exposed here through `ociman` for the
+    /// first time), ready for a later `ociman start` to actually run it
+    /// for the first time (see `cmd_create`'s own doc comment for what
+    /// this doesn't do yet).
+    Create {
+        #[command(flatten)]
+        args: RunArgs,
     },
     /// List containers.
     Ps {
@@ -981,57 +1011,8 @@ fn main() -> std::process::ExitCode {
             Some(Command::History { reference }) => cmd_history(&reference, cli.global.json),
             Some(Command::Prune { all }) => cmd_prune(cli.global.json, all),
             Some(Command::Inspect { reference }) => cmd_inspect(&reference, cli.global.json),
-            Some(Command::Run {
-                image,
-                args,
-                rm,
-                detach,
-                name,
-                memory,
-                memory_swap,
-                cpus,
-                pids_limit,
-                cpuset_cpus,
-                cpuset_mems,
-                security_opt,
-                cap_add,
-                cap_drop,
-                privileged,
-                read_only,
-                env,
-                hostname,
-                add_host,
-                workdir,
-                entrypoint,
-                volume,
-                tls_verify,
-                pull,
-            }) => cmd_run(
-                &image,
-                &args,
-                rm,
-                detach,
-                name.as_deref(),
-                memory.as_deref(),
-                memory_swap.as_deref(),
-                cpus,
-                pids_limit,
-                cpuset_cpus.as_deref(),
-                cpuset_mems.as_deref(),
-                &security_opt,
-                &cap_add,
-                &cap_drop,
-                privileged,
-                read_only,
-                &env,
-                hostname.as_deref(),
-                &add_host,
-                workdir.as_deref(),
-                entrypoint.as_deref(),
-                &volume,
-                tls_verify,
-                pull,
-            ),
+            Some(Command::Run { args, rm, detach }) => cmd_run(args, rm, detach),
+            Some(Command::Create { args }) => cmd_create(args),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Start { id }) => cmd_start(&id),
             Some(Command::Restart { id, time }) => cmd_restart(&id, time),
@@ -1813,40 +1794,50 @@ fn cmd_inspect(reference_str: &str, json: bool) -> anyhow::Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cmd_run(
-    image_ref: &str,
-    args: &[String],
-    rm: bool,
-    detach: bool,
-    name: Option<&str>,
-    memory: Option<&str>,
-    memory_swap: Option<&str>,
-    cpus: Option<f64>,
-    pids_limit: Option<i64>,
-    cpuset_cpus: Option<&str>,
-    cpuset_mems: Option<&str>,
-    security_opts: &[String],
-    cap_add: &[String],
-    cap_drop: &[String],
-    privileged: bool,
-    read_only: bool,
-    env: &[String],
-    hostname: Option<&str>,
-    add_host: &[String],
-    workdir: Option<&str>,
-    entrypoint: Option<&str>,
-    volumes: &[String],
-    tls_verify: bool,
-    pull_policy: PullPolicy,
-) -> anyhow::Result<()> {
-    let entrypoint = entrypoint.map(parse_entrypoint);
-    let volumes = volumes
+/// Everything [`prepare_container`] produces: a container id/state
+/// record and an already-validated [`oci_runtime_core::Bundle`]/
+/// rootfs, ready to either be launched right away ([`cmd_run`]) or
+/// left as-is in a real `Status::Created` state for a later `ociman
+/// start` ([`cmd_create`], 0157).
+struct PreparedContainer {
+    container_id: String,
+    state: oci_runtime_core::PersistedState,
+    containers: StateStore,
+    bundle: oci_runtime_core::Bundle,
+    rootfs: PathBuf,
+    log_path: PathBuf,
+}
+
+/// Resolve/pull `args.image`, extract (or overlay-mount) its rootfs,
+/// write `/etc/hosts`, capture the base filesystem snapshot a future
+/// `ociman diff`/`commit` needs, synthesize and write `config.json`,
+/// and load/validate the resulting bundle — every real side effect
+/// `ociman run` and `ociman create` (0157) both need identically,
+/// before either one ever decides whether (or when) to actually
+/// launch the container's own process. Does **not** decide the
+/// container's own final persisted status: the container record this
+/// creates starts, and is left, at [`Status::Creating`] (`StateStore::
+/// create`'s own default) — `cmd_run`/`cmd_create` each set their own
+/// correct final status afterward (`Running`, or left for
+/// `run_and_finalize`/`launch_detached_and_confirm` to do, vs.
+/// `Created`, respectively).
+///
+/// On any failure, the just-created container record is removed
+/// rather than left behind permanently stuck at `Creating` — matches
+/// `cmd_run`'s own original identical cleanup-on-failure precedent
+/// (itself matching `StateStore::create`'s own for its own write
+/// failure).
+#[allow(clippy::too_many_arguments)]
+fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
+    let entrypoint = args.entrypoint.as_deref().map(parse_entrypoint);
+    let volumes = args
+        .volume
         .iter()
         .map(|v| parse_volume(v))
         .collect::<anyhow::Result<Vec<_>>>()?;
     // The host side of a bind mount is a real, separate side effect
     // (creating something on the *caller's* own filesystem, not the
-    // container's), so it happens here in `cmd_run` rather than inside
+    // container's), so it happens here rather than inside
     // `synthesize_spec`, which otherwise only ever builds a `Spec`
     // value without touching the host filesystem at all. Matches real
     // `docker`'s own long-documented default for a missing bind-mount
@@ -1861,8 +1852,8 @@ fn cmd_run(
                 .with_context(|| format!("creating host volume directory {:?}", volume.host))?;
         }
     }
-    let seccomp = resolve_seccomp(security_opts, privileged)?;
-    let base_capabilities = if privileged {
+    let seccomp = resolve_seccomp(&args.security_opt, args.privileged)?;
+    let base_capabilities = if args.privileged {
         oci_runtime_core::identity::ALL_CAPABILITY_NAMES
             .iter()
             .map(|s| s.to_string())
@@ -1870,9 +1861,13 @@ fn cmd_run(
     } else {
         oci_spec_types::runtime::podman_default_capabilities()
     };
-    let capabilities = merge_capabilities(&base_capabilities, cap_add, cap_drop)?;
-    let memory_limit_bytes = memory.map(parse_memory_limit).transpose()?;
-    let memory_swap_bytes = memory_swap.map(parse_memory_swap_limit).transpose()?;
+    let capabilities = merge_capabilities(&base_capabilities, &args.cap_add, &args.cap_drop)?;
+    let memory_limit_bytes = args.memory.as_deref().map(parse_memory_limit).transpose()?;
+    let memory_swap_bytes = args
+        .memory_swap
+        .as_deref()
+        .map(parse_memory_swap_limit)
+        .transpose()?;
     anyhow::ensure!(
         memory_swap_bytes.is_none() || memory_limit_bytes.is_some(),
         "--memory-swap requires --memory to also be set (there is nothing to convert a \
@@ -1885,13 +1880,13 @@ fn cmd_run(
         );
     }
     anyhow::ensure!(
-        cpus.is_none_or(|c| c > 0.0 && c.is_finite()),
+        args.cpus.is_none_or(|c| c > 0.0 && c.is_finite()),
         "--cpus must be a positive, finite number"
     );
-    let reference = Reference::parse(image_ref)
-        .with_context(|| format!("parsing image reference {image_ref:?}"))?;
+    let reference = Reference::parse(&args.image)
+        .with_context(|| format!("parsing image reference {:?}", args.image))?;
     let store = open_store()?;
-    let record = resolve_or_pull(&store, &reference, tls_verify, pull_policy)?;
+    let record = resolve_or_pull(&store, &reference, args.tls_verify, args.pull)?;
 
     let manifest = store
         .image_manifest(&record)
@@ -1903,7 +1898,7 @@ fn cmd_run(
     let containers = open_container_store()?;
     let mut annotations = std::collections::BTreeMap::new();
     annotations.insert(ANNOTATION_IMAGE.to_string(), reference.to_string());
-    if let Some(name) = name {
+    if let Some(name) = &args.name {
         validate_container_name(name)?;
         if let Ok(existing) = resolve_container_id(&containers, name) {
             anyhow::bail!("container name {name:?} is already in use by {existing:?}");
@@ -1911,7 +1906,7 @@ fn cmd_run(
         annotations.insert(ANNOTATION_NAME.to_string(), name.to_string());
     }
     let (container_id, mut state) = create_container_record(&containers, &annotations)?;
-    tracing::debug!(container_id, %reference, "run starting");
+    tracing::debug!(container_id, %reference, "preparing container");
 
     let bundle_dir = containers.container_dir(&container_id);
     let rootfs_dir = bundle_dir.join("rootfs");
@@ -1963,13 +1958,13 @@ fn cmd_run(
             rootfs_setup::RootfsSetup::Extract => rootfs_dir.clone(),
             rootfs_setup::RootfsSetup::Overlay { .. } => rootfs_setup::upper_dir(&bundle_dir),
         };
-        let effective_hostname = hostname.unwrap_or(&container_id);
-        let effective_name = name.unwrap_or(&container_id);
+        let effective_hostname = args.hostname.as_deref().unwrap_or(&container_id);
+        let effective_name = args.name.as_deref().unwrap_or(&container_id);
         let mut own_names = vec![effective_hostname];
         if effective_name != effective_hostname {
             own_names.push(effective_name);
         }
-        write_etc_hosts(&write_root, &own_names, add_host).context("writing /etc/hosts")?;
+        write_etc_hosts(&write_root, &own_names, &args.add_host).context("writing /etc/hosts")?;
 
         // A real, persisted "before" reference for a future `ociman
         // diff` (0149) — captured *after* every layer has been
@@ -2002,20 +1997,20 @@ fn cmd_run(
         let mut spec = synthesize_spec(
             &config,
             &container_id,
-            args,
+            &args.args,
             &user_resolve_root,
             memory_limit_bytes,
             memory_swap_bytes,
-            cpus,
-            pids_limit,
-            cpuset_cpus,
-            cpuset_mems,
+            args.cpus,
+            args.pids_limit,
+            args.cpuset_cpus.as_deref(),
+            args.cpuset_mems.as_deref(),
             seccomp,
             capabilities,
-            read_only,
-            env,
-            hostname,
-            workdir,
+            args.read_only,
+            &args.env,
+            args.hostname.as_deref(),
+            args.workdir.as_deref(),
             entrypoint.as_deref(),
             &volumes,
         )?;
@@ -2056,6 +2051,26 @@ fn cmd_run(
         }
     };
 
+    Ok(PreparedContainer {
+        container_id,
+        state,
+        containers,
+        bundle,
+        rootfs,
+        log_path,
+    })
+}
+
+fn cmd_run(args: RunArgs, rm: bool, detach: bool) -> anyhow::Result<()> {
+    let PreparedContainer {
+        container_id,
+        state,
+        containers,
+        bundle,
+        rootfs,
+        log_path,
+    } = prepare_container(&args)?;
+
     if detach {
         // SAFETY: `ociman`'s own process has not spawned any additional
         // threads by this point (argument parsing, pulling, layer
@@ -2092,6 +2107,48 @@ fn cmd_run(
     // bypasses `oci_cli_common::run_main`'s usual Ok(())-means-success
     // mapping.
     std::process::exit(exit_code);
+}
+
+/// Pull (if not already present) and extract an image's container,
+/// same as [`cmd_run`], but never launch it — matching real `docker
+/// create`/`podman create` exactly. The container is left in a real
+/// [`Status::Created`] state (`ocirun`'s own separate `create`/`start`
+/// lifecycle, milestone 3, exposed here through `ociman` for the first
+/// time — checked directly, real podman's own `prepareToStart`,
+/// `~/git/podman/libpod/container_internal.go`, accepts exactly
+/// `Configured`/`Created`/`Stopped`/`Exited` as startable, which this
+/// project's own simpler two-name split maps onto as `Created` (never
+/// yet run) and `Stopped` (ran to completion at least once) — both
+/// already handled identically by [`cmd_start`], which needed only its
+/// own precondition relaxed, not any new logic, to also accept a
+/// `Created` container), ready for a later `ociman start` to actually
+/// run it for the first time.
+///
+/// What this doesn't do yet: `--rm` (real podman's own `podman create
+/// --rm` is a real, valid combination: auto-remove once the container
+/// eventually runs — via a later `start` — and exits). This project's
+/// `cmd_start`/`cmd_restart` currently always pass a hardcoded `rm:
+/// false` to `launch_detached_and_confirm`/`run_and_finalize`, with no
+/// persisted record anywhere of what a container's own original
+/// `--rm` even was — a real, pre-existing gap this increment's own
+/// `RunArgs` doesn't touch (it never included `rm`/`detach` to begin
+/// with, see that struct's own doc comment) and doesn't attempt to fix
+/// here: correctly threading `--rm` through a `create` that might not
+/// be started until an arbitrarily later, separate `ociman start`
+/// invocation needs a new persisted annotation `cmd_start`/`cmd_
+/// restart` both also consult, a bigger, cross-cutting change better
+/// scoped as its own future increment.
+fn cmd_create(args: RunArgs) -> anyhow::Result<()> {
+    let PreparedContainer {
+        container_id,
+        mut state,
+        containers,
+        ..
+    } = prepare_container(&args)?;
+    state.status = Status::Created;
+    containers.write(&state)?;
+    println!("{container_id}");
+    Ok(())
 }
 
 /// Fork a detached "keeper" process that runs `bundle`'s already-
@@ -2607,7 +2664,11 @@ fn cmd_ps(all: bool, quiet: bool, json: bool) -> anyhow::Result<()> {
         .list()
         .context("listing containers")?
         .iter()
-        .filter(|s| all || s.effective_status() != Status::Stopped)
+        // A never-started (`ociman create`, 0157) container is hidden
+        // by default exactly like a `Stopped` one -- confirmed
+        // directly against a real `podman create` followed by a plain
+        // `podman ps` (nothing shown; only `podman ps -a` does).
+        .filter(|s| all || !matches!(s.effective_status(), Status::Stopped | Status::Created))
         .map(ContainerView::from_state)
         .collect();
     views.sort_by(|a, b| a.created.cmp(&b.created));
@@ -3346,12 +3407,18 @@ fn stop_container(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Start an already-`Stopped` container again, reusing its own
-/// already-on-disk `config.json`/`rootfs/` exactly as `run` originally
-/// left them — no re-extraction, no re-resolving the original image
+/// Start an already-`Created` (never yet run, see `cmd_create`, 0157)
+/// or already-`Stopped` container, reusing its own already-on-disk
+/// `config.json`/`rootfs/` exactly as `run`/`create` originally left
+/// them — no re-extraction, no re-resolving the original image
 /// reference, no re-writing `/etc/hosts` or the base `diff` snapshot
 /// (0149): everything about the container's own bundle is already
 /// real, valid, and completely unchanged since it was first created.
+/// Both cases are handled by the exact same code below: a `Created`
+/// container's own bundle is already just as complete and valid as a
+/// `Stopped` one's, `cmd_start` doesn't care about *why* the container
+/// hasn't run yet (never started at all, vs. ran once already and
+/// exited), only that a valid bundle already exists right now.
 ///
 /// Always detached (backgrounded), matching real `docker start`/
 /// `podman start`'s own real, checked-directly default (confirmed
@@ -3361,10 +3428,12 @@ fn stop_container(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> 
 /// for this first increment: `-a`/`--attach` itself isn't implemented
 /// yet (see this function's own "what this doesn't do yet").
 ///
-/// A clear, real error for anything other than a `Stopped` container —
-/// matching real `podman start`'s own identical refusal to start an
-/// already-`Running` one (`~/git/podman/libpod/container_internal.go`'s
-/// own `prepareToStart`: `ErrCtrStateRunning`).
+/// A clear, real error for anything else (in particular, an already-
+/// `Running` one) — matching real `podman start`'s own identical
+/// refusal (`~/git/podman/libpod/container_internal.go`'s own
+/// `prepareToStart`: accepts `Configured`/`Created`/`Stopped`/`Exited`,
+/// which this project's own simpler two-name split maps onto as
+/// `Created`/`Stopped`, `ErrCtrStateRunning` otherwise).
 ///
 /// What this doesn't do yet: `-a`/`--attach`/`-i`/`--interactive`
 /// (streaming the restarted container's own output live and waiting
@@ -3377,8 +3446,9 @@ fn cmd_start(id: &str) -> anyhow::Result<()> {
     let mut state = containers.load(&resolved)?;
     let status = state.effective_status();
     anyhow::ensure!(
-        status == Status::Stopped,
-        "container {id:?} must be stopped to be started (its own current status is {status})"
+        matches!(status, Status::Created | Status::Stopped),
+        "container {id:?} must be created or stopped to be started (its own current status is \
+         {status})"
     );
     // `effective_status` above can report `Stopped` purely because the
     // container's own recorded pid is no longer alive, even while the
