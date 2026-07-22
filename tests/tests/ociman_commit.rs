@@ -588,3 +588,168 @@ fn commit_with_pause_false_never_freezes_a_running_container() {
     let _ = run.kill();
     let _ = run.wait();
 }
+
+#[test]
+fn commit_change_applies_every_real_supported_instruction_and_adds_no_extra_history() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/commit-change-base:latest",
+        "exit 0",
+    );
+
+    let base_history = ociman(
+        storage_dir.path(),
+        &["history", "ociman-test/commit-change-base:latest", "--json"],
+    );
+    let base_len: usize = serde_json::from_slice::<serde_json::Value>(&base_history.stdout)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .len();
+
+    let commit = ociman(
+        storage_dir.path(),
+        &[
+            "commit",
+            "--change",
+            "CMD [\"/bin/sh\", \"-c\", \"echo hi\"]",
+            "--change",
+            "ENTRYPOINT [\"/bin/sh\"]",
+            "--change",
+            "ENV FOO=bar",
+            "--change",
+            "EXPOSE 8080",
+            "--change",
+            "LABEL a=b",
+            "--change",
+            "ONBUILD RUN echo hi",
+            "--change",
+            "STOPSIGNAL SIGTERM",
+            "--change",
+            "USER 1000",
+            "--change",
+            "VOLUME /data",
+            "--change",
+            "WORKDIR /tmp",
+            &id,
+            "ociman-test/commit-change-result:latest",
+        ],
+    );
+    assert!(
+        commit.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "ociman-test/commit-change-result:latest",
+            "--json",
+        ],
+    );
+    assert!(inspect.status.success());
+    let config: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    let cc = &config["config"];
+    assert_eq!(cc["Cmd"], serde_json::json!(["/bin/sh", "-c", "echo hi"]));
+    assert_eq!(cc["Entrypoint"], serde_json::json!(["/bin/sh"]));
+    assert_eq!(cc["Env"], serde_json::json!(["FOO=bar"]));
+    assert_eq!(cc["ExposedPorts"]["8080"], serde_json::json!({}));
+    assert_eq!(cc["Labels"]["a"], "b");
+    assert_eq!(cc["OnBuild"], serde_json::json!(["RUN echo hi"]));
+    assert_eq!(cc["StopSignal"], "SIGTERM");
+    assert_eq!(cc["User"], "1000");
+    assert_eq!(cc["Volumes"]["/data"], serde_json::json!({}));
+    assert_eq!(cc["WorkingDir"], "/tmp");
+
+    // No extra history entries from --change itself -- only the one
+    // real diff layer's own entry, exactly like a commit with no
+    // --change at all.
+    let history = ociman(
+        storage_dir.path(),
+        &[
+            "history",
+            "ociman-test/commit-change-result:latest",
+            "--json",
+        ],
+    );
+    let len: usize = serde_json::from_slice::<serde_json::Value>(&history.stdout)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(
+        len,
+        base_len + 1,
+        "--change should add no history entries of its own, only the one real new layer's"
+    );
+}
+
+#[test]
+fn commit_change_rejects_a_build_only_instruction() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/commit-change-bad:latest",
+        "exit 0",
+    );
+
+    for bad in [
+        "RUN echo hi",
+        "COPY a b",
+        "ADD a b",
+        "FROM scratch",
+        "ARG X=1",
+    ] {
+        let commit = ociman(
+            storage_dir.path(),
+            &[
+                "commit",
+                "--change",
+                bad,
+                &id,
+                "ociman-test/commit-change-bad-result:latest",
+            ],
+        );
+        assert!(
+            !commit.status.success(),
+            "--change {bad:?} should have been rejected"
+        );
+    }
+}
+
+#[test]
+fn commit_change_rejects_an_unparseable_instruction() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/commit-change-garbage:latest",
+        "exit 0",
+    );
+
+    let commit = ociman(
+        storage_dir.path(),
+        &[
+            "commit",
+            "--change",
+            "NOTAREALINSTRUCTION x",
+            &id,
+            "ociman-test/commit-change-garbage-result:latest",
+        ],
+    );
+    assert!(!commit.status.success());
+}

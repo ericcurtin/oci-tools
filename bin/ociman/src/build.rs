@@ -2392,7 +2392,7 @@ fn chown_recursive(root: &Path, uid: u32, gid: u32) {
 /// `docker`/`podman build`'s own shell-form wrapping: a shell-form
 /// `RUN`/`CMD`/`ENTRYPOINT` argument becomes `/bin/sh -c "<text>"`
 /// when actually run; exec/JSON form is used verbatim.
-fn args_for(value: &ShellOrExec) -> Vec<String> {
+pub(crate) fn args_for(value: &ShellOrExec) -> Vec<String> {
     match value {
         ShellOrExec::Shell(command) => {
             vec!["/bin/sh".to_string(), "-c".to_string(), command.clone()]
@@ -2446,7 +2446,7 @@ pub(crate) fn apply_env_overrides(env: &mut Vec<String>, overrides: &[String]) {
     }
 }
 
-fn format_pairs(pairs: &[(String, String)]) -> String {
+pub(crate) fn format_pairs(pairs: &[(String, String)]) -> String {
     pairs
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
@@ -2460,7 +2460,7 @@ fn format_pairs(pairs: &[(String, String)]) -> String {
 /// relative one is joined onto it. Both cases are then normalized
 /// (`.`/`..`/empty components collapsed), matching `filepath.Clean`'s
 /// own effect after `filepath.Join` in the real implementation.
-fn resolve_workdir(current: Option<&str>, new: &str) -> String {
+pub(crate) fn resolve_workdir(current: Option<&str>, new: &str) -> String {
     if new.starts_with('/') {
         normalize_absolute_path(new)
     } else {

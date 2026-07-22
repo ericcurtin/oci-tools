@@ -26,8 +26,8 @@ use oci_runtime_core::StateStore;
 use oci_runtime_core::state::Status;
 use oci_spec_types::Reference;
 use oci_spec_types::image::{
-    ContainerConfig, Descriptor, ImageManifest, MEDIA_TYPE_IMAGE_CONFIG, MEDIA_TYPE_IMAGE_MANIFEST,
-    Platform,
+    ContainerConfig, Descriptor, ImageConfig, ImageManifest, MEDIA_TYPE_IMAGE_CONFIG,
+    MEDIA_TYPE_IMAGE_MANIFEST, Platform,
 };
 use oci_spec_types::time::format_rfc3339_utc;
 use oci_store::{ImageRecord, ImageSummary, Store};
@@ -805,9 +805,9 @@ enum Command {
     /// the image it was created from — matching real `docker commit`/
     /// `podman commit` exactly for the "one new layer, on top of the
     /// exact same base layers" case (see `cmd_commit`'s own doc
-    /// comment for what's deliberately out of scope for now: `--change`/
-    /// `--config`/`--squash`/`--include-volumes`, and the same
-    /// rootless-overlay-rootfs gap `cp`/`diff` already have).
+    /// comment for what's deliberately out of scope for now: `--config`/
+    /// `--squash`/`--include-volumes`, and the same rootless-overlay-
+    /// rootfs gap `cp`/`diff` already have).
     Commit {
         /// The container's ID or `--name`.
         container: String,
@@ -847,6 +847,25 @@ enum Command {
         /// with the same flag.
         #[arg(short, long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         pause: bool,
+        /// Apply one Dockerfile-instruction-style config change to the
+        /// resulting image, matching real `podman commit --change`
+        /// exactly (checked directly, `~/git/podman/cmd/podman/common/
+        /// completion.go`'s own `ChangeCmds` list): only `CMD`/
+        /// `ENTRYPOINT`/`ENV`/`EXPOSE`/`LABEL`/`ONBUILD`/`STOPSIGNAL`/
+        /// `USER`/`VOLUME`/`WORKDIR` are accepted (an instruction that
+        /// only makes sense as part of an actual, multi-step *build* —
+        /// `RUN`/`COPY`/`ADD`/`FROM`/`ARG`, ...) is a real, clear error
+        /// instead. Repeatable, applied in the order given, each
+        /// parsed and applied the exact same way `ociman build` itself
+        /// already applies the identical instruction (real, shared
+        /// code — `oci_dockerfile::parse_change` plus this crate's own
+        /// `apply_change_instruction`) — never its own extra history
+        /// entry, only the one real entry the new layer itself gets
+        /// (matching real buildah's own `Commit`, which applies
+        /// `--change` as plain `ImportBuilder` config setters, not a
+        /// build step of its own).
+        #[arg(short, long = "change")]
+        change: Vec<String>,
     },
     /// Gracefully stop a running container: send it a signal (`TERM`
     /// by default) and wait up to `--time` seconds for it to exit on
@@ -1104,12 +1123,14 @@ fn main() -> std::process::ExitCode {
                 author,
                 message,
                 pause,
+                change,
             }) => cmd_commit(
                 &container,
                 &image,
                 author.as_deref(),
                 message.as_deref(),
                 pause,
+                &change,
                 cli.global.json,
             ),
             Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, &signal),
@@ -3347,14 +3368,27 @@ struct CommitResult {
 /// without any tag at all" storage convention yet anywhere else in the
 /// codebase (matches `ociman build --tag`'s own identical, already-
 /// documented narrowing).
+#[allow(clippy::too_many_arguments)]
 fn cmd_commit(
     id: &str,
     image: &str,
     author: Option<&str>,
     message: Option<&str>,
     pause: bool,
+    change: &[String],
     json: bool,
 ) -> anyhow::Result<()> {
+    // Parsed and validated *before* ever resolving the container or
+    // pausing anything: a bad `--change` value should fail fast, with
+    // no pointless freeze/thaw or wasted diff work first.
+    let change_instructions = change
+        .iter()
+        .map(|text| {
+            oci_dockerfile::parse_change(text)
+                .map_err(|e| anyhow::anyhow!("--change {text:?}: {e}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
     let (root, state) = resolve_container_root(id, "commit")?;
 
     // Real podman's own default (checked directly,
@@ -3369,7 +3403,16 @@ fn cmd_commit(
         oci_runtime_core::cgroups::set_frozen(&cgroup_dir, true)
             .with_context(|| format!("pausing container {id:?} for commit"))?;
     }
-    let result = commit_inner(id, image, author, message, json, &root, &state);
+    let result = commit_inner(
+        id,
+        image,
+        author,
+        message,
+        &change_instructions,
+        json,
+        &root,
+        &state,
+    );
     if paused_here {
         // Best-effort: always attempt to unpause, even if the commit
         // itself failed partway through -- matches real podman's own
@@ -3394,6 +3437,7 @@ fn commit_inner(
     image: &str,
     author: Option<&str>,
     message: Option<&str>,
+    change: &[oci_dockerfile::Instruction],
     json: bool,
     root: &Path,
     state: &oci_runtime_core::PersistedState,
@@ -3459,6 +3503,9 @@ fn commit_inner(
     if let Some(author) = author {
         config.author = Some(author.to_string());
     }
+    for instruction in change {
+        apply_change_instruction(&mut config, instruction)?;
+    }
     config.created = Some(format_rfc3339_utc(std::time::SystemTime::now()));
 
     let config_bytes = serde_json::to_vec(&config).context("serializing image config")?;
@@ -3502,6 +3549,89 @@ fn commit_inner(
     } else {
         println!("{}", manifest_ingested.digest);
         println!("tagged: {tag_reference}");
+    }
+    Ok(())
+}
+
+/// Apply one `--change` instruction to `config`, matching real
+/// `podman commit --change`/buildah's own `Commit` exactly: each of
+/// the 10 real, checked-directly-allowed instructions
+/// (`Command::Commit`'s own `change` field doc comment has the exact
+/// list and the citation) is applied as a plain config-field setter —
+/// the *same* effect `ociman build`'s own `apply_instruction` gives
+/// the identical instruction (reusing its own `args_for`/
+/// `format_pairs`/`resolve_workdir` helpers directly, so the two can
+/// never silently drift apart on what e.g. a relative `WORKDIR` or a
+/// shell-form `CMD` actually resolves to), but — deliberately, unlike
+/// `ociman build`'s own per-instruction `record_empty_history` call —
+/// with no history entry of its own: real buildah's own `Commit`
+/// applies `--change` as plain `ImportBuilder` config setters, not a
+/// build step of its own, so the *only* new history entry a real
+/// commit ever gets is the one real diff layer's own (already added by
+/// `record_layer` before this is ever called). Any instruction outside
+/// that list (`RUN`/`COPY`/`ADD`/`FROM`/`ARG`/`SHELL`/`HEALTHCHECK`/
+/// `MAINTAINER` — anything that only makes sense as part of an actual,
+/// multi-step *build*) is a real, clear, immediate error.
+fn apply_change_instruction(
+    config: &mut ImageConfig,
+    instruction: &oci_dockerfile::Instruction,
+) -> anyhow::Result<()> {
+    use oci_dockerfile::Instruction;
+    match instruction {
+        Instruction::Cmd(shell_or_exec) => {
+            let cc = config.config.get_or_insert_with(ContainerConfig::default);
+            cc.cmd = Some(build::args_for(shell_or_exec));
+        }
+        Instruction::Entrypoint(shell_or_exec) => {
+            let cc = config.config.get_or_insert_with(ContainerConfig::default);
+            cc.entrypoint = Some(build::args_for(shell_or_exec));
+        }
+        Instruction::Env(pairs) => {
+            let cc = config.config.get_or_insert_with(ContainerConfig::default);
+            for (key, value) in pairs {
+                build::set_env_var(&mut cc.env, key, value);
+            }
+        }
+        Instruction::Expose(ports) => {
+            let cc = config.config.get_or_insert_with(ContainerConfig::default);
+            for port in ports {
+                cc.exposed_ports.insert(port.clone(), serde_json::json!({}));
+            }
+        }
+        Instruction::Label(pairs) => {
+            let cc = config.config.get_or_insert_with(ContainerConfig::default);
+            for (key, value) in pairs {
+                cc.labels.insert(key.clone(), value.clone());
+            }
+        }
+        Instruction::Onbuild(trigger) => {
+            let cc = config.config.get_or_insert_with(ContainerConfig::default);
+            cc.on_build.push(trigger.clone());
+        }
+        Instruction::StopSignal(sig) => {
+            let cc = config.config.get_or_insert_with(ContainerConfig::default);
+            cc.stop_signal = Some(sig.clone());
+        }
+        Instruction::User(user) => {
+            let cc = config.config.get_or_insert_with(ContainerConfig::default);
+            cc.user = Some(user.clone());
+        }
+        Instruction::Volume(paths) => {
+            let cc = config.config.get_or_insert_with(ContainerConfig::default);
+            for path in paths {
+                cc.volumes.insert(path.clone(), serde_json::json!({}));
+            }
+        }
+        Instruction::Workdir(dir) => {
+            let cc = config.config.get_or_insert_with(ContainerConfig::default);
+            let resolved = build::resolve_workdir(cc.working_dir.as_deref(), dir);
+            cc.working_dir = Some(resolved);
+        }
+        other => anyhow::bail!(
+            "--change only supports CMD, ENTRYPOINT, ENV, EXPOSE, LABEL, ONBUILD, STOPSIGNAL, \
+             USER, VOLUME, and WORKDIR (matching real `podman commit --change`'s own exact list) \
+             -- got {other:?}, which only makes sense as part of an actual build"
+        ),
     }
     Ok(())
 }
@@ -4461,7 +4591,7 @@ fn compression_for_media_type(media_type: &str) -> anyhow::Result<oci_layer::Com
 /// `args` replaces `CMD`, `ENTRYPOINT` is always kept).
 #[allow(clippy::too_many_arguments)]
 fn synthesize_spec(
-    config: &oci_spec_types::image::ImageConfig,
+    config: &ImageConfig,
     id: &str,
     args: &[String],
     rootfs: &Path,

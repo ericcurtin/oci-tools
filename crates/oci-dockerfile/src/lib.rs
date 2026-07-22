@@ -103,6 +103,24 @@ pub fn parse(input: &str) -> Result<Vec<Instruction>, String> {
         .collect()
 }
 
+/// Parse a single, standalone instruction line (no line-continuation
+/// splicing, no parser-directive scanning — there is no whole file
+/// here, just one already-complete line) into one [`Instruction`] —
+/// what `ociman commit --change`/a future `ociman import --change`
+/// need (real `podman commit --change`/`podman import --change`'s own
+/// exact grammar, checked directly against buildah's own `Commit`:
+/// each `--change` value is parsed as one ordinary Dockerfile
+/// instruction, the same grammar `parse` above already uses for a
+/// whole file's own lines, just applied to exactly one line at a
+/// time). `line_number` is always reported as `1` in any error message
+/// (there is no "line number" to speak of for one standalone string).
+pub fn parse_change(text: &str) -> Result<Instruction, String> {
+    instruction::parse_instruction(&lexer::LogicalLine {
+        line_number: 1,
+        text: text.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +172,24 @@ CMD [\"--verbose\"]
     #[test]
     fn stops_at_the_first_invalid_line() {
         let err = parse("FROM scratch\nNOTAREALINSTRUCTION x\n").unwrap_err();
+        assert!(err.contains("NOTAREALINSTRUCTION"), "{err}");
+    }
+
+    #[test]
+    fn parse_change_parses_one_standalone_instruction_line() {
+        assert!(matches!(
+            parse_change("CMD [\"/bin/sh\"]").unwrap(),
+            Instruction::Cmd(ShellOrExec::Exec(args)) if args == vec!["/bin/sh".to_string()]
+        ));
+        assert!(matches!(
+            parse_change("ENV FOO=bar").unwrap(),
+            Instruction::Env(pairs) if pairs == vec![("FOO".to_string(), "bar".to_string())]
+        ));
+    }
+
+    #[test]
+    fn parse_change_rejects_an_invalid_line_the_same_way_a_whole_file_would() {
+        let err = parse_change("NOTAREALINSTRUCTION x").unwrap_err();
         assert!(err.contains("NOTAREALINSTRUCTION"), "{err}");
     }
 }
