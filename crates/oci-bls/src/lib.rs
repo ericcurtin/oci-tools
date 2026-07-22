@@ -26,11 +26,16 @@
 //!   without fall back to their own file name, decreasing version
 //!   order, boot-counting suffix removed.
 //! - [`cmdline`] — kernel command-line parsing and editing
-//!   ([`Cmdline`]/[`Parameter`]/[`Action`]), a direct, narrower port of
-//!   real bootc's own `bootc-kernel-cmdline` crate, cross-checked
-//!   against its own real test suite (including its own
-//!   "pathological" quoting edge cases) — the primitive a future
-//!   `ociboot kargs` subcommand needs; no CLI surface of its own yet.
+//!   ([`Cmdline`]/[`Parameter`]/[`Action`]/[`cmdline::apply_kargs_
+//!   diff`]), a direct, narrower port of real bootc's own
+//!   `bootc-kernel-cmdline` crate plus its own `bootc_kargs.rs`'s own
+//!   `compute_apply_kargs_diff`, cross-checked against the real
+//!   crate's own test suite (including its own "pathological" quoting
+//!   edge cases) — real bootc has no standalone `kargs` subcommand at
+//!   all (checked directly against its own current CLI: kargs are
+//!   only ever applied via a `--karg` flag on `install`/`upgrade`, a
+//!   correction to this crate's own earlier, inaccurate framing); no
+//!   CLI surface of any kind here yet either.
 //!
 //! `ociboot grubenv` (`bin/ociboot/src/main.rs`) is the first real CLI
 //! surface built on [`grubenv`]: a generic, real, pure-Rust
@@ -45,10 +50,13 @@
 //!   ([`boot_count`] only covers the filename-suffix convention so
 //!   far) so a deployment that repeatedly fails to reach
 //!   `boot-complete.target` auto-falls-back to the previous deployment
-//! - an actual `ociboot kargs` subcommand built on [`cmdline`], and a
-//!   real image's own declared kargs (a `kargs.d`-shaped config,
-//!   matching real bootc's own convention) diffed against a BLS
-//!   entry's own current `options` field
+//! - a real image's own declared kargs (a `kargs.d`-shaped config,
+//!   matching real bootc's own convention — see [`cmdline::apply_
+//!   kargs_diff`]'s own doc comment for the diffing logic itself,
+//!   already implemented) applied to a BLS entry's own `options`
+//!   field by a future `ociboot install`/`upgrade`'s own `--karg`
+//!   flag, matching real bootc's own approach (a flag on those
+//!   commands, not a standalone subcommand)
 //!
 //! External tools (`grub2-mkconfig`, `grub-install`) will be wrapped
 //! behind traits here so pure-Rust replacements can be swapped in

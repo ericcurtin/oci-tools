@@ -291,6 +291,47 @@ impl Cmdline {
     }
 }
 
+/// Apply the difference between `existing_kargs` (a deployment's own
+/// previous kargs, e.g. what a real image's own `usr/lib/bootc/
+/// kargs.d/*.toml` files declared *last* time) and `remote_kargs`
+/// (what a *new* image's own equivalent config now declares) onto
+/// `new_kargs` (typically starting out as a clone of whatever kargs
+/// are already actually in effect, real user-added ones included) —
+/// a direct port of real bootc's own `compute_apply_kargs_diff`
+/// (`~/git/bootc/crates/lib/src/bootc_kargs.rs`, read directly).
+///
+/// A karg present in `remote_kargs` but not `existing_kargs` is a new
+/// one the incoming image is adding, and is [`Cmdline::add`]ed to
+/// `new_kargs`; one present in `existing_kargs` but not `remote_kargs`
+/// is one the incoming image is dropping, and is
+/// [`Cmdline::remove_exact`]d from `new_kargs` — both by *exact*
+/// key-and-value match, never merely by key, so a real user's own
+/// manually-added karg (never part of either image's own declared
+/// set at all) is left completely untouched either way. This is what
+/// lets a real upgrade apply exactly the *new* image's own kargs.d
+/// changes on top of whatever's currently actually in effect, without
+/// clobbering an unrelated, real user customization in the process —
+/// matching real bootc's own documented rationale exactly ("allows
+/// bootc to maintain user customizations while applying changes from
+/// updated container images").
+pub fn apply_kargs_diff(existing_kargs: &Cmdline, remote_kargs: &Cmdline, new_kargs: &mut Cmdline) {
+    let added: Vec<Parameter> = remote_kargs
+        .iter()
+        .filter(|item| !existing_kargs.iter().any(|existing| *item == existing))
+        .collect();
+    let removed: Vec<Parameter> = existing_kargs
+        .iter()
+        .filter(|item| !remote_kargs.iter().any(|remote| *item == remote))
+        .collect();
+
+    for arg in &removed {
+        new_kargs.remove_exact(arg);
+    }
+    for arg in &added {
+        new_kargs.add(arg);
+    }
+}
+
 impl<T: AsRef<str> + ?Sized> From<&T> for Cmdline {
     fn from(input: &T) -> Self {
         Cmdline(input.as_ref().to_string())
@@ -517,5 +558,79 @@ mod tests {
     fn cmdline_display_round_trips_a_simple_string() {
         let cmdline = Cmdline::from("quiet root=/dev/sda1");
         assert_eq!(cmdline.to_string(), "quiet root=/dev/sda1");
+    }
+
+    fn kargs(s: &str) -> Vec<String> {
+        Cmdline::from(s).iter().map(|p| p.token.clone()).collect()
+    }
+
+    #[test]
+    fn apply_kargs_diff_adds_a_karg_the_new_image_newly_declares() {
+        let existing = Cmdline::from("console=tty0");
+        let remote = Cmdline::from("console=tty0 nosmt");
+        let mut new_kargs = existing.clone();
+        apply_kargs_diff(&existing, &remote, &mut new_kargs);
+        assert_eq!(kargs(&new_kargs.to_string()), vec!["console=tty0", "nosmt"]);
+    }
+
+    #[test]
+    fn apply_kargs_diff_removes_a_karg_the_new_image_no_longer_declares() {
+        let existing = Cmdline::from("console=tty0 nosmt");
+        let remote = Cmdline::from("console=tty0");
+        let mut new_kargs = existing.clone();
+        apply_kargs_diff(&existing, &remote, &mut new_kargs);
+        assert_eq!(kargs(&new_kargs.to_string()), vec!["console=tty0"]);
+    }
+
+    /// The real, load-bearing property `apply_kargs_diff` exists for:
+    /// a karg a real user added manually (never declared by *either*
+    /// image's own kargs.d) is untouched either way, because it never
+    /// appears in the `existing`/`remote` sets `apply_kargs_diff`
+    /// itself only ever compares — matching real bootc's own
+    /// documented rationale.
+    #[test]
+    fn apply_kargs_diff_never_touches_a_kargs_d_undeclared_user_customization() {
+        let existing = Cmdline::from("console=tty0");
+        let remote = Cmdline::from("console=tty0 nosmt");
+        // The real, currently-effective kargs include a user's own
+        // manual addition (`mitigations=off`) neither image's own
+        // kargs.d ever declared at all.
+        let mut new_kargs = Cmdline::from("console=tty0 mitigations=off");
+        apply_kargs_diff(&existing, &remote, &mut new_kargs);
+        assert_eq!(
+            kargs(&new_kargs.to_string()),
+            vec!["console=tty0", "mitigations=off", "nosmt"]
+        );
+    }
+
+    #[test]
+    fn apply_kargs_diff_is_a_no_op_when_both_images_declare_the_same_kargs() {
+        let existing = Cmdline::from("console=tty0 nosmt");
+        let remote = Cmdline::from("console=tty0 nosmt");
+        let mut new_kargs = existing.clone();
+        apply_kargs_diff(&existing, &remote, &mut new_kargs);
+        assert_eq!(kargs(&new_kargs.to_string()), vec!["console=tty0", "nosmt"]);
+    }
+
+    /// A karg's own *value* changing between images is, by exact
+    /// key-and-value comparison, simultaneously "removed" (the old
+    /// value) and "added" (the new one) -- net effect: the value is
+    /// updated.
+    #[test]
+    fn apply_kargs_diff_updates_a_kargs_own_changed_value() {
+        let existing = Cmdline::from("foo=old");
+        let remote = Cmdline::from("foo=new");
+        let mut new_kargs = existing.clone();
+        apply_kargs_diff(&existing, &remote, &mut new_kargs);
+        assert_eq!(kargs(&new_kargs.to_string()), vec!["foo=new"]);
+    }
+
+    #[test]
+    fn apply_kargs_diff_on_an_empty_existing_and_remote_is_a_no_op() {
+        let existing = Cmdline::new();
+        let remote = Cmdline::new();
+        let mut new_kargs = Cmdline::from("console=tty0");
+        apply_kargs_diff(&existing, &remote, &mut new_kargs);
+        assert_eq!(kargs(&new_kargs.to_string()), vec!["console=tty0"]);
     }
 }
