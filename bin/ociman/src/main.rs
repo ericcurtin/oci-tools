@@ -635,6 +635,23 @@ enum Command {
         #[arg(short, long)]
         force: bool,
     },
+    /// Copy files/directories between the local filesystem and a
+    /// container (running or stopped) — matching real `docker cp`/
+    /// `podman cp` exactly for the "one side is a container, the
+    /// other is the host" case (see `cmd_cp`'s own doc comment for
+    /// what's deliberately out of scope for now: container-to-
+    /// container, and a rootless-overlay-rootfs container).
+    Cp {
+        /// `[CONTAINER:]SRC_PATH` — exactly one of `src`/`dest` must
+        /// have a `CONTAINER:` prefix.
+        src: String,
+        /// `[CONTAINER:]DEST_PATH`.
+        dest: String,
+        /// Allow overwriting a directory with a non-directory (or
+        /// vice versa) at the destination.
+        #[arg(long)]
+        overwrite: bool,
+    },
     /// Gracefully stop a running container: send it a signal (`TERM`
     /// by default) and wait up to `--time` seconds for it to exit on
     /// its own, then `KILL` it outright if it hasn't — matching real
@@ -873,6 +890,11 @@ fn main() -> std::process::ExitCode {
             ),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
+            Some(Command::Cp {
+                src,
+                dest,
+                overwrite,
+            }) => cmd_cp(&src, &dest, overwrite),
             Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, &signal),
             Some(Command::Kill { id, signal }) => cmd_kill(&id, &signal),
             Some(Command::Pause { id }) => cmd_pause(&id),
@@ -2398,6 +2420,177 @@ fn cmd_rm(id: &str, force: bool) -> anyhow::Result<()> {
     remove_container(&containers, id, force)?;
     println!("{id}");
     Ok(())
+}
+
+/// `docker cp`/`podman cp`-style file copy between the local
+/// filesystem and a container's own persistent on-disk storage —
+/// works on a running *or* stopped container alike (unlike almost
+/// every other per-container command in this binary, this only ever
+/// touches on-disk state directly, never a live process/cgroup at
+/// all — matching real `podman cp`'s own identical "running or
+/// stopped" support).
+///
+/// `[CONTAINER:]PATH` parsing ([`parse_user_input`]) is a direct,
+/// checked-against port of real podman's own `parseUserInput`
+/// (`~/git/podman/pkg/copy/parse.go`).
+///
+/// Two real gaps, both a clear, loud error rather than a silently
+/// wrong copy:
+///
+/// * **Container-to-container isn't supported yet** (real `podman cp`
+///   supports it) — this increment only covers the by far more common
+///   "one side is the host" case (see `docs/design/0146`'s own "what
+///   this doesn't do yet").
+/// * **A container using this project's own rootless-overlay rootfs
+///   optimization (`docs/design/0110`) isn't supported at all yet** —
+///   a real, checked-directly discovery made *while building this
+///   exact feature*: such a container's own real writes only ever
+///   land in a private per-container `upper/` directory, genuinely
+///   distinct from the (empty, on the host's own view) `rootfs/`
+///   directory [`oci_runtime_core::PersistedState::rootfs`] reports
+///   (`echo hi > /marker` inside a real overlay-rootfs container
+///   landed in `upper/marker`, not `rootfs/marker`, confirmed by
+///   directly inspecting the bundle directory of a real running
+///   container). Correctly reading such a container's own real merged
+///   view would need genuine overlayfs-whiteout-aware directory
+///   merging this increment doesn't implement; [`resolve_container_
+///   root`] detects this via `upper/`'s own presence (`rootfs_setup::
+///   prepare_overlay`'s own unconditional layout) and reports a clear
+///   error instead of a plausible-looking but silently incomplete
+///   copy.
+fn cmd_cp(src: &str, dest: &str, overwrite: bool) -> anyhow::Result<()> {
+    let (src_container, src_path) = parse_user_input(src);
+    let (dest_container, dest_path) = parse_user_input(dest);
+
+    if src_path.is_empty() || dest_path.is_empty() {
+        anyhow::bail!("ociman cp: both {src:?} and {dest:?} must specify a path");
+    }
+
+    match (src_container, dest_container) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "ociman cp: copying directly between two containers isn't supported yet -- copy \
+             through the host instead"
+        ),
+        (Some(container), None) => {
+            let root = resolve_container_root(&container)?;
+            let real_src = resolve_container_path(&root, &src_path)?;
+            copy_cp_path(&real_src, Path::new(&dest_path), overwrite)
+        }
+        (None, Some(container)) => {
+            let root = resolve_container_root(&container)?;
+            let real_dest = resolve_container_path(&root, &dest_path)?;
+            copy_cp_path(Path::new(&src_path), &real_dest, overwrite)
+        }
+        (None, None) => anyhow::bail!(
+            "ociman cp: neither {src:?} nor {dest:?} names a container -- exactly one of \
+             SRC_PATH/DEST_PATH must be `CONTAINER:PATH`"
+        ),
+    }
+}
+
+/// The exact syntax-only parsing rule real podman's own
+/// `parseUserInput` uses (checked directly against
+/// `~/git/podman/pkg/copy/parse.go`): colons in a path are supported
+/// as long as the path starts with a dot or a slash — otherwise,
+/// everything up to the first `:` names a container. Purely
+/// syntactic: never checks whether that name actually resolves to a
+/// real container ([`resolve_container_root`]'s own job, once this
+/// has decided a container was even named at all) — matches real
+/// podman exactly (`containerMustExist` is a separate, later check
+/// there too). Podman's own version also special-cases `filepath.
+/// IsAbs` for Windows drive letters (`C:\...`); irrelevant on this
+/// project's own Linux-only target, where that's simply the same
+/// "starts with `/`" check again.
+fn parse_user_input(input: &str) -> (Option<String>, String) {
+    if input.is_empty() || input.starts_with('.') || input.starts_with('/') {
+        return (None, input.to_string());
+    }
+    match input.split_once(':') {
+        Some((container, path)) => (Some(container.to_string()), path.to_string()),
+        None => (None, input.to_string()),
+    }
+}
+
+/// The real, current root directory [`cmd_cp`] should resolve
+/// `id`'s own container-side paths against — any status at all (no
+/// cgroup/pid involved), matching real `podman cp`'s own "running or
+/// stopped" support. A clear, real error for a container using this
+/// project's own rootless-overlay rootfs optimization — see
+/// `cmd_cp`'s own doc comment for why.
+fn resolve_container_root(id: &str) -> anyhow::Result<PathBuf> {
+    let containers = open_container_store()?;
+    let resolved = resolve_container_id(&containers, id)?;
+    let state = containers.load(&resolved)?;
+    let bundle_dir = containers.container_dir(&resolved);
+    anyhow::ensure!(
+        !bundle_dir.join("upper").exists(),
+        "ociman cp: container {id:?} uses this project's own rootless-overlay rootfs \
+         optimization, which `cp` doesn't support yet (see docs/design/0146)"
+    );
+    Ok(PathBuf::from(state.rootfs))
+}
+
+/// Join `container_relative_path` (an absolute-or-relative path as
+/// the *container* sees it, e.g. `/etc/hosts` or `some/dir`) onto
+/// `root`, refusing any `..` component — the same minimal safety bar
+/// `oci_runtime_core::cgroups::directory_for` already established for
+/// an analogous "untrusted relative path joined onto a real root
+/// directory" case, rather than a full symlink-aware chroot
+/// resolution.
+fn resolve_container_path(root: &Path, container_relative_path: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        !container_relative_path.split('/').any(|c| c == ".."),
+        "ociman cp: {container_relative_path:?} contains a `..` component, which isn't allowed"
+    );
+    Ok(root.join(container_relative_path.trim_start_matches('/')))
+}
+
+/// The actual copy, once both `src`/`dest` have been resolved to real
+/// host paths: matches real `docker cp`/`podman cp`'s own documented
+/// core behavior (not every edge case — see `docs/design/0146`'s own
+/// "what this doesn't do yet") --  a source *file* copied onto an
+/// already-existing destination *directory* lands inside it under its
+/// own basename (`copy_path_recursive` itself already gives a source
+/// *directory* this same "merge into an existing destination
+/// directory" behavior for free, with no special-casing needed: it
+/// walks `src`'s own entries and joins each under `dest`, which is
+/// exactly "copied into the directory" whether or not `dest` already
+/// existed). `--overwrite` governs the one real remaining conflict:
+/// `src` is a directory but `dest` already exists as a non-directory
+/// at that exact literal path — matching real `podman cp --overwrite`
+/// exactly, without it that's a clear, real error; with it, the
+/// conflicting destination is removed first.
+fn copy_cp_path(src: &Path, dest: &Path, overwrite: bool) -> anyhow::Result<()> {
+    let src_metadata = std::fs::symlink_metadata(src)
+        .with_context(|| format!("{}: no such file or directory", src.display()))?;
+    let dest_metadata = std::fs::symlink_metadata(dest).ok();
+
+    let mut real_dest = dest.to_path_buf();
+    match (&dest_metadata, src_metadata.is_dir()) {
+        // A source *file* landing on an already-existing destination
+        // *directory* goes inside it, under its own basename.
+        (Some(m), false) if m.is_dir() => {
+            let file_name = src
+                .file_name()
+                .with_context(|| format!("{}: has no file name", src.display()))?;
+            real_dest = dest.join(file_name);
+        }
+        // A source *directory* landing on an already-existing
+        // destination *non-directory* is the one real conflict.
+        (Some(m), true) if !m.is_dir() => {
+            anyhow::ensure!(
+                overwrite,
+                "ociman cp: {} already exists and is not a directory (source is a directory) \
+                 -- pass --overwrite to replace it",
+                dest.display()
+            );
+            std::fs::remove_file(dest)
+                .with_context(|| format!("removing existing {}", dest.display()))?;
+        }
+        _ => {}
+    }
+
+    build::copy_path_recursive(src, &real_dest, None, None, None)
 }
 
 /// The actual "stop (if `force`) and remove one container's own
@@ -4209,5 +4402,52 @@ mod tests {
     #[test]
     fn human_size_handles_a_realistic_128_5_gb_physical_ram_figure() {
         assert_eq!(human_size(128_548_953_600), "128.5GB");
+    }
+
+    // `parse_user_input` checked directly against real podman's own
+    // `parseUserInput` (`~/git/podman/pkg/copy/parse.go`).
+    #[test]
+    fn parse_user_input_splits_a_container_prefixed_path() {
+        assert_eq!(
+            parse_user_input("mycontainer:/etc/hosts"),
+            (Some("mycontainer".to_string()), "/etc/hosts".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_user_input_a_relative_path_with_no_colon_names_no_container() {
+        assert_eq!(
+            parse_user_input("some/relative/path"),
+            (None, "some/relative/path".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_user_input_a_path_starting_with_dot_never_names_a_container() {
+        assert_eq!(
+            parse_user_input("./weird:but:relative"),
+            (None, "./weird:but:relative".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_user_input_an_absolute_path_never_names_a_container() {
+        assert_eq!(
+            parse_user_input("/abs/path:with:colons"),
+            (None, "/abs/path:with:colons".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_user_input_empty_string_is_empty_path_no_container() {
+        assert_eq!(parse_user_input(""), (None, String::new()));
+    }
+
+    #[test]
+    fn parse_user_input_container_with_no_path_at_all_is_an_empty_path() {
+        assert_eq!(
+            parse_user_input("mycontainer:"),
+            (Some("mycontainer".to_string()), String::new())
+        );
     }
 }

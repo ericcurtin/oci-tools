@@ -2123,7 +2123,7 @@ fn write_new_file(target: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> 
 /// empty directory behind in the built image, but never with its own
 /// source-preserved mode/ownership (confirmed directly, see
 /// `oci_dockerfile::dockerignore`'s own doc comment).
-fn copy_path_recursive(
+pub(crate) fn copy_path_recursive(
     src: &Path,
     dest: &Path,
     chmod: Option<u32>,
