@@ -1407,9 +1407,16 @@ fn run_instruction(
     // base-layer extraction, and every earlier `RUN` step in this same
     // build don't spawn any -- matching `cmd_run`'s own identical
     // safety note for the same `oci_runtime_core::launch` entry point.
+    //
+    // `close_stdin: true` (0187): a `RUN` step never gets real, live
+    // stdin at all, matching real `docker build`/`podman build`
+    // exactly -- checked directly (piping real input into `podman
+    // build` for a Containerfile whose one `RUN` step tries to read
+    // it back never sees it, even though the `podman build` process
+    // itself did).
     #[allow(unsafe_code)]
     let exit_code =
-        unsafe { oci_runtime_core::launch::run("ociman-build", &bundle, &validated_rootfs) }
+        unsafe { oci_runtime_core::launch::run("ociman-build", &bundle, &validated_rootfs, true) }
             .with_context(|| format!("running RUN {command_text}"))?;
     anyhow::ensure!(
         exit_code == 0,

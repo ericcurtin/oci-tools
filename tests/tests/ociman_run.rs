@@ -2514,3 +2514,121 @@ fn run_by_id_records_the_images_own_real_reference_not_the_id_typed() {
          the bare ID {short_id:?} it was actually started with: {view:?}"
     );
 }
+
+/// `ociman run` without `-i`/`--interactive` (0187): the container's
+/// own stdin must always be a fresh, empty `/dev/null`, never a silent
+/// pass-through of whatever real stdin `ociman` itself happened to
+/// have — matching real `docker run`/`podman run` exactly (checked
+/// directly: piping real input into a plain `podman run` with no `-i`
+/// never reaches the container at all).
+///
+/// A real, previously-unnoticed bug this test would have caught: before
+/// this fix, `ociman run`'s own foreground path never touched the
+/// container's stdin at all, so it silently inherited whatever fd 0
+/// `ociman` itself had -- forwarding real piped input completely
+/// unconditionally, with no way to turn it off.
+#[test]
+fn run_without_interactive_never_forwards_real_stdin() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stdin-default:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "ociman-test/stdin-default:latest",
+            "/bin/sh",
+            "-c",
+            "if read -t 5 line; then echo GOT:$line; else echo NOINPUT; fi",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman run");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello-from-host-stdin\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "NOINPUT",
+        "without --interactive, the container should never see real host stdin"
+    );
+}
+
+/// `ociman run -i`/`--interactive` (0187): the container's own stdin
+/// must be this process's own real stdin, matching real `docker run
+/// -i`/`podman run -i` exactly.
+#[test]
+fn run_interactive_forwards_real_stdin() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stdin-interactive:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "--interactive",
+            "ociman-test/stdin-interactive:latest",
+            "/bin/sh",
+            "-c",
+            "if read -t 5 line; then echo GOT:$line; else echo NOINPUT; fi",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman run");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello-from-host-stdin\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "GOT:hello-from-host-stdin",
+        "--interactive should forward this process's own real stdin to the container"
+    );
+}

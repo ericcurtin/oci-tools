@@ -764,6 +764,18 @@ enum Command {
         /// fully captured (`ociman logs`), just never shown live.
         #[arg(short, long)]
         detach: bool,
+        /// Keep the container's own stdin open and forward this
+        /// process's own real stdin to it, matching real `docker run
+        /// -i`/`podman run -i` exactly (checked directly: without
+        /// this, the container's own stdin is always closed —
+        /// `/dev/null` — regardless of whatever stdin `ociman` itself
+        /// was given, never a silent pass-through of it). Has no
+        /// effect with `--detach` (a detached container's own stdin
+        /// is always closed either way, real `docker run -d -i`'s own
+        /// "leave stdin open for a later `attach`" behavior is a
+        /// separate, still-deferred gap).
+        #[arg(short, long)]
+        interactive: bool,
     },
     /// Pull (if not already present) and extract an image's container,
     /// same as `run`, but never launch it -- matching real `docker
@@ -1435,7 +1447,12 @@ fn main() -> std::process::ExitCode {
             Some(Command::History { reference }) => cmd_history(&reference, cli.global.json),
             Some(Command::Prune { all }) => cmd_prune(cli.global.json, all),
             Some(Command::Inspect { reference }) => cmd_inspect(&reference, cli.global.json),
-            Some(Command::Run { args, rm, detach }) => cmd_run(args, rm, detach),
+            Some(Command::Run {
+                args,
+                rm,
+                detach,
+                interactive,
+            }) => cmd_run(args, rm, detach, interactive),
             Some(Command::Create { args, rm }) => cmd_create(args, rm),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Start { id, attach }) => cmd_start(&id, attach),
@@ -3073,7 +3090,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
     })
 }
 
-fn cmd_run(args: RunArgs, rm: bool, detach: bool) -> anyhow::Result<()> {
+fn cmd_run(args: RunArgs, rm: bool, detach: bool, interactive: bool) -> anyhow::Result<()> {
     let PreparedContainer {
         container_id,
         mut state,
@@ -3111,6 +3128,10 @@ fn cmd_run(args: RunArgs, rm: bool, detach: bool) -> anyhow::Result<()> {
                 state,
                 rm,
                 true,
+                // `--interactive` has no effect once detached (see
+                // `Command::Run`'s own doc comment) — a detached
+                // container's own stdin is always closed either way.
+                false,
             )?;
         }
         return Ok(());
@@ -3124,6 +3145,7 @@ fn cmd_run(args: RunArgs, rm: bool, detach: bool) -> anyhow::Result<()> {
         state,
         &log_path,
         rm,
+        interactive,
     )?;
 
     // The container's own exit code becomes ours, matching `ocirun
@@ -3189,6 +3211,18 @@ fn cmd_create(args: RunArgs, rm: bool) -> anyhow::Result<()> {
 /// the container id at all (checked directly), only the container's
 /// own live output once it starts arriving.
 ///
+/// `interactive` (0187): forwarded to [`run_and_finalize`]'s own
+/// identical parameter, but always moot in practice here — this
+/// keeper process (below) always closes its own stdin (`/dev/null`)
+/// before ever calling `run_and_finalize`, regardless of what's
+/// passed, so the container's own stdin ends up closed either way.
+/// Both current callers (`ociman run -d`, `ociman start`) pass `false`
+/// for exactly this reason (see each one's own call site comment) —
+/// kept as a real parameter, not hardcoded here, so a future `-d -i`
+/// (real docker/podman's own separate "leave stdin open for a later
+/// attach" behavior, still a deferred gap) has an obvious, already-
+/// wired place to plug into instead of a silent, hidden assumption.
+///
 /// # Safety
 ///
 /// Forwards `oci_runtime_core::process::fork`'s own safety
@@ -3204,6 +3238,7 @@ unsafe fn launch_detached_and_confirm(
     state: oci_runtime_core::PersistedState,
     rm: bool,
     print_id: bool,
+    interactive: bool,
 ) -> anyhow::Result<()> {
     let container_id_for_keeper = container_id.to_string();
 
@@ -3243,6 +3278,7 @@ unsafe fn launch_detached_and_confirm(
                 state,
                 &log_path,
                 rm,
+                interactive,
             );
             std::process::exit(0);
         })
@@ -3276,6 +3312,13 @@ unsafe fn launch_detached_and_confirm(
 /// stop, not a real, final one. A container that was never launched
 /// with `--rm` at all (`rm == false`) skips this re-check entirely —
 /// no extra disk read at all for the much more common non-`--rm` case.
+///
+/// `interactive` (0187): forwarded to `launch::run_reporting_pid`'s
+/// own `close_stdin` (inverted — `interactive` means *don't* close
+/// it) — see `Command::Run`'s own `--interactive` doc comment for the
+/// real, checked-directly default this narrows (stdin closed unless
+/// asked otherwise, matching real `docker run`/`podman run` exactly).
+#[allow(clippy::too_many_arguments)]
 fn run_and_finalize(
     container_id: &str,
     bundle: &oci_runtime_core::Bundle,
@@ -3284,6 +3327,7 @@ fn run_and_finalize(
     mut state: oci_runtime_core::PersistedState,
     log_path: &Path,
     rm: bool,
+    interactive: bool,
 ) -> anyhow::Result<i32> {
     // A fresh scope-name nonce for *this* launch (0159) — set on
     // `state` in memory now, piggy-backed on `record_running`'s own
@@ -3348,6 +3392,7 @@ fn run_and_finalize(
             rootfs,
             Some(log_path),
             cgroup_setup,
+            !interactive,
             record_running,
         )
     }
@@ -4857,6 +4902,10 @@ fn cmd_start(id: &str, attach: bool) -> anyhow::Result<()> {
             state,
             rm,
             !attach,
+            // `ociman start` has no `-i`/`--interactive` of its own
+            // yet — see `cmd_start`'s own doc comment for this real,
+            // still-deferred gap.
+            false,
         )?;
     }
     if attach {
@@ -4901,7 +4950,20 @@ fn attach_and_wait_for_exit(containers: &StateStore, resolved: &str) -> anyhow::
             print_new_log_bytes(file)?;
         }
         let state = containers.load(resolved)?;
-        if state.effective_status() == Status::Stopped {
+        // The *raw* on-disk status, deliberately not `effective_status()`
+        // (a real, previously-hit race, caught by hand): `effective_
+        // status()` reports `Stopped` the instant the container's own
+        // recorded pid is no longer alive, which can be *before* its
+        // own detached keeper process has actually gotten around to
+        // persisting the final state -- `ANNOTATION_EXIT_CODE` included
+        // -- since both are written together in one call right at the
+        // very end (`run_and_finalize`). Trusting `effective_status()`
+        // here let this function race ahead and read back a *missing*
+        // exit code (silently falling back to this function's own `-1`
+        // below) essentially every time, not a rare corner case --
+        // exactly the same distinction `wait_for_keeper_to_finalize`'s
+        // own doc comment already explains for its own, separate use.
+        if state.status == Status::Stopped {
             // One final catch-up read: the container may have written
             // more output between the last poll above and actually
             // stopping.

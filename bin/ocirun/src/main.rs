@@ -434,6 +434,12 @@ fn cmd_run(id: &str, bundle: Option<&Path>, pid_file: Option<&Path>) -> anyhow::
             &rootfs,
             None,
             oci_runtime_core::launch::CgroupSetup::FromSpec,
+            // `close_stdin: false` — matching real `runc run`/`crun
+            // run` exactly: neither has any "attach"/"interactive"
+            // concept of its own at all, always forwarding whatever
+            // stdio their own caller already set up verbatim (see
+            // `run_reporting_pid`'s own doc comment, 0187).
+            false,
             |pid| {
                 if let Some(path) = pid_file {
                     write_pid_file(path, pid);

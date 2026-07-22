@@ -65,14 +65,32 @@ pub const COMMAND_NOT_FOUND_EXIT_CODE: i32 = 127;
 /// before the container's process ever ran (every such failure is logged
 /// to stderr before that happens).
 ///
+/// `close_stdin` (0187): if true, the container's own stdin is a fresh
+/// `/dev/null` rather than whatever fd 0 this calling process itself
+/// happens to have — this function's own one real caller,
+/// `ociman build`'s `RUN` step execution, always passes `true`,
+/// matching real `docker build`/`podman build` exactly (checked
+/// directly: a `RUN` step never sees real, live stdin at all, even if
+/// the `build` invocation itself had some piped in).
+///
 /// # Safety
 ///
 /// Must be called from a single-threaded process — this forks (see
 /// [`crate::process::fork_and_wait`]'s safety note, which this inherits).
 #[allow(unsafe_code)]
-pub unsafe fn run(id: &str, bundle: &Bundle, rootfs: &Path) -> io::Result<i32> {
+pub unsafe fn run(id: &str, bundle: &Bundle, rootfs: &Path, close_stdin: bool) -> io::Result<i32> {
     // SAFETY: forwarded from this function's own contract.
-    unsafe { run_reporting_pid(id, bundle, rootfs, None, CgroupSetup::FromSpec, |_pid| {}) }
+    unsafe {
+        run_reporting_pid(
+            id,
+            bundle,
+            rootfs,
+            None,
+            CgroupSetup::FromSpec,
+            close_stdin,
+            |_pid| {},
+        )
+    }
 }
 
 /// How a container's cgroup gets set up — see `docs/design/0033` and
@@ -137,6 +155,17 @@ pub enum CgroupSetup {
 /// broken notify/cleanup script isn't a reason to report the
 /// container itself as having failed.
 ///
+/// `close_stdin` (0187): if true, the container's own stdin is a
+/// fresh `/dev/null` rather than whatever fd 0 this calling process
+/// itself already has — `ocirun run`'s own direct call site always
+/// passes `false` (matching real `runc run`/`crun run` exactly:
+/// neither has any concept of "attach"/"interactive" at all, always
+/// forwarding whatever stdio their own caller already set up
+/// verbatim), while `ociman`'s own call site threads its `ociman run
+/// -i`/`--interactive` flag through (`ociman run` without `-i`
+/// defaults to `true`, matching real `docker run`/`podman run`
+/// exactly — checked directly).
+///
 /// # Safety
 ///
 /// Same contract as [`run`].
@@ -147,9 +176,19 @@ pub unsafe fn run_reporting_pid(
     rootfs: &Path,
     log_path: Option<&Path>,
     cgroup_setup: CgroupSetup,
+    close_stdin: bool,
     on_pid: impl FnOnce(i32),
 ) -> io::Result<i32> {
     let mut child_setup = build_child_setup(bundle, rootfs, id)?;
+    if close_stdin {
+        child_setup.stdin_fd = Some(
+            std::fs::File::open("/dev/null")
+                .map_err(|e| {
+                    io::Error::other(format!("opening /dev/null for container stdin: {e}"))
+                })?
+                .into(),
+        );
+    }
     let (read_fd, write_fd) =
         rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)?;
     child_setup.pid_pipe_write = Some(write_fd);
@@ -721,6 +760,7 @@ fn build_child_setup(bundle: &Bundle, rootfs: &Path, id: &str) -> io::Result<Chi
         exec_fifo: None,
         pid_pipe_write: None,
         container_hooks,
+        stdin_fd: None,
         stdout_log_fd: None,
         stderr_log_fd: None,
         cgroup_ready_read: None,
@@ -806,6 +846,15 @@ struct ChildSetup {
     pid_pipe_write: Option<rustix::fd::OwnedFd>,
     /// See [`ContainerHooks`]'s own doc comment.
     container_hooks: Option<ContainerHooks>,
+    /// Set by [`run_reporting_pid`]/[`run`] (0187) when `close_stdin`
+    /// is true: a freshly-opened `/dev/null`, dup'd onto the
+    /// container's own stdin instead of whatever fd 0 this process
+    /// itself already has (which every caller inherited before this
+    /// field existed, and still does when this is `None` — [`create`]
+    /// never sets it at all, matching real runc/crun's own equivalent
+    /// two-phase lifecycle, which has no "attach"/"interactive"
+    /// concept either).
+    stdin_fd: Option<rustix::fd::OwnedFd>,
     /// Set by [`run_reporting_pid`] (via [`setup_log_tee_pipe`]) when a
     /// log path was given: the write end of the pipe whose read end a
     /// background thread in the *caller's* process tees to both a log
@@ -1119,13 +1168,17 @@ impl ChildSetup {
         // `self` is only ever a shared reference here, so the `OwnedFd`s
         // themselves can't be moved out of it directly; reconstructing
         // a fresh `Stdio` from the same raw number is sound because
-        // this process (which never uses `self.stdout_log_fd`/
-        // `stderr_log_fd` again) always terminates from here on by
-        // either a successful `exec` (replacing the process image,
-        // which reclaims every fd via ordinary kernel process teardown
-        // — Rust's own `Drop` for the original `OwnedFd` field never
-        // gets to run either way) or `fail`'s `std::process::exit`
-        // (same reclaiming, same reasoning).
+        // this process (which never uses `self.stdin_fd`/
+        // `self.stdout_log_fd`/`stderr_log_fd` again) always terminates
+        // from here on by either a successful `exec` (replacing the
+        // process image, which reclaims every fd via ordinary kernel
+        // process teardown — Rust's own `Drop` for the original
+        // `OwnedFd` field never gets to run either way) or `fail`'s
+        // `std::process::exit` (same reclaiming, same reasoning).
+        #[allow(unsafe_code)]
+        if let Some(fd) = &self.stdin_fd {
+            command.stdin(unsafe { std::process::Stdio::from_raw_fd(fd.as_raw_fd()) });
+        }
         #[allow(unsafe_code)]
         if let Some(fd) = &self.stdout_log_fd {
             command.stdout(unsafe { std::process::Stdio::from_raw_fd(fd.as_raw_fd()) });

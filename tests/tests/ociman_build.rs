@@ -5,8 +5,9 @@
 //! but-structurally-real seeded base image via `seed_image`, no
 //! registry access needed).
 
+use std::io::Write as _;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use oci_spec_types::image::ContainerConfig;
 use oci_store::Store;
@@ -6323,4 +6324,90 @@ fn build_squash_and_squash_all_together_is_a_clear_error() {
     assert!(!build.status.success());
     let stderr = String::from_utf8_lossy(&build.stderr);
     assert!(stderr.contains("cannot be used together"), "{stderr}");
+}
+
+/// A `RUN` step's own stdin (0187) must always be a fresh, empty
+/// `/dev/null`, never a silent pass-through of whatever real stdin the
+/// `ociman build` invocation itself happened to have -- matching real
+/// `docker build`/`podman build` exactly (checked directly: piping
+/// real input into a real `podman build` whose one `RUN` step tries to
+/// read it back never sees it, even though the `podman build` process
+/// itself did).
+///
+/// A real, previously-unnoticed bug this test would have caught:
+/// before this fix, every `RUN` step silently inherited whatever fd 0
+/// `ociman build` itself had, forwarding real piped input completely
+/// unconditionally, with no way to turn it off -- the same underlying
+/// root cause `run_without_interactive_never_forwards_real_stdin`
+/// (`tests/tests/ociman_run.rs`) independently caught for `ociman run`.
+#[test]
+fn build_run_step_never_sees_real_host_stdin() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-stdin-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-stdin-base:latest\n\
+         RUN if read -t 5 line; then echo GOT:$line >/marker; else echo NOINPUT >/marker; fi\n",
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-stdin-result:latest",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman build");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello-from-host-stdin\n")
+        .unwrap();
+    let build = child.wait_with_output().unwrap();
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/build-stdin-result:latest",
+            "/bin/cat",
+            "/marker",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).trim(),
+        "NOINPUT",
+        "a RUN step should never see real host stdin, piped into the build invocation or not"
+    );
 }
