@@ -676,6 +676,21 @@ enum Command {
         /// The container's ID or `--name`.
         id: String,
     },
+    /// A single, one-shot resource-usage sample for a running
+    /// container's own real cgroup — matching real `podman stats
+    /// --no-stream`'s own single-call semantics exactly (see the
+    /// `cmd_stats` doc comment for the one, deliberately narrow gap:
+    /// the real default *continuous* streaming mode isn't implemented
+    /// yet, and is a clear, loud error instead of a silent behavioral
+    /// difference — see `docs/design/0145`).
+    Stats {
+        /// The container's ID or `--name`.
+        id: String,
+        /// Required for now — see the `Stats` variant's own doc
+        /// comment.
+        #[arg(long)]
+        no_stream: bool,
+    },
     /// Block until a container stops, then print its exit code —
     /// matching real `docker wait`/`podman wait`. Returns immediately
     /// (still printing the exit code) if the container has already
@@ -862,6 +877,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Kill { id, signal }) => cmd_kill(&id, &signal),
             Some(Command::Pause { id }) => cmd_pause(&id),
             Some(Command::Unpause { id }) => cmd_unpause(&id),
+            Some(Command::Stats { id, no_stream }) => cmd_stats(&id, no_stream, cli.global.json),
             Some(Command::Wait { id, interval }) => cmd_wait(&id, interval),
             Some(Command::Rename { id, name }) => cmd_rename(&id, &name),
             Some(Command::Top { id, ps_args }) => cmd_top(&id, &ps_args),
@@ -2688,6 +2704,157 @@ fn cmd_unpause(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `docker stats`/`podman stats`-style one-shot resource-usage sample
+/// for one container, straight from its own real cgroup v2 accounting
+/// files.
+#[derive(Debug, Serialize)]
+struct ContainerStatsView {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    cpu_percent: f64,
+    mem_usage: u64,
+    mem_limit: u64,
+    mem_percent: f64,
+    pids: u64,
+}
+
+/// A single, one-shot resource-usage sample for a running container's
+/// own real cgroup: CPU %, memory usage/limit, memory %, and pid
+/// count, all read directly from cgroup v2 accounting files via the
+/// same `resolve_running_container_cgroup` resolution `cmd_top`/
+/// `cmd_pause`/`cmd_unpause` already use — matching real `podman
+/// stats --no-stream`'s own single-call behavior exactly (checked
+/// directly against `~/git/podman/libpod/stats_linux.go`'s own
+/// `calculateCPUPercent` and `GetContainerStats`'s own handling of "no
+/// previous sample available yet"): with no previous sample to diff
+/// against, real podman computes `cpu_percent` as this exact formula
+/// — `(total cgroup CPU time consumed so far, in ns) / (wall-clock
+/// time elapsed since the container started, in ns) * 100` — which
+/// this project approximates using the container's own recorded
+/// `created` timestamp (real podman uses a separately tracked
+/// `StartedTime` instead; this project has no separate field of its
+/// own for that yet, so for a combined `ociman run` — this project's
+/// own only way to start a container at all right now, see
+/// `docs/design/0145`'s own "what this doesn't do yet" — `created`
+/// and "started" are for all practical purposes the same instant).
+///
+/// `--no-stream` is required for now: real `podman stats`'s own
+/// *default* behavior streams continuously, re-sampling roughly once
+/// a second until interrupted — not implemented yet, and deliberately
+/// a clear, loud error instead of silently behaving differently from
+/// the real command (matches this project's own already-established
+/// "loud error over silently-wrong behavior" convention).
+fn cmd_stats(id: &str, no_stream: bool, json: bool) -> anyhow::Result<()> {
+    if !no_stream {
+        anyhow::bail!(
+            "ociman stats: continuous (streaming) mode isn't implemented yet -- pass --no-stream"
+        );
+    }
+
+    let containers = open_container_store()?;
+    let resolved = resolve_container_id(&containers, id)?;
+    let state = containers.load(&resolved)?;
+    if state.effective_status() != Status::Running {
+        anyhow::bail!("container {id:?} is not running");
+    }
+    let pid = state
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
+    let cgroup_dir =
+        oci_runtime_core::cgroups::cgroup_dir_for_running_pid(Path::new("/sys/fs/cgroup"), pid)
+            .with_context(|| format!("resolving cgroup for container {id:?}"))?;
+
+    let cpu_nanos = oci_runtime_core::cgroups::cpu_usage_nanos(&cgroup_dir)
+        .with_context(|| format!("reading cpu usage for container {id:?}"))?;
+    let mem_usage = oci_runtime_core::cgroups::memory_usage_bytes(&cgroup_dir)
+        .with_context(|| format!("reading memory usage for container {id:?}"))?;
+    let mem_limit =
+        oci_runtime_core::cgroups::memory_limit_bytes_clamped_to_physical_ram(&cgroup_dir)
+            .with_context(|| format!("reading memory limit for container {id:?}"))?;
+    let pids = oci_runtime_core::cgroups::pids_current(&cgroup_dir)
+        .with_context(|| format!("reading pid count for container {id:?}"))?;
+
+    let created = oci_spec_types::time::parse_rfc3339_utc(&state.created).ok_or_else(|| {
+        anyhow::anyhow!(
+            "container {id:?} has an unparseable created timestamp: {:?}",
+            state.created
+        )
+    })?;
+    let elapsed_nanos = std::time::SystemTime::now()
+        .duration_since(created)
+        .unwrap_or_default()
+        .as_nanos()
+        .max(1); // never divide by zero, even for a container created this same instant.
+    let cpu_percent = (cpu_nanos as f64 / elapsed_nanos as f64) * 100.0;
+    let mem_percent = if mem_limit == 0 {
+        0.0
+    } else {
+        (mem_usage as f64 / mem_limit as f64) * 100.0
+    };
+
+    let view = ContainerStatsView {
+        id: state.id.clone(),
+        name: state.annotations.get(ANNOTATION_NAME).cloned(),
+        cpu_percent,
+        mem_usage,
+        mem_limit,
+        mem_percent,
+        pids,
+    };
+
+    if json {
+        oci_cli_common::output::print_json(&view)?;
+        return Ok(());
+    }
+    println!(
+        "{:<14} {:<20} {:<10} {:<24} {:<8}PIDS",
+        "ID", "NAME", "CPU %", "MEM USAGE / LIMIT", "MEM %"
+    );
+    println!(
+        "{:<14} {:<20} {:<10} {:<24} {:<8}{}",
+        view.id,
+        view.name.as_deref().unwrap_or(""),
+        format!("{:.2}%", view.cpu_percent),
+        format!(
+            "{} / {}",
+            human_size(view.mem_usage),
+            human_size(view.mem_limit)
+        ),
+        format!("{:.2}%", view.mem_percent),
+        view.pids
+    );
+    Ok(())
+}
+
+/// A human-readable, decimal-SI byte size (`"65.54kB"`, `"128.5GB"`,
+/// `"110B"`) approximating real docker/podman's own `go-units`
+/// `HumanSize` — same base-1000 units and roughly the same 4-
+/// significant-digit precision (checked directly against
+/// `~/git/moby/vendor/github.com/docker/go-units/size.go`), though not
+/// byte-for-byte identical to Go's own `%.4g` float formatting in
+/// every edge case (see `docs/design/0145`'s own "what this doesn't do
+/// yet").
+fn human_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1000.0 && unit < UNITS.len() - 1 {
+        size /= 1000.0;
+        unit += 1;
+    }
+    let integer_digits = format!("{}", size.trunc() as u64).len();
+    let decimals = 4usize.saturating_sub(integer_digits);
+    let mut formatted = format!("{size:.decimals$}");
+    if formatted.contains('.') {
+        formatted = formatted
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string();
+    }
+    format!("{formatted}{}", UNITS[unit])
+}
+
 /// Print a container's captured output (see `docs/design/0025`):
 /// everything its process has written to stdout/stderr since `run`
 /// started it, combined in the order it was produced. Doesn't yet
@@ -4004,5 +4171,43 @@ mod tests {
     fn history_layer_sizes_every_entry_empty_never_touches_layers() {
         let history = vec![history_entry(true), history_entry(true)];
         assert_eq!(history_layer_sizes(&history, &[]), vec![0, 0]);
+    }
+
+    // `human_size` checked directly against real observed `podman
+    // stats --no-stream` output (`110B / 430B`, `65.54kB / 128.5GB`)
+    // and real go-units `HumanSize`'s own doc-comment examples
+    // (`"2.746 MB"`, `"796 KB"` -- without the space this project's
+    // own table columns never had to begin with).
+    #[test]
+    fn human_size_matches_real_observed_podman_stats_output() {
+        assert_eq!(human_size(0), "0B");
+        assert_eq!(human_size(110), "110B");
+        assert_eq!(human_size(430), "430B");
+        assert_eq!(human_size(65_536), "65.54kB");
+    }
+
+    #[test]
+    fn human_size_matches_go_units_doc_comment_examples() {
+        assert_eq!(human_size(796_000), "796kB");
+        assert_eq!(human_size(2_746_000), "2.746MB");
+    }
+
+    #[test]
+    fn human_size_trims_a_trailing_zero_and_dot_for_a_whole_number() {
+        assert_eq!(human_size(100), "100B");
+        assert_eq!(human_size(100_000_000), "100MB");
+    }
+
+    #[test]
+    fn human_size_picks_the_largest_unit_under_a_thousand() {
+        assert_eq!(human_size(999), "999B");
+        assert_eq!(human_size(1_000), "1kB");
+        assert_eq!(human_size(999_000), "999kB");
+        assert_eq!(human_size(1_000_000), "1MB");
+    }
+
+    #[test]
+    fn human_size_handles_a_realistic_128_5_gb_physical_ram_figure() {
+        assert_eq!(human_size(128_548_953_600), "128.5GB");
     }
 }

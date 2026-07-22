@@ -430,6 +430,124 @@ fn wait_frozen(
     ))
 }
 
+// Cgroup v2 accounting reads `ociman stats` needs (see
+// `docs/design/0145`) — deliberately narrow: each of these reports a
+// single, cumulative counter or point-in-time value, exactly as the
+// real cgroup v2 interface files themselves store it; deriving a rate
+// (e.g. a CPU percentage) out of two samples over time is the
+// caller's own job, same as real runc/podman.
+
+/// Total CPU time `cgroup_dir`'s own cgroup has consumed since it was
+/// created, in nanoseconds — `cpu.stat`'s own `usage_usec` key,
+/// converted from microseconds (`* 1000`). Matches real podman's own
+/// `cpuStat` exactly (checked directly against
+/// `~/git/container-libs/common/pkg/cgroups/cpu_linux.go`).
+pub fn cpu_usage_nanos(cgroup_dir: &Path) -> io::Result<u64> {
+    let usec = read_stat_key_as_u64(&cgroup_dir.join("cpu.stat"), "usage_usec")?;
+    Ok(usec.saturating_mul(1000))
+}
+
+/// Real, current memory usage in bytes — `memory.current` minus
+/// `memory.stat`'s own `inactive_file` (clamped to zero, never
+/// negative). Matches real podman's own `memoryStat` exactly (checked
+/// directly against
+/// `~/git/container-libs/common/pkg/cgroups/memory_linux.go`): the
+/// same "reclaimable page cache doesn't count as real usage" docker
+/// convention podman itself ports, rather than reporting the raw (and
+/// substantially less useful — includes ordinary page cache)
+/// `memory.current` value alone.
+pub fn memory_usage_bytes(cgroup_dir: &Path) -> io::Result<u64> {
+    let current = read_single_value_as_u64(&cgroup_dir.join("memory.current"))?;
+    let inactive_file = read_stat_key_as_u64(&cgroup_dir.join("memory.stat"), "inactive_file")?;
+    Ok(current.saturating_sub(inactive_file))
+}
+
+/// The cgroup's own configured memory limit in bytes — `memory.max`,
+/// with the real kernel's own `"max"` sentinel (no limit at all)
+/// mapped to `u64::MAX`, matching real podman's own `readFileAsUint64`
+/// exactly (same source file as [`memory_usage_bytes`]).
+pub fn memory_limit_bytes(cgroup_dir: &Path) -> io::Result<u64> {
+    read_single_value_as_u64(&cgroup_dir.join("memory.max"))
+}
+
+/// The number of tasks (processes+threads) currently in the cgroup —
+/// `pids.current`.
+pub fn pids_current(cgroup_dir: &Path) -> io::Result<u64> {
+    read_single_value_as_u64(&cgroup_dir.join("pids.current"))
+}
+
+/// `memory_limit_bytes`, but clamped to this host's own total physical
+/// RAM whenever the cgroup itself reports no limit at all (`memory.max`
+/// = `"max"`, i.e. [`memory_limit_bytes`] returned `u64::MAX`) or a
+/// limit larger than physical RAM — matches real podman's own
+/// `getMemLimit` exactly (checked directly against
+/// `~/git/podman/libpod/stats_linux.go`), including its own real,
+/// checked-directly quirk of using `Sysinfo.Totalram` completely
+/// unscaled by its own `mem_unit` field (correct on every mainstream
+/// 64-bit Linux target, where `mem_unit` is always `1`) rather than
+/// the more "textbook-correct" `Totalram * mem_unit`.
+pub fn memory_limit_bytes_clamped_to_physical_ram(cgroup_dir: &Path) -> io::Result<u64> {
+    let limit = memory_limit_bytes(cgroup_dir)?;
+    let physical = rustix::system::sysinfo().totalram as u64;
+    Ok(clamp_memory_limit_to_physical_ram(limit, physical))
+}
+
+/// The pure comparison [`memory_limit_bytes_clamped_to_physical_ram`]
+/// applies, factored out so it's unit-testable without a real
+/// `sysinfo(2)` call.
+fn clamp_memory_limit_to_physical_ram(limit: u64, physical: u64) -> u64 {
+    if limit == 0 || limit > physical {
+        physical
+    } else {
+        limit
+    }
+}
+
+/// Read a cgroup v2 interface file holding one bare number on its own
+/// line, or the literal `"max"` sentinel (mapped to `u64::MAX` — the
+/// same convention every real "unlimited" cgroup v2 knob uses, see the
+/// module's own doc comment).
+fn read_single_value_as_u64(path: &Path) -> io::Result<u64> {
+    let content = std::fs::read_to_string(path)?;
+    parse_u64_or_max(content.trim()).ok_or_else(|| not_a_real_cgroup_value(path, &content))
+}
+
+/// Read one `key value` line out of a cgroup v2 flat-map stat file
+/// (the format `cpu.stat`/`memory.stat`/`io.stat` all share). A key
+/// that's simply missing from the file entirely is `Ok(0)`, not an
+/// error — matches real podman's own tolerance for a stat file not
+/// yet mentioning a counter that has never moved off its own zero
+/// default (e.g. a freshly created cgroup's own `memory.stat` before
+/// anything has ever been paged out).
+fn read_stat_key_as_u64(path: &Path, key: &str) -> io::Result<u64> {
+    let content = std::fs::read_to_string(path)?;
+    let Some(value) = content
+        .lines()
+        .find_map(|line| line.strip_prefix(key)?.strip_prefix(' '))
+    else {
+        return Ok(0);
+    };
+    parse_u64_or_max(value.trim()).ok_or_else(|| not_a_real_cgroup_value(path, &content))
+}
+
+fn parse_u64_or_max(value: &str) -> Option<u64> {
+    if value == "max" {
+        Some(u64::MAX)
+    } else {
+        value.parse().ok()
+    }
+}
+
+fn not_a_real_cgroup_value(path: &Path, content: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{}: not a real cgroup v2 value: {content:?}",
+            path.display()
+        ),
+    )
+}
+
 /// Every real pid currently in `cgroup_dir`'s own `cgroup.procs`, plus
 /// every pid in any (recursively nested) sub-cgroup underneath it —
 /// matches real runc/crun's own `cgroups.GetAllPids` exactly (ported
@@ -1034,6 +1152,119 @@ mod tests {
             std::fs::read_to_string(dir.path().join("cgroup.freeze")).unwrap(),
             "1"
         );
+    }
+
+    #[test]
+    fn cpu_usage_nanos_converts_usec_to_nanos() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("cpu.stat"),
+            "usage_usec 2500\nuser_usec 2000\nsystem_usec 500\n",
+        )
+        .unwrap();
+        assert_eq!(cpu_usage_nanos(dir.path()).unwrap(), 2_500_000);
+    }
+
+    #[test]
+    fn cpu_usage_nanos_is_zero_when_the_container_has_never_run() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("cpu.stat"),
+            "usage_usec 0\nuser_usec 0\nsystem_usec 0\n",
+        )
+        .unwrap();
+        assert_eq!(cpu_usage_nanos(dir.path()).unwrap(), 0);
+    }
+
+    #[test]
+    fn memory_usage_bytes_subtracts_inactive_file_from_current() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("memory.current"), "10000000\n").unwrap();
+        std::fs::write(
+            dir.path().join("memory.stat"),
+            "anon 4000000\ninactive_file 3000000\nactive_file 1000000\n",
+        )
+        .unwrap();
+        assert_eq!(memory_usage_bytes(dir.path()).unwrap(), 7_000_000);
+    }
+
+    #[test]
+    fn memory_usage_bytes_clamps_to_zero_rather_than_underflowing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("memory.current"), "100\n").unwrap();
+        // Contrived (real accounting never actually reports more
+        // inactive_file than memory.current itself), but the read
+        // path must still never panic on a saturating subtraction.
+        std::fs::write(dir.path().join("memory.stat"), "inactive_file 500\n").unwrap();
+        assert_eq!(memory_usage_bytes(dir.path()).unwrap(), 0);
+    }
+
+    #[test]
+    fn memory_usage_bytes_tolerates_a_stat_file_missing_inactive_file_entirely() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("memory.current"), "42\n").unwrap();
+        std::fs::write(dir.path().join("memory.stat"), "anon 10\n").unwrap();
+        assert_eq!(memory_usage_bytes(dir.path()).unwrap(), 42);
+    }
+
+    #[test]
+    fn memory_limit_bytes_reads_a_real_numeric_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("memory.max"), "104857600\n").unwrap();
+        assert_eq!(memory_limit_bytes(dir.path()).unwrap(), 104_857_600);
+    }
+
+    #[test]
+    fn memory_limit_bytes_maps_the_max_sentinel_to_u64_max() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("memory.max"), "max\n").unwrap();
+        assert_eq!(memory_limit_bytes(dir.path()).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn clamp_memory_limit_to_physical_ram_leaves_a_real_smaller_limit_untouched() {
+        assert_eq!(clamp_memory_limit_to_physical_ram(1_000, 10_000), 1_000);
+    }
+
+    #[test]
+    fn clamp_memory_limit_to_physical_ram_clamps_a_limit_larger_than_physical_ram() {
+        assert_eq!(clamp_memory_limit_to_physical_ram(20_000, 10_000), 10_000);
+    }
+
+    #[test]
+    fn clamp_memory_limit_to_physical_ram_clamps_the_max_sentinel() {
+        assert_eq!(clamp_memory_limit_to_physical_ram(u64::MAX, 10_000), 10_000);
+    }
+
+    #[test]
+    fn clamp_memory_limit_to_physical_ram_clamps_a_zero_limit_too() {
+        assert_eq!(clamp_memory_limit_to_physical_ram(0, 10_000), 10_000);
+    }
+
+    #[test]
+    fn memory_limit_bytes_clamped_to_physical_ram_never_exceeds_this_hosts_own_real_physical_ram() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("memory.max"), "max\n").unwrap();
+        let physical = rustix::system::sysinfo().totalram as u64;
+        assert_eq!(
+            memory_limit_bytes_clamped_to_physical_ram(dir.path()).unwrap(),
+            physical
+        );
+    }
+
+    #[test]
+    fn pids_current_reads_a_bare_count() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pids.current"), "7\n").unwrap();
+        assert_eq!(pids_current(dir.path()).unwrap(), 7);
+    }
+
+    #[test]
+    fn reading_garbage_is_a_real_error_not_a_silent_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("memory.max"), "not-a-number\n").unwrap();
+        let err = memory_limit_bytes(dir.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
