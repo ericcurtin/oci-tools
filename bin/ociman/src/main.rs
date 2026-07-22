@@ -995,6 +995,19 @@ enum Command {
         #[arg(long)]
         tail: Option<usize>,
     },
+    /// Display detailed version information, matching real `docker
+    /// version`/`podman version` exactly for the "no remote server, no
+    /// `Server:` section" case a real rootless `podman version`
+    /// already shows too (checked directly against a real installed
+    /// `podman version` with no `--remote`) — this project has no
+    /// daemon at all, so there is only ever the one, "client" half.
+    /// Real podman's own version report also has a `GoVersion` field
+    /// (this project is real Go's own, but not this one's own real
+    /// language, so no honest value exists for it — omitted entirely
+    /// rather than filled in with something misleading) and a
+    /// `BuiltTime` (this project's own build doesn't currently record
+    /// one — also omitted, rather than a fake/placeholder timestamp).
+    Version,
 }
 
 fn main() -> std::process::ExitCode {
@@ -1103,6 +1116,7 @@ fn main() -> std::process::ExitCode {
                 args,
             }) => cmd_exec(&id, user.as_deref(), cwd.as_deref(), &env, &args),
             Some(Command::Logs { id, follow, tail }) => cmd_logs(&id, follow, tail),
+            Some(Command::Version) => cmd_version(cli.global.json),
         }
     })
 }
@@ -1297,6 +1311,43 @@ fn cmd_logout(registry: &str, json: bool) -> anyhow::Result<()> {
     } else {
         println!("Not logged in to {registry}");
     }
+    Ok(())
+}
+
+/// `ociman version`'s own report — matches real `podman version --
+/// format json`'s own `Client` object's field *names* it has an honest
+/// equivalent for (`Version`/`GitCommit`/`OsArch`), deliberately
+/// omitting the ones it doesn't (`GoVersion`, `BuiltTime`/`Built`: see
+/// [`Command::Version`]'s own doc comment for why).
+#[derive(Debug, Serialize)]
+struct VersionReport {
+    version: String,
+    git_commit: String,
+    os_arch: String,
+}
+
+/// Real `podman version`'s own plain-text output has a `Client:`
+/// header followed by a real, checked-directly-against-the-actual-
+/// binary label/value table — this project has no `Server:` section
+/// at all to ever follow it with (see [`Command::Version`]'s own doc
+/// comment), matching a real rootless `podman version`'s own identical
+/// "no remote server configured" shape exactly.
+fn cmd_version(json: bool) -> anyhow::Result<()> {
+    let platform = Platform::host();
+    let report = VersionReport {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        git_commit: oci_cli_common::version::GIT_HASH.to_string(),
+        os_arch: format!("{}/{}", platform.os, platform.architecture),
+    };
+
+    if json {
+        oci_cli_common::output::print_json(&report)?;
+        return Ok(());
+    }
+    println!("Client:       ociman");
+    println!("Version:      {}", report.version);
+    println!("Git Commit:   {}", report.git_commit);
+    println!("OS/Arch:      {}", report.os_arch);
     Ok(())
 }
 
