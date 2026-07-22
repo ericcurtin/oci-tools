@@ -2243,12 +2243,34 @@ fn cmd_images(json: bool) -> anyhow::Result<()> {
 /// removed along with it (`--force` only — always empty otherwise,
 /// since a dependent container without `--force` is a hard error, not
 /// a partial success).
+///
+/// Either reference field is `None`/omits an entry for this project's
+/// own internal untagged-image sentinel (`untagged_reference`, 0179)
+/// rather than showing that raw digest-shaped string — the same
+/// `<none>`-not-the-sentinel convention `ImageView`/`BuildResult`/
+/// `CommitResult` already established, extended here (0179's own
+/// "what this doesn't do yet" flagged this exact display gap for
+/// `rmi` specifically): resolving by ID with siblings that include an
+/// untagged record (alongside one or more real tags) is a real,
+/// reachable case removing *by ID* already handles correctly, just
+/// with the raw sentinel leaking into the display before this fix.
 #[derive(Debug, Serialize)]
 struct RmiResult {
-    reference: String,
+    reference: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    additional_references_removed: Vec<String>,
+    additional_references_removed: Vec<Option<String>>,
     removed_containers: Vec<String>,
+}
+
+/// `reference`, or this project's own internal untagged-image
+/// sentinel's real, honest `<none>` display placeholder if it's one --
+/// see [`RmiResult`]'s own doc comment for why.
+fn display_reference(reference: &str) -> &str {
+    if is_untagged_reference(reference) {
+        "<none>"
+    } else {
+        reference
+    }
 }
 
 /// Remove an image from local storage — see [`Command::Rmi`]'s own
@@ -2296,7 +2318,11 @@ fn cmd_rmi(reference_str: &str, force: bool, json: bool) -> anyhow::Result<()> {
                 force || siblings.len() <= 1,
                 "unable to delete image {reference_str:?} by ID with more than one tag ({}); \
                  please force removal",
-                siblings.join(", ")
+                siblings
+                    .iter()
+                    .map(|s| display_reference(s))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             siblings
         }
@@ -2339,14 +2365,15 @@ fn cmd_rmi(reference_str: &str, force: bool, json: bool) -> anyhow::Result<()> {
         .split_first()
         .expect("at least the resolved image's own reference is always present");
     if json {
+        let display_or_none = |r: &str| (!is_untagged_reference(r)).then(|| r.to_string());
         oci_cli_common::output::print_json(&RmiResult {
-            reference: primary.clone(),
-            additional_references_removed: rest.to_vec(),
+            reference: display_or_none(primary),
+            additional_references_removed: rest.iter().map(|r| display_or_none(r)).collect(),
             removed_containers: dependents,
         })?;
     } else {
         for reference in &references_to_remove {
-            println!("{reference}");
+            println!("{}", display_reference(reference));
         }
     }
     Ok(())

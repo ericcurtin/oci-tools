@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use oci_spec_types::image::ContainerConfig;
-use oci_store::Store;
+use oci_store::{ImageRecord, Store};
 
 use oci_tools_tests::{bin_path, busybox_path, seed_image};
 
@@ -532,4 +532,87 @@ fn rmi_json_reports_the_canonical_reference_and_any_removed_containers() {
         view["removed_containers"].as_array().unwrap(),
         &[serde_json::Value::String(dependent_id)]
     );
+}
+
+/// Resolving by ID with siblings that include this project's own
+/// internal untagged-image sentinel (0179 -- e.g. a real tag plus an
+/// earlier untagged build of the exact same image) shows `<none>`,
+/// never the raw sentinel string, both in the "more than one tag"
+/// refusal and in the actual removal listing (text and `--json`
+/// alike) -- 0179's own "what this doesn't do yet" flagged this
+/// display gap directly, closed here.
+#[test]
+fn rmi_by_id_shows_none_not_the_raw_sentinel_for_an_untagged_sibling() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rmi-untagged-sibling:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let record = store
+        .resolve_image("docker.io/ociman-test/rmi-untagged-sibling:latest")
+        .unwrap()
+        .unwrap();
+
+    // A second, untagged pointer at the exact same digest -- the same
+    // sentinel shape `ociman build`/`ociman commit` with no tag at all
+    // record (0179/0180): the manifest digest, verbatim, no `/` at
+    // all.
+    let sentinel = record.manifest_digest.to_string();
+    store
+        .put_image(&ImageRecord {
+            reference: sentinel.clone(),
+            manifest_digest: record.manifest_digest.clone(),
+        })
+        .unwrap();
+
+    let short_id = record.manifest_digest.hex()[..12].to_string();
+
+    let rmi = ociman(storage_dir.path(), &["rmi", &short_id]);
+    assert!(!rmi.status.success());
+    let stderr = String::from_utf8_lossy(&rmi.stderr);
+    assert!(stderr.contains("more than one tag"), "{stderr}");
+    assert!(
+        stderr.contains("<none>"),
+        "the untagged sibling should show as <none>, not the raw sentinel: {stderr}"
+    );
+    assert!(
+        !stderr.contains(&sentinel),
+        "the raw internal sentinel string should never leak into user-facing output: {stderr}"
+    );
+
+    let rmi_json = ociman(storage_dir.path(), &["--json", "rmi", "--force", &short_id]);
+    assert!(
+        rmi_json.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rmi_json.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&rmi_json.stdout).unwrap();
+    // Alphabetically, "docker.io/..." sorts before "sha256:...", so
+    // the real tag is primary and the sentinel is the one and only
+    // "additional" reference here.
+    assert_eq!(
+        view["reference"],
+        "docker.io/ociman-test/rmi-untagged-sibling:latest"
+    );
+    assert_eq!(
+        view["additional_references_removed"],
+        serde_json::json!([null]),
+        "the untagged sibling should serialize as null, not the raw sentinel string: {view:?}"
+    );
+
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-untagged-sibling:latest")
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.resolve_image(&sentinel).unwrap().is_none());
 }
