@@ -417,12 +417,6 @@ fn restart_does_not_auto_remove_a_rm_container_but_a_later_real_stop_still_does(
         "stderr: {}",
         String::from_utf8_lossy(&restart.stderr)
     );
-    // Give the (real, separately-tracked) systemd-scope-reuse delay
-    // between the old scope tearing down and the new one settling
-    // (observed directly: a real, if unfortunate, multi-second stall,
-    // not a hang -- a known, deliberately out-of-scope-for-this-fix
-    // gap, see this test's own module-level context) room to resolve
-    // before asserting the container is genuinely still there.
     assert_eq!(
         wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
         "running",
@@ -435,8 +429,22 @@ fn restart_does_not_auto_remove_a_rm_container_but_a_later_real_stop_still_does(
         "stderr: {}",
         String::from_utf8_lossy(&stop.stderr)
     );
+    // A real, tight bound (0159), not just "eventually within a
+    // generous window": a real, previously-hit performance bug (found
+    // while fixing the auto-removal race above) made this take several
+    // real seconds -- `stop_container`'s own `reset_failed_systemd_
+    // scope` call left a background D-Bus thread of its own still
+    // potentially alive at the exact moment `restart`'s internal
+    // `cmd_start` half forked its brand new keeper, corrupting that
+    // new keeper's own subsequent systemd scope creation until its own
+    // ~10s D-Bus job-wait timeout finally gave up. This bound
+    // (comfortably above the real, sub-200ms cost this genuinely
+    // takes post-fix, but nowhere near the multi-second stall the bug
+    // itself caused) guards against a regression back to that bug,
+    // not just the end result.
     assert!(
-        wait_until_removed(storage_dir.path(), &id, Duration::from_secs(20)),
-        "a real, final stop on a --rm container should still auto-remove it, restarted or not"
+        wait_until_removed(storage_dir.path(), &id, Duration::from_secs(3)),
+        "a real, final stop on a --rm container should still auto-remove it, restarted or not \
+         -- and quickly (0159), not after a multi-second stall"
     );
 }

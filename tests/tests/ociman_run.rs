@@ -49,6 +49,30 @@ fn ociman_run(storage_root: &Path, image: &str, args: &[&str]) -> std::process::
         .expect("failed to spawn ociman run")
 }
 
+/// The real, current systemd scope name for `container_id`'s own most
+/// recent launch — since 0159, this is no longer just
+/// `ociman-<id>.scope` (every real launch gets a fresh nonce folded
+/// in, so a restarted container's own second launch never collides
+/// with its first one's still-settling scope teardown); read directly
+/// from the container's own persisted `state.json` rather than
+/// hardcoded, so these tests keep working regardless of the exact
+/// nonce a given run happens to get.
+fn real_scope_name(storage_root: &Path, container_id: &str) -> String {
+    let state_path = storage_root
+        .join("containers")
+        .join(container_id)
+        .join("state.json");
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap_or_else(|e| {
+            panic!("reading {}: {e}", state_path.display());
+        }))
+        .expect("state.json should be valid JSON");
+    match state["annotations"]["io.oci-tools.scope-nonce"].as_str() {
+        Some(nonce) => format!("ociman-{container_id}-{nonce}.scope"),
+        None => format!("ociman-{container_id}.scope"),
+    }
+}
+
 /// `ociman run` grants real `podman run`'s own default 11-capability
 /// set (`oci_spec_types::runtime::podman_default_capabilities`) —
 /// deliberately *not* `Spec::example()`'s own bare 3-capability
@@ -1705,7 +1729,7 @@ fn run_cpus_flag_sets_the_real_systemd_scopes_own_cpu_quota() {
     // below isn't racing ahead of the scope's own creation.
     let status = wait_for_running(storage_dir.path(), &container_id, Duration::from_secs(20));
     assert_eq!(status, "running", "container never reached `running`");
-    let scope_name = format!("ociman-{container_id}.scope");
+    let scope_name = real_scope_name(storage_dir.path(), &container_id);
 
     let show = Command::new("systemctl")
         .args([
@@ -1784,7 +1808,7 @@ fn run_memory_swap_flag_sets_the_real_systemd_scopes_own_swap_max() {
     assert!(!container_id.is_empty(), "container never appeared in `ps`");
     let status = wait_for_running(storage_dir.path(), &container_id, Duration::from_secs(20));
     assert_eq!(status, "running", "container never reached `running`");
-    let scope_name = format!("ociman-{container_id}.scope");
+    let scope_name = real_scope_name(storage_dir.path(), &container_id);
 
     let show = Command::new("systemctl")
         .args([
@@ -1860,7 +1884,7 @@ fn run_memory_swap_accepts_negative_one_via_the_real_cli_as_unlimited() {
     assert!(!container_id.is_empty(), "container never appeared in `ps`");
     let status = wait_for_running(storage_dir.path(), &container_id, Duration::from_secs(20));
     assert_eq!(status, "running", "container never reached `running`");
-    let scope_name = format!("ociman-{container_id}.scope");
+    let scope_name = real_scope_name(storage_dir.path(), &container_id);
 
     let show = Command::new("systemctl")
         .args([
@@ -1935,7 +1959,7 @@ fn run_cpuset_flags_set_the_real_systemd_scopes_own_allowed_cpus_property() {
     assert!(!container_id.is_empty(), "container never appeared in `ps`");
     let status = wait_for_running(storage_dir.path(), &container_id, Duration::from_secs(20));
     assert_eq!(status, "running", "container never reached `running`");
-    let scope_name = format!("ociman-{container_id}.scope");
+    let scope_name = real_scope_name(storage_dir.path(), &container_id);
 
     let show_cpus = Command::new("systemctl")
         .args([

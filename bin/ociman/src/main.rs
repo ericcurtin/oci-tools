@@ -68,6 +68,29 @@ const ANNOTATION_NAME: &str = "io.oci-tools.name";
 /// the exact same container does remove it (see `run_and_finalize`'s
 /// own doc comment for the exact mechanism this enables).
 const ANNOTATION_AUTO_REMOVE: &str = "io.oci-tools.auto-remove";
+/// A fresh, short, unique-enough string (see [`short_id`]) generated
+/// once per real *launch* of a container (not once per container id),
+/// folded into that launch's own transient systemd scope name
+/// (`ociman-<id>-<nonce>.scope`, `run_and_finalize`'s own `cgroup_
+/// setup`) — a real, measured fix (0159) for a real, previously-found
+/// performance issue (0158's own "what this doesn't do yet"): reusing
+/// the exact same scope name (`ociman-<id>.scope`, no nonce) across a
+/// restarted container's *second* launch made that launch's own
+/// keeper take several real seconds before its own final state write
+/// landed, even though the old scope had already been confirmed fully
+/// unloaded — consistent with systemd's own internal job-queue/
+/// garbage-collection timing needing real, non-instant time to settle
+/// before a transient unit of the *identical* name can be recreated.
+/// A fresh name every launch sidesteps this by construction, no matter
+/// its underlying cause. Persisted the same way `ANNOTATION_COMMAND`
+/// already is (piggy-backed on `record_running`'s own already-existing
+/// first write, zero extra I/O over the previous baseline) — anything
+/// needing to reference *this* launch's own scope name later
+/// (`reset_failed_systemd_scope`, via [`scope_name_for`]) falls back to
+/// the plain, nonce-less name if this is somehow absent (a container
+/// whose own launch never got far enough to record it, in which case
+/// nothing was ever created under either name anyway).
+const ANNOTATION_SCOPE_NONCE: &str = "io.oci-tools.scope-nonce";
 
 /// Command-line interface.
 #[derive(Debug, Parser)]
@@ -2289,6 +2312,21 @@ fn run_and_finalize(
     log_path: &Path,
     rm: bool,
 ) -> anyhow::Result<i32> {
+    // A fresh scope-name nonce for *this* launch (0159) — set on
+    // `state` in memory now, piggy-backed on `record_running`'s own
+    // already-existing first write below (zero extra I/O over the
+    // previous baseline: if the container's own process is ever
+    // actually reaped later, `record_running` is guaranteed to have
+    // already run, so the nonce is guaranteed to already be persisted
+    // by the time anything downstream — `stop_container`/`remove_
+    // container` — could ever need to reset this launch's own scope).
+    // See `ANNOTATION_SCOPE_NONCE`'s own doc comment for why this
+    // exists at all.
+    let scope_nonce = short_id();
+    state
+        .annotations
+        .insert(ANNOTATION_SCOPE_NONCE.to_string(), scope_nonce.clone());
+
     // Records a *live* pid (and status `Running`) before blocking
     // on the container, unlike a plain `launch::run` — this is
     // what makes a concurrent `ociman exec`/`ps`/`rm` against this
@@ -2314,7 +2352,7 @@ fn run_and_finalize(
     // one) rides along, translated into systemd unit properties
     // rather than dropped — see `docs/design/0037`.
     let cgroup_setup = oci_runtime_core::launch::CgroupSetup::Systemd {
-        scope_name: format!("ociman-{container_id}.scope"),
+        scope_name: format!("ociman-{container_id}-{scope_nonce}.scope"),
         description: format!("oci-tools container {container_id}"),
         resources: bundle
             .spec
@@ -2356,7 +2394,7 @@ fn run_and_finalize(
     // work for the rare, previously-unhandled case of an abnormally
     // *failed* scope, matching real crun's own unconditional call at
     // scope-teardown time (see `docs/design/0096`).
-    reset_failed_systemd_scope(container_id);
+    reset_failed_systemd_scope(container_id, &state);
 
     if rm {
         let fresh = containers.load(container_id).ok();
@@ -3317,23 +3355,39 @@ fn remove_container(containers: &StateStore, id: &str, force: bool) -> anyhow::R
         // stop that can leave its own transient systemd scope in a
         // "failed" state rather than the clean, self-removing exit
         // path a container that runs to completion on its own gets.
-        reset_failed_systemd_scope(&resolved);
+        reset_failed_systemd_scope(&resolved, &state);
     }
 
     containers.remove(&resolved)?;
     Ok(())
 }
 
+/// The systemd scope name for `container_id`'s own *current* (most
+/// recent) launch — see [`ANNOTATION_SCOPE_NONCE`]'s own doc comment
+/// (0159): every real launch gets a fresh nonce folded into its own
+/// scope name, so this always reconstructs whichever one is actually
+/// relevant right now, not a stale or reused one. Falls back to the
+/// plain, nonce-less name (this project's own original, pre-0159
+/// scheme) for a container whose own state predates this annotation —
+/// there is nothing to look up under a nonce that was never actually
+/// recorded, since nothing was ever created under it either.
+fn scope_name_for(container_id: &str, state: &oci_runtime_core::PersistedState) -> String {
+    match state.annotations.get(ANNOTATION_SCOPE_NONCE) {
+        Some(nonce) => format!("ociman-{container_id}-{nonce}.scope"),
+        None => format!("ociman-{container_id}.scope"),
+    }
+}
+
 /// Best-effort cleanup of `container_id`'s own transient systemd
 /// scope (see `docs/design/0033`'s "known, not-yet-handled edge case"
 /// and `docs/design/0096`): the scope name is fully deterministic
-/// (`cmd_run`'s own `CgroupSetup::Systemd::scope_name`), so this needs
-/// no new persisted state to know what to clean up. A no-op, not an
-/// error, for the overwhelmingly common case (a container that ran to
-/// completion on its own already had its scope fully removed by
-/// systemd itself, with nothing left to reset).
-fn reset_failed_systemd_scope(container_id: &str) {
-    oci_runtime_core::systemd_cgroup::reset_failed_unit(&format!("ociman-{container_id}.scope"));
+/// given `state`'s own recorded launch nonce ([`scope_name_for`]), so
+/// this needs no *new* lookup of its own to know what to clean up. A
+/// no-op, not an error, for the overwhelmingly common case (a
+/// container that ran to completion on its own already had its scope
+/// fully removed by systemd itself, with nothing left to reset).
+fn reset_failed_systemd_scope(container_id: &str, state: &oci_runtime_core::PersistedState) {
+    oci_runtime_core::systemd_cgroup::reset_failed_unit(&scope_name_for(container_id, state));
 }
 
 /// Gracefully stop a running container (see [`Command::Stop`]'s own
@@ -3341,7 +3395,7 @@ fn reset_failed_systemd_scope(container_id: &str) {
 /// stopped, matching real `docker stop`/`podman stop`'s own
 /// idempotent behavior rather than erroring on a redundant call.
 fn cmd_stop(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
-    stop_container(id, time_secs, signal)?;
+    stop_container(id, time_secs, signal, true)?;
     println!("{id}");
     Ok(())
 }
@@ -3383,7 +3437,7 @@ fn wait_for_keeper_to_finalize(containers: &StateStore, resolved: &str) {
 /// for the stop half and again for the start half (same reasoning
 /// `remove_container`'s own doc comment already established for
 /// `cmd_rm`/`cmd_rmi --force`).
-fn stop_container(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
+fn stop_container(id: &str, time_secs: u64, signal: &str, reset_scope: bool) -> anyhow::Result<()> {
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)?;
     let state = containers.load(&resolved)?;
@@ -3440,7 +3494,9 @@ fn stop_container(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> 
             std::thread::sleep(std::time::Duration::from_millis(200));
             if !oci_runtime_core::process::alive(pid) {
                 wait_for_keeper_to_finalize(&containers, &resolved);
-                reset_failed_systemd_scope(&resolved);
+                if reset_scope {
+                    reset_failed_systemd_scope(&resolved, &state);
+                }
                 return Ok(());
             }
             let _ = oci_runtime_core::process::kill(pid, sig);
@@ -3451,7 +3507,9 @@ fn stop_container(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> 
     while std::time::Instant::now() < deadline {
         if !oci_runtime_core::process::alive(pid) {
             wait_for_keeper_to_finalize(&containers, &resolved);
-            reset_failed_systemd_scope(&resolved);
+            if reset_scope {
+                reset_failed_systemd_scope(&resolved, &state);
+            }
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -3472,7 +3530,9 @@ fn stop_container(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> 
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     wait_for_keeper_to_finalize(&containers, &resolved);
-    reset_failed_systemd_scope(&resolved);
+    if reset_scope {
+        reset_failed_systemd_scope(&resolved, &state);
+    }
     Ok(())
 }
 
@@ -3609,10 +3669,32 @@ fn cmd_start(id: &str) -> anyhow::Result<()> {
 /// `run_and_finalize`'s own doc comment for the other half of this
 /// mechanism (re-checking the annotation fresh, rather than trusting a
 /// value captured once at launch time).
+///
+/// A second, real, previously-hit bug (0159, found while re-verifying
+/// the first one): `stop_container`'s own `reset_failed_systemd_scope`
+/// call spawns a background thread of its own
+/// (`oci_runtime_core::systemd_cgroup::reset_failed_unit`'s own D-Bus
+/// round trip) — calling it here, synchronously before `cmd_start`
+/// below forks its own brand new keeper, left that thread still
+/// potentially alive at the exact moment of that `fork()`, violating
+/// `process::fork`'s own documented single-threaded-caller safety
+/// requirement. Reproduced directly (not just theorized): with this
+/// call left in place here, the new keeper's own subsequent systemd
+/// scope creation measurably hung for several real seconds (up to its
+/// own ~10s D-Bus job-wait timeout) before finally, silently falling
+/// back to no cgroup at all — confirmed as the actual cause by
+/// temporarily removing just this one call and observing the delay
+/// vanish entirely. Fixed by passing `reset_scope: false` to
+/// `stop_container` here (deferring the *old* scope's own best-effort
+/// "failed" cleanup) and performing that reset only *after* `cmd_start`
+/// has already forked its own new keeper below — at which point this
+/// function itself never forks again, so a background thread spawned
+/// here can no longer corrupt anything.
 fn cmd_restart(id: &str, time_secs: u64) -> anyhow::Result<()> {
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)?;
-    let had_auto_remove = if let Ok(mut state) = containers.load(&resolved) {
+    let old_state = containers.load(&resolved).ok();
+    let had_auto_remove = if let Some(mut state) = old_state.clone() {
         let had = state.annotations.remove(ANNOTATION_AUTO_REMOVE).is_some();
         if had {
             containers.write(&state)?;
@@ -3622,7 +3704,7 @@ fn cmd_restart(id: &str, time_secs: u64) -> anyhow::Result<()> {
         false
     };
 
-    stop_container(id, time_secs, "TERM")?;
+    stop_container(id, time_secs, "TERM", false)?;
 
     if had_auto_remove && let Ok(mut state) = containers.load(&resolved) {
         state
@@ -3631,7 +3713,18 @@ fn cmd_restart(id: &str, time_secs: u64) -> anyhow::Result<()> {
         containers.write(&state)?;
     }
 
-    cmd_start(id)
+    cmd_start(id)?;
+
+    // Only now, after the new keeper has already been forked, is it
+    // safe to spawn a background D-Bus thread of our own for the
+    // *old* launch's own best-effort scope cleanup (see this
+    // function's own doc comment above) -- using the state as it was
+    // *before* the stop above, so this resets the correct (old) scope
+    // name, not whatever the brand new run's own nonce now is.
+    if let Some(old_state) = old_state {
+        reset_failed_systemd_scope(&resolved, &old_state);
+    }
+    Ok(())
 }
 
 /// Send `signal` to a running container's own init process, once,
