@@ -840,8 +840,9 @@ enum Command {
     /// `podman commit` exactly for the "one new layer, on top of the
     /// exact same base layers" case (see `cmd_commit`'s own doc
     /// comment for what's deliberately out of scope for now: `--config`/
-    /// `--squash`/`--include-volumes`, and the same rootless-overlay-
-    /// rootfs gap `cp`/`diff` already have).
+    /// `--include-volumes`, and the same rootless-overlay-rootfs gap
+    /// `cp`/`diff` already have; `--squash` *is* supported, see the
+    /// `squash` field below).
     Commit {
         /// The container's ID or `--name`.
         container: String,
@@ -900,6 +901,19 @@ enum Command {
         /// build step of its own).
         #[arg(short, long = "change")]
         change: Vec<String>,
+        /// Produce a single new layer containing the container's
+        /// entire current rootfs, with no base layers referenced at
+        /// all — matching real `podman commit --squash`/buildah's own
+        /// squash mechanism exactly (checked directly against
+        /// `~/git/podman/vendor/go.podman.io/buildah/image.go` and a
+        /// real `podman commit --squash` run: one new layer holding
+        /// the whole current tree, `Parent: ""`, exactly one history
+        /// entry). Unlike the default (a diff-only layer stacked on
+        /// the base image's own layers), this needs no recorded base
+        /// snapshot at all — see `commit_inner`'s own doc comment for
+        /// why the two paths diverge this early.
+        #[arg(short = 's', long)]
+        squash: bool,
     },
     /// Gracefully stop a running container: send it a signal (`TERM`
     /// by default) and wait up to `--time` seconds for it to exit on
@@ -1385,6 +1399,7 @@ fn main() -> std::process::ExitCode {
                 message,
                 pause,
                 change,
+                squash,
             }) => cmd_commit(
                 &container,
                 &image,
@@ -1392,6 +1407,7 @@ fn main() -> std::process::ExitCode {
                 message.as_deref(),
                 pause,
                 &change,
+                squash,
                 cli.global.json,
             ),
             Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, &signal),
@@ -4000,6 +4016,7 @@ fn cmd_commit(
     message: Option<&str>,
     pause: bool,
     change: &[String],
+    squash: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     // Parsed and validated *before* ever resolving the container or
@@ -4033,6 +4050,7 @@ fn cmd_commit(
         author,
         message,
         &change_instructions,
+        squash,
         json,
         &root,
         &state,
@@ -4055,6 +4073,14 @@ fn cmd_commit(
 /// wraps with its own pause/unpause bracket -- split out only so that
 /// bracket can wrap one single expression cleanly, not because this
 /// is reused anywhere else.
+///
+/// `squash` diverges from the default path as early as possible: the
+/// default path needs the container's own recorded base snapshot to
+/// compute a diff at all (an older container predating that snapshot
+/// convention can't be committed without it), while a squash needs no
+/// diff — [`oci_dockerfile::squash_layer`] only ever looks at `root`'s
+/// own current state — so `squash` skips reading that snapshot file
+/// entirely rather than reading it and then throwing the diff away.
 #[allow(clippy::too_many_arguments)]
 fn commit_inner(
     id: &str,
@@ -4062,24 +4088,11 @@ fn commit_inner(
     author: Option<&str>,
     message: Option<&str>,
     change: &[oci_dockerfile::Instruction],
+    squash: bool,
     json: bool,
     root: &Path,
     state: &oci_runtime_core::PersistedState,
 ) -> anyhow::Result<()> {
-    let snapshot_path = Path::new(&state.bundle).join(BASE_SNAPSHOT_FILENAME);
-    let snapshot_bytes = std::fs::read(&snapshot_path).with_context(|| {
-        format!(
-            "container {id:?} has no recorded base filesystem snapshot ({}) -- created by an \
-             older version of ociman, before this existed?",
-            snapshot_path.display()
-        )
-    })?;
-    let before: oci_layer::Snapshot = serde_json::from_slice(&snapshot_bytes)
-        .with_context(|| format!("parsing {}", snapshot_path.display()))?;
-    let changes = oci_layer::changes(root, &before).with_context(|| {
-        format!("diffing container {id:?}'s own filesystem against its base image")
-    })?;
-
     let store = open_store()?;
     let base_reference = state.annotations.get(ANNOTATION_IMAGE).ok_or_else(|| {
         anyhow::anyhow!(
@@ -4101,17 +4114,54 @@ fn commit_inner(
                 "{base_reference}: container {id:?}'s own base image is no longer in local storage"
             )
         })?;
-    let base_manifest = store
-        .image_manifest(&base_record)
-        .with_context(|| format!("reading manifest for {base_reference}"))?;
     let mut config = store
         .image_config(&base_record)
         .with_context(|| format!("reading config for {base_reference}"))?;
-    let mut layers = base_manifest.layers.clone();
 
-    let committed = oci_dockerfile::commit_layer(&store, root, &changes)
-        .with_context(|| format!("committing a new layer for container {id:?}"))?;
-    oci_dockerfile::record_layer(&mut config, &mut layers, &committed, format!("commit {id}"));
+    let (mut layers, committed, created_by) = if squash {
+        // No base layers referenced at all -- `config`'s own
+        // `rootfs.diff_ids`/`history`, both inherited from the base
+        // image above, must be reset to hold only the one new
+        // squashed layer (matches real buildah's own squash: the
+        // resulting image has exactly one layer and one history
+        // entry, checked directly — see `Command::Commit`'s own
+        // `squash` field doc comment for the citation).
+        config.rootfs.diff_ids.clear();
+        config.history.clear();
+        let committed = oci_dockerfile::squash_layer(&store, root).with_context(|| {
+            format!("squashing container {id:?}'s own filesystem into one layer")
+        })?;
+        (
+            Vec::new(),
+            committed,
+            format!("ociman commit --squash {id} (was based on {base_reference})"),
+        )
+    } else {
+        let snapshot_path = Path::new(&state.bundle).join(BASE_SNAPSHOT_FILENAME);
+        let snapshot_bytes = std::fs::read(&snapshot_path).with_context(|| {
+            format!(
+                "container {id:?} has no recorded base filesystem snapshot ({}) -- created by \
+                 an older version of ociman, before this existed?",
+                snapshot_path.display()
+            )
+        })?;
+        let before: oci_layer::Snapshot = serde_json::from_slice(&snapshot_bytes)
+            .with_context(|| format!("parsing {}", snapshot_path.display()))?;
+        let changes = oci_layer::changes(root, &before).with_context(|| {
+            format!("diffing container {id:?}'s own filesystem against its base image")
+        })?;
+        let base_manifest = store
+            .image_manifest(&base_record)
+            .with_context(|| format!("reading manifest for {base_reference}"))?;
+        let committed = oci_dockerfile::commit_layer(&store, root, &changes)
+            .with_context(|| format!("committing a new layer for container {id:?}"))?;
+        (
+            base_manifest.layers.clone(),
+            committed,
+            format!("commit {id}"),
+        )
+    };
+    oci_dockerfile::record_layer(&mut config, &mut layers, &committed, created_by);
     if let Some(message) = message {
         // The OCI image spec's own `history[].comment` field, not a
         // top-level `Comment` -- see `Command::Commit`'s own doc

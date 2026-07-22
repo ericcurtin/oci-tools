@@ -589,6 +589,235 @@ fn commit_with_pause_false_never_freezes_a_running_container() {
     let _ = run.wait();
 }
 
+/// `--squash` collapses an arbitrarily deep layer stack (base image
+/// plus two separate real commits on top of it) down to exactly one
+/// layer and one history entry, while every real change made along
+/// the way (an add from the base, an add from the first intermediate
+/// commit, and a deletion made in the final container) is still
+/// present in the flattened result — the same real property verified
+/// directly against real `podman commit --squash` during this
+/// feature's own design (see `docs/design/0174`).
+#[test]
+fn commit_squash_flattens_a_multi_layer_stack_into_one_layer_preserving_all_content() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    // Base image (one layer) -> commit a second layer on top of it
+    // (non-squash) -> run a third container from *that* two-layer
+    // image, adding and deleting more -> squash the whole thing.
+    let id1 = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/squash-base:latest",
+        "echo from-base > /from-base.txt; exit 0",
+    );
+    let commit1 = ociman(
+        storage_dir.path(),
+        &["commit", &id1, "ociman-test/squash-intermediate:latest"],
+    );
+    assert!(
+        commit1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&commit1.stderr)
+    );
+
+    let run2 = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "squash-intermediate-ctr",
+            "ociman-test/squash-intermediate:latest",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "echo from-intermediate > /from-intermediate.txt; rm /from-base.txt",
+        ],
+    );
+    assert!(
+        run2.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run2.stderr)
+    );
+    let id2 = "squash-intermediate-ctr";
+
+    let squash = ociman(
+        storage_dir.path(),
+        &[
+            "commit",
+            "--squash",
+            "--message",
+            "a squash commit",
+            id2,
+            "ociman-test/squash-result:latest",
+        ],
+    );
+    assert!(
+        squash.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&squash.stderr)
+    );
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &["inspect", "ociman-test/squash-result:latest", "--json"],
+    );
+    assert!(inspect.status.success());
+    let config: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(
+        config["rootfs"]["diff_ids"].as_array().unwrap().len(),
+        1,
+        "a squashed image must have exactly one layer, regardless of how many real commits led \
+         up to it: {config:?}"
+    );
+
+    let history = ociman(
+        storage_dir.path(),
+        &["history", "ociman-test/squash-result:latest", "--json"],
+    );
+    assert!(history.status.success());
+    let views: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
+    let views = views.as_array().unwrap();
+    assert_eq!(
+        views.len(),
+        1,
+        "a squashed image must have exactly one history entry: {views:?}"
+    );
+    assert_eq!(views[0]["comment"], "a squash commit");
+
+    // Real content check: the intermediate file survives, the
+    // base-layer-deleted file is really gone, and no former-layer
+    // boundary/whiteout artifact leaks through.
+    let run3 = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/squash-result:latest",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "cat /from-intermediate.txt && test ! -e /from-base.txt && echo base-gone",
+        ],
+    );
+    assert!(
+        run3.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run3.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run3.stdout),
+        "from-intermediate\nbase-gone\n"
+    );
+}
+
+#[test]
+fn commit_squash_needs_no_base_snapshot_and_works_even_without_change_history() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/squash-noop-base:latest",
+        "exit 0",
+    );
+
+    // No filesystem changes at all -- still a real, valid single-layer
+    // squash, matching commit_layer's own identical "an empty diff
+    // still commits a real layer" property (`oci-dockerfile`'s own
+    // `an_empty_change_list_still_commits_a_real_valid_layer` test).
+    let squash = ociman(
+        storage_dir.path(),
+        &[
+            "commit",
+            "--squash",
+            &id,
+            "ociman-test/squash-noop-result:latest",
+        ],
+    );
+    assert!(
+        squash.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&squash.stderr)
+    );
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &["inspect", "ociman-test/squash-noop-result:latest", "--json"],
+    );
+    assert!(inspect.status.success());
+    let config: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(config["rootfs"]["diff_ids"].as_array().unwrap().len(), 1);
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/squash-noop-result:latest",
+            "/bin/busybox",
+            "true",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn commit_squash_still_applies_author_and_change_instructions() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/squash-change-base:latest",
+        "exit 0",
+    );
+
+    let squash = ociman(
+        storage_dir.path(),
+        &[
+            "commit",
+            "--squash",
+            "--author",
+            "Jane Doe <jane@example.com>",
+            "--change",
+            "ENV FOO=bar",
+            &id,
+            "ociman-test/squash-change-result:latest",
+        ],
+    );
+    assert!(
+        squash.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&squash.stderr)
+    );
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "ociman-test/squash-change-result:latest",
+            "--json",
+        ],
+    );
+    assert!(inspect.status.success());
+    let config: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(config["author"], "Jane Doe <jane@example.com>");
+    assert_eq!(config["config"]["Env"], serde_json::json!(["FOO=bar"]));
+    // --change never adds a history entry of its own, squash or not.
+    assert_eq!(config["rootfs"]["diff_ids"].as_array().unwrap().len(), 1);
+}
+
 #[test]
 fn commit_change_applies_every_real_supported_instruction_and_adds_no_extra_history() {
     let Some(_busybox) = busybox_path() else {

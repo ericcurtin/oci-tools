@@ -75,6 +75,7 @@ mod stage;
 
 pub use commit::{
     CommitLayerError, CommittedLayer, commit_layer, record_empty_history, record_layer,
+    squash_layer,
 };
 pub use dependencies::{resolve_copy_from_dependencies, resolve_dependencies, stages_needed_for};
 pub use dockerignore::{DockerIgnore, parse as parse_dockerignore};

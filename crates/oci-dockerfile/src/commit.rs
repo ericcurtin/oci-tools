@@ -22,6 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::io::{Seek, SeekFrom};
 use std::time::SystemTime;
 
 use oci_layer::Change;
@@ -86,6 +87,58 @@ pub fn commit_layer(
         .map_err(io_from_layer_error)?;
 
     let ingested = store.ingest(compressed.as_slice())?;
+
+    Ok(CommittedLayer {
+        descriptor: Descriptor {
+            media_type: MEDIA_TYPE_IMAGE_LAYER_GZIP.to_string(),
+            digest: ingested.digest,
+            size: ingested.size,
+            urls: vec![],
+            annotations: BTreeMap::new(),
+            platform: None,
+        },
+        diff_id,
+    })
+}
+
+/// Turn `root`'s own *entire current* filesystem tree (not a diff
+/// against any earlier snapshot) into one new layer — the "squash"
+/// counterpart to [`commit_layer`], for a caller that wants a single
+/// layer containing everything, with no base layers referenced at
+/// all (checked directly against real buildah's own squash mechanism,
+/// `~/git/podman/vendor/go.podman.io/buildah/image.go`: squashing
+/// captures the container's whole current rootfs as one new layer,
+/// not a diff against its own base image). Uses
+/// [`oci_layer::export_tree`] (real, already-tested: mount-boundary-
+/// aware, hardlink-deduplicating) in place of `commit_layer`'s own
+/// `export`+precomputed-`changes` pair, then the same
+/// `compress_for_storage`-then-[`Store::ingest`] pipeline.
+///
+/// Unlike `commit_layer`, this streams through two real scratch files
+/// (`tempfile::NamedTempFile`) rather than holding the tar/gzip bytes
+/// fully in memory: `commit_layer`'s own in-memory `Vec<u8>` buffers
+/// are sized to one build step's *diff*, typically small, but a
+/// squash's own input is a whole rootfs, which can be arbitrarily
+/// large (matches `bin/ociman/src/archive.rs`'s own identical
+/// scratch-file precedent, `ingest_docker_archive_layer`, chosen for
+/// exactly the same reason).
+pub fn squash_layer(
+    store: &Store,
+    root: &std::path::Path,
+) -> Result<CommittedLayer, CommitLayerError> {
+    let mut tar_scratch = tempfile::NamedTempFile::new()?;
+    oci_layer::export_tree(root, tar_scratch.as_file_mut()).map_err(io_from_layer_error)?;
+    tar_scratch.as_file_mut().seek(SeekFrom::Start(0))?;
+
+    let mut compressed_scratch = tempfile::NamedTempFile::new()?;
+    let diff_id = oci_layer::compress_for_storage(
+        tar_scratch.as_file_mut(),
+        compressed_scratch.as_file_mut(),
+    )
+    .map_err(io_from_layer_error)?;
+    compressed_scratch.as_file_mut().seek(SeekFrom::Start(0))?;
+
+    let ingested = store.ingest(compressed_scratch.as_file_mut())?;
 
     Ok(CommittedLayer {
         descriptor: Descriptor {
@@ -214,6 +267,63 @@ mod tests {
         assert_eq!(
             store.read_blob(&committed.descriptor.digest).unwrap(),
             expected_compressed
+        );
+    }
+
+    #[test]
+    fn squash_layer_captures_the_whole_current_tree_not_a_diff() {
+        let (_store_dir, store) = temp_store();
+        let root = tempfile::tempdir().unwrap();
+        // Two "layers" worth of real content, but squash_layer never
+        // sees any before/after snapshot at all -- it only ever looks
+        // at root's own current state.
+        write_file(&root.path().join("base.txt"), b"from the base image");
+        write_file(&root.path().join("new/file.txt"), b"added afterward");
+
+        let committed = squash_layer(&store, root.path()).unwrap();
+
+        assert_eq!(committed.descriptor.media_type, MEDIA_TYPE_IMAGE_LAYER_GZIP);
+        assert!(store.has_blob(&committed.descriptor.digest));
+
+        // Matches oci_layer::export_tree run directly over the same
+        // root byte-for-byte -- squash_layer is a pure streaming
+        // wrapper around it, not a reprocessing step of its own.
+        let mut expected_tar = Vec::new();
+        oci_layer::export_tree(root.path(), &mut expected_tar).unwrap();
+        let mut expected_compressed = Vec::new();
+        let expected_diff_id =
+            oci_layer::compress_for_storage(expected_tar.as_slice(), &mut expected_compressed)
+                .unwrap();
+        assert_eq!(committed.diff_id, expected_diff_id);
+        assert_eq!(
+            store.read_blob(&committed.descriptor.digest).unwrap(),
+            expected_compressed
+        );
+    }
+
+    #[test]
+    fn squash_layer_ignores_any_earlier_snapshot_unlike_commit_layer() {
+        let (_store_dir, store) = temp_store();
+        let root = tempfile::tempdir().unwrap();
+        write_file(&root.path().join("already-here.txt"), b"pre-existing");
+        // A `before` snapshot exists (as it would for a real
+        // container's own base image), but squash_layer takes no
+        // such parameter at all -- everything under root ends up in
+        // the one new layer regardless of when it was written.
+        let _before = Snapshot::capture(root.path()).unwrap();
+
+        let committed = squash_layer(&store, root.path()).unwrap();
+        let extracted_dir = tempfile::tempdir().unwrap();
+        let compressed = store.read_blob(&committed.descriptor.digest).unwrap();
+        oci_layer::apply(
+            compressed.as_slice(),
+            oci_layer::Compression::Gzip,
+            extracted_dir.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(extracted_dir.path().join("already-here.txt")).unwrap(),
+            b"pre-existing"
         );
     }
 
