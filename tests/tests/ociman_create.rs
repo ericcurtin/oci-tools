@@ -287,3 +287,46 @@ fn create_of_a_nonexistent_image_is_a_clear_error() {
     );
     assert!(!create.status.success());
 }
+
+/// `ociman create` shares `ociman run`'s own image-resolution logic
+/// (`prepare_container`) entirely, so it can target an image by its
+/// own real or short ID too, with no separate fix needed -- closing
+/// the same gap `tests/tests/ociman_run.rs`'s own identical test
+/// closes for `run` (0179/0180/0181 each separately named this
+/// inconsistency).
+#[test]
+fn create_by_short_image_id_works() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_marker_image(&store, "ociman-test/create-by-id:latest", &busybox);
+    let record = store
+        .resolve_image("docker.io/ociman-test/create-by-id:latest")
+        .unwrap()
+        .unwrap();
+    let short_id = &record.manifest_digest.hex()[..12];
+
+    let create = ociman(storage_dir.path(), &["create", short_id]);
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    assert_eq!(inspect_json(storage_dir.path(), &id)["status"], "created");
+
+    let start = ociman(storage_dir.path(), &["start", &id]);
+    assert!(
+        start.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+}

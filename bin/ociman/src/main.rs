@@ -2810,21 +2810,53 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         args.memory_swap.as_deref(),
         args.cpus,
     )?;
-    let reference = Reference::parse(&args.image)
-        .with_context(|| format!("parsing image reference {:?}", args.image))?;
     let store = open_store()?;
-    let record = resolve_or_pull(&store, &reference, args.tls_verify, args.pull)?;
+    // Real or short image ID (0122's own convention, extended to
+    // `run`/`create` here — 0179/0180/0181 all separately named this
+    // exact gap) tried *first*, before ever treating `args.image` as
+    // a tag reference at all -- unlike `resolve_image_by_reference_or_
+    // id`'s own opposite "tag first" ordering (safe there: neither
+    // `inspect`/`rmi`/`tag`/`push`/`save` ever touch the network
+    // either way). Here, ordering really matters: an ID almost always
+    // *also* parses as some syntactically valid but nonsense tag
+    // reference (e.g. `docker.io/library/<hex>:latest`), and this
+    // project's own pull policy would otherwise dutifully attempt a
+    // real, wasted network pull of that nonsense reference before
+    // ever falling back to ID resolution. `resolve_image_by_id_only`'s
+    // own cheap, local-only hex-prefix filter rejects virtually every
+    // real tag string instantly, so this ordering costs nothing at
+    // all for the overwhelmingly common "run a real tag" case.
+    let (record, reference_display) = match resolve_image_by_id_only(&store, &args.image)? {
+        Some(record) => {
+            let display = record.reference.clone();
+            (record, display)
+        }
+        None => {
+            let reference = Reference::parse(&args.image)
+                .with_context(|| format!("parsing image reference {:?}", args.image))?;
+            let record = resolve_or_pull(&store, &reference, args.tls_verify, args.pull)?;
+            (record, reference.to_string())
+        }
+    };
 
     let manifest = store
         .image_manifest(&record)
-        .with_context(|| format!("reading manifest for {reference}"))?;
+        .with_context(|| format!("reading manifest for {reference_display}"))?;
     let config = store
         .image_config(&record)
-        .with_context(|| format!("reading config for {reference}"))?;
+        .with_context(|| format!("reading config for {reference_display}"))?;
 
     let containers = open_container_store()?;
     let mut annotations = std::collections::BTreeMap::new();
-    annotations.insert(ANNOTATION_IMAGE.to_string(), reference.to_string());
+    // The record's own actual reference, not necessarily `args.image`
+    // verbatim -- for a tag resolution these always agree (`resolve_
+    // or_pull` only ever returns a record `store.resolve_image`
+    // already keyed by that same normalized string), but for an ID
+    // resolution `record.reference` correctly captures whichever real
+    // tag (or this project's own untagged sentinel, 0179) the image
+    // actually has, resolvable back through `store.resolve_image`
+    // identically either way.
+    annotations.insert(ANNOTATION_IMAGE.to_string(), record.reference.clone());
     if let Some(name) = &args.name {
         validate_container_name(name)?;
         if let Ok(existing) = resolve_container_id(&containers, name) {
@@ -2833,7 +2865,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         annotations.insert(ANNOTATION_NAME.to_string(), name.to_string());
     }
     let (container_id, mut state) = create_container_record(&containers, &annotations)?;
-    tracing::debug!(container_id, %reference, "preparing container");
+    tracing::debug!(container_id, %reference_display, "preparing container");
 
     let bundle_dir = containers.container_dir(&container_id);
     let rootfs_dir = bundle_dir.join("rootfs");
@@ -3467,7 +3499,25 @@ fn resolve_image_by_reference_or_id(
     {
         return Ok(Some(ResolvedImage::Tag(record)));
     }
+    Ok(resolve_image_by_id_only(store, spec)?.map(ResolvedImage::Id))
+}
 
+/// The real-or-short-image-ID half of [`resolve_image_by_reference_or_id`],
+/// split out so a caller that needs the *opposite* ordering (ID first,
+/// tag/pull-policy second — [`prepare_container`]'s own image
+/// resolution, where trying a tag first would mean a real, wasted
+/// network round-trip for the common "run/create by ID" case: an ID
+/// almost always also parses as *some* syntactically valid but
+/// nonsense tag reference, e.g. `docker.io/library/<hex>:latest`, and
+/// this project's own pull policy would otherwise dutifully try to
+/// pull that nonsense reference before ever falling back to ID
+/// resolution) can call this directly, with no tag lookup of its own
+/// at all. Real tag references essentially never accidentally match
+/// the hex-only filter below (matches real docker/podman's own
+/// established "ID resolution basically never collides with a real
+/// name" precedent) — see [`prepare_container`]'s own call site for
+/// why ID-first is safe there.
+fn resolve_image_by_id_only(store: &Store, spec: &str) -> anyhow::Result<Option<ImageRecord>> {
     let candidate = spec
         .strip_prefix("sha256:")
         .unwrap_or(spec)
@@ -3511,7 +3561,7 @@ fn resolve_image_by_reference_or_id(
     }
     match by_digest.len() {
         0 => Ok(None),
-        1 => Ok(by_digest.into_values().next().map(ResolvedImage::Id)),
+        1 => Ok(by_digest.into_values().next()),
         n => anyhow::bail!("image ID {spec:?} is ambiguous: matches {n} different images"),
     }
 }

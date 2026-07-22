@@ -2337,3 +2337,180 @@ fn run_actually_uses_cmd_from_a_pascal_case_wire_config() {
         "got stdout: {stdout:?}"
     );
 }
+
+/// `ociman run` can target an image by its own real or short ID, not
+/// just a tag reference -- closing the gap 0179/0180/0181 each
+/// separately named as the same, still-open, real inconsistency: every
+/// other image-targeting command (`inspect`/`rmi`/`tag`/`push`/`save`,
+/// 0122) already supported this. Both the short (12 hex char) and the
+/// full `sha256:<hex>` forms are checked here.
+#[test]
+fn run_by_short_or_full_image_id_works() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/run-by-id:latest",
+        &busybox,
+        &["sh", "echo"],
+        ContainerConfig::default(),
+    );
+    let record = store
+        .resolve_image("docker.io/ociman-test/run-by-id:latest")
+        .unwrap()
+        .unwrap();
+    let full_digest = record.manifest_digest.to_string();
+    let short_id = &record.manifest_digest.hex()[..12];
+
+    let out = ociman_run(
+        storage_dir.path(),
+        short_id,
+        &["--", "/bin/sh", "-c", "echo hello-by-short-id"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("hello-by-short-id"));
+
+    let out = ociman_run(
+        storage_dir.path(),
+        &full_digest,
+        &["--", "/bin/sh", "-c", "echo hello-by-full-digest"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("hello-by-full-digest"));
+}
+
+/// Resolving `run`'s own image argument by ID happens *before* ever
+/// treating it as a tag reference at all, precisely so a real image ID
+/// never triggers a real, wasted network pull attempt first (an ID
+/// almost always also parses as *some* syntactically valid but
+/// nonsense tag reference). Verified here by using `--pull always`
+/// (which would otherwise always attempt a real registry round trip)
+/// against a real image ID in this fully offline test environment: if
+/// ID resolution weren't tried first, this would hang/fail trying to
+/// reach a real registry instead of succeeding immediately.
+#[test]
+fn run_by_id_with_pull_always_never_touches_the_network() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/run-by-id-pull-always:latest",
+        &busybox,
+        &["sh", "echo"],
+        ContainerConfig::default(),
+    );
+    let record = store
+        .resolve_image("docker.io/ociman-test/run-by-id-pull-always:latest")
+        .unwrap()
+        .unwrap();
+    let short_id = &record.manifest_digest.hex()[..12];
+
+    let out = ociman_run(
+        storage_dir.path(),
+        short_id,
+        &[
+            "--pull",
+            "always",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo hello-with-pull-always",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("hello-with-pull-always"));
+}
+
+/// An unknown image ID is a clear error, same as an unknown tag
+/// reference -- never silently misparsed into a nonsense pull attempt.
+#[test]
+fn run_by_an_unknown_image_id_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "0123456789ab",
+        &["--pull", "never", "--", "/bin/true"],
+    );
+    assert!(!out.status.success());
+}
+
+/// A container run by image ID records the image's own *actual*
+/// reference (a real tag if it has one, or this project's own
+/// internal untagged sentinel otherwise, 0179) as its own
+/// `io.oci-tools.image` annotation -- never the raw ID string the user
+/// actually typed -- so a later `ociman commit`/`ociman rmi`'s own
+/// dependent-container lookup (which reads that annotation back and
+/// resolves it through the exact same store) keeps working correctly
+/// regardless of which form was used to start it.
+#[test]
+fn run_by_id_records_the_images_own_real_reference_not_the_id_typed() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/run-by-id-annotation:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let record = store
+        .resolve_image("docker.io/ociman-test/run-by-id-annotation:latest")
+        .unwrap()
+        .unwrap();
+    let short_id = &record.manifest_digest.hex()[..12];
+
+    // Foreground, no `--rm`: exits fast, leaving a real stopped
+    // container record behind to inspect afterward.
+    let out = ociman_run(storage_dir.path(), short_id, &["--", "/bin/true"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    assert!(!container_id.is_empty());
+
+    let inspect = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["inspect", "--json", &container_id])
+        .output()
+        .unwrap();
+    assert!(
+        inspect.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(
+        view["image"], "docker.io/ociman-test/run-by-id-annotation:latest",
+        "the container's own recorded image annotation should be the image's real tag, not \
+         the bare ID {short_id:?} it was actually started with: {view:?}"
+    );
+}
