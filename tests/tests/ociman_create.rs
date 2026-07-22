@@ -218,6 +218,66 @@ fn create_with_name_is_resolvable_by_name() {
     ociman(storage_dir.path(), &["rm", "my-created-container"]);
 }
 
+/// Poll `ociman ps -a -q` until `id` is no longer listed at all —
+/// distinct from [`wait_for_status`], which needs the container to
+/// still exist (`ociman inspect` would itself fail on a genuinely
+/// removed one).
+fn wait_until_removed(storage_root: &Path, id: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = ociman(storage_root, &["ps", "-a", "-q"]);
+        let still_present = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line == id);
+        if !still_present || Instant::now() >= deadline {
+            return !still_present;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn create_rm_auto_removes_the_container_once_it_finally_exits() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_marker_image(&store, "ociman-test/create-rm:latest", &busybox);
+
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "--rm", "ociman-test/create-rm:latest"],
+    );
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    assert_eq!(inspect_json(storage_dir.path(), &id)["status"], "created");
+
+    let start = ociman(storage_dir.path(), &["start", &id]);
+    assert!(
+        start.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    // `--rm` on `create` (0158) is only honored once *this* run
+    // finally exits -- matching real `podman create --rm` exactly.
+    assert!(
+        wait_until_removed(storage_dir.path(), &id, Duration::from_secs(20)),
+        "a container created with --rm should auto-remove once its own first real run exits"
+    );
+}
+
 #[test]
 fn create_of_a_nonexistent_image_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();

@@ -51,6 +51,23 @@ const ANNOTATION_EXIT_CODE: &str = "io.oci-tools.exit-code";
 /// [`resolve_container_id`] for how this makes a name usable anywhere
 /// an id is, matching real `docker`/`podman`).
 const ANNOTATION_NAME: &str = "io.oci-tools.name";
+/// Present (value always `"true"`) whenever a container's own most
+/// recent launch was given `--rm` — the persisted record `cmd_start`
+/// (0154) needs to correctly auto-remove a container that was
+/// *originally* launched via `ociman run --rm`/`ociman create --rm`
+/// (0158) but is only *now*, potentially much later, actually being
+/// (re-)started for the first time, since neither of those commands
+/// gets to be the one deciding what happens whenever *this* run
+/// eventually exits. `cmd_restart` also temporarily clears this
+/// (persisting the removal, then restoring it again before actually
+/// starting the new run) around its own internal `stop_container`
+/// call, so that stop doesn't trigger a real, final auto-removal —
+/// matching real podman's own identical behavior, checked directly:
+/// `podman restart` on a `--rm` container leaves it running again
+/// rather than removing it, while a real, standalone `podman stop` on
+/// the exact same container does remove it (see `run_and_finalize`'s
+/// own doc comment for the exact mechanism this enables).
+const ANNOTATION_AUTO_REMOVE: &str = "io.oci-tools.auto-remove";
 
 /// Command-line interface.
 #[derive(Debug, Parser)]
@@ -679,6 +696,16 @@ enum Command {
     Create {
         #[command(flatten)]
         args: RunArgs,
+        /// Remove the container's storage automatically once it
+        /// eventually runs (via a later `ociman start`) and exits —
+        /// matches real `docker create --rm`/`podman create --rm`
+        /// exactly, including the fact that it's a real, valid
+        /// combination even though `create` itself never runs
+        /// anything (see `ANNOTATION_AUTO_REMOVE`'s own doc comment
+        /// for how this is persisted for that later, separate `start`
+        /// to actually honor — 0158).
+        #[arg(long)]
+        rm: bool,
     },
     /// List containers.
     Ps {
@@ -1012,7 +1039,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Prune { all }) => cmd_prune(cli.global.json, all),
             Some(Command::Inspect { reference }) => cmd_inspect(&reference, cli.global.json),
             Some(Command::Run { args, rm, detach }) => cmd_run(args, rm, detach),
-            Some(Command::Create { args }) => cmd_create(args),
+            Some(Command::Create { args, rm }) => cmd_create(args, rm),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Start { id }) => cmd_start(&id),
             Some(Command::Restart { id, time }) => cmd_restart(&id, time),
@@ -2064,12 +2091,24 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
 fn cmd_run(args: RunArgs, rm: bool, detach: bool) -> anyhow::Result<()> {
     let PreparedContainer {
         container_id,
-        state,
+        mut state,
         containers,
         bundle,
         rootfs,
         log_path,
     } = prepare_container(&args)?;
+
+    if rm {
+        // A real, persisted record of `--rm`, independent of this
+        // one invocation's own `rm: bool` -- a later, separate
+        // `ociman start` (0154) has no other way to know this
+        // container should still auto-remove once *that* run finally
+        // exits (see `ANNOTATION_AUTO_REMOVE`'s own doc comment).
+        state
+            .annotations
+            .insert(ANNOTATION_AUTO_REMOVE.to_string(), "true".to_string());
+        containers.write(&state)?;
+    }
 
     if detach {
         // SAFETY: `ociman`'s own process has not spawned any additional
@@ -2124,21 +2163,12 @@ fn cmd_run(args: RunArgs, rm: bool, detach: bool) -> anyhow::Result<()> {
 /// `Created` container), ready for a later `ociman start` to actually
 /// run it for the first time.
 ///
-/// What this doesn't do yet: `--rm` (real podman's own `podman create
-/// --rm` is a real, valid combination: auto-remove once the container
-/// eventually runs — via a later `start` — and exits). This project's
-/// `cmd_start`/`cmd_restart` currently always pass a hardcoded `rm:
-/// false` to `launch_detached_and_confirm`/`run_and_finalize`, with no
-/// persisted record anywhere of what a container's own original
-/// `--rm` even was — a real, pre-existing gap this increment's own
-/// `RunArgs` doesn't touch (it never included `rm`/`detach` to begin
-/// with, see that struct's own doc comment) and doesn't attempt to fix
-/// here: correctly threading `--rm` through a `create` that might not
-/// be started until an arbitrarily later, separate `ociman start`
-/// invocation needs a new persisted annotation `cmd_start`/`cmd_
-/// restart` both also consult, a bigger, cross-cutting change better
-/// scoped as its own future increment.
-fn cmd_create(args: RunArgs) -> anyhow::Result<()> {
+/// `rm` (0158): persisted as [`ANNOTATION_AUTO_REMOVE`] rather than
+/// used directly here (unlike `cmd_run`'s own identical flag, `create`
+/// itself never launches anything at all, so there is no exit of its
+/// own to react to yet) — a later, separate `ociman start` reads it
+/// back to correctly auto-remove once *that* run finally exits.
+fn cmd_create(args: RunArgs, rm: bool) -> anyhow::Result<()> {
     let PreparedContainer {
         container_id,
         mut state,
@@ -2146,6 +2176,11 @@ fn cmd_create(args: RunArgs) -> anyhow::Result<()> {
         ..
     } = prepare_container(&args)?;
     state.status = Status::Created;
+    if rm {
+        state
+            .annotations
+            .insert(ANNOTATION_AUTO_REMOVE.to_string(), "true".to_string());
+    }
     containers.write(&state)?;
     println!("{container_id}");
     Ok(())
@@ -2231,6 +2266,20 @@ unsafe fn launch_detached_and_confirm(
 /// logic between the foreground (`ociman run`) and detached (`ociman
 /// run -d`) paths (see `cmd_run`'s own two call sites, `docs/design/
 /// 0098`).
+///
+/// `rm`'s own auto-remove branch re-checks [`ANNOTATION_AUTO_REMOVE`]
+/// from a *fresh* read of persisted state right at the moment of
+/// deciding, rather than blindly trusting `rm` alone (captured once,
+/// back whenever this container was originally launched — from
+/// `cmd_run`'s own CLI-level `--rm`, or `cmd_start`'s own persisted-
+/// annotation lookup) — this is exactly what lets `cmd_restart` (0158)
+/// suppress *just one* removal (by clearing the annotation immediately
+/// before its own internal `stop_container` call, then restoring it
+/// again before actually starting the new run) for a container whose
+/// current exit is only happening because of `restart`'s own internal
+/// stop, not a real, final one. A container that was never launched
+/// with `--rm` at all (`rm == false`) skips this re-check entirely —
+/// no extra disk read at all for the much more common non-`--rm` case.
 fn run_and_finalize(
     container_id: &str,
     bundle: &oci_runtime_core::Bundle,
@@ -2310,7 +2359,27 @@ fn run_and_finalize(
     reset_failed_systemd_scope(container_id);
 
     if rm {
-        let _ = containers.remove(container_id);
+        let fresh = containers.load(container_id).ok();
+        let still_wants_auto_remove = fresh
+            .as_ref()
+            .is_some_and(|s| s.annotations.contains_key(ANNOTATION_AUTO_REMOVE));
+        if still_wants_auto_remove {
+            let _ = containers.remove(container_id);
+        } else if let Some(mut fresh_state) = fresh {
+            // Use the freshly-reloaded state, not `state` (whose own
+            // in-memory `annotations` snapshot is stale from launch
+            // time, and would still include a since-cleared
+            // `ANNOTATION_AUTO_REMOVE` if blindly re-persisted,
+            // silently undoing `cmd_restart`'s own suppression).
+            fresh_state.status = Status::Stopped;
+            fresh_state.pid = state.pid;
+            fresh_state
+                .annotations
+                .insert(ANNOTATION_EXIT_CODE.to_string(), exit_code.to_string());
+            containers.write(&fresh_state)?;
+        }
+        // else: the container's own record is already gone entirely
+        // (e.g. a concurrent `rm -f`) -- nothing left to write to.
     } else {
         state.status = Status::Stopped;
         state
@@ -3474,6 +3543,12 @@ fn cmd_start(id: &str) -> anyhow::Result<()> {
         oci_runtime_core::validate::validate(&bundle).context("config.json failed validation")?;
     let log_path = bundle_dir.join("container.log");
 
+    // A real, persisted record of the container's own original
+    // `--rm` (`ociman run --rm`/`ociman create --rm`, 0158) — this
+    // invocation of `cmd_start` has no CLI flag of its own to consult,
+    // only whatever the container's own annotations already say.
+    let rm = state.annotations.contains_key(ANNOTATION_AUTO_REMOVE);
+
     // Matches `cmd_run`'s own initial `Creating` status: the shared
     // `wait_for_detached_container_to_start` this reuses waits for
     // exactly this status to change *away* from `Creating` again,
@@ -3490,15 +3565,7 @@ fn cmd_start(id: &str) -> anyhow::Result<()> {
     // `launch_detached_and_confirm`'s own fork forwards.
     #[allow(unsafe_code)]
     unsafe {
-        launch_detached_and_confirm(
-            &resolved,
-            &containers,
-            bundle,
-            rootfs,
-            log_path,
-            state,
-            false,
-        )?;
+        launch_detached_and_confirm(&resolved, &containers, bundle, rootfs, log_path, state, rm)?;
     }
     Ok(())
 }
@@ -3513,8 +3580,57 @@ fn cmd_start(id: &str) -> anyhow::Result<()> {
 /// Prints the container id exactly once, at the very end — see
 /// `stop_container`'s own doc comment for why it's factored out of
 /// `cmd_stop` specifically to make this possible.
+///
+/// A real, previously-hit bug for a `--rm` container specifically
+/// (0158, found and fixed before it could ship alongside `ociman
+/// create --rm`, which would otherwise have hit it immediately):
+/// `stop_container`'s own internal stop is not a real, final stop, but
+/// the container's own detached keeper process (still the *same* one
+/// from whenever it was originally launched) has no way to know that —
+/// left alone, it would auto-remove the whole container the moment
+/// this stop makes its process exit, and the `cmd_start` call right
+/// below would then fail with "container does not exist" (reproduced
+/// directly before this fix: `ociman run -d --rm` followed by `ociman
+/// restart` on the still-running container). Matches real podman's own
+/// identical behavior exactly (checked directly: `podman restart` on a
+/// `--rm` container leaves it running again, while a real, standalone
+/// `podman stop` on the same container does remove it — real podman's
+/// own `restartWithTimeout` calls a lower-level `c.stop` that never
+/// goes through its own auto-removal path at all, a distinction this
+/// project's own single, shared `stop_container` doesn't have, since
+/// `cmd_stop` needs exactly the opposite behavior). Fixed here, not in
+/// `stop_container` itself (which `cmd_stop` also calls, and a real,
+/// final `ociman stop` on a `--rm` container *should* still remove it):
+/// temporarily clear `ANNOTATION_AUTO_REMOVE` — persisted immediately,
+/// *before* the stop that might make the old keeper notice the process
+/// died — then restore it again immediately after `stop_container`
+/// returns, *before* `cmd_start` launches the new run, so that run's
+/// own eventual, real exit still auto-removes correctly. See
+/// `run_and_finalize`'s own doc comment for the other half of this
+/// mechanism (re-checking the annotation fresh, rather than trusting a
+/// value captured once at launch time).
 fn cmd_restart(id: &str, time_secs: u64) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let resolved = resolve_container_id(&containers, id)?;
+    let had_auto_remove = if let Ok(mut state) = containers.load(&resolved) {
+        let had = state.annotations.remove(ANNOTATION_AUTO_REMOVE).is_some();
+        if had {
+            containers.write(&state)?;
+        }
+        had
+    } else {
+        false
+    };
+
     stop_container(id, time_secs, "TERM")?;
+
+    if had_auto_remove && let Ok(mut state) = containers.load(&resolved) {
+        state
+            .annotations
+            .insert(ANNOTATION_AUTO_REMOVE.to_string(), "true".to_string());
+        containers.write(&state)?;
+    }
+
     cmd_start(id)
 }
 

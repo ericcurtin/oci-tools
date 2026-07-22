@@ -336,3 +336,107 @@ fn restart_of_a_nonexistent_container_is_a_clear_error() {
     let out = ociman(storage_dir.path(), &["restart", "does-not-exist"]);
     assert!(!out.status.success());
 }
+
+/// Poll `ociman ps -a -q` until `id` is no longer listed at all —
+/// distinct from [`wait_for_status`], which needs the container to
+/// still exist (`ociman inspect` would itself fail on a genuinely
+/// removed one).
+fn wait_until_removed(storage_root: &Path, id: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = ociman(storage_root, &["ps", "-a", "-q"]);
+        let still_present = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line == id);
+        if !still_present || Instant::now() >= deadline {
+            return !still_present;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A real, previously-hit bug (0158, found and fixed before it could
+/// ship alongside `ociman create --rm`, which would otherwise have hit
+/// it immediately): `restart`'s own internal `stop` is not a real,
+/// final stop, but a `--rm` container's own detached keeper process
+/// has no way to know that on its own -- left unfixed, it would
+/// auto-remove the whole container the moment that internal stop makes
+/// its process exit, and `restart`'s own subsequent re-launch attempt
+/// would then fail with "container does not exist" (reproduced
+/// directly before the fix). A real, final `ociman stop` on the same
+/// container afterward should still remove it, exactly like a `--rm`
+/// container that was never restarted at all.
+#[test]
+fn restart_does_not_auto_remove_a_rm_container_but_a_later_real_stop_still_does() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/restart-rm:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "-d",
+            "--rm",
+            "ociman-test/restart-rm:latest",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let restart = ociman(storage_dir.path(), &["restart", "--time", "1", &id]);
+    assert!(
+        restart.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    // Give the (real, separately-tracked) systemd-scope-reuse delay
+    // between the old scope tearing down and the new one settling
+    // (observed directly: a real, if unfortunate, multi-second stall,
+    // not a hang -- a known, deliberately out-of-scope-for-this-fix
+    // gap, see this test's own module-level context) room to resolve
+    // before asserting the container is genuinely still there.
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running",
+        "restart's own internal stop must not have auto-removed a --rm container"
+    );
+
+    let stop = ociman(storage_dir.path(), &["stop", "--time", "0", &id]);
+    assert!(
+        stop.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        wait_until_removed(storage_dir.path(), &id, Duration::from_secs(20)),
+        "a real, final stop on a --rm container should still auto-remove it, restarted or not"
+    );
+}
