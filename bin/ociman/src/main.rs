@@ -1008,6 +1008,18 @@ enum Command {
     /// `BuiltTime` (this project's own build doesn't currently record
     /// one — also omitted, rather than a fake/placeholder timestamp).
     Version,
+    /// Display system information, matching real `docker info`/
+    /// `podman info`'s own general shape (`host`/`store`/`version`
+    /// sections) — a deliberately much narrower first slice of real
+    /// `podman info`'s own huge report (host CPU utilization,
+    /// `conmon`/`netavark`/`pasta`/`slirp4netns` versions, storage-
+    /// driver internals, registry/plugin lists, ...), since this
+    /// project has no daemon, no separate network stack, no pluggable
+    /// storage-driver backend, and no `conmon`-equivalent supervisor
+    /// process to report on at all — see `cmd_info`'s own doc comment
+    /// for exactly which fields this reports and why, and what it
+    /// deliberately doesn't yet.
+    Info,
 }
 
 fn main() -> std::process::ExitCode {
@@ -1117,6 +1129,7 @@ fn main() -> std::process::ExitCode {
             }) => cmd_exec(&id, user.as_deref(), cwd.as_deref(), &env, &args),
             Some(Command::Logs { id, follow, tail }) => cmd_logs(&id, follow, tail),
             Some(Command::Version) => cmd_version(cli.global.json),
+            Some(Command::Info) => cmd_info(cli.global.json),
         }
     })
 }
@@ -1332,13 +1345,21 @@ struct VersionReport {
 /// at all to ever follow it with (see [`Command::Version`]'s own doc
 /// comment), matching a real rootless `podman version`'s own identical
 /// "no remote server configured" shape exactly.
-fn cmd_version(json: bool) -> anyhow::Result<()> {
+/// Builds a real [`VersionReport`] — factored out of [`cmd_version`]
+/// so [`cmd_info`] (0163) can embed the exact same real values in its
+/// own, larger report without duplicating how any of them are
+/// actually computed.
+fn version_report() -> VersionReport {
     let platform = Platform::host();
-    let report = VersionReport {
+    VersionReport {
         version: env!("CARGO_PKG_VERSION").to_string(),
         git_commit: oci_cli_common::version::GIT_HASH.to_string(),
         os_arch: format!("{}/{}", platform.os, platform.architecture),
-    };
+    }
+}
+
+fn cmd_version(json: bool) -> anyhow::Result<()> {
+    let report = version_report();
 
     if json {
         oci_cli_common::output::print_json(&report)?;
@@ -1348,6 +1369,117 @@ fn cmd_version(json: bool) -> anyhow::Result<()> {
     println!("Version:      {}", report.version);
     println!("Git Commit:   {}", report.git_commit);
     println!("OS/Arch:      {}", report.os_arch);
+    Ok(())
+}
+
+/// `ociman info`'s own `host` section — the subset of real `podman
+/// info`'s own giant `host` object this project has an honest,
+/// directly-checkable value for. `hostname`/`kernel` come straight
+/// from a real `uname(2)` (`rustix::system::uname`); `mem_total`/
+/// `mem_free` from a real `sysinfo(2)` (already this same crate's own
+/// established source for physical RAM elsewhere, see `cgroups::
+/// memory_limit_bytes_clamped_to_physical_ram`'s own doc comment for
+/// why `totalram`/`freeram` need no `mem_unit` scaling on any
+/// mainstream 64-bit Linux target); `cgroup_version` is always `"v2"`
+/// (this project's own cgroup v1 support doesn't exist at all, unlike
+/// real podman, which reports whichever the host actually has).
+#[derive(Debug, Serialize)]
+struct HostInfo {
+    hostname: String,
+    kernel: String,
+    os_arch: String,
+    cpus: usize,
+    mem_total: u64,
+    mem_free: u64,
+    cgroup_version: String,
+    rootless: bool,
+}
+
+/// `ociman info`'s own `store` section — real `podman info`'s own
+/// `store` object has separate `graphRoot`/`runRoot` (image layers vs.
+/// container/volume runtime state, on separate real storage-driver-
+/// managed filesystems) since podman's own pluggable graph-driver
+/// storage backend is a genuinely different subsystem from its own
+/// container runtime state; this project has no such split at all —
+/// images and containers already share the exact same single storage
+/// root (`containers` is just a subdirectory of it, see `open_
+/// container_store`'s own doc comment) — so there is only the one,
+/// honestly-named `graph_root` here, not two paths that would happen
+/// to be identical anyway.
+#[derive(Debug, Serialize)]
+struct StoreInfo {
+    graph_root: String,
+    containers: usize,
+    images: usize,
+}
+
+/// `ociman info`'s own full report.
+#[derive(Debug, Serialize)]
+struct InfoReport {
+    host: HostInfo,
+    store: StoreInfo,
+    version: VersionReport,
+}
+
+/// Display system information — see [`Command::Info`]'s own doc
+/// comment for why this is a deliberately much narrower report than
+/// real `podman info`'s own. Plain-text output is a simple, real
+/// `key: value` listing (not real podman's own full YAML rendering of
+/// its much larger, deeply nested report) grouped under the same
+/// three section headers as `--json`.
+fn cmd_info(json: bool) -> anyhow::Result<()> {
+    let uname = rustix::system::uname();
+    let sysinfo = rustix::system::sysinfo();
+    let platform = Platform::host();
+    let (euid, _) = oci_cli_common::identity::effective_uid_gid();
+
+    let store = open_store()?;
+    let containers = open_container_store()?;
+    let image_count = store.list_images().context("listing local images")?.len();
+    let container_count = containers.list().context("listing containers")?.len();
+
+    let report = InfoReport {
+        host: HostInfo {
+            hostname: uname.nodename().to_string_lossy().into_owned(),
+            kernel: uname.release().to_string_lossy().into_owned(),
+            os_arch: format!("{}/{}", platform.os, platform.architecture),
+            cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            mem_total: sysinfo.totalram as u64,
+            mem_free: sysinfo.freeram as u64,
+            cgroup_version: "v2".to_string(),
+            rootless: euid != 0,
+        },
+        store: StoreInfo {
+            graph_root: oci_cli_common::storage::default_root()
+                .display()
+                .to_string(),
+            containers: container_count,
+            images: image_count,
+        },
+        version: version_report(),
+    };
+
+    if json {
+        oci_cli_common::output::print_json(&report)?;
+        return Ok(());
+    }
+    println!("Host:");
+    println!("  Hostname:       {}", report.host.hostname);
+    println!("  Kernel:         {}", report.host.kernel);
+    println!("  OS/Arch:        {}", report.host.os_arch);
+    println!("  CPUs:           {}", report.host.cpus);
+    println!("  MemTotal:       {}", report.host.mem_total);
+    println!("  MemFree:        {}", report.host.mem_free);
+    println!("  CgroupVersion:  {}", report.host.cgroup_version);
+    println!("  Rootless:       {}", report.host.rootless);
+    println!("Store:");
+    println!("  GraphRoot:      {}", report.store.graph_root);
+    println!("  Containers:     {}", report.store.containers);
+    println!("  Images:         {}", report.store.images);
+    println!("Version:");
+    println!("  Version:        {}", report.version.version);
+    println!("  GitCommit:      {}", report.version.git_commit);
+    println!("  OsArch:         {}", report.version.os_arch);
     Ok(())
 }
 
