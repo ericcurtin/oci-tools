@@ -297,3 +297,139 @@ fn logs_follow_on_an_already_stopped_container_returns_immediately() {
         "-f against an already-stopped container should return immediately, took {elapsed:?}"
     );
 }
+
+/// `--tail N` only shows the last `N` lines already captured --
+/// matching real `docker logs --tail`/`podman logs --tail` exactly.
+#[test]
+fn logs_tail_shows_only_the_last_n_lines() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/logs-tail:latest",
+        &busybox,
+        &["sh", "echo"],
+        ContainerConfig::default(),
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "ociman-test/logs-tail:latest",
+            "/bin/sh",
+            "-c",
+            "echo one; echo two; echo three; echo four",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+
+    let logs = ociman(storage_dir.path(), &["logs", "--tail", "2", &id]);
+    assert!(
+        logs.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&logs.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&logs.stdout),
+        "three\nfour\n",
+        "--tail 2 should show only the last two lines"
+    );
+
+    // `--tail 0` is a real, meaningful "show nothing" value, distinct
+    // from not passing `--tail` at all.
+    let logs_zero = ociman(storage_dir.path(), &["logs", "--tail", "0", &id]);
+    assert!(logs_zero.status.success());
+    assert_eq!(String::from_utf8_lossy(&logs_zero.stdout), "");
+
+    // A count larger than the real number of lines just shows all of
+    // them, matching plain `logs` with no `--tail` at all.
+    let logs_all = ociman(storage_dir.path(), &["logs", "--tail", "100", &id]);
+    assert!(logs_all.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&logs_all.stdout),
+        "one\ntwo\nthree\nfour\n"
+    );
+
+    // No `--tail` at all is unaffected -- still the full output.
+    let logs_none = ociman(storage_dir.path(), &["logs", &id]);
+    assert!(logs_none.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&logs_none.stdout),
+        "one\ntwo\nthree\nfour\n"
+    );
+}
+
+/// `--tail N -f` trims only the initial catch-up read -- any *new*
+/// output produced while still following is never trimmed, matching
+/// real `podman logs --tail N -f` exactly.
+#[test]
+fn logs_tail_combined_with_follow_only_trims_the_initial_catch_up_read() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/logs-tail-follow:latest",
+        &busybox,
+        &["sh", "sleep", "echo"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/logs-tail-follow:latest",
+        &[
+            "/bin/sh",
+            "-c",
+            "echo old1; echo old2; echo old3; sleep 0.3; echo new1",
+        ],
+    );
+
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+
+    // Poll until the pre-sleep lines are captured, so the `--tail 1`
+    // catch-up read has real, deterministic content to trim.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let logs = ociman(storage_dir.path(), &["logs", &id]);
+        if String::from_utf8_lossy(&logs.stdout).contains("old3") || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let logs = ociman(storage_dir.path(), &["logs", "--tail", "1", "-f", &id]);
+    assert!(
+        logs.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&logs.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&logs.stdout).into_owned();
+    assert!(
+        !stdout.contains("old1") && !stdout.contains("old2"),
+        "the catch-up read should have been trimmed to just the last line: {stdout:?}"
+    );
+    assert!(stdout.contains("old3"), "got: {stdout:?}");
+    assert!(
+        stdout.contains("new1"),
+        "output produced while still following must never be trimmed: {stdout:?}"
+    );
+
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "--force", &id]);
+}

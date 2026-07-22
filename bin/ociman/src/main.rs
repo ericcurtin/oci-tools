@@ -823,6 +823,22 @@ enum Command {
         /// container — nothing new to wait for).
         #[arg(short, long)]
         follow: bool,
+        /// Only show the last `N` lines already captured (default:
+        /// all of them) — matching real `docker logs --tail`/`podman
+        /// logs --tail` exactly for a non-negative count (real
+        /// podman's own `--tail` also accepts a real `-1` sentinel
+        /// for "all lines", its own actual default; expressed here as
+        /// this flag simply not being given at all, real podman has
+        /// no short `-n`/`-t` alias for this specific flag either —
+        /// confirmed directly, `~/git/podman/cmd/podman/containers/
+        /// logs.go`, those letters are already real podman's own
+        /// `--names`/`--timestamps`). Combines with `--follow` the
+        /// same way real `podman logs --tail N -f` does: only the
+        /// already-captured catch-up output is trimmed to the last
+        /// `N` lines, new output produced *after* that point while
+        /// still following is never trimmed.
+        #[arg(long)]
+        tail: Option<usize>,
     },
 }
 
@@ -964,7 +980,7 @@ fn main() -> std::process::ExitCode {
                 env,
                 args,
             }) => cmd_exec(&id, user.as_deref(), cwd.as_deref(), &env, &args),
-            Some(Command::Logs { id, follow }) => cmd_logs(&id, follow),
+            Some(Command::Logs { id, follow, tail }) => cmd_logs(&id, follow, tail),
         }
     })
 }
@@ -3304,7 +3320,16 @@ fn human_size(bytes: u64) -> String {
 /// feature) prints nothing rather than erroring — only an unknown
 /// container ID itself is an error, via the same `containers.load`
 /// every other subcommand already uses.
-fn cmd_logs(id: &str, follow: bool) -> anyhow::Result<()> {
+///
+/// `tail` (`--tail N`) trims the initial catch-up read to just the
+/// last `N` lines already captured — matching real `docker logs
+/// --tail`/`podman logs --tail` exactly for a real non-negative
+/// count, `None` here standing in for real podman's own actual
+/// default (an explicit `-1` sentinel meaning "all lines", see this
+/// flag's own CLI doc comment). Only ever applied to that one initial
+/// read: new output produced afterward while still `--follow`ing is
+/// never trimmed, matching real `podman logs --tail N -f` exactly.
+fn cmd_logs(id: &str, follow: bool, tail: Option<usize>) -> anyhow::Result<()> {
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)
         .with_context(|| format!("looking up container {id:?}"))?;
@@ -3347,7 +3372,22 @@ fn cmd_logs(id: &str, follow: bool) -> anyhow::Result<()> {
         }
     };
 
-    print_new_log_bytes(&mut file)?;
+    {
+        use std::io::Read as _;
+        use std::io::Write as _;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)
+            .context("reading container log")?;
+        let to_print = match tail {
+            Some(n) => tail_lines(&buf, n),
+            None => buf.as_slice(),
+        };
+        if !to_print.is_empty() {
+            std::io::stdout()
+                .write_all(to_print)
+                .context("writing logs to stdout")?;
+        }
+    }
     if !follow {
         return Ok(());
     }
@@ -3370,6 +3410,22 @@ fn cmd_logs(id: &str, follow: bool) -> anyhow::Result<()> {
         print_new_log_bytes(&mut file)?;
     }
     Ok(())
+}
+
+/// The last `n` real lines of `bytes` (each ending in its own real
+/// `\n`, except possibly the very last one if `bytes` itself doesn't
+/// end with one) — `n == 0` is a real, meaningful value of its own
+/// (matches real podman's own `--tail 0` exactly): none at all, an
+/// empty slice, not "unset"/"all" (that's `cmd_logs`'s own `tail:
+/// None` instead).
+fn tail_lines(bytes: &[u8], n: usize) -> &[u8] {
+    if n == 0 {
+        return &[];
+    }
+    let lines: Vec<&[u8]> = bytes.split_inclusive(|&b| b == b'\n').collect();
+    let start = lines.len().saturating_sub(n);
+    let skipped_len: usize = lines[..start].iter().map(|line| line.len()).sum();
+    &bytes[skipped_len..]
 }
 
 /// Read (and print to stdout) whatever real bytes have been appended
@@ -4977,5 +5033,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = write_etc_hosts(dir.path(), &["myhost"], &["bad".to_string()]).unwrap_err();
         assert!(err.to_string().contains("--add-host"));
+    }
+
+    #[test]
+    fn tail_lines_returns_the_whole_input_when_n_is_at_least_the_real_line_count() {
+        assert_eq!(tail_lines(b"a\nb\nc\n", 3), b"a\nb\nc\n");
+        assert_eq!(tail_lines(b"a\nb\nc\n", 10), b"a\nb\nc\n");
+    }
+
+    #[test]
+    fn tail_lines_returns_only_the_last_n_lines() {
+        assert_eq!(tail_lines(b"a\nb\nc\n", 2), b"b\nc\n");
+        assert_eq!(tail_lines(b"a\nb\nc\n", 1), b"c\n");
+    }
+
+    #[test]
+    fn tail_lines_zero_is_a_real_empty_result_not_all_lines() {
+        assert_eq!(tail_lines(b"a\nb\nc\n", 0), b"");
+    }
+
+    #[test]
+    fn tail_lines_handles_no_trailing_newline_on_the_final_line() {
+        assert_eq!(tail_lines(b"a\nb\nc", 2), b"b\nc");
+        assert_eq!(tail_lines(b"a\nb\nc", 1), b"c");
+    }
+
+    #[test]
+    fn tail_lines_on_empty_input_is_empty_regardless_of_n() {
+        assert_eq!(tail_lines(b"", 5), b"");
+        assert_eq!(tail_lines(b"", 0), b"");
     }
 }
