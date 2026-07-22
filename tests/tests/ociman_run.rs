@@ -2685,3 +2685,230 @@ fn run_detached_rm_with_an_instantly_exiting_command_never_races_its_own_startup
         );
     }
 }
+
+/// The persisted spec's own `no_new_privileges` (0190): a real,
+/// previously-unnoticed bug found by hand -- `ociman run`'s own
+/// synthesized spec started from `Spec::example()`, whose own
+/// `no_new_privileges: true` is the *correct* default for `ocirun
+/// spec`'s own real-runc-compatible template but was never overridden
+/// back to real podman's own actual default of `false`, so every
+/// container reported `NoNewPrivs: 1` unconditionally regardless of
+/// any flag. This checks the persisted `config.json` field directly
+/// (`noNewPrivileges` omitted entirely -- `false` -- by default,
+/// present and `true` only with `--security-opt no-new-privileges`)
+/// -- the real, observable `/proc/self/status` value additionally
+/// depends on whether a seccomp filter is actually installed at all
+/// (see the tests below, and `resolve_security_opts`'s own doc
+/// comment for the one real, honestly-flagged remaining gap: an
+/// *active* default seccomp profile currently forces `NoNewPrivs: 1`
+/// regardless of this setting, unlike real podman).
+#[test]
+fn run_default_no_new_privileges_is_false_in_the_persisted_spec() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/nnp-default:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/nnp-default:latest",
+        &["/bin/sh", "-c", "exit 0"],
+    );
+    assert!(out.status.success());
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    let config_path = storage_dir
+        .path()
+        .join("containers")
+        .join(&container_id)
+        .join("config.json");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    assert!(
+        config["process"]["noNewPrivileges"].is_null()
+            || config["process"]["noNewPrivileges"] == false,
+        "expected no_new_privileges to default to false, got: {config:?}"
+    );
+}
+
+/// `--security-opt no-new-privileges` sets the persisted spec's own
+/// `noNewPrivileges: true` explicitly.
+#[test]
+fn run_security_opt_no_new_privileges_sets_it_true_in_the_persisted_spec() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/nnp-flag:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/nnp-flag:latest",
+        &[
+            "--security-opt",
+            "no-new-privileges",
+            "/bin/sh",
+            "-c",
+            "exit 0",
+        ],
+    );
+    assert!(out.status.success());
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    let config_path = storage_dir
+        .path()
+        .join("containers")
+        .join(&container_id)
+        .join("config.json");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    assert_eq!(config["process"]["noNewPrivileges"], true);
+}
+
+/// The real, observable `/proc/self/status` `NoNewPrivs` value when no
+/// seccomp filter is actually installed at all (`--privileged`) --
+/// verified to genuinely match real podman's own checked-directly
+/// default of `0` (never forced to `1` merely by `--privileged`
+/// itself), and to genuinely flip to `1` with an explicit
+/// `--security-opt no-new-privileges` alongside it.
+#[test]
+fn run_privileged_no_new_privileges_real_proc_status_value() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/nnp-privileged:latest",
+        &busybox,
+        &["sh", "grep"],
+        ContainerConfig::default(),
+    );
+
+    let default_out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/nnp-privileged:latest",
+        &[
+            "--privileged",
+            "/bin/sh",
+            "-c",
+            "grep NoNewPrivs: /proc/self/status",
+        ],
+    );
+    assert!(
+        default_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&default_out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&default_out.stdout).trim(),
+        "NoNewPrivs:\t0",
+        "--privileged alone should never force NoNewPrivs on, matching real podman exactly"
+    );
+
+    let flagged_out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/nnp-privileged:latest",
+        &[
+            "--privileged",
+            "--security-opt",
+            "no-new-privileges",
+            "/bin/sh",
+            "-c",
+            "grep NoNewPrivs: /proc/self/status",
+        ],
+    );
+    assert!(
+        flagged_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&flagged_out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&flagged_out.stdout).trim(),
+        "NoNewPrivs:\t1"
+    );
+}
+
+/// Same real, observable `/proc/self/status` proof as the
+/// `--privileged` test above, but via `--security-opt
+/// seccomp=unconfined` instead (the other real way to have no active
+/// seccomp filter at all).
+#[test]
+fn run_security_opt_seccomp_unconfined_no_new_privileges_real_proc_status_value() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/nnp-unconfined:latest",
+        &busybox,
+        &["sh", "grep"],
+        ContainerConfig::default(),
+    );
+
+    let default_out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/nnp-unconfined:latest",
+        &[
+            "--security-opt",
+            "seccomp=unconfined",
+            "/bin/sh",
+            "-c",
+            "grep NoNewPrivs: /proc/self/status",
+        ],
+    );
+    assert!(
+        default_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&default_out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&default_out.stdout).trim(),
+        "NoNewPrivs:\t0"
+    );
+
+    let flagged_out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/nnp-unconfined:latest",
+        &[
+            "--security-opt",
+            "seccomp=unconfined",
+            "--security-opt",
+            "no-new-privileges=true",
+            "/bin/sh",
+            "-c",
+            "grep NoNewPrivs: /proc/self/status",
+        ],
+    );
+    assert!(
+        flagged_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&flagged_out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&flagged_out.stdout).trim(),
+        "NoNewPrivs:\t1"
+    );
+}

@@ -295,24 +295,40 @@ struct RunArgs {
     /// Override the container's own seccomp confinement, matching
     /// real `docker run --security-opt seccomp=<value>`/`podman
     /// run --security-opt seccomp=<value>` (repeatable, like real
-    /// `docker`/`podman`, though only the `seccomp=` key is
+    /// `docker`/`podman`; only `seccomp=`/`no-new-privileges` are
     /// implemented so far — any other key, e.g. real `docker`/
-    /// `podman`'s own `apparmor=`/`label=`/`no-new-privileges`,
-    /// is rejected with a clear error rather than silently
-    /// ignored). `seccomp=unconfined` disables seccomp entirely;
-    /// `seccomp=<path>` reads a JSON seccomp profile (the same
-    /// `{"defaultAction": ..., "syscalls": [...]}` shape real
-    /// `docker`'s own default profile uses) from `<path>` and uses
-    /// it verbatim instead of this project's own bundled default
-    /// (0044) — unlike the bundled default, a custom profile is
-    /// never filtered down to this build's own supported syscall
-    /// set first: an unknown syscall name in a file the caller
-    /// explicitly supplied is a real, surfaced error (from
-    /// `oci_runtime_core::seccomp::apply`'s own existing strict
-    /// validation), not something to silently drop. `--privileged`
-    /// (its own separate flag, see below) also disables seccomp,
-    /// but only when no `--security-opt seccomp=` was explicitly
-    /// given at all — an explicit choice here always wins.
+    /// `podman`'s own `apparmor=`/`label=`, is rejected with a
+    /// clear error rather than silently ignored). `seccomp=unconfined`
+    /// disables seccomp entirely; `seccomp=<path>` reads a JSON
+    /// seccomp profile (the same `{"defaultAction": ...,
+    /// "syscalls": [...]}` shape real `docker`'s own default
+    /// profile uses) from `<path>` and uses it verbatim instead of
+    /// this project's own bundled default (0044) — unlike the
+    /// bundled default, a custom profile is never filtered down to
+    /// this build's own supported syscall set first: an unknown
+    /// syscall name in a file the caller explicitly supplied is a
+    /// real, surfaced error (from `oci_runtime_core::seccomp::
+    /// apply`'s own existing strict validation), not something to
+    /// silently drop. `--privileged` (its own separate flag, see
+    /// below) also disables seccomp, but only when no
+    /// `--security-opt seccomp=` was explicitly given at all — an
+    /// explicit choice here always wins. `no-new-privileges` (bare,
+    /// or with an explicit `:true`/`:false`/`=true`/`=false`, all
+    /// four forms real docker/podman themselves accept, and all
+    /// four accepted here too) sets the container's own real
+    /// `no_new_privs` — matching real `docker`/`podman`'s own
+    /// checked-directly default of *not* setting it otherwise, and
+    /// verified to genuinely take effect (a real `/proc/self/status`
+    /// `NoNewPrivs: 0`/`1`) whenever seccomp confinement itself is
+    /// *not* active (`--privileged`, or `seccomp=unconfined`) — but
+    /// **not yet** when this project's own default seccomp profile is
+    /// actually installed (this project's own default for every
+    /// container that isn't `--privileged`): `NoNewPrivs` still reads
+    /// `1` there regardless of this flag or the default, a real,
+    /// honestly-flagged gap relative to real podman's own identical
+    /// case (which shows `0`) — see `resolve_security_opts`'s own doc
+    /// comment for the exact, already-researched reason and what a
+    /// real fix would need (0190).
     #[arg(long = "security-opt")]
     security_opt: Vec<String>,
     /// Grant additional capabilities beyond this project's own
@@ -2942,7 +2958,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let seccomp = resolve_seccomp(&args.security_opt, args.privileged)?;
+    let (seccomp, no_new_privileges) = resolve_security_opts(&args.security_opt, args.privileged)?;
     let base_capabilities = if args.privileged {
         oci_runtime_core::identity::ALL_CAPABILITY_NAMES
             .iter()
@@ -3112,6 +3128,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             args.cpuset_cpus.as_deref(),
             args.cpuset_mems.as_deref(),
             seccomp,
+            no_new_privileges,
             capabilities,
             args.read_only,
             &args.env,
@@ -6256,6 +6273,7 @@ fn synthesize_spec(
     cpuset_cpus: Option<&str>,
     cpuset_mems: Option<&str>,
     seccomp: Option<oci_spec_types::runtime::LinuxSeccomp>,
+    no_new_privileges: bool,
     capabilities: Vec<String>,
     read_only: bool,
     env: &[String],
@@ -6306,6 +6324,19 @@ fn synthesize_spec(
     });
     process.user.uid = uid;
     process.user.gid = gid;
+    // `Spec::example()`'s own `no_new_privileges: true` is the correct
+    // default for `ocirun spec`'s own real-`runc`-spec-compatible
+    // template (real `runc spec` also defaults to `noNewPrivileges:
+    // true`), but not what a real container engine actually wants by
+    // default — matching `root.readonly`'s own identical override just
+    // above (`spec.root.readonly = read_only`, see its own doc comment
+    // for the parallel reasoning): real `docker run`/`podman run`
+    // report `NoNewPrivs: 0` unless `--security-opt no-new-privileges`
+    // is explicitly given (checked directly), a real, previously-
+    // unnoticed bug this fixes (0190) — every `ociman run`/`ociman
+    // create` container reported `NoNewPrivs: 1` unconditionally
+    // before this, regardless of any flag at all.
+    process.no_new_privileges = no_new_privileges;
     if !container_config.env.is_empty() {
         process.env = container_config.env;
     }
@@ -6386,40 +6417,119 @@ fn synthesize_spec(
 }
 
 /// Resolve `ociman run`'s own `--security-opt` flags into the
-/// effective seccomp confinement for a container: `None` if seccomp
-/// should be disabled entirely (`seccomp=unconfined`), or `Some` (the
-/// bundled default, or a caller-supplied profile) otherwise — matching
-/// real `docker run`/`podman run --security-opt
-/// seccomp=<unconfined|path>`. Only the `seccomp=` key is implemented;
-/// any other `--security-opt` value (real `docker`/`podman` also
-/// support `apparmor=`/`label=`/`no-new-privileges`/...) is rejected
-/// with a clear error rather than silently ignored.
+/// effective seccomp confinement (`None` if seccomp should be disabled
+/// entirely — `seccomp=unconfined` — or `Some`, the bundled default or
+/// a caller-supplied profile, otherwise) and whether `no_new_privs`
+/// should be set on the container's own process — matching real
+/// `docker run`/`podman run --security-opt
+/// seccomp=<unconfined|path>`/`--security-opt no-new-privileges` both.
 ///
-/// A caller-supplied profile (`seccomp=<path>`) is used exactly as
-/// read — unlike the bundled default, it is *not* passed through
-/// `filter_to_supported_syscalls`: a profile the caller explicitly
-/// wrote is presumed to already be scoped to whatever architecture
-/// they intend it for, and an unknown syscall name in it should
-/// surface as a real, visible error (via `oci_runtime_core::
+/// `no-new-privileges` (0190): checked directly against both real
+/// tools before implementing anything — a real, installed `podman
+/// run` (no `--security-opt` at all, but *without* an active seccomp
+/// filter — see this doc comment's own last section for the one real
+/// remaining case this doesn't cover) reports `NoNewPrivs: 0` in
+/// `/proc/self/status`, `--security-opt no-new-privileges` (bare, or
+/// with an explicit `:true`/`:false`/`=true`/`=false`, all four forms
+/// accepted by real docker/podman and all four accepted here too)
+/// reports `1`; `--privileged` alone never changes it either way.
+/// This was a real, previously-unnoticed bug this same increment also
+/// fixes: `ociman run`'s own synthesized spec started from
+/// `Spec::example()`, whose own `no_new_privileges: true` is the
+/// *correct* default for `ocirun spec`'s own real-`runc`-spec-
+/// compatible template (confirmed directly, real `runc spec` also
+/// defaults to `noNewPrivileges: true`) but was never overridden back
+/// to real podman's own actual `run`-time default of `false` the way
+/// `Spec::example()`'s own `root.readonly: true` already correctly is
+/// (see `synthesize_spec`'s own doc comment on that one) — so every
+/// `ociman run`/`ociman create` container has been reporting
+/// `NoNewPrivs: 1` unconditionally, regardless of any flag, until now.
+///
+/// Only the `seccomp=`/`no-new-privileges` keys are implemented; any
+/// other `--security-opt` value (real `docker`/`podman` also support
+/// `apparmor=`/`label=`/...) is rejected with a clear error rather
+/// than silently ignored.
+///
+/// **A real, honestly-flagged remaining gap, found while verifying
+/// this fix end to end**: with this project's own *default* seccomp
+/// profile actually installed (every container that isn't
+/// `--privileged`/`seccomp=unconfined` — i.e. the overwhelmingly
+/// common case), `NoNewPrivs` still reads `1` regardless of this
+/// flag or `synthesize_spec`'s own now-correct `false` default,
+/// unlike real podman (confirmed directly: a real `podman run` with
+/// no flags at all, its own default seccomp profile active, still
+/// shows `NoNewPrivs: 0`). Root-caused directly, not guessed: this
+/// crate's own [`apply`] installs the compiled BPF program via
+/// `seccompiler::apply_filter`, which *unconditionally* calls
+/// `prctl(PR_SET_NO_NEW_PRIVS, 1, ...)` internally before the
+/// `seccomp(2)` syscall (confirmed by reading `seccompiler` 0.5.0's
+/// own source, `apply_filter_with_flags`) — real crun avoids ever
+/// needing that at all for the common (`no_new_privileges: false`)
+/// case by applying seccomp via the *raw* `seccomp(2)` syscall
+/// directly, and — critically — doing so *before* the container's
+/// own configured capability set is dropped down from the fresh
+/// rootless user namespace's own initial full set, while `CAP_SYS_
+/// ADMIN` is still present (confirmed directly by reading `~/git/
+/// crun/src/libcrun/container.c`'s own `container_init_setup`/
+/// `initialize_security`: seccomp is applied *before* `libcrun_set_
+/// caps` exactly when `no_new_privileges` is `false`, and only
+/// *after* it — once `no_new_privs` is already set as a side effect
+/// of dropping capabilities — when `no_new_privileges` is `true`).
+/// A real fix here would need this crate's own [`apply`] to install
+/// the filter via the raw syscall itself (bypassing `seccompiler`'s
+/// own convenience wrapper) *and* this project's own capability-
+/// drop/seccomp-application ordering in `oci_runtime_core::launch`
+/// reordered to match crun's exact two-branch structure — a real,
+/// security-sensitive change to the hottest, most safety-critical
+/// code path in the whole project (every single container launch,
+/// `ocirun` and `ociman` alike), deliberately deferred to its own
+/// carefully-designed, carefully-tested future increment rather than
+/// rushed alongside this one.
+///
+/// A caller-supplied seccomp profile (`seccomp=<path>`) is used
+/// exactly as read — unlike the bundled default, it is *not* passed
+/// through `filter_to_supported_syscalls`: a profile the caller
+/// explicitly wrote is presumed to already be scoped to whatever
+/// architecture they intend it for, and an unknown syscall name in it
+/// should surface as a real, visible error (via `oci_runtime_core::
 /// seccomp::apply`'s own existing strict validation, at container
 /// launch) rather than being silently dropped the way this project's
 /// own bundled default's rarely-relevant, architecture-specific extras
 /// are.
-fn resolve_seccomp(
+fn resolve_security_opts(
     security_opts: &[String],
     privileged: bool,
-) -> anyhow::Result<Option<oci_spec_types::runtime::LinuxSeccomp>> {
+) -> anyhow::Result<(Option<oci_spec_types::runtime::LinuxSeccomp>, bool)> {
     let mut seccomp_opt: Option<&str> = None;
+    let mut no_new_privileges = false;
     for opt in security_opts {
+        if opt == "no-new-privileges" {
+            no_new_privileges = true;
+            continue;
+        }
+        if let Some((key, value)) = opt.split_once(['=', ':'])
+            && key == "no-new-privileges"
+        {
+            no_new_privileges = match value {
+                "true" => true,
+                "false" => false,
+                other => anyhow::bail!(
+                    "ociman run: --security-opt no-new-privileges has an invalid value \
+                     {other:?} (expected true or false)"
+                ),
+            };
+            continue;
+        }
         match opt.split_once('=') {
             Some(("seccomp", value)) => seccomp_opt = Some(value),
             _ => anyhow::bail!(
                 "ociman run: --security-opt {opt:?} is not yet supported (only \
-                 seccomp=unconfined or seccomp=<path to a JSON seccomp profile> are)"
+                 seccomp=unconfined, seccomp=<path to a JSON seccomp profile>, or \
+                 no-new-privileges are)"
             ),
         }
     }
-    match seccomp_opt {
+    let seccomp = match seccomp_opt {
         // `--privileged` forces seccomp off entirely -- matching real
         // `podman`'s own `security_linux.go` check (`s.IsPrivileged()
         // && s.SeccompProfilePath == ""`) -- but only when no
@@ -6427,21 +6537,20 @@ fn resolve_seccomp(
         // explicit choice (even `seccomp=unconfined` itself, matched
         // by the arm below regardless) always wins over `--privileged`'s
         // own default.
-        None if privileged => Ok(None),
-        None => Ok(Some(
-            oci_runtime_core::seccomp::filter_to_supported_syscalls(
-                &oci_runtime_core::seccomp::default_profile(),
-            ),
+        None if privileged => None,
+        None => Some(oci_runtime_core::seccomp::filter_to_supported_syscalls(
+            &oci_runtime_core::seccomp::default_profile(),
         )),
-        Some("unconfined") => Ok(None),
+        Some("unconfined") => None,
         Some(path) => {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading seccomp profile {path:?}"))?;
             let profile: oci_spec_types::runtime::LinuxSeccomp = serde_json::from_str(&text)
                 .with_context(|| format!("parsing seccomp profile {path:?}"))?;
-            Ok(Some(profile))
+            Some(profile)
         }
-    }
+    };
+    Ok((seccomp, no_new_privileges))
 }
 
 /// The special `--cap-add`/`--cap-drop` value meaning "every
@@ -7555,18 +7664,20 @@ mod tests {
 
     #[test]
     fn resolve_seccomp_with_no_security_opt_at_all_returns_the_bundled_default() {
-        let seccomp = resolve_seccomp(&[], false).unwrap().unwrap();
+        let (seccomp, no_new_privileges) = resolve_security_opts(&[], false).unwrap();
         assert_eq!(
-            seccomp,
+            seccomp.unwrap(),
             oci_runtime_core::seccomp::filter_to_supported_syscalls(
                 &oci_runtime_core::seccomp::default_profile()
             )
         );
+        assert!(!no_new_privileges);
     }
 
     #[test]
     fn resolve_seccomp_unconfined_disables_seccomp_entirely() {
-        let seccomp = resolve_seccomp(&["seccomp=unconfined".to_string()], false).unwrap();
+        let (seccomp, _) =
+            resolve_security_opts(&["seccomp=unconfined".to_string()], false).unwrap();
         assert!(seccomp.is_none());
     }
 
@@ -7585,9 +7696,9 @@ mod tests {
         )
         .unwrap();
 
-        let seccomp = resolve_seccomp(&[format!("seccomp={}", profile_path.display())], false)
-            .unwrap()
-            .unwrap();
+        let (seccomp, _) =
+            resolve_security_opts(&[format!("seccomp={}", profile_path.display())], false).unwrap();
+        let seccomp = seccomp.unwrap();
         assert_eq!(seccomp.default_action, "SCMP_ACT_ALLOW");
         assert_eq!(seccomp.syscalls.len(), 1);
         assert_eq!(seccomp.syscalls[0].names, vec!["made_up_syscall_name"]);
@@ -7595,19 +7706,20 @@ mod tests {
 
     #[test]
     fn resolve_seccomp_rejects_a_missing_custom_profile_file() {
-        let err = resolve_seccomp(&["seccomp=/no/such/file.json".to_string()], false).unwrap_err();
+        let err =
+            resolve_security_opts(&["seccomp=/no/such/file.json".to_string()], false).unwrap_err();
         assert!(format!("{err:#}").contains("/no/such/file.json"));
     }
 
     #[test]
     fn resolve_seccomp_rejects_an_unsupported_security_opt_key() {
-        let err = resolve_seccomp(&["apparmor=unconfined".to_string()], false).unwrap_err();
+        let err = resolve_security_opts(&["apparmor=unconfined".to_string()], false).unwrap_err();
         assert!(err.to_string().contains("apparmor=unconfined"), "{err}");
     }
 
     #[test]
     fn resolve_seccomp_last_seccomp_value_wins_when_repeated() {
-        let seccomp = resolve_seccomp(
+        let (seccomp, _) = resolve_security_opts(
             &[
                 "seccomp=/no/such/file.json".to_string(),
                 "seccomp=unconfined".to_string(),
@@ -7620,7 +7732,7 @@ mod tests {
 
     #[test]
     fn resolve_seccomp_privileged_with_no_security_opt_disables_seccomp() {
-        let seccomp = resolve_seccomp(&[], true).unwrap();
+        let (seccomp, _) = resolve_security_opts(&[], true).unwrap();
         assert!(seccomp.is_none());
     }
 
@@ -7634,10 +7746,49 @@ mod tests {
         )
         .unwrap();
 
-        let seccomp = resolve_seccomp(&[format!("seccomp={}", profile_path.display())], true)
-            .unwrap()
-            .unwrap();
-        assert_eq!(seccomp.default_action, "SCMP_ACT_ALLOW");
+        let (seccomp, _) =
+            resolve_security_opts(&[format!("seccomp={}", profile_path.display())], true).unwrap();
+        assert_eq!(seccomp.unwrap().default_action, "SCMP_ACT_ALLOW");
+    }
+
+    #[test]
+    fn resolve_security_opts_no_new_privileges_bare_form_is_true() {
+        let (_, no_new_privileges) =
+            resolve_security_opts(&["no-new-privileges".to_string()], false).unwrap();
+        assert!(no_new_privileges);
+    }
+
+    #[test]
+    fn resolve_security_opts_no_new_privileges_accepts_colon_and_equals_true_and_false() {
+        for opt in ["no-new-privileges:true", "no-new-privileges=true"] {
+            let (_, no_new_privileges) = resolve_security_opts(&[opt.to_string()], false).unwrap();
+            assert!(no_new_privileges, "{opt}");
+        }
+        for opt in ["no-new-privileges:false", "no-new-privileges=false"] {
+            let (_, no_new_privileges) = resolve_security_opts(&[opt.to_string()], false).unwrap();
+            assert!(!no_new_privileges, "{opt}");
+        }
+    }
+
+    #[test]
+    fn resolve_security_opts_no_new_privileges_rejects_a_garbage_value() {
+        let err =
+            resolve_security_opts(&["no-new-privileges=maybe".to_string()], false).unwrap_err();
+        assert!(err.to_string().contains("invalid value"), "{err}");
+    }
+
+    #[test]
+    fn resolve_security_opts_seccomp_and_no_new_privileges_combine_in_one_call() {
+        let (seccomp, no_new_privileges) = resolve_security_opts(
+            &[
+                "seccomp=unconfined".to_string(),
+                "no-new-privileges".to_string(),
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(seccomp.is_none());
+        assert!(no_new_privileges);
     }
 
     fn strings(names: &[&str]) -> Vec<String> {

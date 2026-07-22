@@ -2623,11 +2623,15 @@ fn clone_cache_tree_inner(
 }
 
 /// Parse a `--chmod` value: an octal permission mode string (e.g.
-/// `"0741"`, `"755"`), `0..=0o7777` — real BuildKit also accepts a
-/// symbolic form (`u+rwx,g-w`, via its own `mode.Parse`), deliberately
-/// not supported here yet: every Containerfile this project's own
-/// milestone needs to build in practice only ever uses the plain
-/// numeric form.
+/// `"0741"`, `"755"`), `0..=0o7777` — checked directly, not assumed:
+/// real `docker build` (BuildKit) also accepts a symbolic form
+/// (`u+rwx,g-w`), but this project's own real equivalent, `podman
+/// build`/buildah, does not — a real, installed `podman build
+/// --chmod=a+x`/`--chmod=u+rwx,g+r,o-rwx` both fail outright with
+/// `Error parsing chmod ...` (version 4.9.3), so octal-only here
+/// already matches `podman`'s own real behavior exactly, not a gap
+/// relative to this project's own stated equivalent — only a bonus,
+/// optional BuildKit compatibility this project doesn't attempt.
 fn chmod_mode(value: &str) -> anyhow::Result<u32> {
     let mode = u32::from_str_radix(value, 8)
         .with_context(|| format!("ociman build: invalid --chmod mode {value:?} (expected an octal number, e.g. 0755; a symbolic mode like u+rwx is not yet supported)"))?;
@@ -2876,7 +2880,7 @@ mod tests {
         assert!(chmod_mode("999").is_err(), "9 is not a valid octal digit");
         assert!(
             chmod_mode("u+rwx").is_err(),
-            "symbolic mode not supported yet"
+            "symbolic mode not supported, matching real podman/buildah's own identical rejection"
         );
         assert!(chmod_mode("").is_err());
     }
