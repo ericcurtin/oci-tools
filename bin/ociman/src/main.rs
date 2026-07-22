@@ -656,6 +656,30 @@ enum Command {
         #[arg(short, long)]
         quiet: bool,
     },
+    /// Start an already-`Stopped` container again, reusing its own
+    /// existing rootfs/config exactly as `run` originally left it —
+    /// matching real `docker start`/`podman start` exactly, including
+    /// their own real detached-by-default behavior (see `cmd_start`'s
+    /// own doc comment for the one real gap this narrows:
+    /// `-a`/`--attach` isn't supported yet).
+    Start {
+        /// The container's ID or `--name`.
+        id: String,
+    },
+    /// Restart a container: stop it first if it's currently running
+    /// (same signal/timeout escalation as `ociman stop`), then start
+    /// it again — matching real `docker restart`/`podman restart`
+    /// exactly. A no-op-then-start for an already-stopped container
+    /// (nothing to stop first).
+    Restart {
+        /// The container's ID or `--name`.
+        id: String,
+        /// Seconds to wait after the initial signal before escalating
+        /// to `KILL`, if the container is currently running (same
+        /// meaning as `ociman stop --time`).
+        #[arg(short, long, default_value_t = 10)]
+        time: u64,
+    },
     /// Remove a stopped container's storage. Refuses a still-running
     /// one unless `--force` (which kills it first).
     Rm {
@@ -958,6 +982,8 @@ fn main() -> std::process::ExitCode {
                 pull,
             ),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
+            Some(Command::Start { id }) => cmd_start(&id),
+            Some(Command::Restart { id, time }) => cmd_restart(&id, time),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
             Some(Command::Cp {
                 src,
@@ -1966,68 +1992,22 @@ fn cmd_run(
     };
 
     if detach {
-        // Cloned for the forked child below: the original `container_id`/
-        // `containers` are still needed afterward, in *this* process,
-        // to poll for the container's own real startup (`StateStore`
-        // itself is just a thin, cheap-to-recreate handle around a
-        // root path, not a shared, cloneable connection of any kind —
-        // re-opening it fresh in the child is simpler and just as
-        // correct as cloning would be).
-        let container_id_for_keeper = container_id.clone();
-
         // SAFETY: `ociman`'s own process has not spawned any additional
         // threads by this point (argument parsing, pulling, layer
-        // extraction, and spec synthesis don't spawn any), and a
-        // fresh `fork(2)` child is always single-threaded regardless
-        // of its parent — the same safety invariant
-        // `run_and_finalize`'s own `run_reporting_pid` call already
-        // requires, forwarded here since this fork happens through
-        // the exact same primitive `launch::run_reporting_pid` itself
-        // uses.
+        // extraction, and spec synthesis don't spawn any) — the
+        // requirement `launch_detached_and_confirm`'s own fork forwards.
         #[allow(unsafe_code)]
-        let keeper_pid = unsafe {
-            oci_runtime_core::process::fork(move || {
-                // Detach from the controlling terminal/session
-                // entirely, and stop this process from ever again
-                // writing to (or blocking on) the original terminal —
-                // matches real `docker run -d`'s own "no live output
-                // for a detached container" convention: `ociman
-                // logs`, not this fd, is where output is read back
-                // from (the log-tee thread `run_and_finalize`'s own
-                // `run_reporting_pid` call spawns still writes the
-                // real container output to `container.log`
-                // regardless; only its *second* copy, normally also
-                // echoed to this process's own stdout for a
-                // foreground `run`, is silenced here).
-                let _ = rustix::process::setsid();
-                let devnull = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open("/dev/null");
-                if let Ok(devnull) = devnull {
-                    let _ = rustix::stdio::dup2_stdin(&devnull);
-                    let _ = rustix::stdio::dup2_stdout(&devnull);
-                    let _ = rustix::stdio::dup2_stderr(&devnull);
-                }
-                let Ok(containers) = open_container_store() else {
-                    std::process::exit(1);
-                };
-                let _ = run_and_finalize(
-                    &container_id_for_keeper,
-                    &bundle,
-                    &rootfs,
-                    &containers,
-                    state,
-                    &log_path,
-                    rm,
-                );
-                std::process::exit(0);
-            })
+        unsafe {
+            launch_detached_and_confirm(
+                &container_id,
+                &containers,
+                bundle,
+                rootfs,
+                log_path,
+                state,
+                rm,
+            )?;
         }
-        .context("detaching container")?;
-
-        wait_for_detached_container_to_start(&containers, &container_id, keeper_pid)?;
-        println!("{container_id}");
         return Ok(());
     }
 
@@ -2047,6 +2027,80 @@ fn cmd_run(
     // bypasses `oci_cli_common::run_main`'s usual Ok(())-means-success
     // mapping.
     std::process::exit(exit_code);
+}
+
+/// Fork a detached "keeper" process that runs `bundle`'s already-
+/// fully-prepared container to completion via [`run_and_finalize`],
+/// then block until it reports a real, running pid (or a clear reason
+/// it never did) before returning — shared by `ociman run -d` and
+/// `ociman start` (0154): a brand-new bundle `cmd_run` itself just
+/// finished preparing, or an existing, already-`Stopped` container's
+/// own already-on-disk bundle being launched again, both need the
+/// exact same "launch in the background, confirm it actually started,
+/// print the id back" sequence.
+///
+/// # Safety
+///
+/// Forwards `oci_runtime_core::process::fork`'s own safety
+/// requirement to the caller: the calling process must not have
+/// spawned any additional threads by this point.
+#[allow(clippy::too_many_arguments, unsafe_code)]
+unsafe fn launch_detached_and_confirm(
+    container_id: &str,
+    containers: &StateStore,
+    bundle: oci_runtime_core::Bundle,
+    rootfs: PathBuf,
+    log_path: PathBuf,
+    state: oci_runtime_core::PersistedState,
+    rm: bool,
+) -> anyhow::Result<()> {
+    let container_id_for_keeper = container_id.to_string();
+
+    // SAFETY: forwarded from this function's own contract above.
+    #[allow(unsafe_code)]
+    let keeper_pid = unsafe {
+        oci_runtime_core::process::fork(move || {
+            // Detach from the controlling terminal/session entirely,
+            // and stop this process from ever again writing to (or
+            // blocking on) the original terminal — matches real
+            // `docker run -d`'s own "no live output for a detached
+            // container" convention: `ociman logs`, not this fd, is
+            // where output is read back from (the log-tee thread
+            // `run_and_finalize`'s own `run_reporting_pid` call spawns
+            // still writes the real container output to
+            // `container.log` regardless; only its *second* copy,
+            // normally also echoed to this process's own stdout for a
+            // foreground run, is silenced here).
+            let _ = rustix::process::setsid();
+            let devnull = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null");
+            if let Ok(devnull) = devnull {
+                let _ = rustix::stdio::dup2_stdin(&devnull);
+                let _ = rustix::stdio::dup2_stdout(&devnull);
+                let _ = rustix::stdio::dup2_stderr(&devnull);
+            }
+            let Ok(containers) = open_container_store() else {
+                std::process::exit(1);
+            };
+            let _ = run_and_finalize(
+                &container_id_for_keeper,
+                &bundle,
+                &rootfs,
+                &containers,
+                state,
+                &log_path,
+                rm,
+            );
+            std::process::exit(0);
+        })
+    }
+    .context("detaching container")?;
+
+    wait_for_detached_container_to_start(containers, container_id, keeper_pid)?;
+    println!("{container_id}");
+    Ok(())
 }
 
 /// Run `bundle`'s already-fully-prepared container to completion
@@ -2896,11 +2950,66 @@ fn reset_failed_systemd_scope(container_id: &str) {
 /// stopped, matching real `docker stop`/`podman stop`'s own
 /// idempotent behavior rather than erroring on a redundant call.
 fn cmd_stop(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
+    stop_container(id, time_secs, signal)?;
+    println!("{id}");
+    Ok(())
+}
+
+/// After a container's own process has genuinely exited, its detached
+/// *keeper* process (the one blocked in `run_and_finalize`, which
+/// forked it) still has its own trailing bookkeeping left to do —
+/// `reset_failed_systemd_scope` plus the final disk write that flips
+/// the persisted status to `Status::Stopped` — before the container
+/// is truly at rest. This is a real, previously-hit race (`docs/
+/// design/0154`): treating "the process itself is no longer alive" as
+/// "fully stopped" is not enough, since a subsequent `ociman start`
+/// unaware of the still in-flight keeper can begin a brand new launch
+/// whose own fresh `Creating`/`Running` state the old keeper's own
+/// delayed terminal write then silently clobbers moments later.
+/// Bounded rather than unconditional: the keeper's own remaining work
+/// is normally near-instant once the child it is waiting on has
+/// exited, but this must never hang forever if something upstream
+/// left a stale `Running`/`Creating` record behind with no keeper
+/// left to ever finalize it.
+fn wait_for_keeper_to_finalize(containers: &StateStore, resolved: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match containers.load(resolved) {
+            Ok(state) if state.status == Status::Running || state.status == Status::Creating => {}
+            _ => return,
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// The actual "gracefully stop, escalating to `KILL`" logic, factored
+/// out of [`cmd_stop`] so [`cmd_restart`] (0154) can reuse it *without*
+/// also inheriting `cmd_stop`'s own `println!` — real `podman restart`
+/// prints the container id exactly once, at the very end, not once
+/// for the stop half and again for the start half (same reasoning
+/// `remove_container`'s own doc comment already established for
+/// `cmd_rm`/`cmd_rmi --force`).
+fn stop_container(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)?;
     let state = containers.load(&resolved)?;
     if state.effective_status() == Status::Stopped {
-        println!("{id}");
+        // `effective_status` can report `Stopped` purely because the
+        // container's own recorded pid is no longer alive, even while
+        // the *raw* status is still `Running`/`Creating` — meaning the
+        // container's own detached keeper process (see
+        // `wait_for_keeper_to_finalize`'s own doc comment above) has
+        // not actually finished its own bookkeeping yet. Wait for that
+        // to genuinely settle before returning here too, not just in
+        // the below branches: a real, previously-hit race (`docs/
+        // design/0154`) where returning immediately in exactly this
+        // case let a subsequent `ociman start` begin a brand new
+        // launch that the old keeper's own delayed terminal write
+        // then silently clobbered moments later.
+        wait_for_keeper_to_finalize(&containers, &resolved);
         return Ok(());
     }
     let pid = state
@@ -2939,8 +3048,8 @@ fn cmd_stop(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
         for _ in 0..4 {
             std::thread::sleep(std::time::Duration::from_millis(200));
             if !oci_runtime_core::process::alive(pid) {
+                wait_for_keeper_to_finalize(&containers, &resolved);
                 reset_failed_systemd_scope(&resolved);
-                println!("{id}");
                 return Ok(());
             }
             let _ = oci_runtime_core::process::kill(pid, sig);
@@ -2950,8 +3059,8 @@ fn cmd_stop(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(time_secs);
     while std::time::Instant::now() < deadline {
         if !oci_runtime_core::process::alive(pid) {
+            wait_for_keeper_to_finalize(&containers, &resolved);
             reset_failed_systemd_scope(&resolved);
-            println!("{id}");
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2971,10 +3080,111 @@ fn cmd_stop(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    wait_for_keeper_to_finalize(&containers, &resolved);
     reset_failed_systemd_scope(&resolved);
-
-    println!("{id}");
     Ok(())
+}
+
+/// Start an already-`Stopped` container again, reusing its own
+/// already-on-disk `config.json`/`rootfs/` exactly as `run` originally
+/// left them — no re-extraction, no re-resolving the original image
+/// reference, no re-writing `/etc/hosts` or the base `diff` snapshot
+/// (0149): everything about the container's own bundle is already
+/// real, valid, and completely unchanged since it was first created.
+///
+/// Always detached (backgrounded), matching real `docker start`/
+/// `podman start`'s own real, checked-directly default (confirmed
+/// directly, `~/git/podman/cmd/podman/containers/start.go`: only
+/// `-a`/`--attach`, not given by default, streams the container's own
+/// output live and blocks) — deliberately narrower than real podman
+/// for this first increment: `-a`/`--attach` itself isn't implemented
+/// yet (see this function's own "what this doesn't do yet").
+///
+/// A clear, real error for anything other than a `Stopped` container —
+/// matching real `podman start`'s own identical refusal to start an
+/// already-`Running` one (`~/git/podman/libpod/container_internal.go`'s
+/// own `prepareToStart`: `ErrCtrStateRunning`).
+///
+/// What this doesn't do yet: `-a`/`--attach`/`-i`/`--interactive`
+/// (streaming the restarted container's own output live and waiting
+/// for it, rather than always detaching) — a real gap, deferred to a
+/// future increment; real podman's own default (this increment's own
+/// only supported mode) is detached either way.
+fn cmd_start(id: &str) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let resolved = resolve_container_id(&containers, id)?;
+    let mut state = containers.load(&resolved)?;
+    let status = state.effective_status();
+    anyhow::ensure!(
+        status == Status::Stopped,
+        "container {id:?} must be stopped to be started (its own current status is {status})"
+    );
+    // `effective_status` above can report `Stopped` purely because the
+    // container's own recorded pid is no longer alive, even while the
+    // *raw*, on-disk status is still `Running`/`Creating` — meaning
+    // its own previous detached keeper process (see
+    // `wait_for_keeper_to_finalize`'s own doc comment) has not
+    // actually finished its own bookkeeping yet. A real, previously-
+    // hit race (`docs/design/0154`): proceeding to overwrite the
+    // state with a fresh `Creating` immediately, without waiting for
+    // that here, lets the *old* keeper's own delayed terminal
+    // `Stopped` write land after this fresh one and silently clobber
+    // it.
+    wait_for_keeper_to_finalize(&containers, &resolved);
+    // Reload: `wait_for_keeper_to_finalize` may have observed a newer
+    // on-disk state (e.g. the exit code annotation) than what's
+    // already in `state`.
+    state = containers.load(&resolved)?;
+
+    let bundle_dir = containers.container_dir(&resolved);
+    let bundle = oci_runtime_core::Bundle::load(&bundle_dir)
+        .with_context(|| format!("loading bundle from {}", bundle_dir.display()))?;
+    let rootfs =
+        oci_runtime_core::validate::validate(&bundle).context("config.json failed validation")?;
+    let log_path = bundle_dir.join("container.log");
+
+    // Matches `cmd_run`'s own initial `Creating` status: the shared
+    // `wait_for_detached_container_to_start` this reuses waits for
+    // exactly this status to change *away* from `Creating` again,
+    // which would otherwise return instantly (and incorrectly
+    // "successfully", before the container has actually started at
+    // all) here — the container's own *current*, pre-launch status,
+    // `Stopped`, already satisfies "not Creating" trivially.
+    state.status = Status::Creating;
+    containers.write(&state)?;
+
+    // SAFETY: `ociman`'s own process has not spawned any additional
+    // threads by this point (argument parsing and the bundle load/
+    // validate above don't spawn any) — the requirement
+    // `launch_detached_and_confirm`'s own fork forwards.
+    #[allow(unsafe_code)]
+    unsafe {
+        launch_detached_and_confirm(
+            &resolved,
+            &containers,
+            bundle,
+            rootfs,
+            log_path,
+            state,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+/// Restart a container: stop it first (same signal/timeout escalation
+/// as `ociman stop`, real `SIGTERM`, matching real podman's own
+/// default) if it's currently running, then start it again — matching
+/// real `docker restart`/`podman restart` exactly (checked directly,
+/// `~/git/podman/libpod/container_internal.go`'s own
+/// `restartWithTimeout`: stop only if actually `Running`, then
+/// re-`init`/start regardless of whatever state that left it in).
+/// Prints the container id exactly once, at the very end — see
+/// `stop_container`'s own doc comment for why it's factored out of
+/// `cmd_stop` specifically to make this possible.
+fn cmd_restart(id: &str, time_secs: u64) -> anyhow::Result<()> {
+    stop_container(id, time_secs, "TERM")?;
+    cmd_start(id)
 }
 
 /// Send `signal` to a running container's own init process, once,
