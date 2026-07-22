@@ -249,6 +249,90 @@ fn prune_without_all_leaves_an_unused_but_still_tagged_image_alone() {
     );
 }
 
+/// A dangling (untagged, `docs/design/0179`) image not currently used
+/// by any container *is* reclaimed even without `--all` — matching
+/// real `docker system prune`/`podman system prune`'s own identical
+/// default exactly (checked directly against both real tools during
+/// this feature's own design, see `docs/design/0181`): only `--all`
+/// is needed to *additionally* reach a still-*tagged* image, never a
+/// dangling one to begin with. Also reclaims that image's own now-
+/// orphaned blob in the very same call, the same "no second `ociman
+/// prune` invocation needed" benefit `--all`'s own identical pass
+/// already has.
+#[test]
+fn prune_without_all_removes_a_dangling_untagged_image_and_reclaims_its_blobs_too() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/prune-dangling-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/prune-dangling-base:latest\nLABEL foo=bar\n",
+    )
+    .unwrap();
+    let build = ociman(
+        storage_dir.path(),
+        &["build", context_dir.path().to_str().unwrap()],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let digest = String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+
+    let prune = ociman(storage_dir.path(), &["--json", "prune"]);
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(
+        view["images_removed"],
+        serde_json::json!([digest]),
+        "the dangling image's own internal sentinel reference (its own digest, verbatim) \
+         should show up as the one image removed: {view:?}"
+    );
+    assert!(view["blobs_removed"].as_u64().unwrap() > 0, "{view:?}");
+
+    let images = ociman(storage_dir.path(), &["images", "--json"]);
+    assert!(images.status.success());
+    let views: serde_json::Value = serde_json::from_slice(&images.stdout).unwrap();
+    assert!(
+        views
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v["digest"] != digest),
+        "the dangling image should be gone from the listing entirely: {views:?}"
+    );
+
+    // The base image's own real tag is completely untouched, matching
+    // the pre-existing `--all`-only tagged-image policy exactly.
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/prune-dangling-base:latest")
+            .unwrap()
+            .is_some()
+    );
+}
+
 #[test]
 fn prune_all_removes_an_image_no_container_uses_and_reclaims_its_blobs_too() {
     let Some(busybox) = busybox_path() else {

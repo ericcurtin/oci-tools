@@ -697,24 +697,29 @@ enum Command {
         /// tagged.
         reference: String,
     },
-    /// Reclaim disk space no longer needed by anything currently
-    /// tagged: unreferenced blobs (`Store::gc`'s own real mark-and-
-    /// sweep, already implemented but never wired to any command
-    /// before this one) and rootfs-cache entries (`docs/design/0109`)
-    /// for a manifest digest no image reference resolves to anymore.
-    /// Matches real `docker system prune`/`podman system prune`'s own
-    /// "only reclaim what's genuinely unreferenced, only when asked"
-    /// convention — never run implicitly by `rmi`/`rm`, which would
-    /// tax every ordinary removal with a full reachability scan for a
-    /// benefit only worth paying for occasionally.
+    /// Reclaim disk space no longer needed: any dangling (untagged,
+    /// `docs/design/0179`) image not currently used by any container,
+    /// unreferenced blobs (`Store::gc`'s own real mark-and-sweep,
+    /// already implemented but never wired to any command before this
+    /// one), and rootfs-cache entries (`docs/design/0109`) for a
+    /// manifest digest no image reference resolves to anymore. Matches
+    /// real `docker system prune`/`podman system prune`'s own default
+    /// exactly (checked directly, not assumed — both real tools'
+    /// `-a`/`--all` help text says "not just dangling ones", and a
+    /// real dangling image was confirmed removed by each, with no
+    /// `--all`, by testing directly) — never run implicitly by
+    /// `rmi`/`rm`, which would tax every ordinary removal with a full
+    /// reachability scan for a benefit only worth paying for
+    /// occasionally.
     Prune {
-        /// Also remove every image not currently used by any
-        /// container (running or stopped), not just already-untagged
-        /// blobs/cache entries — matching real `docker system prune
-        /// -a`/`podman system prune -a`'s own more aggressive mode.
-        /// Without this flag (the default), an image still tagged is
-        /// never touched even if nothing currently uses it, matching
-        /// real `docker system prune`'s own default.
+        /// Also remove every *tagged* image not currently used by any
+        /// container (running or stopped) — matching real `docker
+        /// system prune -a`/`podman system prune -a`'s own more
+        /// aggressive mode. Without this flag (the default), a
+        /// dangling image is still reclaimed (see this command's own
+        /// doc comment), but a tagged one never is, even if nothing
+        /// currently uses it, matching real `docker system prune`'s
+        /// own default exactly.
         #[arg(short, long)]
         all: bool,
     },
@@ -2599,39 +2604,50 @@ fn prune_build_scratch(store: &Store) -> anyhow::Result<(usize, u64)> {
 fn cmd_prune(json: bool, all: bool) -> anyhow::Result<()> {
     let store = open_store()?;
 
-    // `--all`'s own extra pass runs *before* the blob/cache GC below
-    // so that an image this pass just untags immediately makes its
-    // own now-unreferenced blobs/cache entries eligible for the same
-    // GC run, rather than needing a second `ociman prune` invocation
-    // to actually reclaim them.
+    // A dangling (untagged, `is_untagged_reference`, 0179) image not
+    // currently in use by any container is reclaimed even *without*
+    // `--all` — matching real `docker system prune`/`podman system
+    // prune`'s own identical default exactly (checked directly, not
+    // assumed: both real tools' own `-a`/`--all` help text says
+    // "remove all unused images, not just dangling ones", and a real
+    // `podman system prune`/`docker system prune` was each run
+    // directly against a real dangling image, confirming it gets
+    // removed with no `--all` at all). `--all` extends removal to
+    // *every* unused image regardless of tag, the pre-existing
+    // behavior, unchanged. Either pass runs *before* the blob/cache GC
+    // below so that an image either one just untags immediately makes
+    // its own now-unreferenced blobs/cache entries eligible for the
+    // same GC run, rather than needing a second `ociman prune`
+    // invocation to actually reclaim them.
+    let containers = open_container_store()?;
+    // Matched by the underlying manifest digest, not the exact
+    // reference string a container happened to be started with: two
+    // tags pointing at the same image (`ociman tag`'s own whole
+    // point) must both count as "in use" if a container uses *either*
+    // one, the same real image either way.
+    let mut in_use_digests: std::collections::HashSet<oci_spec_types::Digest> =
+        std::collections::HashSet::new();
+    for state in containers.list().context("listing containers")? {
+        if let Some(image_ref) = state.annotations.get(ANNOTATION_IMAGE)
+            && let Some(record) = store
+                .resolve_image(image_ref)
+                .context("resolving a container's own image reference")?
+        {
+            in_use_digests.insert(record.manifest_digest);
+        }
+    }
     let mut images_removed = Vec::new();
-    if all {
-        let containers = open_container_store()?;
-        // Matched by the underlying manifest digest, not the exact
-        // reference string a container happened to be started with:
-        // two tags pointing at the same image (`ociman tag`'s own
-        // whole point) must both count as "in use" if a container
-        // uses *either* one, the same real image either way.
-        let mut in_use_digests: std::collections::HashSet<oci_spec_types::Digest> =
-            std::collections::HashSet::new();
-        for state in containers.list().context("listing containers")? {
-            if let Some(image_ref) = state.annotations.get(ANNOTATION_IMAGE)
-                && let Some(record) = store
-                    .resolve_image(image_ref)
-                    .context("resolving a container's own image reference")?
-            {
-                in_use_digests.insert(record.manifest_digest);
-            }
+    for record in store.list_images().context("listing images")? {
+        if in_use_digests.contains(&record.manifest_digest) {
+            continue;
         }
-        for record in store.list_images().context("listing images")? {
-            if in_use_digests.contains(&record.manifest_digest) {
-                continue;
-            }
-            store
-                .remove_image(&record.reference)
-                .with_context(|| format!("removing unused image {}", record.reference))?;
-            images_removed.push(record.reference);
+        if !all && !is_untagged_reference(&record.reference) {
+            continue;
         }
+        store
+            .remove_image(&record.reference)
+            .with_context(|| format!("removing unused image {}", record.reference))?;
+        images_removed.push(record.reference);
     }
 
     let blob_report = store
@@ -2653,13 +2669,11 @@ fn cmd_prune(json: bool, all: bool) -> anyhow::Result<()> {
             build_scratch_reclaimed_bytes,
         })?;
     } else {
-        if all {
-            println!(
-                "images: removed {} ({})",
-                images_removed.len(),
-                images_removed.join(", ")
-            );
-        }
+        println!(
+            "images: removed {} ({})",
+            images_removed.len(),
+            images_removed.join(", ")
+        );
         println!(
             "blobs: removed {}, reclaimed {} bytes",
             blob_report.removed.len(),
