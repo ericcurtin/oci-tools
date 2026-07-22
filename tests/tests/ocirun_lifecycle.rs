@@ -20,7 +20,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use oci_tools_tests::{
-    bin_path, busybox_path, ocirun, ocirun_create, state_status, wait_for_status, write_bundle,
+    bin_path, busybox_path, list_status, ocirun, ocirun_create, state_status, wait_for_status,
+    write_bundle,
 };
 
 /// Same real, reachable-`systemd --user`-session probe
@@ -705,6 +706,16 @@ fn pause_freezes_and_resume_thaws_a_real_running_containers_own_cpu_usage() {
         "1",
         "cgroup.freeze should read back \"1\" after a real pause"
     );
+    assert_eq!(
+        state_status(root_dir.path(), "pause-test"),
+        "paused",
+        "ocirun state should report the real, computed \"paused\" status once frozen"
+    );
+    assert_eq!(
+        list_status(root_dir.path(), "pause-test"),
+        "paused",
+        "ocirun list should also report the real, computed \"paused\" status once frozen"
+    );
 
     let usage_just_after_pause = read_cpu_usage_usec(&cgroup_dir);
     std::thread::sleep(Duration::from_millis(500));
@@ -726,6 +737,16 @@ fn pause_freezes_and_resume_thaws_a_real_running_containers_own_cpu_usage() {
             .trim(),
         "0",
         "cgroup.freeze should read back \"0\" after a real resume"
+    );
+    assert_eq!(
+        state_status(root_dir.path(), "pause-test"),
+        "running",
+        "ocirun state should report \"running\" again once genuinely thawed"
+    );
+    assert_eq!(
+        list_status(root_dir.path(), "pause-test"),
+        "running",
+        "ocirun list should also report \"running\" again once genuinely thawed"
     );
 
     std::thread::sleep(Duration::from_millis(300));

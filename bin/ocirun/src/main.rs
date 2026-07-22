@@ -331,18 +331,54 @@ fn cmd_spec(bundle: Option<&Path>, rootless: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `state`'s own real, current cgroup (`bundle.spec.linux.
+/// cgroupsPath`, the same plain-cgroupfs-driver path `resolve_cgroup_
+/// dir`/`cmd_update`/`cmd_pause` already use) reports frozen right
+/// now — used by `cmd_state`/`cmd_list` to report a real, computed
+/// [`Status::Paused`] instead of `Status::Running`, matching real
+/// runc's own `isPaused()` (see `docs/design/0144`).
+///
+/// Always `false` (never an error) for anything that isn't a plausible
+/// candidate at all — no `cgroupsPath` set, the bundle failed to load,
+/// the cgroup directory doesn't exist, or the freezer file can't be
+/// read — a container this project can't meaningfully check is
+/// reported exactly as it always was before this existed, never a
+/// spurious failure of the whole `state`/`list` command over what is,
+/// after all, an optional, best-effort display enhancement.
+fn is_frozen(state: &oci_runtime_core::state::PersistedState) -> bool {
+    let Ok(bundle) = oci_runtime_core::Bundle::load(&state.bundle) else {
+        return false;
+    };
+    let Ok(Some(cgroup_dir)) = oci_runtime_core::cgroups::directory_for(
+        Path::new("/sys/fs/cgroup"),
+        bundle
+            .spec
+            .linux
+            .as_ref()
+            .and_then(|l| l.cgroups_path.as_deref()),
+    ) else {
+        return false;
+    };
+    oci_runtime_core::cgroups::is_frozen(&cgroup_dir).unwrap_or(false)
+}
+
 fn cmd_state(root: &Path, id: &str) -> anyhow::Result<()> {
     let store = StateStore::open(root)
         .with_context(|| format!("opening container state root {}", root.display()))?;
     let state = store.load(id)?;
-    oci_cli_common::output::print_json(&state.to_view())?;
+    let frozen = is_frozen(&state);
+    oci_cli_common::output::print_json(&state.to_view_with_frozen(frozen))?;
     Ok(())
 }
 
 fn cmd_list(root: &Path, format: &str, quiet: bool) -> anyhow::Result<()> {
     let store = StateStore::open(root)
         .with_context(|| format!("opening container state root {}", root.display()))?;
-    let views: Vec<_> = store.list()?.iter().map(|s| s.to_view()).collect();
+    let views: Vec<_> = store
+        .list()?
+        .iter()
+        .map(|s| s.to_view_with_frozen(is_frozen(s)))
+        .collect();
 
     if quiet {
         for view in &views {

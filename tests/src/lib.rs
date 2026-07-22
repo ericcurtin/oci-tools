@@ -301,6 +301,27 @@ pub fn state_status(root: &Path, id: &str) -> String {
     json["status"].as_str().unwrap().to_string()
 }
 
+/// The `status` field for `id` out of `ocirun list --format json` (as
+/// plain JSON output), asserting the command itself succeeded and
+/// that `id` is actually present in the list.
+pub fn list_status(root: &Path, id: &str) -> String {
+    let out = ocirun(root, &["list", "--format", "json"]);
+    assert!(
+        out.status.success(),
+        "ocirun list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let views = json
+        .as_array()
+        .expect("ocirun list --format json is an array");
+    let view = views
+        .iter()
+        .find(|v| v["id"].as_str() == Some(id))
+        .unwrap_or_else(|| panic!("{id:?} not found in ocirun list output: {views:?}"));
+    view["status"].as_str().unwrap().to_string()
+}
+
 /// Poll [`state_status`] until it equals `want` or `timeout` elapses
 /// (status transitions — e.g. a killed container becoming "stopped" —
 /// aren't necessarily instantaneous from a separate process's point of

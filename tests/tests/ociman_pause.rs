@@ -79,6 +79,19 @@ fn wait_for_container_status(
     }
 }
 
+/// The `status` field from `ociman inspect <id> --json`, asserting
+/// the command itself succeeded.
+fn inspect_status(storage_root: &Path, id: &str) -> String {
+    let out = ociman(storage_root, &["inspect", id, "--json"]);
+    assert!(
+        out.status.success(),
+        "ociman inspect failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    json["status"].as_str().unwrap().to_string()
+}
+
 /// Same real, reachable-`systemd --user`-session probe
 /// `ociman_top.rs`'s own tests use.
 fn systemd_user_session_available() -> bool {
@@ -194,6 +207,16 @@ fn pause_freezes_and_unpause_thaws_a_real_running_containers_own_cpu_usage() {
             .trim(),
         "1"
     );
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "paused", Duration::from_secs(5)),
+        "paused",
+        "ociman ps should report the real, computed \"paused\" status once frozen"
+    );
+    assert_eq!(
+        inspect_status(storage_dir.path(), &id),
+        "paused",
+        "ociman inspect should also report the real, computed \"paused\" status once frozen"
+    );
 
     let usage_just_after_pause = cpu_usage_usec(&cgroup_dir);
     std::thread::sleep(Duration::from_millis(500));
@@ -214,6 +237,16 @@ fn pause_freezes_and_unpause_thaws_a_real_running_containers_own_cpu_usage() {
             .unwrap()
             .trim(),
         "0"
+    );
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(5)),
+        "running",
+        "ociman ps should report \"running\" again once genuinely thawed"
+    );
+    assert_eq!(
+        inspect_status(storage_dir.path(), &id),
+        "running",
+        "ociman inspect should also report \"running\" again once genuinely thawed"
     );
 
     std::thread::sleep(Duration::from_millis(300));

@@ -27,8 +27,20 @@ pub const OCI_VERSION: &str = oci_spec_types::runtime::VERSION;
 
 /// A container's lifecycle status, per the OCI runtime spec's
 /// `ContainerState` (`creating`/`created`/`running`/`stopped`; the spec
-/// also allows implementation-defined additional states, but these four
-/// are all any of runc/crun/oci-tools ever produce).
+/// also allows implementation-defined additional states) plus one such
+/// additional state, [`Status::Paused`], matching real runc/crun's own
+/// (both report a real `"paused"` via `state`/`list` once a container's
+/// own cgroup freezer reports frozen — checked directly against real
+/// runc's own `isPaused()`, `~/git/runc/libcontainer/container_linux.
+/// go`).
+///
+/// [`Status::Paused`] is deliberately never *persisted* to a real
+/// `state.json` the way the other four variants are — real runc's own
+/// doesn't either, computing it dynamically at query time from the
+/// real, current cgroup freezer state instead (see `docs/design/0144`)
+/// — [`PersistedState::status`]'s own on-disk field never holds this
+/// value; only [`PersistedState::to_view_with_frozen`]'s own returned
+/// [`StateView`] ever does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
@@ -42,6 +54,11 @@ pub enum Status {
     Running,
     /// The container process has exited.
     Stopped,
+    /// `start` has run the user-specified process, and its own cgroup
+    /// freezer currently reports it frozen (`ocirun pause`/`ociman
+    /// pause`) — see this enum's own doc comment for why this is never
+    /// persisted, only ever computed at display time.
+    Paused,
 }
 
 impl Status {
@@ -52,6 +69,7 @@ impl Status {
             Status::Created => "created",
             Status::Running => "running",
             Status::Stopped => "stopped",
+            Status::Paused => "paused",
         }
     }
 }
@@ -138,6 +156,24 @@ impl PersistedState {
             created: self.created.clone(),
             annotations: self.annotations.clone(),
         }
+    }
+
+    /// Like [`Self::to_view`], but reports [`Status::Paused`] instead
+    /// of [`Status::Running`] when `frozen` is `true` — matching real
+    /// runc's own `isPaused()`-computed status exactly (see this
+    /// module's own `Status::Paused` doc comment). A caller determines
+    /// `frozen` itself (by checking the container's own real, current
+    /// cgroup — this module has no cgroup access of its own, deliberately,
+    /// see its own top doc comment) and passes it in; `false` for a
+    /// container this project doesn't even try to check (no cgroup at
+    /// all, or the check itself failed) is always a safe default, never
+    /// worse than what [`Self::to_view`] alone already reports.
+    pub fn to_view_with_frozen(&self, frozen: bool) -> StateView {
+        let mut view = self.to_view();
+        if frozen && view.status == Status::Running {
+            view.status = Status::Paused;
+        }
+        view
     }
 }
 
@@ -608,6 +644,41 @@ mod tests {
         let view = state.to_view();
         assert_eq!(view.pid, std::process::id() as i32);
         assert_eq!(view.status, Status::Running);
+    }
+
+    #[test]
+    fn to_view_with_frozen_upgrades_running_to_paused() {
+        let (_dir, store) = store();
+        let mut state = store
+            .create(
+                "c1",
+                Path::new("/bundle"),
+                Path::new("/bundle/rootfs"),
+                BTreeMap::new(),
+            )
+            .unwrap();
+        state.status = Status::Running;
+        state.pid = Some(std::process::id() as i32);
+
+        assert_eq!(state.to_view_with_frozen(false).status, Status::Running);
+        assert_eq!(state.to_view_with_frozen(true).status, Status::Paused);
+    }
+
+    #[test]
+    fn to_view_with_frozen_never_upgrades_a_non_running_status() {
+        let (_dir, store) = store();
+        let state = store
+            .create(
+                "c1",
+                Path::new("/bundle"),
+                Path::new("/bundle/rootfs"),
+                BTreeMap::new(),
+            )
+            .unwrap();
+        // Still `Creating` (no pid recorded yet) -- `frozen = true`
+        // must never turn a non-`Running` status into `Paused`, even
+        // if a caller somehow got that wrong.
+        assert_eq!(state.to_view_with_frozen(true).status, Status::Creating);
     }
 
     #[test]

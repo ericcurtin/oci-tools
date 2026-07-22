@@ -2213,6 +2213,7 @@ struct ContainerView {
 
 impl ContainerView {
     fn from_state(state: &oci_runtime_core::PersistedState) -> Self {
+        let status = display_status(state);
         ContainerView {
             id: state.id.clone(),
             name: state.annotations.get(ANNOTATION_NAME).cloned(),
@@ -2226,13 +2227,50 @@ impl ContainerView {
                 .get(ANNOTATION_COMMAND)
                 .cloned()
                 .unwrap_or_default(),
-            status: state.effective_status().to_string(),
+            status: status.to_string(),
             created: state.created.clone(),
             exit_code: state
                 .annotations
                 .get(ANNOTATION_EXIT_CODE)
                 .and_then(|s| s.parse().ok()),
         }
+    }
+}
+
+/// `state`'s own effective status, upgraded to [`Status::Paused`] when
+/// its real, current *systemd-driver* cgroup (derived from its
+/// recorded pid via `cgroup_dir_for_running_pid`, same technique
+/// `resolve_running_container_cgroup`/`cmd_top` already use) reports
+/// frozen right now — used by both [`ContainerView::from_state`]
+/// ("`ps`") and [`ContainerInspectView::from_state`] ("`inspect`") so
+/// both report a real, computed paused status matching real runc's
+/// own `isPaused()` (see `docs/design/0144`), same reasoning as
+/// `ocirun`'s own `PersistedState::to_view_with_frozen`.
+///
+/// Never upgrades anything that isn't a plausible candidate: not
+/// currently `Running` at all (per `effective_status`), no recorded
+/// pid, the cgroup can't be resolved, or the freezer file can't be
+/// read — a container this project can't meaningfully check is
+/// reported exactly as it always was before this existed, never a
+/// spurious failure of the whole `ps`/`inspect` command over what is,
+/// after all, an optional, best-effort display enhancement.
+fn display_status(state: &oci_runtime_core::PersistedState) -> Status {
+    let status = state.effective_status();
+    if status != Status::Running {
+        return status;
+    }
+    let Some(pid) = state.pid else {
+        return status;
+    };
+    let Ok(cgroup_dir) =
+        oci_runtime_core::cgroups::cgroup_dir_for_running_pid(Path::new("/sys/fs/cgroup"), pid)
+    else {
+        return status;
+    };
+    if oci_runtime_core::cgroups::is_frozen(&cgroup_dir).unwrap_or(false) {
+        Status::Paused
+    } else {
+        status
     }
 }
 
@@ -2264,7 +2302,7 @@ struct ContainerInspectView {
 
 impl ContainerInspectView {
     fn from_state(state: &oci_runtime_core::PersistedState) -> Self {
-        let status = state.effective_status();
+        let status = display_status(state);
         ContainerInspectView {
             id: state.id.clone(),
             name: state.annotations.get(ANNOTATION_NAME).cloned(),
