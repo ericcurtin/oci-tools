@@ -800,12 +800,22 @@ enum Command {
     /// Start an already-`Stopped` container again, reusing its own
     /// existing rootfs/config exactly as `run` originally left it —
     /// matching real `docker start`/`podman start` exactly, including
-    /// their own real detached-by-default behavior (see `cmd_start`'s
-    /// own doc comment for the one real gap this narrows:
-    /// `-a`/`--attach` isn't supported yet).
+    /// their own real detached-by-default behavior.
     Start {
         /// The container's ID or `--name`.
         id: String,
+        /// Stream the container's own live output to stdout and block
+        /// until it exits, this command's own exit code then becoming
+        /// the container's own real exit code — matching real `docker
+        /// start -a`/`podman start -a` exactly (checked directly: with
+        /// `-a`, neither real tool prints the container id at all,
+        /// only its live output; without it, both print only the id,
+        /// exactly as `ociman start` already did before this flag
+        /// existed). `-i`/`--interactive` (stdin forwarding) is a
+        /// separate, still-deferred gap — see `cmd_start`'s own doc
+        /// comment.
+        #[arg(short, long)]
+        attach: bool,
     },
     /// Restart a container: stop it first if it's currently running
     /// (same signal/timeout escalation as `ociman stop`), then start
@@ -1428,7 +1438,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Run { args, rm, detach }) => cmd_run(args, rm, detach),
             Some(Command::Create { args, rm }) => cmd_create(args, rm),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
-            Some(Command::Start { id }) => cmd_start(&id),
+            Some(Command::Start { id, attach }) => cmd_start(&id, attach),
             Some(Command::Restart { id, time }) => cmd_restart(&id, time),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
             Some(Command::Cp {
@@ -3100,6 +3110,7 @@ fn cmd_run(args: RunArgs, rm: bool, detach: bool) -> anyhow::Result<()> {
                 log_path,
                 state,
                 rm,
+                true,
             )?;
         }
         return Ok(());
@@ -3168,8 +3179,15 @@ fn cmd_create(args: RunArgs, rm: bool) -> anyhow::Result<()> {
 /// `ociman start` (0154): a brand-new bundle `cmd_run` itself just
 /// finished preparing, or an existing, already-`Stopped` container's
 /// own already-on-disk bundle being launched again, both need the
-/// exact same "launch in the background, confirm it actually started,
-/// print the id back" sequence.
+/// exact same "launch in the background, confirm it actually started"
+/// sequence.
+///
+/// `print_id` (0186): `ociman run -d`'s own call site always passes
+/// `true` (unchanged from before this parameter existed); `ociman
+/// start`'s own call site passes `false` when its own new `--attach`
+/// is set, since real `docker start -a`/`podman start -a` never print
+/// the container id at all (checked directly), only the container's
+/// own live output once it starts arriving.
 ///
 /// # Safety
 ///
@@ -3185,6 +3203,7 @@ unsafe fn launch_detached_and_confirm(
     log_path: PathBuf,
     state: oci_runtime_core::PersistedState,
     rm: bool,
+    print_id: bool,
 ) -> anyhow::Result<()> {
     let container_id_for_keeper = container_id.to_string();
 
@@ -3231,7 +3250,9 @@ unsafe fn launch_detached_and_confirm(
     .context("detaching container")?;
 
     wait_for_detached_container_to_start(containers, container_id, keeper_pid)?;
-    println!("{container_id}");
+    if print_id {
+        println!("{container_id}");
+    }
     Ok(())
 }
 
@@ -4748,13 +4769,17 @@ fn stop_container(id: &str, time_secs: u64, signal: &str, reset_scope: bool) -> 
 /// hasn't run yet (never started at all, vs. ran once already and
 /// exited), only that a valid bundle already exists right now.
 ///
-/// Always detached (backgrounded), matching real `docker start`/
-/// `podman start`'s own real, checked-directly default (confirmed
-/// directly, `~/git/podman/cmd/podman/containers/start.go`: only
-/// `-a`/`--attach`, not given by default, streams the container's own
-/// output live and blocks) — deliberately narrower than real podman
-/// for this first increment: `-a`/`--attach` itself isn't implemented
-/// yet (see this function's own "what this doesn't do yet").
+/// Always detached (backgrounded) by default, matching real `docker
+/// start`/`podman start`'s own real, checked-directly default
+/// (confirmed directly, `~/git/podman/cmd/podman/containers/start.go`:
+/// only `-a`/`--attach` streams the container's own output live and
+/// blocks) — `attach` (0186) mirrors that flag exactly: with it,
+/// nothing is printed until the container's own live output starts
+/// arriving (never the container id — checked directly against both
+/// real tools, neither prints it with `-a`), and this function's own
+/// caller exits with the container's own real exit code once it
+/// stops, exactly like `ociman run`'s own foreground mode already
+/// does.
 ///
 /// A clear, real error for anything else (in particular, an already-
 /// `Running` one) — matching real `podman start`'s own identical
@@ -4763,12 +4788,11 @@ fn stop_container(id: &str, time_secs: u64, signal: &str, reset_scope: bool) -> 
 /// which this project's own simpler two-name split maps onto as
 /// `Created`/`Stopped`, `ErrCtrStateRunning` otherwise).
 ///
-/// What this doesn't do yet: `-a`/`--attach`/`-i`/`--interactive`
-/// (streaming the restarted container's own output live and waiting
-/// for it, rather than always detaching) — a real gap, deferred to a
-/// future increment; real podman's own default (this increment's own
-/// only supported mode) is detached either way.
-fn cmd_start(id: &str) -> anyhow::Result<()> {
+/// What this doesn't do yet: `-i`/`--interactive` (forwarding this
+/// process's own stdin into the container) — a real, separate gap,
+/// deferred to a future increment; real podman's own `-a` alone
+/// (this function's own newly-supported mode) never needs it either.
+fn cmd_start(id: &str, attach: bool) -> anyhow::Result<()> {
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)?;
     let mut state = containers.load(&resolved)?;
@@ -4824,9 +4848,78 @@ fn cmd_start(id: &str) -> anyhow::Result<()> {
     // `launch_detached_and_confirm`'s own fork forwards.
     #[allow(unsafe_code)]
     unsafe {
-        launch_detached_and_confirm(&resolved, &containers, bundle, rootfs, log_path, state, rm)?;
+        launch_detached_and_confirm(
+            &resolved,
+            &containers,
+            bundle,
+            rootfs,
+            log_path,
+            state,
+            rm,
+            !attach,
+        )?;
+    }
+    if attach {
+        let exit_code = attach_and_wait_for_exit(&containers, &resolved)?;
+        std::process::exit(exit_code);
     }
     Ok(())
+}
+
+/// Stream a just-(re)started container's own live output to stdout,
+/// blocking until it stops, then return its own real exit code —
+/// `cmd_start`'s own `--attach` (0186), matching real `docker start
+/// -a`/`podman start -a` exactly (checked directly: streamed output,
+/// then the `start -a` command's own process itself exits with the
+/// container's own real exit code, never printing the container id).
+///
+/// Deliberately a small, new, dedicated function rather than sharing
+/// [`cmd_logs`]'s own near-identical `follow` polling loop: that
+/// loop's own already-extensive test coverage is too valuable to risk
+/// disturbing for the sake of a refactor here. The one real behavioral
+/// difference besides that is the poll interval — 20ms throughout
+/// (matching the interval `cmd_logs`'s own initial "wait for the log
+/// file to even exist" phase already uses), rather than `cmd_logs`'s
+/// own steady-state 200ms, since a container started via `-a` might be
+/// very short-lived and 200ms of extra latency before the final
+/// catch-up read would be far more noticeable here than in an
+/// already-long-running `logs -f`.
+///
+/// The exit code itself comes from [`ANNOTATION_EXIT_CODE`], exactly
+/// like [`cmd_wait`]'s own identical read-back (including its own
+/// `-1` fallback for the — should not happen in practice — case the
+/// annotation is somehow missing once the container is genuinely
+/// stopped).
+fn attach_and_wait_for_exit(containers: &StateStore, resolved: &str) -> anyhow::Result<i32> {
+    let log_path = containers.container_dir(resolved).join("container.log");
+    let mut file: Option<std::fs::File> = None;
+    loop {
+        if file.is_none() {
+            file = std::fs::File::open(&log_path).ok();
+        }
+        if let Some(file) = &mut file {
+            print_new_log_bytes(file)?;
+        }
+        let state = containers.load(resolved)?;
+        if state.effective_status() == Status::Stopped {
+            // One final catch-up read: the container may have written
+            // more output between the last poll above and actually
+            // stopping.
+            if file.is_none() {
+                file = std::fs::File::open(&log_path).ok();
+            }
+            if let Some(file) = &mut file {
+                print_new_log_bytes(file)?;
+            }
+            let exit_code: i32 = state
+                .annotations
+                .get(ANNOTATION_EXIT_CODE)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(-1);
+            return Ok(exit_code);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Restart a container: stop it first (same signal/timeout escalation
@@ -4912,7 +5005,7 @@ fn cmd_restart(id: &str, time_secs: u64) -> anyhow::Result<()> {
         containers.write(&state)?;
     }
 
-    cmd_start(id)?;
+    cmd_start(id, false)?;
 
     // Only now, after the new keeper has already been forked, is it
     // safe to spawn a background D-Bus thread of our own for the

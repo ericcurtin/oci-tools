@@ -337,6 +337,132 @@ fn restart_of_a_nonexistent_container_is_a_clear_error() {
     assert!(!out.status.success());
 }
 
+/// `ociman start -a`/`--attach` (0186): streams the container's own
+/// live output to stdout and blocks, this command's own exit code
+/// then becoming the container's own real, nonzero exit code —
+/// matching real `docker start -a`/`podman start -a` exactly (checked
+/// directly). Deliberately never prints the container id, unlike the
+/// non-attach case.
+#[test]
+fn start_attach_streams_output_and_propagates_exit_code() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/start-attach:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo hello-from-start-attach; exit 7".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/start-attach:latest"],
+    );
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    assert!(!id.is_empty());
+
+    let start = ociman(storage_dir.path(), &["start", "--attach", &id]);
+    assert_eq!(
+        start.status.code(),
+        Some(7),
+        "start --attach's own exit code should be the container's own real exit code; \
+         stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&start.stdout),
+        "hello-from-start-attach\n",
+        "start --attach should stream the container's own live output, and never print \
+         the container id"
+    );
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "stopped", Duration::from_secs(20)),
+        "stopped"
+    );
+
+    ociman(storage_dir.path(), &["rm", &id]);
+}
+
+/// Without `--attach`, `ociman start` keeps its own existing, unchanged
+/// behavior: print only the container id, exit `0` regardless of the
+/// container's own eventual exit code.
+#[test]
+fn start_without_attach_still_only_prints_the_container_id() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/start-no-attach:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo should-not-appear-on-stdout; exit 3".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/start-no-attach:latest"],
+    );
+    assert!(create.status.success());
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    assert!(!id.is_empty());
+
+    let start = ociman(storage_dir.path(), &["start", &id]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&start.stdout).trim(),
+        id,
+        "non-attach start should print only the container id"
+    );
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "stopped", Duration::from_secs(20)),
+        "stopped"
+    );
+
+    ociman(storage_dir.path(), &["rm", &id]);
+}
+
 /// Poll `ociman ps -a -q` until `id` is no longer listed at all —
 /// distinct from [`wait_for_status`], which needs the container to
 /// still exist (`ociman inspect` would itself fail on a genuinely
