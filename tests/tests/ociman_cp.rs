@@ -287,25 +287,110 @@ fn cp_a_dotdot_component_in_the_container_path_is_a_clear_error() {
     assert!(String::from_utf8_lossy(&cp.stderr).contains(".."));
 }
 
+/// [`seed_and_run_stopped_container`] resolves the container it just
+/// created via `ps -a -q`, which lists *every* container in
+/// `storage_root` -- fine for every other test here (one container
+/// per storage root at a time), but ambiguous the moment a *second*
+/// container needs to coexist in the same store, as a real
+/// container-to-container `cp` needs. This variant sidesteps that
+/// entirely: `--name` gives each container its own real, stable
+/// identifier up front, so no `ps` lookup (or its own inherent
+/// "which one do you mean" ambiguity once more than one container
+/// exists) is needed at all.
+fn seed_and_run_named_stopped_container(storage_root: &Path, image: &str, name: &str) -> String {
+    std::fs::write(storage_root.join(".rootless-overlay-supported"), "false").unwrap();
+    let busybox = busybox_path().expect("busybox not found on $PATH");
+    let store = Store::open(storage_root).unwrap();
+    seed_image(
+        &store,
+        image,
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 0".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    let run = ociman(storage_root, &["run", "--name", name, image]);
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    name.to_string()
+}
+
+/// Container-to-container `cp` (real `podman cp` supports this too;
+/// see `docs/design/0151`) copies a real file directly from one
+/// container's own storage into another's, with no host-side
+/// intermediate step at all.
 #[test]
-fn cp_between_two_containers_is_a_clear_error() {
+fn cp_between_two_containers_copies_a_real_file() {
     let Some(_busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");
         return;
     };
     let storage_dir = tempfile::tempdir().unwrap();
-    let id = seed_and_run_stopped_container(storage_dir.path(), "ociman-test/cp-c2c:latest", true);
+    let id_a = seed_and_run_named_stopped_container(
+        storage_dir.path(),
+        "ociman-test/cp-c2c-a:latest",
+        "cp-c2c-a",
+    );
+    let id_b = seed_and_run_named_stopped_container(
+        storage_dir.path(),
+        "ociman-test/cp-c2c-b:latest",
+        "cp-c2c-b",
+    );
+    let rootfs_a = container_rootfs(storage_dir.path(), &id_a);
+    let rootfs_b = container_rootfs(storage_dir.path(), &id_b);
+
+    std::fs::write(Path::new(&rootfs_a).join("from-a.txt"), "hello from a").unwrap();
 
     let cp = ociman(
         storage_dir.path(),
-        &["cp", &format!("{id}:/lib"), &format!("{id}:/lib2")],
+        &[
+            "cp",
+            &format!("{id_a}:/from-a.txt"),
+            &format!("{id_b}:/copied.txt"),
+        ],
     );
-    assert!(!cp.status.success());
     assert!(
-        String::from_utf8_lossy(&cp.stderr).contains("between two containers"),
+        cp.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&cp.stderr)
     );
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&rootfs_b).join("copied.txt")).unwrap(),
+        "hello from a"
+    );
+    // The source container's own copy is untouched.
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&rootfs_a).join("from-a.txt")).unwrap(),
+        "hello from a"
+    );
+}
+
+/// Container-to-container `cp` against an unknown destination
+/// container is a clear, real error (the source side resolves fine).
+#[test]
+fn cp_between_two_containers_an_unknown_destination_is_a_clear_error() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id =
+        seed_and_run_stopped_container(storage_dir.path(), "ociman-test/cp-c2c-src:latest", true);
+
+    let cp = ociman(
+        storage_dir.path(),
+        &["cp", &format!("{id}:/lib"), "does-not-exist:/lib2"],
+    );
+    assert!(!cp.status.success());
 }
 
 #[test]

@@ -2521,30 +2521,37 @@ fn cmd_rm(id: &str, force: bool) -> anyhow::Result<()> {
 /// checked-against port of real podman's own `parseUserInput`
 /// (`~/git/podman/pkg/copy/parse.go`).
 ///
-/// Two real gaps, both a clear, loud error rather than a silently
-/// wrong copy:
+/// Container-to-container copying (real `podman cp` supports it too,
+/// streaming a tar archive between the two over a pipe internally,
+/// `~/git/podman/cmd/podman/containers/cp.go`'s own
+/// `copyContainerToContainer`) works here too — since both
+/// containers' own storage already lives on the very same local
+/// filesystem, it's just [`copy_cp_path`] again, called with each
+/// side's own resolved container path instead of a bare host one, no
+/// streaming/piping machinery needed at all (this project has no
+/// remote/network transport for container storage to begin with).
 ///
-/// * **Container-to-container isn't supported yet** (real `podman cp`
-///   supports it) — this increment only covers the by far more common
-///   "one side is the host" case (see `docs/design/0146`'s own "what
-///   this doesn't do yet").
-/// * **A container using this project's own rootless-overlay rootfs
-///   optimization (`docs/design/0110`) isn't supported at all yet** —
-///   a real, checked-directly discovery made *while building this
-///   exact feature*: such a container's own real writes only ever
-///   land in a private per-container `upper/` directory, genuinely
-///   distinct from the (empty, on the host's own view) `rootfs/`
-///   directory [`oci_runtime_core::PersistedState::rootfs`] reports
-///   (`echo hi > /marker` inside a real overlay-rootfs container
-///   landed in `upper/marker`, not `rootfs/marker`, confirmed by
-///   directly inspecting the bundle directory of a real running
-///   container). Correctly reading such a container's own real merged
-///   view would need genuine overlayfs-whiteout-aware directory
-///   merging this increment doesn't implement; [`resolve_container_
-///   root`] detects this via `upper/`'s own presence (`rootfs_setup::
-///   prepare_overlay`'s own unconditional layout) and reports a clear
-///   error instead of a plausible-looking but silently incomplete
-///   copy.
+/// One real gap, a clear, loud error rather than a silently wrong
+/// copy: **a container using this project's own rootless-overlay
+/// rootfs optimization (`docs/design/0110`) isn't supported at all
+/// yet** — a real, checked-directly discovery made *while building
+/// this exact feature*: such a container's own real writes only ever
+/// land in a private per-container `upper/` directory, genuinely
+/// distinct from the (empty, on the host's own view) `rootfs/`
+/// directory [`oci_runtime_core::PersistedState::rootfs`] reports
+/// (`echo hi > /marker` inside a real overlay-rootfs container landed
+/// in `upper/marker`, not `rootfs/marker`, confirmed by directly
+/// inspecting the bundle directory of a real running container).
+/// Correctly reading such a container's own real merged view would
+/// need genuine overlayfs-whiteout-aware directory merging this
+/// increment doesn't implement; [`resolve_container_root`] detects
+/// this via `upper/`'s own presence (`rootfs_setup::prepare_overlay`'s
+/// own unconditional layout) and reports a clear error instead of a
+/// plausible-looking but silently incomplete copy — checked
+/// independently for *each* container named, so e.g. a container-to-
+/// container copy where only the destination happens to use the
+/// optimization still fails clearly rather than silently copying into
+/// the wrong (empty) place.
 fn cmd_cp(src: &str, dest: &str, overwrite: bool) -> anyhow::Result<()> {
     let (src_container, src_path) = parse_user_input(src);
     let (dest_container, dest_path) = parse_user_input(dest);
@@ -2554,10 +2561,13 @@ fn cmd_cp(src: &str, dest: &str, overwrite: bool) -> anyhow::Result<()> {
     }
 
     match (src_container, dest_container) {
-        (Some(_), Some(_)) => anyhow::bail!(
-            "ociman cp: copying directly between two containers isn't supported yet -- copy \
-             through the host instead"
-        ),
+        (Some(src_container), Some(dest_container)) => {
+            let (src_root, _state) = resolve_container_root(&src_container, "cp")?;
+            let (dest_root, _state) = resolve_container_root(&dest_container, "cp")?;
+            let real_src = resolve_container_path(&src_root, &src_path)?;
+            let real_dest = resolve_container_path(&dest_root, &dest_path)?;
+            copy_cp_path(&real_src, &real_dest, overwrite)
+        }
         (Some(container), None) => {
             let (root, _state) = resolve_container_root(&container, "cp")?;
             let real_src = resolve_container_path(&root, &src_path)?;
