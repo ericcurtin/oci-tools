@@ -47,15 +47,22 @@ pub enum PullError {
     },
 }
 
-/// Pull `reference` for `platform` (pass [`Platform::host`] to match the
-/// machine oci-tools is running on) into `store`, fetching only blobs the
-/// store does not already have. Returns the stored pointer record.
-pub fn pull(
+/// Resolve `reference` (for `platform`) down to the single, real
+/// manifest that would actually be pulled — following a multi-platform
+/// index down to the one matching `platform` if the top-level
+/// reference serves one — returning its own real bytes, (always
+/// locally computed, per [`PulledManifest`]'s own doc comment) digest,
+/// and already-parsed [`ImageManifest`] (so neither caller below ever
+/// parses the same bytes twice), without writing anything to a
+/// [`Store`] at all. Shared by [`pull`] itself (which pulls exactly
+/// this manifest, then also fetches its config/layer blobs) and
+/// [`has_different_digest`] (which only ever needs the digest, never
+/// a blob).
+fn resolve_manifest(
     client: &mut Client,
-    store: &Store,
     reference: &Reference,
     platform: &Platform,
-) -> Result<ImageRecord, PullError> {
+) -> Result<(Vec<u8>, Digest, ImageManifest), PullError> {
     let top = client.pull_manifest(reference)?;
     let parsed = Manifest::parse(&top.bytes, top.content_type.as_deref()).map_err(|source| {
         PullError::InvalidJson {
@@ -64,8 +71,8 @@ pub fn pull(
         }
     })?;
 
-    let (manifest_bytes, manifest): (Vec<u8>, ImageManifest) = match parsed {
-        Manifest::Image(image) => (top.bytes, *image),
+    match parsed {
+        Manifest::Image(image) => Ok((top.bytes, top.digest, *image)),
         Manifest::Index(index) => {
             let selected = index
                 .select(platform)
@@ -85,9 +92,21 @@ pub fn pull(
                     what: "manifest",
                     source,
                 })?;
-            (child.bytes, image)
+            Ok((child.bytes, child.digest, image))
         }
-    };
+    }
+}
+
+/// Pull `reference` for `platform` (pass [`Platform::host`] to match the
+/// machine oci-tools is running on) into `store`, fetching only blobs the
+/// store does not already have. Returns the stored pointer record.
+pub fn pull(
+    client: &mut Client,
+    store: &Store,
+    reference: &Reference,
+    platform: &Platform,
+) -> Result<ImageRecord, PullError> {
+    let (manifest_bytes, _digest, manifest) = resolve_manifest(client, reference, platform)?;
 
     let ingested_manifest = store.ingest(&manifest_bytes[..])?;
 
@@ -102,6 +121,27 @@ pub fn pull(
     };
     store.put_image(&record)?;
     Ok(record)
+}
+
+/// Whether `reference`'s own real, current manifest on the registry
+/// (resolved down to `platform` exactly like [`pull`] itself does, if
+/// the top-level reference serves a multi-platform index) has a
+/// different digest than `local_digest` — the real check real
+/// podman/buildah's own `--pull newer` policy performs
+/// (`hasDifferentDigestWithSystemContext`, `~/git/podman/vendor/
+/// go.podman.io/common/libimage/image.go`, read directly): comparing
+/// digests, never a timestamp — a real registry request is always
+/// made (there is no cheaper way to know without one), but never a
+/// blob download unless the digest actually turns out to differ (left
+/// to a subsequent real [`pull`] call, not performed here).
+pub fn has_different_digest(
+    client: &mut Client,
+    reference: &Reference,
+    platform: &Platform,
+    local_digest: &Digest,
+) -> Result<bool, PullError> {
+    let (_, remote_digest, _manifest) = resolve_manifest(client, reference, platform)?;
+    Ok(&remote_digest != local_digest)
 }
 
 fn fetch_blob_if_missing(
@@ -275,5 +315,116 @@ mod tests {
         // second (blob-less) mock still succeeds.
         let record2 = pull(&mut client2, &store, &reference2, &Platform::host()).unwrap();
         assert_eq!(record2.manifest_digest, record.manifest_digest);
+    }
+
+    fn single_layer_manifest_routes(
+        marker: &[u8],
+    ) -> (HashMap<String, (&'static str, Vec<u8>)>, Digest) {
+        let config = oci_spec_types::image::ImageConfig {
+            architecture: Some("arm64".to_string()),
+            os: Some("linux".to_string()),
+            rootfs: RootFs {
+                kind: "layers".to_string(),
+                diff_ids: vec![],
+            },
+            ..Default::default()
+        };
+        let config_bytes = serde_json::to_vec(&config).unwrap();
+        let config_digest = sha256(&config_bytes);
+        let layer_bytes = marker.to_vec();
+        let layer_digest = sha256(&layer_bytes);
+        let manifest = ImageManifest {
+            schema_version: 2,
+            media_type: Some(MEDIA_TYPE_IMAGE_MANIFEST.to_string()),
+            config: Descriptor {
+                media_type: MEDIA_TYPE_IMAGE_CONFIG.to_string(),
+                digest: config_digest.clone(),
+                size: config_bytes.len() as u64,
+                urls: vec![],
+                annotations: BTreeMap::new(),
+                platform: None,
+            },
+            layers: vec![Descriptor {
+                media_type: MEDIA_TYPE_IMAGE_LAYER_GZIP.to_string(),
+                digest: layer_digest.clone(),
+                size: layer_bytes.len() as u64,
+                urls: vec![],
+                annotations: BTreeMap::new(),
+                platform: None,
+            }],
+            annotations: BTreeMap::new(),
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = sha256(&manifest_bytes);
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/v2/testrepo/manifests/latest".to_string(),
+            (MEDIA_TYPE_IMAGE_MANIFEST, manifest_bytes),
+        );
+        routes.insert(
+            format!("/v2/testrepo/blobs/{config_digest}"),
+            ("application/octet-stream", config_bytes),
+        );
+        routes.insert(
+            format!("/v2/testrepo/blobs/{layer_digest}"),
+            ("application/octet-stream", layer_bytes),
+        );
+        (routes, manifest_digest)
+    }
+
+    #[test]
+    fn has_different_digest_is_false_when_the_remote_manifest_matches_local() {
+        let (routes, manifest_digest) = single_layer_manifest_routes(b"same content");
+        let mock = MockRegistry::start(routes);
+        let mut client =
+            Client::with_options(Credentials::empty(), std::iter::once(mock.addr.to_string()));
+        let reference = Reference::parse(&format!("{}/testrepo:latest", mock.addr)).unwrap();
+
+        let different =
+            has_different_digest(&mut client, &reference, &Platform::host(), &manifest_digest)
+                .unwrap();
+        assert!(!different);
+    }
+
+    #[test]
+    fn has_different_digest_is_true_when_the_remote_manifest_differs() {
+        let (routes, _remote_manifest_digest) = single_layer_manifest_routes(b"new content");
+        let mock = MockRegistry::start(routes);
+        let mut client =
+            Client::with_options(Credentials::empty(), std::iter::once(mock.addr.to_string()));
+        let reference = Reference::parse(&format!("{}/testrepo:latest", mock.addr)).unwrap();
+
+        // A digest that plainly doesn't match anything the mock serves --
+        // standing in for "whatever this project's own local storage
+        // already had from a previous, different pull".
+        let stale_local_digest = sha256(b"a completely different, stale local manifest");
+        let different = has_different_digest(
+            &mut client,
+            &reference,
+            &Platform::host(),
+            &stale_local_digest,
+        )
+        .unwrap();
+        assert!(different);
+    }
+
+    #[test]
+    fn has_different_digest_never_fetches_a_blob_at_all() {
+        // Only the manifest route exists -- if `has_different_digest`
+        // ever tried to fetch a blob (it never should), this mock would
+        // 404 and the call would fail instead of returning a real,
+        // successful `bool`.
+        let (mut routes, manifest_digest) = single_layer_manifest_routes(b"irrelevant content");
+        routes.retain(|path, _| path.contains("/manifests/"));
+        let mock = MockRegistry::start(routes);
+        let mut client =
+            Client::with_options(Credentials::empty(), std::iter::once(mock.addr.to_string()));
+        let reference = Reference::parse(&format!("{}/testrepo:latest", mock.addr)).unwrap();
+
+        let different =
+            has_different_digest(&mut client, &reference, &Platform::host(), &manifest_digest)
+                .unwrap();
+        assert!(!different);
     }
 }

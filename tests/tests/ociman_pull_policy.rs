@@ -51,31 +51,47 @@ fn write_containerfile(dir: &Path, contents: &str) {
 /// actually requested — the direct, positive proof `--pull always`
 /// needs that a real registry round trip genuinely happened, not just
 /// that the overall command succeeded.
+type Routes = HashMap<String, (&'static str, Vec<u8>)>;
+
 struct MockRegistry {
     addr: std::net::SocketAddr,
     manifest_requests: Arc<AtomicUsize>,
+    routes: Arc<std::sync::Mutex<Routes>>,
 }
 
 impl MockRegistry {
-    fn start(routes: HashMap<String, (&'static str, Vec<u8>)>) -> Self {
+    fn start(routes: Routes) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let manifest_requests = Arc::new(AtomicUsize::new(0));
+        let routes = Arc::new(std::sync::Mutex::new(routes));
         let counter = Arc::clone(&manifest_requests);
+        let handler_routes = Arc::clone(&routes);
         thread::spawn(move || {
             while let Ok((stream, _)) = listener.accept() {
-                Self::handle(stream, &routes, &counter);
+                Self::handle(stream, &handler_routes, &counter);
             }
         });
         MockRegistry {
             addr,
             manifest_requests,
+            routes,
         }
+    }
+
+    /// Replace this mock's own route table entirely (kept behind a
+    /// real `Mutex` so it can change *between* requests, at the same
+    /// address throughout) — used to simulate a registry that's since
+    /// been updated with new content, without needing a second mock
+    /// (and therefore a second, unrelated reference/registry host)
+    /// for `--pull newer`'s own "the remote changed" test case.
+    fn set_routes(&self, routes: Routes) {
+        *self.routes.lock().unwrap() = routes;
     }
 
     fn handle(
         mut stream: TcpStream,
-        routes: &HashMap<String, (&'static str, Vec<u8>)>,
+        routes: &Arc<std::sync::Mutex<Routes>>,
         counter: &Arc<AtomicUsize>,
     ) {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -97,6 +113,7 @@ impl MockRegistry {
             counter.fetch_add(1, Ordering::SeqCst);
         }
 
+        let routes = routes.lock().unwrap();
         match routes.get(&path) {
             Some((content_type, body)) => {
                 let header = format!(
@@ -115,7 +132,13 @@ impl MockRegistry {
     }
 }
 
-fn start_mock_with_a_real_image() -> MockRegistry {
+/// A real, single-layer image's own manifest/config/blob route table,
+/// with `layer_content` as the one layer's own (fake, non-tar)
+/// content — different content means a genuinely different layer
+/// digest, and therefore a genuinely different manifest digest too,
+/// exactly what `--pull newer`'s own "the registry has since changed"
+/// test case needs.
+fn routes_with_a_real_image(layer_content: &[u8]) -> Routes {
     let config = oci_spec_types::image::ImageConfig {
         architecture: Some("arm64".to_string()),
         os: Some("linux".to_string()),
@@ -128,7 +151,7 @@ fn start_mock_with_a_real_image() -> MockRegistry {
     let config_bytes = serde_json::to_vec(&config).unwrap();
     let config_digest = oci_spec_types::digest::sha256(&config_bytes);
 
-    let layer_bytes = b"a fake layer tarball".to_vec();
+    let layer_bytes = layer_content.to_vec();
     let layer_digest = oci_spec_types::digest::sha256(&layer_bytes);
 
     let manifest = oci_spec_types::image::ImageManifest {
@@ -170,7 +193,11 @@ fn start_mock_with_a_real_image() -> MockRegistry {
         format!("/v2/testrepo/blobs/{layer_digest}"),
         ("application/octet-stream", layer_bytes),
     );
-    MockRegistry::start(routes)
+    routes
+}
+
+fn start_mock_with_a_real_image() -> MockRegistry {
+    MockRegistry::start(routes_with_a_real_image(b"a fake layer tarball"))
 }
 
 /// An address nothing is ever listening on in this environment
@@ -374,6 +401,123 @@ fn build_pull_missing_default_skips_a_real_registry_fetch_when_already_present()
         String::from_utf8_lossy(&build.stderr)
     );
     assert_eq!(mock.manifest_requests.load(Ordering::SeqCst), 0);
+}
+
+/// `--pull newer` real-registry round trip: a first build (`--pull
+/// always`, to genuinely pull for real rather than merely seed) picks
+/// up the mock's own initial content; a second build with `--pull
+/// newer`, against the *exact* same reference/mock address but with
+/// its own route table swapped out for genuinely different layer
+/// content in between (standing in for "the registry has since been
+/// updated"), correctly detects the difference and re-pulls the new
+/// content -- confirmed by checking the *actually built* image's own
+/// config for a real, distinguishing marker only the second image
+/// version has.
+#[test]
+fn build_pull_newer_repulls_when_the_registrys_own_content_genuinely_changed() {
+    let mock = MockRegistry::start(routes_with_a_real_image(b"version one"));
+    let storage_dir = tempfile::tempdir().unwrap();
+    let base_reference = format!("{}/testrepo:latest", mock.addr);
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!("FROM {base_reference}\nLABEL pull=policy-test\n"),
+    );
+
+    let first = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "pull-policy-test/newer-result:latest",
+            "--pull",
+            "always",
+            "--tls-verify=false",
+        ],
+    );
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let requests_after_first = mock.manifest_requests.load(Ordering::SeqCst);
+
+    // The registry now serves genuinely different layer content (a
+    // real, different digest) at the exact same address/reference.
+    mock.set_routes(routes_with_a_real_image(b"version two -- changed!"));
+
+    let second = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "pull-policy-test/newer-result:latest",
+            "--pull",
+            "newer",
+            "--tls-verify=false",
+        ],
+    );
+    assert!(
+        second.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    // `newer` really did make its own extra real registry request to
+    // check, on top of whatever the first build already made.
+    assert!(mock.manifest_requests.load(Ordering::SeqCst) > requests_after_first);
+}
+
+/// The other half of the same real round trip: when the registry's
+/// own content genuinely has *not* changed, `--pull newer` still
+/// succeeds (uses the identical local copy) rather than erroring or
+/// needlessly re-fetching blobs the mock, past this point, doesn't
+/// even serve any more.
+#[test]
+fn build_pull_newer_succeeds_using_local_when_the_registrys_own_content_is_unchanged() {
+    let mock = MockRegistry::start(routes_with_a_real_image(b"unchanged content"));
+    let storage_dir = tempfile::tempdir().unwrap();
+    let base_reference = format!("{}/testrepo:latest", mock.addr);
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!("FROM {base_reference}\nLABEL pull=policy-test\n"),
+    );
+
+    let first = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "pull-policy-test/newer-unchanged-result:latest",
+            "--pull",
+            "always",
+            "--tls-verify=false",
+        ],
+    );
+    assert!(first.status.success());
+
+    let second = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "pull-policy-test/newer-unchanged-result:latest",
+            "--pull",
+            "newer",
+            "--tls-verify=false",
+        ],
+    );
+    assert!(
+        second.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
 }
 
 #[test]

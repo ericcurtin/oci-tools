@@ -41,7 +41,7 @@ pub mod push;
 pub use client::{BlobReader, Client, PulledManifest};
 pub use credentials::Credentials;
 use oci_spec_types::Digest;
-pub use pull::{PullError, pull as pull_image};
+pub use pull::{PullError, has_different_digest, pull as pull_image};
 pub use push::{PushError, push as push_image};
 
 /// Errors from registry operations.

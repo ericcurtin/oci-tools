@@ -87,18 +87,21 @@ struct Cli {
 /// real `podman run --pull always`/`podman build --pull=always`
 /// against an already-pulled image still shows a real "Trying to
 /// pull..." line); `Never` never pulls at all, failing with a clear
-/// error if the reference isn't already present.
-///
-/// Deliberately narrower than real podman in one way: no `newer`
-/// policy (pull only if the registry's own copy is newer than what's
-/// local) — real podman's own `newer` needs an extra registry round
-/// trip purely to fetch comparison metadata, a genuinely separate,
-/// well-scoped future increment rather than folded into this one.
+/// error if the reference isn't already present; `Newer` pulls only
+/// if the registry's own current manifest has a *different digest*
+/// than what's already stored locally — never a timestamp comparison,
+/// checked directly against real podman/buildah's own current source
+/// (`hasDifferentDigestWithSystemContext`, `~/git/podman/vendor/
+/// go.podman.io/common/libimage/image.go`) — a real registry request
+/// is always made when something is already present (there's no
+/// cheaper way to know without one), but never a real blob download
+/// unless the digest actually differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum PullPolicy {
     Always,
     Missing,
     Never,
+    Newer,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -2651,6 +2654,24 @@ fn resolve_or_pull(
             pull_unconditionally(store, reference, tls_verify)
         }
         PullPolicy::Always => pull_unconditionally(store, reference, tls_verify),
+        PullPolicy::Newer => {
+            let Some(record) = local else {
+                return pull_unconditionally(store, reference, tls_verify);
+            };
+            let mut client = registry_client(reference.registry_host(), tls_verify);
+            let different = oci_registry::has_different_digest(
+                &mut client,
+                reference,
+                &Platform::host(),
+                &record.manifest_digest,
+            )
+            .with_context(|| format!("checking whether {reference} has a newer manifest"))?;
+            if different {
+                pull_unconditionally(store, reference, tls_verify)
+            } else {
+                Ok(record)
+            }
+        }
     }
 }
 
