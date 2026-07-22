@@ -69,6 +69,21 @@ pub unsafe fn fork_and_wait(child_body: impl FnOnce()) -> io::Result<i32> {
 /// intentionally exits without reaping (leaving the child to be
 /// reparented and reaped by init/a subreaper, as `create` does).
 pub unsafe fn fork(child_body: impl FnOnce()) -> io::Result<i32> {
+    // Debug-only (compiled out entirely in release builds, so this is
+    // zero-cost there — matching this whole workspace's own "no
+    // performance regression" requirement): a real, previously-hit bug
+    // (0159) had a caller violate this function's own single-threaded-
+    // caller safety contract, by calling it shortly after a *different*
+    // code path (upstream of this specific call, in the same process)
+    // had spawned a background thread of its own and never joined it.
+    // That bug manifested as a confusing, silent, several-seconds-long
+    // D-Bus hang in the *child*, not a crash or an obvious assertion
+    // failure — exactly the kind of hard-to-diagnose-from-its-own-
+    // symptoms class of bug this check exists to catch immediately,
+    // right at its actual source, the next time any caller (present or
+    // future) makes the same mistake.
+    debug_assert_single_threaded();
+
     // SAFETY: raw `fork(2)`; the function's own safety contract (above)
     // is what callers must uphold for `child_body`.
     let pid = unsafe { libc::fork() };
@@ -84,6 +99,72 @@ pub unsafe fn fork(child_body: impl FnOnce()) -> io::Result<i32> {
         unsafe { libc::_exit(127) };
     }
     Ok(pid)
+}
+
+/// Panic (debug builds only) if the calling process currently has more
+/// than one thread — [`fork`]'s own doc comment explains exactly why
+/// that matters. Reads the real kernel-reported thread count directly
+/// from `/proc/self/status`'s own `Threads:` line (a single, fixed-cost
+/// read regardless of how many threads actually exist — deliberately
+/// not `/proc/self/task`'s own directory *entries*, which would cost
+/// one more `readdir` per thread already alive, real overhead this
+/// hot, per-`fork()`-call check must not add even in a debug build:
+/// `oci-tools`' own test suite forks per container launch, and a
+/// heavily loaded host running the *whole* suite concurrently is
+/// exactly the situation where every extra syscall on this path adds
+/// up) rather than tracking anything at the Rust level, so this also
+/// catches a thread spawned by a dependency two levels removed (e.g.
+/// an async runtime/D-Bus client library) that no caller here would
+/// ever think to track by hand. Best-effort: if `/proc/self/status`
+/// can't be read/parsed at all (should never happen on a real Linux
+/// system), this silently does nothing rather than turn an unrelated,
+/// pre-existing environment problem into a spurious panic.
+///
+/// A no-op under `#[cfg(test)]` specifically (this crate's own unit
+/// test binary, not the real `ociman`/`ocirun` binaries integration
+/// tests exercise as separate, genuinely single-threaded-at-`fork()`-
+/// time processes via `Command::new`): `cargo test`'s own test harness
+/// runs many worker threads of its own in the *same* process regardless
+/// of what any individual `#[test]` function does, a fundamentally
+/// different (and already pre-existing, already accepted) situation
+/// from a *production* binary's own process accidentally spawning an
+/// extra thread before forking — confirmed directly, not assumed: this
+/// crate's own `process::tests::*`/`overlay::tests::*` unit tests that
+/// call `fork`/`fork_and_wait` directly failed immediately with 20+
+/// threads reported (the test harness's own worker pool) the first
+/// time this check was added without this exclusion.
+fn debug_assert_single_threaded() {
+    if !cfg!(debug_assertions) || cfg!(test) {
+        return;
+    }
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return;
+    };
+    let Some(thread_count) = parse_thread_count(&status) else {
+        return;
+    };
+    assert!(
+        thread_count <= 1,
+        "fork() called with {thread_count} threads alive in this process (expected exactly 1) \
+         -- a forked child only inherits the calling thread, so any lock held by one of the \
+         others (allocator, Mutex, an async runtime's own executor, ...) would stay locked \
+         forever in the child; see this module's own doc comment, and `docs/design/0159` for a \
+         real, previously-hit instance of exactly this class of bug"
+    );
+}
+
+/// Extract the thread count from a real `/proc/[pid]/status` file's own
+/// contents (its `Threads:\t<N>` line) — split out from [`debug_assert_
+/// single_threaded`] purely so this parsing logic has its own direct
+/// unit tests, decoupled from that function's own `cfg!(test)` no-op
+/// (which exists so *this crate's own* multi-threaded test harness
+/// doesn't trip the assertion — see its own doc comment — and would
+/// otherwise make the parsing logic itself untestable too).
+fn parse_thread_count(status: &str) -> Option<usize> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Threads:"))
+        .and_then(|n| n.trim().parse::<usize>().ok())
 }
 
 /// `waitpid(2)` for `pid` (retrying on `EINTR`), returning the raw
@@ -149,6 +230,45 @@ pub fn exit_code_from_wait_status(status: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_thread_count_reads_a_real_status_files_own_threads_line() {
+        let status = "Name:\tbash\nUmask:\t0022\nThreads:\t7\nSigQ:\t0/31066\n";
+        assert_eq!(parse_thread_count(status), Some(7));
+    }
+
+    #[test]
+    fn parse_thread_count_handles_a_single_thread() {
+        let status = "Name:\tociman\nThreads:\t1\n";
+        assert_eq!(parse_thread_count(status), Some(1));
+    }
+
+    #[test]
+    fn parse_thread_count_is_none_without_a_threads_line_at_all() {
+        assert_eq!(parse_thread_count("Name:\tsomething\nUmask:\t0022\n"), None);
+    }
+
+    #[test]
+    fn parse_thread_count_is_none_for_unparseable_content() {
+        assert_eq!(parse_thread_count("Threads:\tnot-a-number\n"), None);
+        assert_eq!(parse_thread_count(""), None);
+    }
+
+    #[test]
+    fn parse_thread_count_reads_this_real_test_processs_own_actual_proc_self_status() {
+        // A real, direct sanity check against the actual live kernel
+        // file this whole mechanism reads in production -- not just a
+        // synthetic string -- confirming the exact same parsing logic
+        // handles its own real, current-format input correctly. This
+        // test binary itself is (like any `cargo test` binary) legitimately
+        // multi-threaded, so this only asserts a real count was found at
+        // all, not any particular value.
+        let real_status = std::fs::read_to_string("/proc/self/status").unwrap();
+        assert!(
+            parse_thread_count(&real_status).is_some_and(|n| n >= 1),
+            "a real /proc/self/status should always have a parseable Threads: line"
+        );
+    }
 
     /// # Safety
     /// The child's whole body is one async-signal-safe call (`_exit`
