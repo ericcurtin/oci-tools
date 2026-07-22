@@ -95,13 +95,12 @@ fn save_rejects_an_unrecognized_format_value_before_touching_the_store() {
 }
 
 #[test]
-fn save_with_no_format_flag_defaults_to_oci_archive_not_real_podmans_own_docker_archive_default() {
-    // A deliberate, documented difference from real `podman
-    // save`/`docker save` (see `SaveFormat`'s own doc comment in
-    // `bin/ociman/src/main.rs`): `ociman load` doesn't read
-    // `docker-archive` yet, so `save` keeps defaulting to
-    // `oci-archive` to avoid breaking `ociman save | ociman load`'s
-    // own round trip out of the box.
+fn save_with_no_format_flag_defaults_to_docker_archive_matching_real_podman_and_docker() {
+    // Matches real `podman save`/`docker save`'s own default exactly
+    // (see `SaveFormat`'s own doc comment in `bin/ociman/src/main.rs`
+    // for why this changed from `oci-archive` back to `docker-archive`
+    // once `ociman load` gained the ability to read `docker-archive`
+    // too in the same increment that added this test).
     let Some(busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");
         return;
@@ -133,8 +132,8 @@ fn save_with_no_format_flag_defaults_to_oci_archive_not_real_podmans_own_docker_
     );
     let entries = read_tar_entries(&std::fs::read(&output_path).unwrap());
     assert!(
-        entries.contains_key("oci-layout"),
-        "expected the default format to still be oci-archive; entries: {:?}",
+        entries.contains_key("manifest.json") && !entries.contains_key("oci-layout"),
+        "expected the default format to be docker-archive; entries: {:?}",
         entries.keys().collect::<Vec<_>>()
     );
 }
@@ -251,7 +250,12 @@ fn save_with_no_output_flag_writes_the_archive_straight_to_stdout_and_nothing_el
 
     let save = ociman(
         storage_dir.path(),
-        &["save", "ociman-test/save-stdout:latest"],
+        &[
+            "save",
+            "--format",
+            "oci-archive",
+            "ociman-test/save-stdout:latest",
+        ],
     );
     assert!(
         save.status.success(),
@@ -292,7 +296,14 @@ fn save_resolves_by_a_short_image_id_the_same_way_push_does() {
     let output_path = storage_dir.path().join("out.tar");
     let save = ociman(
         storage_dir.path(),
-        &["save", "-o", output_path.to_str().unwrap(), short_id],
+        &[
+            "save",
+            "--format",
+            "oci-archive",
+            "-o",
+            output_path.to_str().unwrap(),
+            short_id,
+        ],
     );
     assert!(
         save.status.success(),

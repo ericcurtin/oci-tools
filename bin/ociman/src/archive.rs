@@ -39,6 +39,20 @@ use oci_spec_types::image::{Descriptor, ImageIndex, ImageManifest, MEDIA_TYPE_IM
 use oci_store::{ImageRecord, Store};
 
 const ANNOTATION_REF_NAME: &str = "org.opencontainers.image.ref.name";
+/// A real, non-OCI-spec annotation `buildkit`/`containerd` (and
+/// therefore modern `docker save`, which is `buildkit`-based) set to
+/// the *full* reference (`docker.io/library/busybox:latest`), unlike
+/// [`ANNOTATION_REF_NAME`] itself, which the OCI image-spec only ever
+/// defines as "the name of the reference" — real modern `docker save`
+/// sets it to just the bare tag (`latest`), not a full reference at
+/// all (confirmed directly: `docker save`'s own real `index.json`
+/// output; `podman save`, by contrast, puts the *full* reference under
+/// [`ANNOTATION_REF_NAME`] itself). [`load_archive`] checks this one
+/// first, exactly matching real podman's own identical precedence —
+/// checked directly against `~/git/container-libs/common/libimage/
+/// pull.go`'s own `nameFromAnnotations`, itself citing a real upstream
+/// bug this exact mismatch caused (`containers/podman/issues/12560`).
+const ANNOTATION_CONTAINERD_IMAGE_NAME: &str = "io.containerd.image.name";
 const OCI_LAYOUT_VERSION: &str = "1.0.0";
 
 /// Write `record`'s image (manifest, config, every layer) to `writer`
@@ -128,12 +142,16 @@ pub(crate) fn save_oci_archive(
 /// `Parent`/`LayerSources` (both `omitempty` there) are never written
 /// here at all, matching what an image saved standalone (not as part
 /// of a build's own parent chain) already looks like from real
-/// `podman save` too.
-#[derive(Debug, serde::Serialize)]
+/// `podman save` too. Also the type [`load_archive`] deserializes a
+/// real `manifest.json`'s own entries into on the read side — real
+/// `podman load` also tolerates a missing/absent `RepoTags` (an
+/// untagged/by-digest save), so `#[serde(default)]` there rather than
+/// a hard parse failure.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct DockerArchiveManifestItem {
     #[serde(rename = "Config")]
     config: String,
-    #[serde(rename = "RepoTags")]
+    #[serde(rename = "RepoTags", default)]
     repo_tags: Vec<String>,
     #[serde(rename = "Layers")]
     layers: Vec<String>,
@@ -360,47 +378,84 @@ fn append_blob_from_store(
         .with_context(|| format!("writing blob entry {path:?}"))
 }
 
-/// What [`load_oci_archive`] actually did — mirrors real `podman
-/// load`'s own "Loaded image: ..." line, which names a tag when the
-/// archive's own `index.json` carried one (the
-/// `org.opencontainers.image.ref.name` annotation [`save_oci_archive`]
-/// itself writes), or falls back to the bare digest when it didn't
-/// (an untagged/by-digest-only archive — this project's own [`Store`]
-/// happily holds a manifest with no reference pointing at it at all,
-/// so this is a real, supported case, not an error).
+/// What [`load_archive`] actually did — mirrors real `podman load`'s
+/// own "Loaded image: ..." line(s): zero references for an untagged/
+/// by-digest-only archive (this project's own [`Store`] happily holds
+/// a manifest with no reference pointing at it at all, so this is a
+/// real, supported case, not an error), one for the overwhelmingly
+/// common case, or more than one for a real `docker-archive` whose own
+/// `manifest.json` named several `RepoTags` for the same image (real
+/// `docker load`'s own identical "tag it under every one of them"
+/// behavior — an `oci-archive`'s own `index.json` can only ever name
+/// at most one, since [`save_oci_archive`] never writes more than one
+/// `org.opencontainers.image.ref.name` annotation).
 #[derive(Debug)]
 pub(crate) struct LoadedImage {
-    pub(crate) reference: Option<String>,
+    pub(crate) references: Vec<String>,
     pub(crate) manifest_digest: Digest,
 }
 
-/// Read a real `oci-archive:`-format tar from `reader` (a real file or
-/// standard input, either way just anything [`Read`]) and ingest every
-/// blob it names into `store`, verifying each blob's content against
-/// the exact digest its own `blobs/sha256/<hex>` filename claims (the
-/// same defense a registry pull already applies via
-/// [`Store::ingest_verified`] — a malicious or corrupt archive can
-/// never poison local storage with content under the wrong digest).
+/// Read a real archive from `reader` (a real file or standard input,
+/// either way just anything [`Read`]) and load the image it contains
+/// into `store` — auto-detecting the format, matching real `podman
+/// load`/`docker load`'s own identical auto-detection (no `--format`
+/// flag on load, only on save): the presence of `index.json` means
+/// `oci-archive`; the presence of `manifest.json` (with no
+/// `index.json`) means `docker-archive`. Neither present at all is a
+/// clear, named error.
 ///
-/// A single linear pass over the tar stream (never needs to seek, so
-/// this works directly against standard input too, unlike real
-/// `containers/image`'s own oci-archive reader, which extracts to a
-/// temp directory first): every `blobs/sha256/<hex>` entry is ingested
-/// as it's encountered, `index.json`/`oci-layout` are buffered in
-/// memory (both always small) and only interpreted once the whole
-/// stream has been consumed, so entry order within the archive
-/// (blobs before or after `index.json`, in practice always before —
-/// see this module's own `save_oci_archive`) never matters.
+/// A single linear pass over the tar stream regardless of which
+/// format it turns out to be (never needs to seek, so this works
+/// directly against standard input too, unlike real `containers/
+/// image`'s own `oci-archive` reader, which extracts to a temp
+/// directory first): every blob-shaped entry (`blobs/sha256/<hex>`
+/// for `oci-archive`; a top-level `<hex>.json`/`<hex>.tar` for
+/// `docker-archive`) is ingested as it's encountered; the small,
+/// format-defining files (`index.json`/`oci-layout`/`manifest.json`)
+/// are buffered in memory and only interpreted once the whole stream
+/// has been consumed, so entry order within the archive never
+/// matters.
 ///
-/// Only ever accepts a single-manifest, single-platform archive —
-/// matching the only shape [`save_oci_archive`] itself ever produces;
-/// a multi-manifest `index.json` (a real multi-platform image saved by
-/// some other tool) is a clear, named error rather than a silent
+/// For `oci-archive`, every blob is ingested verbatim, verified
+/// against the exact digest its own filename claims (the same defense
+/// a registry pull already applies via [`Store::ingest_verified`] — a
+/// malicious or corrupt archive can never poison local storage with
+/// content under the wrong digest). For `docker-archive`, each
+/// top-level `<hex>.tar` is a **plain, uncompressed** layer (the
+/// format's own convention — see [`save_docker_archive`]'s own doc
+/// comment): it's gzip-compressed while streaming straight into the
+/// store via the same [`oci_layer::compress_for_storage`] `ociman
+/// build`/`commit` already use, which also yields that layer's own
+/// real, independently-computed uncompressed digest (the `diff_id`) —
+/// cross-checked against the config's own `rootfs.diff_ids` afterward
+/// (never assumed to already match just because the archive claims
+/// so), and a fresh, real OCI [`ImageManifest`] is synthesized to wrap
+/// the (unchanged) config blob and the freshly re-compressed layers,
+/// since `docker-archive` itself never stores a manifest blob at all,
+/// only `manifest.json`'s own flatter `Config`/`RepoTags`/`Layers`
+/// description of one.
+///
+/// Only ever accepts a single-manifest archive for either format —
+/// matching the only shape [`save_oci_archive`]/[`save_docker_archive`]
+/// themselves ever produce; more than one manifest (a real multi-
+/// platform/multi-image archive saved by some other tool, or real
+/// `podman save -m`) is a clear, named error rather than a silent
 /// "picks whichever one" guess.
-pub(crate) fn load_oci_archive(store: &Store, reader: impl Read) -> anyhow::Result<LoadedImage> {
+pub(crate) fn load_archive(store: &Store, reader: impl Read) -> anyhow::Result<LoadedImage> {
     let mut archive = tar::Archive::new(reader);
     let mut index_bytes: Option<Vec<u8>> = None;
     let mut oci_layout_bytes: Option<Vec<u8>> = None;
+    let mut docker_manifest_bytes: Option<Vec<u8>> = None;
+    // docker-archive: a top-level `<hex>.json` (real digest of its own
+    // content) -> that digest, once ingested; a top-level `<hex>.tar`
+    // (the *name* `manifest.json` itself claims, not necessarily a
+    // real digest of anything -- verified independently below) -> the
+    // freshly gzip-compressed layer's own real store descriptor plus
+    // its own real, independently-computed uncompressed `diff_id`.
+    let mut docker_configs: std::collections::HashMap<String, Digest> =
+        std::collections::HashMap::new();
+    let mut docker_layers: std::collections::HashMap<String, (Descriptor, Digest)> =
+        std::collections::HashMap::new();
 
     for entry in archive.entries().context("reading archive")? {
         let mut entry = entry.context("reading archive entry")?;
@@ -431,14 +486,61 @@ pub(crate) fn load_oci_archive(store: &Store, reader: impl Read) -> anyhow::Resu
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf).context("reading oci-layout")?;
             oci_layout_bytes = Some(buf);
+        } else if path == "manifest.json" {
+            let mut buf = Vec::new();
+            entry
+                .read_to_end(&mut buf)
+                .context("reading manifest.json")?;
+            docker_manifest_bytes = Some(buf);
+        } else if !path.contains('/') && path.ends_with(".json") {
+            // A docker-archive config blob: real content, ingested
+            // (and digested) exactly as given -- never assumed to
+            // already equal its own filename's claimed hex.
+            let mut buf = Vec::new();
+            entry
+                .read_to_end(&mut buf)
+                .with_context(|| format!("reading {path}"))?;
+            let ingested = store
+                .ingest(&buf[..])
+                .with_context(|| format!("ingesting config blob {path}"))?;
+            docker_configs.insert(path, ingested.digest);
+        } else if !path.contains('/') && path.ends_with(".tar") {
+            let (descriptor, diff_id) = ingest_docker_archive_layer(store, &mut entry)
+                .with_context(|| format!("ingesting layer {path}"))?;
+            docker_layers.insert(path, (descriptor, diff_id));
         }
-        // Anything else (an unrecognized top-level entry) is ignored
-        // rather than rejected outright -- a real, forward-compatible
-        // choice: a future OCI image-spec revision could add another
-        // top-level file this reader doesn't know about yet without
-        // every existing archive suddenly failing to load.
+        // Anything else (an unrecognized top-level entry, a legacy
+        // `repositories` file, a legacy per-layer subdirectory's own
+        // `VERSION`/`json`/`layer.tar` -- see `save_docker_archive`'s
+        // own doc comment for why those are never written, but a real
+        // archive from some *other* tool might still have them) is
+        // ignored rather than rejected outright -- forward-compatible,
+        // and never load-critical either way (checked directly: real
+        // `docker load` doesn't read them either).
     }
 
+    if let Some(index_bytes) = index_bytes {
+        load_oci_archive_index(store, index_bytes, oci_layout_bytes)
+    } else if let Some(docker_manifest_bytes) = docker_manifest_bytes {
+        load_docker_archive_manifest(store, docker_manifest_bytes, docker_configs, docker_layers)
+    } else {
+        anyhow::bail!(
+            "not a valid archive: missing both index.json (oci-archive) and manifest.json \
+             (docker-archive)"
+        )
+    }
+}
+
+/// Finish an `oci-archive` load: interpret the already-buffered
+/// `index.json`/`oci-layout` bytes now that every `blobs/sha256/<hex>`
+/// entry has already been ingested. Split out of [`load_archive`]
+/// purely so that function's own body reads as "accumulate, then
+/// decide" rather than one long branch.
+fn load_oci_archive_index(
+    store: &Store,
+    index_bytes: Vec<u8>,
+    oci_layout_bytes: Option<Vec<u8>>,
+) -> anyhow::Result<LoadedImage> {
     let oci_layout_bytes =
         oci_layout_bytes.context("not a valid oci-archive: missing the oci-layout marker file")?;
     let oci_layout: serde_json::Value =
@@ -452,7 +554,6 @@ pub(crate) fn load_oci_archive(store: &Store, reader: impl Read) -> anyhow::Resu
         );
     }
 
-    let index_bytes = index_bytes.context("not a valid oci-archive: missing index.json")?;
     let index: ImageIndex = serde_json::from_slice(&index_bytes).context("parsing index.json")?;
     match index.manifests.len() {
         0 => anyhow::bail!("index.json names no manifests at all"),
@@ -498,10 +599,20 @@ pub(crate) fn load_oci_archive(store: &Store, reader: impl Read) -> anyhow::Resu
         }
     }
 
-    let reference = match descriptor.annotations.get(ANNOTATION_REF_NAME) {
+    // `io.containerd.image.name` (the real, non-spec, full-reference
+    // annotation `buildkit`/modern `docker save` actually sets) takes
+    // priority over the OCI spec's own `org.opencontainers.image.
+    // ref.name` -- see `ANNOTATION_CONTAINERD_IMAGE_NAME`'s own doc
+    // comment for exactly why, matching real podman's own identical
+    // precedence.
+    let raw_reference = descriptor
+        .annotations
+        .get(ANNOTATION_CONTAINERD_IMAGE_NAME)
+        .or_else(|| descriptor.annotations.get(ANNOTATION_REF_NAME));
+    let references = match raw_reference {
         Some(raw) => {
             let parsed = Reference::parse(raw)
-                .with_context(|| format!("parsing {ANNOTATION_REF_NAME} annotation {raw:?}"))?;
+                .with_context(|| format!("parsing image reference annotation {raw:?}"))?;
             let normalized = parsed.to_string();
             store
                 .put_image(&ImageRecord {
@@ -509,15 +620,142 @@ pub(crate) fn load_oci_archive(store: &Store, reader: impl Read) -> anyhow::Resu
                     manifest_digest: descriptor.digest.clone(),
                 })
                 .context("recording loaded image's tag")?;
-            Some(normalized)
+            vec![normalized]
         }
-        None => None,
+        None => Vec::new(),
     };
 
     Ok(LoadedImage {
-        reference,
+        references,
         manifest_digest: descriptor.digest.clone(),
     })
+}
+
+/// Finish a `docker-archive` load: interpret the already-buffered
+/// `manifest.json` bytes now that every config/layer file has already
+/// been ingested (`docker_configs`/`docker_layers`, keyed by their own
+/// real archive filename). Synthesizes a fresh, real OCI
+/// [`ImageManifest`] wrapping the unchanged config and the freshly
+/// re-compressed layers, since `docker-archive` never stores a
+/// manifest blob of its own at all.
+fn load_docker_archive_manifest(
+    store: &Store,
+    docker_manifest_bytes: Vec<u8>,
+    docker_configs: std::collections::HashMap<String, Digest>,
+    docker_layers: std::collections::HashMap<String, (Descriptor, Digest)>,
+) -> anyhow::Result<LoadedImage> {
+    let items: Vec<DockerArchiveManifestItem> =
+        serde_json::from_slice(&docker_manifest_bytes).context("parsing manifest.json")?;
+    match items.len() {
+        0 => anyhow::bail!("manifest.json names no images at all"),
+        1 => {}
+        n => anyhow::bail!(
+            "manifest.json names {n} images -- multi-image docker-archive archives are not \
+             supported yet, only a single image"
+        ),
+    }
+    let item = &items[0];
+
+    let config_digest = docker_configs.get(&item.config).with_context(|| {
+        format!(
+            "manifest.json names config {:?} but the archive never included it",
+            item.config
+        )
+    })?;
+    let config_bytes = store
+        .read_blob(config_digest)
+        .with_context(|| format!("reading config blob {config_digest}"))?;
+    let config: oci_spec_types::image::ImageConfig =
+        serde_json::from_slice(&config_bytes).context("parsing config blob")?;
+
+    let mut layers = Vec::with_capacity(item.layers.len());
+    let mut diff_ids = Vec::with_capacity(item.layers.len());
+    for name in &item.layers {
+        let (descriptor, diff_id) = docker_layers.get(name).with_context(|| {
+            format!("manifest.json names layer {name:?} but the archive never included it")
+        })?;
+        layers.push(descriptor.clone());
+        diff_ids.push(diff_id.clone());
+    }
+    if config.rootfs.diff_ids != diff_ids {
+        anyhow::bail!(
+            "the config's own rootfs.diff_ids does not match this archive's own layers' real, \
+             independently-computed uncompressed digests -- refusing to load a manifest that \
+             would not describe what's actually in the archive"
+        );
+    }
+
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: Some(MEDIA_TYPE_IMAGE_MANIFEST.to_string()),
+        config: Descriptor {
+            media_type: oci_spec_types::image::MEDIA_TYPE_IMAGE_CONFIG.to_string(),
+            digest: config_digest.clone(),
+            size: config_bytes.len() as u64,
+            urls: Vec::new(),
+            annotations: BTreeMap::new(),
+            platform: None,
+        },
+        layers,
+        annotations: BTreeMap::new(),
+    };
+    let manifest_bytes =
+        serde_json::to_vec(&manifest).context("serializing a fresh manifest for this image")?;
+    let manifest_digest = store
+        .ingest(&manifest_bytes[..])
+        .context("ingesting a fresh manifest for this image")?
+        .digest;
+
+    let mut references = Vec::with_capacity(item.repo_tags.len());
+    for tag in &item.repo_tags {
+        let parsed =
+            Reference::parse(tag).with_context(|| format!("parsing RepoTags entry {tag:?}"))?;
+        let normalized = parsed.to_string();
+        store
+            .put_image(&ImageRecord {
+                reference: normalized.clone(),
+                manifest_digest: manifest_digest.clone(),
+            })
+            .context("recording loaded image's tag")?;
+        references.push(normalized);
+    }
+
+    Ok(LoadedImage {
+        references,
+        manifest_digest,
+    })
+}
+
+/// Gzip-compress a `docker-archive` layer entry (a plain, uncompressed
+/// tar) while streaming it straight into the store, via a real scratch
+/// file (never held fully in memory) — the read-side mirror of
+/// [`append_layer_decompressed`]. Returns the freshly stored layer's
+/// own real descriptor and its own real, independently-computed
+/// uncompressed digest (the `diff_id`).
+fn ingest_docker_archive_layer(
+    store: &Store,
+    entry: &mut (impl Read + ?Sized),
+) -> anyhow::Result<(Descriptor, Digest)> {
+    let mut scratch =
+        tempfile::NamedTempFile::new().context("creating a scratch file to compress a layer")?;
+    let diff_id = oci_layer::compress_for_storage(entry, scratch.as_file_mut())
+        .context("compressing layer")?;
+    scratch
+        .as_file_mut()
+        .seek(std::io::SeekFrom::Start(0))
+        .context("rewinding compressed layer scratch file")?;
+    let ingested = store
+        .ingest(scratch.as_file_mut())
+        .context("ingesting compressed layer")?;
+    let descriptor = Descriptor {
+        media_type: oci_spec_types::image::MEDIA_TYPE_IMAGE_LAYER_GZIP.to_string(),
+        digest: ingested.digest,
+        size: ingested.size,
+        urls: Vec::new(),
+        annotations: BTreeMap::new(),
+        platform: None,
+    };
+    Ok((descriptor, diff_id))
 }
 
 #[cfg(test)]
@@ -646,7 +884,7 @@ mod tests {
         );
     }
 
-    /// The most convincing check for `load_oci_archive`: save a real
+    /// The most convincing check for `load_archive`: save a real
     /// image out of one store, load the resulting bytes into a
     /// completely separate, fresh store, and confirm every blob
     /// (manifest, config, layer) made it across byte for byte and the
@@ -663,12 +901,9 @@ mod tests {
 
         let dest_dir = tempfile::tempdir().unwrap();
         let dest_store = Store::open(dest_dir.path()).unwrap();
-        let loaded = load_oci_archive(&dest_store, &archive_bytes[..]).unwrap();
+        let loaded = load_archive(&dest_store, &archive_bytes[..]).unwrap();
 
-        assert_eq!(
-            loaded.reference.as_deref(),
-            Some("example.com/roundtrip:v1")
-        );
+        assert_eq!(loaded.references, vec!["example.com/roundtrip:v1"]);
         assert_eq!(loaded.manifest_digest, record.manifest_digest);
 
         let dest_record = dest_store
@@ -748,16 +983,88 @@ mod tests {
 
         let dest_dir = tempfile::tempdir().unwrap();
         let dest_store = Store::open(dest_dir.path()).unwrap();
-        let loaded = load_oci_archive(&dest_store, &rebuilt[..]).unwrap();
+        let loaded = load_archive(&dest_store, &rebuilt[..]).unwrap();
 
-        assert_eq!(loaded.reference, None);
+        assert!(loaded.references.is_empty());
         assert_eq!(loaded.manifest_digest, record.manifest_digest);
         assert!(dest_store.has_blob(&record.manifest_digest));
         assert!(dest_store.list_images().unwrap().is_empty());
     }
 
+    /// A real, previously-caught bug (found via manual interop testing
+    /// against a real, modern `docker save`, not written from a
+    /// hypothesis): real `buildkit`-based `docker save` sets
+    /// `org.opencontainers.image.ref.name` to just the bare tag
+    /// (`"latest"`), not a full reference, with the *actual* full
+    /// reference under a separate `io.containerd.image.name`
+    /// annotation instead. Loading such an archive using
+    /// `ref.name` alone previously mis-resolved `docker.io/library/
+    /// busybox:latest` down to the nonsensical `docker.io/library/
+    /// latest:latest` (treating the bare tag `"latest"` as if it were
+    /// itself a bare image name). Real `podman load` handles the exact
+    /// same real archive correctly (verified directly) precisely
+    /// because it prefers `io.containerd.image.name` first — see
+    /// `ANNOTATION_CONTAINERD_IMAGE_NAME`'s own doc comment.
     #[test]
-    fn load_rejects_an_archive_with_no_index_json_at_all() {
+    fn load_prefers_the_real_containerd_image_name_annotation_over_the_bare_oci_ref_name_one() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_store = Store::open(source_dir.path()).unwrap();
+        let record = seed_sample_image(&source_store, "docker.io/library/busybox:latest");
+        let mut archive_bytes = Vec::new();
+        save_oci_archive(&source_store, &record, &mut archive_bytes).unwrap();
+
+        // Rewrite index.json to look exactly like a real modern
+        // `docker save`'s own output: `ref.name` is just the bare tag,
+        // `io.containerd.image.name` carries the real, full reference.
+        let mut entries: Vec<(tar::Header, Vec<u8>)> = Vec::new();
+        {
+            let mut archive = tar::Archive::new(&archive_bytes[..]);
+            for entry in archive.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                let header = entry.header().clone();
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf).unwrap();
+                entries.push((header, buf));
+            }
+        }
+        let mut rebuilt = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut rebuilt);
+            for (mut header, content) in entries {
+                let path = header.path().unwrap().to_string_lossy().into_owned();
+                if path == "index.json" {
+                    let mut index: ImageIndex = serde_json::from_slice(&content).unwrap();
+                    index.manifests[0]
+                        .annotations
+                        .insert(ANNOTATION_REF_NAME.to_string(), "latest".to_string());
+                    index.manifests[0].annotations.insert(
+                        ANNOTATION_CONTAINERD_IMAGE_NAME.to_string(),
+                        "docker.io/library/busybox:latest".to_string(),
+                    );
+                    let new_content = serde_json::to_vec(&index).unwrap();
+                    header.set_size(new_content.len() as u64);
+                    builder
+                        .append_data(&mut header, &path, &new_content[..])
+                        .unwrap();
+                } else if header.entry_type() != tar::EntryType::Directory {
+                    builder
+                        .append_data(&mut header, &path, &content[..])
+                        .unwrap();
+                }
+            }
+            builder.finish().unwrap();
+        }
+
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest_store = Store::open(dest_dir.path()).unwrap();
+        let loaded = load_archive(&dest_store, &rebuilt[..]).unwrap();
+
+        assert_eq!(loaded.references, vec!["docker.io/library/busybox:latest"]);
+        assert_eq!(loaded.manifest_digest, record.manifest_digest);
+    }
+
+    #[test]
+    fn load_rejects_an_archive_with_neither_index_json_nor_manifest_json() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let mut bytes = Vec::new();
@@ -773,8 +1080,179 @@ mod tests {
             .unwrap();
             builder.finish().unwrap();
         }
-        let err = load_oci_archive(&store, &bytes[..]).unwrap_err();
-        assert!(format!("{err:#}").contains("missing index.json"), "{err:#}");
+        let err = load_archive(&store, &bytes[..]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("missing both index.json")
+                && format!("{err:#}").contains("manifest.json"),
+            "{err:#}"
+        );
+    }
+
+    /// A real `oci-archive` with `index.json` present but its own
+    /// required `oci-layout` marker missing -- a real, distinct error
+    /// from the "neither format detected" case above.
+    #[test]
+    fn load_rejects_an_oci_archive_missing_its_own_oci_layout_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let index = ImageIndex {
+            schema_version: 2,
+            media_type: None,
+            manifests: Vec::new(),
+            annotations: BTreeMap::new(),
+        };
+        let mut bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut bytes);
+            append_regular(
+                &mut builder,
+                "index.json",
+                0,
+                0o644,
+                &serde_json::to_vec(&index).unwrap(),
+            )
+            .unwrap();
+            builder.finish().unwrap();
+        }
+        let err = load_archive(&store, &bytes[..]).unwrap_err();
+        assert!(format!("{err:#}").contains("oci-layout"), "{err:#}");
+    }
+
+    /// The docker-archive mirror of `save_then_load_round_trips_into_a
+    /// _fresh_store`: build a docker-archive tar directly (not via
+    /// `save_docker_archive`, to keep this test focused purely on the
+    /// read side), load it, and confirm the freshly synthesized
+    /// manifest/config/layer all round-trip correctly, including
+    /// tagging under every one of several `RepoTags`.
+    #[test]
+    fn load_docker_archive_synthesizes_a_real_manifest_and_tags_every_repo_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let layer_plaintext = b"a real, plain, uncompressed docker-archive layer tar\n";
+        let layer_diff_id = oci_spec_types::digest::sha256(layer_plaintext);
+
+        let config = ImageConfig {
+            architecture: Some("arm64".to_string()),
+            os: Some("linux".to_string()),
+            config: Some(ContainerConfig::default()),
+            rootfs: oci_spec_types::image::RootFs {
+                kind: "layers".to_string(),
+                diff_ids: vec![layer_diff_id.clone()],
+            },
+            history: Vec::new(),
+            created: None,
+            author: None,
+        };
+        let config_bytes = serde_json::to_vec(&config).unwrap();
+        let config_digest = oci_spec_types::digest::sha256(&config_bytes);
+        let config_name = format!("{}.json", config_digest.hex());
+        let layer_name = format!("{}.tar", layer_diff_id.hex());
+
+        let manifest_item = DockerArchiveManifestItem {
+            config: config_name.clone(),
+            repo_tags: vec![
+                "example.com/multi-tag:v1".to_string(),
+                "example.com/multi-tag:latest".to_string(),
+            ],
+            layers: vec![layer_name.clone()],
+        };
+        let manifest_json = serde_json::to_vec(&vec![manifest_item]).unwrap();
+
+        let mut bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut bytes);
+            append_regular(&mut builder, &config_name, 0, 0o444, &config_bytes).unwrap();
+            append_regular(&mut builder, &layer_name, 0, 0o444, layer_plaintext).unwrap();
+            append_regular(&mut builder, "manifest.json", 0, 0o444, &manifest_json).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let loaded = load_archive(&store, &bytes[..]).unwrap();
+        assert_eq!(
+            loaded.references,
+            vec![
+                "example.com/multi-tag:v1".to_string(),
+                "example.com/multi-tag:latest".to_string()
+            ]
+        );
+
+        for reference in &loaded.references {
+            let record = store.resolve_image(reference).unwrap().unwrap();
+            assert_eq!(record.manifest_digest, loaded.manifest_digest);
+        }
+
+        let manifest = store
+            .image_manifest(
+                &store
+                    .resolve_image("example.com/multi-tag:v1")
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(manifest.layers.len(), 1);
+        assert_eq!(manifest.config.digest, config_digest);
+
+        // The stored layer must be real, valid gzip whose decompressed
+        // content is exactly the original plaintext -- not a raw copy
+        // of the (uncompressed) archive entry.
+        let stored_layer_bytes = store.read_blob(&manifest.layers[0].digest).unwrap();
+        let mut decoder = flate2::read::GzDecoder::new(&stored_layer_bytes[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+        assert_eq!(decompressed, layer_plaintext);
+    }
+
+    #[test]
+    fn load_docker_archive_rejects_a_diff_id_mismatch_between_config_and_layer_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let layer_plaintext = b"real layer content";
+        // Deliberately wrong: the config claims a diff_id that doesn't
+        // match this layer's own real, independently-computed digest.
+        let wrong_diff_id = oci_spec_types::digest::sha256(b"not the real layer content");
+
+        let config = ImageConfig {
+            architecture: Some("arm64".to_string()),
+            os: Some("linux".to_string()),
+            config: Some(ContainerConfig::default()),
+            rootfs: oci_spec_types::image::RootFs {
+                kind: "layers".to_string(),
+                diff_ids: vec![wrong_diff_id],
+            },
+            history: Vec::new(),
+            created: None,
+            author: None,
+        };
+        let config_bytes = serde_json::to_vec(&config).unwrap();
+        let config_digest = oci_spec_types::digest::sha256(&config_bytes);
+        let config_name = format!("{}.json", config_digest.hex());
+        // Named after the *real* diff_id, matching what a real save
+        // would do -- the config is the one lying here, not the file
+        // name, exercising the cross-check against the config
+        // specifically.
+        let real_diff_id = oci_spec_types::digest::sha256(layer_plaintext);
+        let layer_name = format!("{}.tar", real_diff_id.hex());
+
+        let manifest_item = DockerArchiveManifestItem {
+            config: config_name.clone(),
+            repo_tags: Vec::new(),
+            layers: vec![layer_name.clone()],
+        };
+        let manifest_json = serde_json::to_vec(&vec![manifest_item]).unwrap();
+
+        let mut bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut bytes);
+            append_regular(&mut builder, &config_name, 0, 0o444, &config_bytes).unwrap();
+            append_regular(&mut builder, &layer_name, 0, 0o444, layer_plaintext).unwrap();
+            append_regular(&mut builder, "manifest.json", 0, 0o444, &manifest_json).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let err = load_archive(&store, &bytes[..]).unwrap_err();
+        assert!(format!("{err:#}").contains("diff_ids"), "{err:#}");
     }
 
     #[test]
@@ -796,7 +1274,7 @@ mod tests {
             .unwrap();
             builder.finish().unwrap();
         }
-        let err = load_oci_archive(&store, &bytes[..]).unwrap_err();
+        let err = load_archive(&store, &bytes[..]).unwrap_err();
         assert!(format!("{err:#}").contains("ingesting blob"), "{err:#}");
     }
 }

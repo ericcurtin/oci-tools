@@ -1,13 +1,22 @@
-//! `ociman load` integration tests: reading a real `oci-archive`
-//! archive back into local storage, matching real `podman load`/
-//! `docker load` (see `docs/design/0166`). Same fully offline seeded-
-//! image approach `ociman_save.rs`/`ociman_tag.rs` established --
-//! real, live `podman load`/`podman save` interop (loading a real
-//! `podman`-produced archive, and a real `podman run` of an image
-//! this binary loaded) was additionally verified by hand during this
-//! feature's own development, since a real `podman`/`docker` binary
-//! is not a dependency this automated suite can assume is present
-//! everywhere it runs -- see `docs/design/0166` for that record.
+//! `ociman load` integration tests: reading a real archive (either
+//! format, auto-detected) back into local storage, matching real
+//! `podman load`/`docker load` (see `docs/design/0166`/`0168`). Same
+//! fully offline seeded-image approach `ociman_save.rs`/
+//! `ociman_tag.rs` established -- real, live `podman load`/`docker
+//! load`/`podman save`/`docker save` interop (loading a real
+//! `podman`/`docker`-produced archive of each format, and a real
+//! `podman run`/`docker run` of an image this binary loaded, plus
+//! loading this binary's own `docker-archive` output with both real
+//! tools) was additionally verified by hand during each feature's own
+//! development, since a real `podman`/`docker` binary is not a
+//! dependency this automated suite can assume is present everywhere
+//! it runs -- see `docs/design/0166`/`0167`/`0168` for those records.
+//! `docker-archive`-specific read-side coverage (manifest
+//! synthesis, `diff_id` cross-checking, multi-`RepoTags` tagging)
+//! lives in `bin/ociman/src/archive.rs`'s own unit tests instead,
+//! since building a docker-archive tar by hand is easier to do
+//! directly against the store than through this file's own CLI-only
+//! `ociman` helper.
 
 use std::path::Path;
 use std::process::Command;
@@ -191,8 +200,8 @@ fn load_with_json_prints_the_reference_and_digest() {
     );
     let parsed: serde_json::Value = serde_json::from_slice(&load.stdout).unwrap();
     assert_eq!(
-        parsed["reference"],
-        "docker.io/ociman-test/load-json:latest"
+        parsed["references"],
+        serde_json::json!(["docker.io/ociman-test/load-json:latest"])
     );
     assert_eq!(parsed["digest"], source_record.manifest_digest.to_string());
 }

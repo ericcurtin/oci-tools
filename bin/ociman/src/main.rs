@@ -149,14 +149,14 @@ enum PullPolicy {
     Newer,
 }
 
-/// `ociman save --format`'s own archive format. `OciArchive` (0165) is
-/// still the *default* (see `Command::Save::format`'s own doc comment
-/// for why, even though real `podman save`/`docker save` themselves
-/// default to `DockerArchive`); `DockerArchive` (0167) can be selected
-/// explicitly. See [`archive`]'s own doc comment for exactly what each
-/// format writes and what's still deliberately out of scope (a
-/// `repositories` file/legacy per-layer subdirectories for
-/// `DockerArchive`; `-m`/`--multi-image-archive` for either).
+/// `ociman save --format`'s own archive format. `DockerArchive` (0167)
+/// is the default, matching real `podman save`/`docker save`'s own
+/// default exactly; `OciArchive` (0165) was this project's own first
+/// format and can still be selected explicitly. See [`archive`]'s own
+/// doc comment for exactly what each format writes and what's still
+/// deliberately out of scope (a `repositories` file/legacy per-layer
+/// subdirectories for `DockerArchive`; `-m`/`--multi-image-archive`
+/// for either).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum SaveFormat {
     OciArchive,
@@ -1033,12 +1033,10 @@ enum Command {
     /// file — matching real `podman save`/`docker save`, for both the
     /// `oci-archive` and `docker-archive` formats (see the `archive`
     /// module's own doc comment for exactly what each writes, and
-    /// what's still deliberately out of scope for each; see
-    /// `format`'s own doc comment for why `oci-archive`, not real
-    /// podman/docker's own `docker-archive`, is still the default
-    /// here). Only a single `IMAGE` is supported (real podman's own
-    /// `-m`/`--multi-image-archive` for several images in one archive
-    /// is out of scope for now too).
+    /// what's still deliberately out of scope for each). Only a
+    /// single `IMAGE` is supported (real podman's own `-m`/
+    /// `--multi-image-archive` for several images in one archive is
+    /// out of scope for now too).
     Save {
         /// The already-stored image to save — a reference exactly as
         /// it was pulled/built/tagged, or a real or short image ID
@@ -1054,31 +1052,27 @@ enum Command {
         output: Option<PathBuf>,
         /// Which real archive format to write — see `SaveFormat`'s
         /// own doc comment for exactly what's implemented so far.
-        /// Defaults to `oci-archive`, **not** real podman/docker's own
-        /// `docker-archive` default: `ociman load` doesn't read
-        /// `docker-archive` yet (see `docs/design/0167`), so
-        /// defaulting `save` to it would break this project's own
-        /// `ociman save | ociman load` round trip out of the box — a
-        /// real, self-inflicted regression this project won't accept
-        /// just to match a default value real interop with other
-        /// tools doesn't actually depend on to begin with (a real
-        /// `podman`/`docker` already defaults to `docker-archive`
-        /// regardless of what `ociman`'s own default is). Revisit
-        /// once `ociman load` also reads `docker-archive`.
-        #[arg(long, value_enum, default_value_t = SaveFormat::OciArchive)]
+        /// Defaults to `docker-archive`, matching real `podman save`/
+        /// `docker save`'s own default exactly (0168 changed this
+        /// from `oci-archive`, once `ociman load` gained the ability
+        /// to read `docker-archive` back too, removing the one
+        /// reason that default had been kept different).
+        #[arg(long, value_enum, default_value_t = SaveFormat::DockerArchive)]
         format: SaveFormat,
     },
     /// Load an image from a real archive file previously written by
     /// `ociman save`/`podman save`/`docker save` — matching real
-    /// `podman load`/`docker load`. Only the `oci-archive` format is
-    /// understood so far (real `docker-archive` archives, and
-    /// multi-manifest/multi-platform `oci-archive` archives, are a
-    /// clear, named error rather than a silent partial load — see the
-    /// `archive` module's own `load_oci_archive` doc comment for
-    /// exactly what's checked). Every blob is verified against its own
-    /// claimed digest while being ingested, the same defense a real
-    /// registry pull already applies, so a corrupt or hostile archive
-    /// can never poison local storage.
+    /// `podman load`/`docker load`, auto-detecting the format
+    /// (`oci-archive` or `docker-archive`) exactly like both real
+    /// tools do (no `--format` flag on load, only on save). A
+    /// multi-manifest/multi-platform/multi-image archive is a clear,
+    /// named error rather than a silent partial load — see the
+    /// `archive` module's own `load_archive` doc comment for exactly
+    /// what's checked. Every blob is verified against its own claimed
+    /// (`oci-archive`) or independently-recomputed (`docker-archive`)
+    /// digest while being ingested, the same defense a real registry
+    /// pull already applies, so a corrupt or hostile archive can never
+    /// poison local storage.
     Load {
         /// Read the archive from this file instead of standard input
         /// (real `podman load`/`docker load`'s own default — `ociman
@@ -1424,7 +1418,7 @@ fn write_archive(
 /// `ociman load`'s own `--json` output.
 #[derive(Debug, Serialize)]
 struct LoadResult {
-    reference: Option<String>,
+    references: Vec<String>,
     digest: String,
 }
 
@@ -1436,11 +1430,11 @@ fn cmd_load(input: Option<&Path>, json: bool) -> anyhow::Result<()> {
         Some(path) => (|| -> anyhow::Result<archive::LoadedImage> {
             let file =
                 std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-            archive::load_oci_archive(&store, std::io::BufReader::new(file))
+            archive::load_archive(&store, std::io::BufReader::new(file))
         })(),
         None => {
             let stdin = std::io::stdin();
-            archive::load_oci_archive(&store, std::io::BufReader::new(stdin.lock()))
+            archive::load_archive(&store, std::io::BufReader::new(stdin.lock()))
         }
     };
     progress.finish_and_clear();
@@ -1448,13 +1442,14 @@ fn cmd_load(input: Option<&Path>, json: bool) -> anyhow::Result<()> {
 
     if json {
         oci_cli_common::output::print_json(&LoadResult {
-            reference: loaded.reference.clone(),
+            references: loaded.references.clone(),
             digest: loaded.manifest_digest.to_string(),
         })?;
+    } else if loaded.references.is_empty() {
+        println!("Loaded image: {}", loaded.manifest_digest);
     } else {
-        match &loaded.reference {
-            Some(reference) => println!("Loaded image: {reference}"),
-            None => println!("Loaded image: {}", loaded.manifest_digest),
+        for reference in &loaded.references {
+            println!("Loaded image: {reference}");
         }
     }
     Ok(())
