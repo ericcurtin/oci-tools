@@ -941,6 +941,46 @@ enum Command {
         /// The container's ID or `--name`.
         id: String,
     },
+    /// Update a running container's real cgroup resource limits in
+    /// place — matching real `podman update` for exactly the same
+    /// subset of resource flags `ociman run` itself already supports
+    /// (`--memory`/`--memory-swap`/`--cpus`/`--pids-limit`/
+    /// `--cpuset-cpus`/`--cpuset-mems`; real `podman update`'s own
+    /// larger flag set — `--cpu-shares`/`--cpu-period`/`--cpu-quota`/
+    /// `--cpu-rt-period`/`--cpu-rt-runtime`/`--memory-reservation`/
+    /// `--memory-swappiness`/`--blkio-weight*`/`--device-*-bps`/
+    /// `--device-*-iops` — is out of scope for the same reason `run`
+    /// itself doesn't support them either). Requires the container to
+    /// actually be running (this project's own cgroup only exists
+    /// while its systemd scope is alive at all, unlike real podman,
+    /// which can also update an already-stopped container's own
+    /// persisted spec for its *next* start — a real, narrower scope,
+    /// matching `ocirun update`'s own identical "container's own
+    /// persisted state is never rewritten" limitation, see
+    /// `docs/design/0099`). Applying no resource flags at all is a
+    /// clear error rather than a silent no-op.
+    Update {
+        /// The container's ID or `--name`.
+        id: String,
+        /// See `Command::Run`'s own identical flag.
+        #[arg(long)]
+        memory: Option<String>,
+        /// See `Command::Run`'s own identical flag.
+        #[arg(long = "memory-swap", allow_hyphen_values = true)]
+        memory_swap: Option<String>,
+        /// See `Command::Run`'s own identical flag.
+        #[arg(long)]
+        cpus: Option<f64>,
+        /// See `Command::Run`'s own identical flag.
+        #[arg(long = "pids-limit", allow_hyphen_values = true)]
+        pids_limit: Option<i64>,
+        /// See `Command::Run`'s own identical flag.
+        #[arg(long = "cpuset-cpus")]
+        cpuset_cpus: Option<String>,
+        /// See `Command::Run`'s own identical flag.
+        #[arg(long = "cpuset-mems")]
+        cpuset_mems: Option<String>,
+    },
     /// A single, one-shot resource-usage sample for a running
     /// container's own real cgroup — matching real `podman stats
     /// --no-stream`'s own single-call semantics exactly (see the
@@ -1262,6 +1302,23 @@ fn main() -> std::process::ExitCode {
             Some(Command::Kill { id, signal }) => cmd_kill(&id, &signal),
             Some(Command::Pause { id }) => cmd_pause(&id),
             Some(Command::Unpause { id }) => cmd_unpause(&id),
+            Some(Command::Update {
+                id,
+                memory,
+                memory_swap,
+                cpus,
+                pids_limit,
+                cpuset_cpus,
+                cpuset_mems,
+            }) => cmd_update(
+                &id,
+                memory.as_deref(),
+                memory_swap.as_deref(),
+                cpus,
+                pids_limit,
+                cpuset_cpus.as_deref(),
+                cpuset_mems.as_deref(),
+            ),
             Some(Command::Stats { id, no_stream }) => cmd_stats(&id, no_stream, cli.global.json),
             Some(Command::Wait { id, interval }) => cmd_wait(&id, interval),
             Some(Command::Rename { id, name }) => cmd_rename(&id, &name),
@@ -2547,27 +2604,11 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         oci_spec_types::runtime::podman_default_capabilities()
     };
     let capabilities = merge_capabilities(&base_capabilities, &args.cap_add, &args.cap_drop)?;
-    let memory_limit_bytes = args.memory.as_deref().map(parse_memory_limit).transpose()?;
-    let memory_swap_bytes = args
-        .memory_swap
-        .as_deref()
-        .map(parse_memory_swap_limit)
-        .transpose()?;
-    anyhow::ensure!(
-        memory_swap_bytes.is_none() || memory_limit_bytes.is_some(),
-        "--memory-swap requires --memory to also be set (there is nothing to convert a \
-         combined memory+swap figure relative to otherwise)"
-    );
-    if let (Some(memory_limit), Some(swap_limit)) = (memory_limit_bytes, memory_swap_bytes) {
-        anyhow::ensure!(
-            swap_limit == -1 || swap_limit >= memory_limit,
-            "--memory-swap must be at least as large as --memory (or -1 for unlimited swap)"
-        );
-    }
-    anyhow::ensure!(
-        args.cpus.is_none_or(|c| c > 0.0 && c.is_finite()),
-        "--cpus must be a positive, finite number"
-    );
+    let (memory_limit_bytes, memory_swap_bytes) = parse_and_validate_memory_and_cpus(
+        args.memory.as_deref(),
+        args.memory_swap.as_deref(),
+        args.cpus,
+    )?;
     let reference = Reference::parse(&args.image)
         .with_context(|| format!("parsing image reference {:?}", args.image))?;
     let store = open_store()?;
@@ -4667,6 +4708,49 @@ fn cmd_unpause(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Update a running container's real cgroup resource limits in
+/// place — see `Command::Update`'s own doc comment for exactly what's
+/// supported and why. Reuses `ociman run`'s own validation
+/// (`parse_and_validate_memory_and_cpus`) and translation
+/// (`resources_from_cli`) unchanged, then applies via the exact same
+/// `oci_runtime_core::cgroups::plan_resources`/`apply` pair `ocirun
+/// update` itself already uses — a real, direct-library-call reuse
+/// (never exec'ing `ocirun`), matching this project's own "share as
+/// much Rust code as possible" pillar.
+fn cmd_update(
+    id: &str,
+    memory: Option<&str>,
+    memory_swap: Option<&str>,
+    cpus: Option<f64>,
+    pids_limit: Option<i64>,
+    cpuset_cpus: Option<&str>,
+    cpuset_mems: Option<&str>,
+) -> anyhow::Result<()> {
+    let (memory_limit_bytes, memory_swap_bytes) =
+        parse_and_validate_memory_and_cpus(memory, memory_swap, cpus)?;
+    let resources = resources_from_cli(
+        memory_limit_bytes,
+        memory_swap_bytes,
+        cpus,
+        pids_limit,
+        cpuset_cpus,
+        cpuset_mems,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "no resource flags given -- at least one of --memory/--memory-swap/--cpus/\
+             --pids-limit/--cpuset-cpus/--cpuset-mems is required"
+        )
+    })?;
+
+    let cgroup_dir = resolve_running_container_cgroup(id)?;
+    let writes = oci_runtime_core::cgroups::plan_resources(&resources);
+    oci_runtime_core::cgroups::apply(&cgroup_dir, &writes)
+        .with_context(|| format!("updating resources for container {id:?}"))?;
+    println!("{id}");
+    Ok(())
+}
+
 /// `docker stats`/`podman stats`-style one-shot resource-usage sample
 /// for one container, straight from its own real cgroup v2 accounting
 /// files.
@@ -5376,6 +5460,42 @@ fn merge_capabilities(
     Ok(result)
 }
 
+/// Parse `--memory`/`--memory-swap` into raw byte counts and validate
+/// them together with `--cpus`, the same "does this even make sense"
+/// checks (memory-swap needs memory; memory-swap must be at least
+/// memory; cpus must be positive/finite) `ociman run`'s own
+/// `prepare_container` already needed — shared with `ociman update`
+/// (0171) so there is exactly one implementation of this validation,
+/// not two silently drifting copies of the same three `ensure!`s.
+/// `--pids-limit`/`--cpuset-cpus`/`--cpuset-mems` need no equivalent
+/// validation here (`resources_from_cli`'s own doc comment covers
+/// them: no syntax validation at all, matching real `docker`/`podman`
+/// themselves).
+fn parse_and_validate_memory_and_cpus(
+    memory: Option<&str>,
+    memory_swap: Option<&str>,
+    cpus: Option<f64>,
+) -> anyhow::Result<(Option<i64>, Option<i64>)> {
+    let memory_limit_bytes = memory.map(parse_memory_limit).transpose()?;
+    let memory_swap_bytes = memory_swap.map(parse_memory_swap_limit).transpose()?;
+    anyhow::ensure!(
+        memory_swap_bytes.is_none() || memory_limit_bytes.is_some(),
+        "--memory-swap requires --memory to also be set (there is nothing to convert a \
+         combined memory+swap figure relative to otherwise)"
+    );
+    if let (Some(memory_limit), Some(swap_limit)) = (memory_limit_bytes, memory_swap_bytes) {
+        anyhow::ensure!(
+            swap_limit == -1 || swap_limit >= memory_limit,
+            "--memory-swap must be at least as large as --memory (or -1 for unlimited swap)"
+        );
+    }
+    anyhow::ensure!(
+        cpus.is_none_or(|c| c > 0.0 && c.is_finite()),
+        "--cpus must be a positive, finite number"
+    );
+    Ok((memory_limit_bytes, memory_swap_bytes))
+}
+
 /// Build a `LinuxResources` from `ociman run`'s own `--memory`/
 /// `--memory-swap`/`--cpus`/`--pids-limit`/`--cpuset-cpus`/
 /// `--cpuset-mems` flags, `None` if none of the six were given at all
@@ -6006,6 +6126,44 @@ mod tests {
         assert!(parse_memory_limit("not-a-number").is_err());
         assert!(parse_memory_limit("128x").is_err());
         assert!(parse_memory_limit("99999999999999999999999t").is_err());
+    }
+
+    #[test]
+    fn parse_and_validate_memory_and_cpus_is_none_none_when_nothing_was_given() {
+        assert_eq!(
+            parse_and_validate_memory_and_cpus(None, None, None).unwrap(),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn parse_and_validate_memory_and_cpus_parses_and_combines_memory_and_swap() {
+        assert_eq!(
+            parse_and_validate_memory_and_cpus(Some("128m"), Some("256m"), None).unwrap(),
+            (Some(128 * 1024 * 1024), Some(256 * 1024 * 1024))
+        );
+    }
+
+    #[test]
+    fn parse_and_validate_memory_and_cpus_rejects_memory_swap_without_memory() {
+        assert!(parse_and_validate_memory_and_cpus(None, Some("256m"), None).is_err());
+    }
+
+    #[test]
+    fn parse_and_validate_memory_and_cpus_rejects_a_swap_value_smaller_than_memory() {
+        assert!(parse_and_validate_memory_and_cpus(Some("256m"), Some("128m"), None).is_err());
+    }
+
+    #[test]
+    fn parse_and_validate_memory_and_cpus_accepts_unlimited_swap() {
+        assert!(parse_and_validate_memory_and_cpus(Some("128m"), Some("-1"), None).is_ok());
+    }
+
+    #[test]
+    fn parse_and_validate_memory_and_cpus_rejects_zero_or_negative_cpus() {
+        assert!(parse_and_validate_memory_and_cpus(None, None, Some(0.0)).is_err());
+        assert!(parse_and_validate_memory_and_cpus(None, None, Some(-1.0)).is_err());
+        assert!(parse_and_validate_memory_and_cpus(None, None, Some(f64::NAN)).is_err());
     }
 
     #[test]
