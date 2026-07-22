@@ -78,6 +78,29 @@ struct Cli {
 /// lint exists for to actually matter, and no single field is large
 /// enough that boxing just one of them would meaningfully help
 /// anyway.
+/// `--pull`'s own image-pull policy — matching real `podman run
+/// --pull`/`podman build --pull` exactly (checked directly against a
+/// real installed `podman`): `Missing` (the default, and this
+/// project's own only behavior before this flag existed) pulls only
+/// if the reference isn't already in local storage; `Always` pulls
+/// unconditionally, even when already present (confirmed directly: a
+/// real `podman run --pull always`/`podman build --pull=always`
+/// against an already-pulled image still shows a real "Trying to
+/// pull..." line); `Never` never pulls at all, failing with a clear
+/// error if the reference isn't already present.
+///
+/// Deliberately narrower than real podman in one way: no `newer`
+/// policy (pull only if the registry's own copy is newer than what's
+/// local) — real podman's own `newer` needs an extra registry round
+/// trip purely to fetch comparison metadata, a genuinely separate,
+/// well-scoped future increment rather than folded into this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum PullPolicy {
+    Always,
+    Missing,
+    Never,
+}
+
 #[derive(Debug, clap::Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Command {
@@ -225,6 +248,15 @@ enum Command {
         /// top-level `annotations`.
         #[arg(long = "annotation", value_name = "KEY=VALUE")]
         annotation: Vec<String>,
+        /// Image-pull policy for both `FROM` and `COPY
+        /// --from=<external-image>` — matching real `podman build
+        /// --pull` exactly, including a real, checked-directly quirk
+        /// of its own: unlike `Command::Run`'s identical flag, a bare
+        /// `--pull` with no explicit value here really does default
+        /// to `always` (confirmed directly against a real `podman
+        /// build --pull` with no value, which pulls unconditionally).
+        #[arg(long, value_enum, default_value_t = PullPolicy::Missing, num_args = 0..=1, default_missing_value = "always")]
+        pull: PullPolicy,
     },
     /// List images in local storage.
     Images,
@@ -571,6 +603,15 @@ enum Command {
         /// exact same syntax/semantics.
         #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         tls_verify: bool,
+        /// Image-pull policy — matching real `podman run --pull`
+        /// exactly, including a real, checked-directly quirk of its
+        /// own: unlike `Command::Build`'s identical flag, this one
+        /// has no default-missing-value at all, so a bare `--pull`
+        /// with no explicit value is a real, immediate CLI parse
+        /// error here (confirmed directly against a real `podman
+        /// run --pull` with no value), not a silent `always`.
+        #[arg(long, value_enum, default_value_t = PullPolicy::Missing)]
+        pull: PullPolicy,
     },
     /// List containers.
     Ps {
@@ -729,6 +770,7 @@ fn main() -> std::process::ExitCode {
                 iidfile,
                 label,
                 annotation,
+                pull,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
@@ -741,6 +783,7 @@ fn main() -> std::process::ExitCode {
                 iidfile.as_deref(),
                 &label,
                 &annotation,
+                pull,
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),
@@ -772,6 +815,7 @@ fn main() -> std::process::ExitCode {
                 entrypoint,
                 volume,
                 tls_verify,
+                pull,
             }) => cmd_run(
                 &image,
                 &args,
@@ -795,6 +839,7 @@ fn main() -> std::process::ExitCode {
                 entrypoint.as_deref(),
                 &volume,
                 tls_verify,
+                pull,
             ),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
@@ -1575,6 +1620,7 @@ fn cmd_run(
     entrypoint: Option<&str>,
     volumes: &[String],
     tls_verify: bool,
+    pull_policy: PullPolicy,
 ) -> anyhow::Result<()> {
     let entrypoint = entrypoint.map(parse_entrypoint);
     let volumes = volumes
@@ -1628,7 +1674,7 @@ fn cmd_run(
     let reference = Reference::parse(image_ref)
         .with_context(|| format!("parsing image reference {image_ref:?}"))?;
     let store = open_store()?;
-    let record = resolve_or_pull(&store, &reference, tls_verify)?;
+    let record = resolve_or_pull(&store, &reference, tls_verify, pull_policy)?;
 
     let manifest = store
         .image_manifest(&record)
@@ -2581,21 +2627,43 @@ fn cmd_logs(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Look `reference` up in local storage, pulling it first if it isn't
-/// there yet (mirrors `cmd_pull`, minus the summary printing).
+/// Look `reference` up in local storage, pulling it according to
+/// `pull_policy` (mirrors `cmd_pull`, minus the summary printing).
 /// `tls_verify` matches `Command::Pull`'s own identical flag — see
 /// `registry_client`'s own doc comment.
 fn resolve_or_pull(
     store: &Store,
     reference: &Reference,
     tls_verify: bool,
+    pull_policy: PullPolicy,
 ) -> anyhow::Result<ImageRecord> {
-    if let Some(record) = store
+    let local = store
         .resolve_image(&reference.to_string())
-        .with_context(|| format!("looking up {reference} in local storage"))?
-    {
-        return Ok(record);
+        .with_context(|| format!("looking up {reference} in local storage"))?;
+    match pull_policy {
+        PullPolicy::Never => local.ok_or_else(|| {
+            anyhow::anyhow!("{reference}: no such image in local storage (run `ociman pull` first)")
+        }),
+        PullPolicy::Missing => {
+            if let Some(record) = local {
+                return Ok(record);
+            }
+            pull_unconditionally(store, reference, tls_verify)
+        }
+        PullPolicy::Always => pull_unconditionally(store, reference, tls_verify),
     }
+}
+
+/// The actual, unconditional pull `resolve_or_pull` performs whenever
+/// its own `pull_policy` decides one is needed — split out so
+/// `PullPolicy::Always` (which always calls this, local copy or not)
+/// and `PullPolicy::Missing` (which only calls this when nothing
+/// local exists yet) share the exact same real pull path.
+fn pull_unconditionally(
+    store: &Store,
+    reference: &Reference,
+    tls_verify: bool,
+) -> anyhow::Result<ImageRecord> {
     let mut client = registry_client(reference.registry_host(), tls_verify);
     let progress = oci_cli_common::progress::spinner(format!("pulling {}", reference.familiar()));
     let result = oci_registry::pull_image(&mut client, store, reference, &Platform::host())
