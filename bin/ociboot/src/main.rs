@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use clap::Parser;
+use oci_erofs::ErofsBuilder as _;
 
 /// Command-line interface.
 #[derive(Debug, Parser)]
@@ -74,6 +75,57 @@ enum Command {
         #[command(subcommand)]
         action: GrubenvAction,
     },
+    /// Build a real, sealed-ready erofs deployment image from an
+    /// already-pulled OCI image reference — the first genuinely new
+    /// slice of milestone 5's own `install to-disk` deliverable,
+    /// deliberately scoped down to just this one, safe, non-destructive
+    /// step: real partitioning, bootloader installation, and BLS entry
+    /// writing are *not* part of `install to-disk` proper (still
+    /// ahead) — this never touches a real disk or partition table at
+    /// all, only ever writes the one erofs image file `--output`
+    /// names.
+    ///
+    /// Reuses the exact same already-extracted-rootfs cache (`oci_
+    /// store::ensure_cached`) `ociman run`'s own overlay setup already
+    /// shares with every other container of the same image, rather
+    /// than a second, independent extraction of it — the same "share
+    /// as much as possible"/"don't waste disk space" reasoning that
+    /// moved `cache_root` into `oci-store` in the first place (0200).
+    ///
+    /// `--timestamp`/`--uuid` (both real `mkfs.erofs` flags
+    /// `oci_erofs::BuildOptions` exposes) are deliberately *not*
+    /// exposed here as their own CLI flags: this crate's own doc
+    /// comment already names deriving them from the image itself as
+    /// `ociboot`'s own policy to own, so this command does exactly
+    /// that instead of asking the caller to compute them by hand.
+    /// `timestamp` comes from the image's own `created` field (0197)
+    /// when parseable, `0` otherwise — real, meaningful provenance
+    /// (when this specific image was actually built) rather than an
+    /// arbitrary number, while still being fully deterministic (never
+    /// wall-clock "now"). `uuid` is derived directly from the image's
+    /// own manifest digest (the first 32 of its 64 hex characters,
+    /// regrouped into the standard 8-4-4-4-12 shape `mkfs.erofs -U`
+    /// expects) — not a real, versioned UUID (RFC 4122 v5 or
+    /// otherwise), just a deterministic reformatting, but that's all
+    /// `mkfs.erofs` itself actually requires: the same manifest digest
+    /// always yields the same UUID, and two different digests are
+    /// exceedingly unlikely to collide in their own leading 16 bytes,
+    /// same practical guarantee a real content-addressed digest
+    /// already gives every other identifier in this workspace.
+    BuildImage {
+        /// The image reference, exactly as it was pulled or tagged —
+        /// must already be present in local storage (`ociman pull`
+        /// first if it isn't; this command never pulls one itself).
+        reference: String,
+        /// Where to write the resulting erofs image (created, or
+        /// overwritten if it already exists).
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+        /// Optional erofs volume label (`mkfs.erofs -L`, 16 bytes max
+        /// — rejected by the real binary itself if longer).
+        #[arg(long, value_name = "LABEL")]
+        volume_label: Option<String>,
+    },
 }
 
 /// `ociboot grubenv`'s own subcommands — real `grub-editenv`'s own
@@ -109,12 +161,109 @@ fn main() -> std::process::ExitCode {
         match cli.command {
             Some(Command::List { boot_dir }) => cmd_list(&boot_dir),
             Some(Command::Grubenv { file, action }) => cmd_grubenv(&file, action),
+            Some(Command::BuildImage {
+                reference,
+                output,
+                volume_label,
+            }) => cmd_build_image(&reference, &output, volume_label.as_deref()),
             None => anyhow::bail!(
                 "no subcommand given (try `ociboot list`); \
-                 `install` arrives with milestone 5"
+                 the rest of `install to-disk` arrives with milestone 5"
             ),
         }
     })
+}
+
+/// Where this process's own real `oci_store::Store` lives — the same
+/// `$OCI_TOOLS_STORAGE_ROOT`-then-real-default resolution `ociman`
+/// itself uses (`oci_cli_common::storage::default_root`'s own doc
+/// comment: "shared by every binary that opens an `oci_store::Store`
+/// (`ociman` today; `ocicri` and `ociboot` later)") — this is that
+/// "later", finally reached.
+fn open_store() -> anyhow::Result<oci_store::Store> {
+    let root = oci_cli_common::storage::default_root();
+    oci_store::Store::open(&root)
+        .with_context(|| format!("opening image storage at {}", root.display()))
+}
+
+/// `ociboot build-image`: see [`Command::BuildImage`]'s own doc
+/// comment for the full scope and reasoning.
+fn cmd_build_image(
+    reference: &str,
+    output: &Path,
+    volume_label: Option<&str>,
+) -> anyhow::Result<()> {
+    let store = open_store()?;
+    // `Store::resolve_image` does an exact string match against
+    // whatever `ociman pull`/`ociman build`/... last recorded, always
+    // the fully-normalized form `oci_spec_types::Reference::parse`/
+    // `Display` produces (a bare `busybox` becomes `docker.io/
+    // library/busybox:latest`, matching every one of `ociman`'s own
+    // call sites doing the exact same normalization before ever
+    // calling it) -- never the caller's own possibly-shorthand input
+    // verbatim.
+    let normalized = oci_spec_types::Reference::parse(reference)
+        .with_context(|| format!("parsing {reference:?} as an image reference"))?
+        .to_string();
+    let record = store
+        .resolve_image(&normalized)
+        .with_context(|| format!("looking up {reference} in local storage"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("{reference}: no such image in local storage (run `ociman pull` first)")
+        })?;
+    let manifest = store
+        .image_manifest(&record)
+        .with_context(|| format!("reading manifest for {reference}"))?;
+    let config = store
+        .image_config(&record)
+        .with_context(|| format!("reading config for {reference}"))?;
+
+    let cache_root = oci_store::cache_root(&store);
+    let rootfs_dir = oci_store::ensure_cached(
+        &store,
+        &cache_root,
+        &record.manifest_digest,
+        &manifest.layers,
+    )
+    .with_context(|| format!("extracting a real rootfs for {reference}"))?;
+
+    let timestamp = config
+        .created
+        .as_deref()
+        .and_then(oci_spec_types::time::parse_rfc3339_utc)
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let uuid = deterministic_uuid_from_digest(&record.manifest_digest);
+
+    let options = oci_erofs::BuildOptions {
+        timestamp,
+        uuid,
+        all_root: true,
+        volume_label: volume_label.map(str::to_string),
+    };
+    oci_erofs::MkfsErofs
+        .build(&rootfs_dir, output, &options)
+        .with_context(|| format!("building erofs image at {}", output.display()))?;
+
+    println!("{}", output.display());
+    Ok(())
+}
+
+/// A deterministic (never random), `mkfs.erofs -U`-shaped UUID string
+/// derived directly from `manifest_digest`'s own hex — see
+/// [`Command::BuildImage`]'s own doc comment for why this is not a
+/// real, versioned UUID and doesn't need to be one.
+fn deterministic_uuid_from_digest(manifest_digest: &oci_spec_types::Digest) -> String {
+    let hex = manifest_digest.hex();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// Scan `boot_dir` for real BLS entries and print them in the real

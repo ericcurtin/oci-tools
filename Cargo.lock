@@ -878,6 +878,9 @@ dependencies = [
  "clap",
  "oci-bls",
  "oci-cli-common",
+ "oci-erofs",
+ "oci-spec-types",
+ "oci-store",
  "tracing",
 ]
 

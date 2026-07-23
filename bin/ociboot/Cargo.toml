@@ -14,6 +14,9 @@ anyhow.workspace = true
 clap.workspace = true
 oci-bls.workspace = true
 oci-cli-common.workspace = true
+oci-erofs.workspace = true
+oci-spec-types.workspace = true
+oci-store.workspace = true
 tracing.workspace = true
 
 [lints]

@@ -30,6 +30,24 @@ use oci_spec_types::image::Descriptor;
 
 use crate::{Store, StoreError};
 
+/// This cache's own root directory, under the same storage root every
+/// other kind of this project's own on-disk state (blobs, images,
+/// containers) already lives under — the one shared source of truth
+/// for this path (0200), rather than every caller independently
+/// `.join("rootfs-cache")`-ing `store.root()` and silently drifting
+/// apart if this ever changes. Originally `ociman`-private
+/// (`bin/ociman/src/rootfs_setup.rs`, still `ociman run`'s own actual
+/// call site plus `ociman prune`'s cleanup pass), moved here once
+/// `ociboot` needed the exact same already-extracted-rootfs cache
+/// `ensure_cached` below provides for its own deployment-image builds
+/// — reusing it rather than building a second, independent extraction
+/// of the same image saves real disk space and time, matching this
+/// project's own "share as much Rust code as possible"/"ensure we
+/// don't run out of disk space" standards directly.
+pub fn cache_root(store: &Store) -> PathBuf {
+    store.root().join("rootfs-cache")
+}
+
 /// The deterministic cache directory for `manifest_digest`, under
 /// `cache_root` — content-addressed the same way this crate's own
 /// blob storage is: the exact same manifest digest always means the
