@@ -7282,3 +7282,189 @@ fn build_quiet_suppresses_unused_build_arg_warning() {
         "-q should suppress the unused --build-arg warning too: {quiet_stderr:?}"
     );
 }
+
+/// `created` (0197): a real, previously-unnoticed bug found while
+/// investigating `ociman prune --filter until=`'s own prerequisites —
+/// the built image's own top-level `created` field was never updated
+/// anywhere in this file, so it silently stayed whatever the base
+/// image's own `created` already was, however many real instructions
+/// actually ran. Matching real `podman build`'s own checked-directly
+/// behavior: `created` always mirrors the built image's own *last*
+/// history entry, so a `RUN` step (which always adds one, timestamped
+/// with the real time it actually committed) bumps it to a real,
+/// current timestamp.
+#[test]
+fn build_updates_created_to_match_the_last_history_entry_after_a_run_step() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    // `seed_image`'s own base config always has `created: None` (see
+    // `oci_tools_tests::seed_image_with_files_and_compression`) — a
+    // built image whose own `created` comes back `Some(...)` at all
+    // can only be explained by this fix actually running, not by
+    // simply inheriting whatever the base already had.
+    seed_image(
+        &store,
+        "ociman-test/created-run-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/created-run-base:latest\nRUN echo hi > /hi.txt\n",
+    );
+
+    let before = std::time::SystemTime::now();
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/created-run-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &["inspect", "--json", "ociman-test/created-run-result:latest"],
+    );
+    assert!(inspect.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    let created = view["created"]
+        .as_str()
+        .expect("a RUN step should give the built image a real created timestamp");
+    let parsed = oci_spec_types::time::parse_rfc3339_utc(created)
+        .expect("created should be a valid RFC3339 timestamp");
+    let elapsed = parsed
+        .duration_since(before)
+        .unwrap_or(std::time::Duration::ZERO);
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "created ({created}) should be roughly \"now\" (the real build time), not the base \
+         image's own (which this project's own `seed_image` always leaves as `None`)"
+    );
+}
+
+/// The other half of 0197's own real rule: a bare `FROM` with no
+/// instructions of its own at all (and no `--label`) adds no new
+/// history entry, so `created` is left completely unchanged from the
+/// base — matching real `podman build`'s own identical no-op for this
+/// exact shape (checked directly).
+#[test]
+fn build_leaves_created_unchanged_for_a_bare_from_with_no_instructions() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/created-bare-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/created-bare-base:latest\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/created-bare-result:latest",
+        ],
+    );
+    assert!(build.status.success());
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "--json",
+            "ociman-test/created-bare-result:latest",
+        ],
+    );
+    assert!(inspect.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(
+        view["created"],
+        serde_json::Value::Null,
+        "a bare FROM with no instructions and no --label should leave `created` unchanged \
+         from the base (`seed_image`'s own base has none): {view:?}"
+    );
+}
+
+/// `--label` alone (no `RUN`/`COPY`/`ADD` at all) also adds its own
+/// trailing history entry — matching real `podman build --label`'s
+/// own checked-directly behavior, this alone is enough to bump
+/// `created` too, exactly like a real instruction would.
+#[test]
+fn build_label_flag_alone_also_bumps_created() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/created-label-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/created-label-base:latest\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--label",
+            "extra=fromflag",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/created-label-result:latest",
+        ],
+    );
+    assert!(build.status.success());
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "--json",
+            "ociman-test/created-label-result:latest",
+        ],
+    );
+    assert!(inspect.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert!(
+        view["created"].as_str().is_some(),
+        "--label alone should also add a history entry, bumping created away from the base's \
+         own None: {view:?}"
+    );
+}

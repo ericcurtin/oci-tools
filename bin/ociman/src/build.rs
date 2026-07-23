@@ -547,6 +547,38 @@ pub fn cmd_build(
         }
     }
 
+    // The built image's own top-level `created` always mirrors its
+    // own *last* history entry's `created` -- matching real `podman
+    // build`'s own checked-directly behavior exactly (0197): a real,
+    // previously-unnoticed bug found by hand while investigating
+    // `ociman prune --filter until=`'s own prerequisites, this field
+    // was never actually updated anywhere in this file before now, so
+    // every image `ociman build` ever produced silently kept its own
+    // base image's original `created` forever, however many `RUN`/
+    // `COPY`/`LABEL` instructions (or CLI `--label`s) it actually ran
+    // -- confirmed directly against a real `podman build`: a bare
+    // `FROM` with no instructions at all (and no `--label`) leaves
+    // `Created` completely unchanged from the base (there is no new
+    // history entry to update it with, the same "no-op" real podman
+    // itself exhibits), but *any* instruction or `--label` that adds a
+    // real history entry (this project's own `record_layer`/
+    // `record_empty_history` already correctly timestamp every one of
+    // those with the real time it actually ran, right down to
+    // sub-second precision matching real podman's own) bumps `Created`
+    // to match it exactly -- this one assignment, applied
+    // unconditionally right at the very end (after `--label`, which
+    // adds its own trailing history entry, and after `--squash`/
+    // `--squash-all`'s own history truncation/rewriting inside
+    // `build_stage`, both of which preserve each entry's own original
+    // timestamp untouched), is correct for every one of those cases at
+    // once: an untouched bare `FROM`'s own last history entry is
+    // already whatever `created` its base already had, a no-op either
+    // way.
+    config.created = config
+        .history
+        .last()
+        .and_then(|entry| entry.created.clone());
+
     let config_bytes = serde_json::to_vec(&config).context("serializing image config")?;
     let config_ingested = store
         .ingest(&config_bytes[..])
