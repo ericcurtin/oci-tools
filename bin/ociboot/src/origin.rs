@@ -90,7 +90,7 @@ pub fn write(image_path: &Path, origin: &DeploymentOrigin) -> std::io::Result<()
 /// anything — `Ok(None)` when there's no origin record at all (an
 /// image built by an older version of this binary, or not by
 /// `ociboot build-image` at all), never an error just for that.
-#[cfg(test)]
+/// `ociboot status`'s own real, first reader.
 pub fn read(image_path: &Path) -> std::io::Result<Option<DeploymentOrigin>> {
     let path = origin_path(image_path);
     match std::fs::read(&path) {

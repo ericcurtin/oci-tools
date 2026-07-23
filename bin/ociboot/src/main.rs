@@ -182,6 +182,29 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         entry: PathBuf,
     },
+    /// Show the real, on-disk provenance record for a deployment
+    /// image built by `ociboot build-image` — reads back exactly
+    /// what `origin::write` recorded there (image reference/digest/
+    /// version, build timestamp), nothing more.
+    ///
+    /// Deliberately *not* yet a full bootc-style "booted/staged/
+    /// rollback" report the way real `bootc status` gives — that
+    /// needs two pieces of real provenance this project doesn't have
+    /// yet: a BLS entry actually pointing at a specific deployment
+    /// image (real partitioning/bootloader/BLS-entry-writing is still
+    /// ahead, milestone 5's own `install to-disk`) and a real
+    /// boot-time digest-in-`/proc/cmdline` convention (`ociboot-init`'s
+    /// own still-ahead job). Reporting those roles today would mean
+    /// inventing data this project genuinely doesn't have — see
+    /// `docs/design/0222` for the full reasoning. This is exactly
+    /// `origin::write`'s own read-side counterpart, no more.
+    Status {
+        /// The deployment image path originally given to `ociboot
+        /// build-image --output` — its own sibling
+        /// `<image>.origin.json` is what actually gets read here,
+        /// never the image file's own contents.
+        image: PathBuf,
+    },
 }
 
 /// `ociboot grubenv`'s own subcommands — real `grub-editenv`'s own
@@ -224,6 +247,7 @@ fn main() -> std::process::ExitCode {
                 seal,
             }) => cmd_build_image(&reference, &output, volume_label.as_deref(), seal),
             Some(Command::Bless { entry }) => cmd_bless(&entry),
+            Some(Command::Status { image }) => cmd_status(&image, cli.global.json),
             None => anyhow::bail!(
                 "no subcommand given (try `ociboot list`); \
                  the rest of `install to-disk` arrives with milestone 5"
@@ -517,6 +541,48 @@ fn cmd_bless(entry: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("renaming {} to {}", entry.display(), new_path.display()))?;
     println!("{}", new_path.display());
     Ok(())
+}
+
+/// `ociboot status`: see [`Command::Status`]'s own doc comment for
+/// the full scope and why this isn't yet a real bootc-style booted/
+/// staged/rollback report.
+fn cmd_status(image: &Path, json: bool) -> anyhow::Result<()> {
+    let record = origin::read(image)
+        .with_context(|| format!("reading a deployment origin record for {}", image.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}: no deployment origin record found (was this built by `ociboot build-image`?)",
+                image.display()
+            )
+        })?;
+    if json {
+        return oci_cli_common::output::print_json(&record);
+    }
+    println!("Image reference: {}", record.image_reference);
+    println!("Image digest:    {}", record.image_digest);
+    println!(
+        "Image version:   {}",
+        record.image_version.as_deref().unwrap_or("<none>")
+    );
+    println!("Built at:        {}", format_built_at(record.built_at));
+    Ok(())
+}
+
+/// `DeploymentOrigin::built_at`'s own real display form — a real,
+/// human-readable RFC 3339 timestamp (matching this workspace's own
+/// existing `oci_spec_types::time::format_rfc3339_utc` convention,
+/// already used everywhere else a Unix timestamp needs to be shown to
+/// a person) unless it's the documented `0` "unparseable/missing
+/// `created` field" sentinel `cmd_build_image` itself already
+/// establishes, which is shown as an honest `"unknown"` rather than a
+/// misleadingly precise `1970-01-01T00:00:00Z`.
+fn format_built_at(built_at: u64) -> String {
+    if built_at == 0 {
+        return "unknown".to_string();
+    }
+    oci_spec_types::time::format_rfc3339_utc(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(built_at),
+    )
 }
 
 /// A human-readable `" [...]"` suffix describing the real BLS boot-
