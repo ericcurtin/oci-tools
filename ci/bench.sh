@@ -150,6 +150,45 @@ if [ "${#hf_args[@]}" -gt 0 ]; then
 fi
 
 echo
+echo "### ociman vs podman vs docker: run -d (detached create+start, returns at running) ###"
+# The isolated create+start half of the startup story (the combined
+# run --rm cycle above includes destroy) -- the same "ociman run -d
+# (create-only) vs podman run -d" figure every performance-
+# reverification note since 0161 measured by hand (see
+# docs/design/0170's own "Method" section): each sample starts a real
+# detached container and returns once it's running; the previous
+# sample's own container is removed in --prepare, outside the timed
+# region.
+"$ociman" rm -f benchd >/dev/null 2>&1 || true
+if need podman; then podman rm -f benchd >/dev/null 2>&1 || true; fi
+if need docker; then docker rm -f benchd >/dev/null 2>&1 || true; fi
+hf_args=()
+if "$ociman" images 2>/dev/null | grep -q "^$image "; then
+    hf_args+=(
+        --prepare "$ociman rm -f benchd >/dev/null 2>&1 || true"
+        --command-name "ociman run -d" "$ociman run -d --name benchd $image sleep 60"
+    )
+fi
+if need podman && podman image exists "$image" 2>/dev/null; then
+    hf_args+=(
+        --prepare "podman rm -f benchd >/dev/null 2>&1 || true"
+        --command-name "podman run -d" "podman run -d --name benchd $image sleep 60"
+    )
+fi
+if need docker && docker image inspect "$image" >/dev/null 2>&1; then
+    hf_args+=(
+        --prepare "docker rm -f benchd >/dev/null 2>&1 || true"
+        --command-name "docker run -d" "docker run -d --name benchd $image sleep 60"
+    )
+fi
+if [ "${#hf_args[@]}" -gt 0 ]; then
+    hyperfine --warmup 3 "${hf_args[@]}"
+fi
+"$ociman" rm -f benchd >/dev/null 2>&1 || true
+if need podman; then podman rm -f benchd >/dev/null 2>&1 || true; fi
+if need docker; then docker rm -f benchd >/dev/null 2>&1 || true; fi
+
+echo
 echo "### ociman vs podman: commit (an already-stopped container, re-committed over the same tag) ###"
 # The exact methodology every performance-reverification note since
 # 0161 has used by hand (see docs/design/0176's own "Method" section):

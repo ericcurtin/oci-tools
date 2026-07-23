@@ -32,6 +32,13 @@ ci/bench.sh
   this project's own goal names destroy time as its own, separate
   benchmark, not just whatever's left over inside a combined `run`
   figure.
+* **`ociman run -d` vs `podman run -d`/`docker run -d`** — the
+  isolated create+start half of the startup story (the combined
+  `run --rm` cycle includes destroy), the same figure every
+  performance-reverification note since 0161 measured by hand; each
+  sample starts a real detached container and returns once it's
+  running, with the previous sample's container removed in
+  `--prepare`, outside the timed region (see `0245` for the wiring).
 * **`ociman commit` vs `podman commit`** — the exact methodology
   every performance-reverification note since 0161 used by hand (see
   `docs/design/0176`'s own "Method" section, and `0235` for the
@@ -67,34 +74,38 @@ it just stops it from failing outright on `crun`.
 
 ## Representative historical results
 
-From `docs/design/0183` (the most recent full re-verification as of
+From `docs/design/0245` (the most recent full re-verification as of
 this writing), this project's own aarch64 dev host, `crun 1.14.1`/
 `runc 1.3.4`/`podman 4.9.3`/`docker 29.2.1`:
 
 | comparison | this project | real equivalent | speedup |
 |---|---:|---:|---:|
-| `ocirun run` vs `crun run` | 3.4ms | 7.5ms | 2.20× |
-| `ocirun run` vs `runc run` | 3.4ms | 21.8ms | 6.37× |
-| `ociman run --rm` vs `podman run --rm` | 66.8ms | 189.9ms | 2.84× |
-| `ociman run --rm` vs `docker run --rm` | 66.8ms | 289.9ms | 4.34× |
-| `ociman rm` (destroy-only) vs `podman rm` | 5.2ms | 72.4ms | 13.94× |
-| `ociman commit` vs `podman commit` | 2.6ms | 98.7ms | 38.19× |
+| `ocirun run` vs `crun run` | 3.1ms | 6.8ms | 2.20× |
+| `ocirun run` vs `runc run` | 3.1ms | 20.3ms | 6.59× |
+| `ociman run --rm` vs `podman run --rm` | 33.2ms | 200.2ms | 6.04× |
+| `ociman run --rm` vs `docker run --rm` | 33.2ms | 298.3ms | 9.00× |
+| `ociman run -d` vs `podman run -d` | 39.5ms | 151.3ms | 3.83× |
+| `ociman run -d` vs `docker run -d` | 39.5ms | 175.8ms | 4.45× |
+| `ociman rm` (destroy-only) vs `podman rm` | 1.3ms | 72.9ms | 54.16× |
+| `ociman commit` vs `podman commit` | 3.4ms | 114.8ms | 33.75× |
 
 Absolute numbers vary session to session (host load, exact tool
 versions) and will differ on any other host entirely — the relative
 gap holding steady release after release, re-verified repeatedly
 rather than assumed to still be true forever, is the actual point.
-Most recently reconfirmed (`docs/design/0221`, same tool versions, 37
-commits later, none touching this path): every figure above still a
-decisive win, some sessions faster/slower than others purely from host
-load, never from a real regression.
+Reconfirmed at every single increment since 0219 (each commit message
+carries its own `ci/bench.sh` figures), most recently and formally in
+`docs/design/0245` — including after 0239 added the same real
+per-start `/dev`-population work crun/runc do (a fairness fix inside
+the hot path): every figure above still a decisive win, sessions
+varying with host load, never a real regression.
 
 ## What this doesn't cover yet
 
-* `ociman create -d`/create-only timing, and every other individual
+* Any remaining individual
   `docs/design/*-performance-reverification-*` figure that isn't one
-  of the four comparisons above — real, still-ahead follow-up work to
-  fold into the script rather than leaving them hand-run-only.
+  of the five comparisons above — the historically hand-run set is
+  now fully folded in (run/run --rm/rm/commit/run -d).
 * Not wired into `.github/workflows/ci.yml`, deliberately: a shared,
   possibly-contended CI runner (and one that may not even have crun/
   runc/podman/docker installed at all) is a poor host for a benchmark
