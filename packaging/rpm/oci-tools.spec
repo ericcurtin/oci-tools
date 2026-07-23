@@ -1,0 +1,67 @@
+Name:           oci-tools
+Version:        0.1.0
+Release:        1%{?dist}
+Summary:        Pure-Rust reimplementation of the container and bootable-container stack
+License:        Apache-2.0
+URL:            https://github.com/ericcurtin/oci-tools
+Source0:        %{name}-%{version}.tar.gz
+
+# rustc/cargo are commonly managed via rustup rather than a distro
+# package (including on the system this spec was first written and
+# verified against) -- listed here for documentation/`dnf builddep`
+# purposes, but a bare `rpmbuild -bb` (this project's own real, local
+# verification method, see packaging/README.md) never actually
+# enforces `BuildRequires` the way `mock`/`dnf builddep` do, so this
+# doesn't block a real local build either way.
+BuildRequires:  gcc
+
+%description
+oci-tools is a pure-Rust, monorepo reimplementation of the container
+and bootable-container stack:
+
+ * ocirun       - OCI runtime (runc/crun-CLI-compatible)
+ * ociman       - daemonless container engine (podman equivalent)
+ * ocicri       - Kubernetes CRI server (cri-o equivalent)
+ * ocibox       - pet containers with home/user/host integration
+                  (distrobox equivalent)
+ * ociboot      - bootable-container OS manager (bootc-inspired,
+                  no ostree/composefs dependency)
+ * ociboot-init - tiny initramfs helper that mounts ociboot
+                  deployments (installed for a future dracut module
+                  to pick up; see packaging/README.md)
+
+This is this project's own first, real packaging slice: it installs
+the six real, already-tested release binaries built from this exact
+source tree, with no systemd units, no dracut module integration, and
+no sub-packages yet -- see packaging/README.md for exactly what's
+still ahead.
+
+%prep
+%setup -q
+
+%build
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo build --release --locked --offline
+
+%install
+install -D -m 0755 target/release/ocirun %{buildroot}%{_bindir}/ocirun
+install -D -m 0755 target/release/ociman %{buildroot}%{_bindir}/ociman
+install -D -m 0755 target/release/ocicri %{buildroot}%{_bindir}/ocicri
+install -D -m 0755 target/release/ocibox %{buildroot}%{_bindir}/ocibox
+install -D -m 0755 target/release/ociboot %{buildroot}%{_bindir}/ociboot
+install -D -m 0755 target/release/ociboot-init %{buildroot}%{_libexecdir}/oci-tools/ociboot-init
+
+%files
+%license LICENSE
+%doc README.md
+%{_bindir}/ocirun
+%{_bindir}/ociman
+%{_bindir}/ocicri
+%{_bindir}/ocibox
+%{_bindir}/ociboot
+%{_libexecdir}/oci-tools/ociboot-init
+
+%changelog
+* Thu Jul 23 2026 The oci-tools contributors <oci-tools@example.invalid> - 0.1.0-1
+- Initial packaging: the six real release binaries, no systemd units
+  or dracut module integration yet (see docs/design/0216).
