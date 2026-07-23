@@ -260,7 +260,7 @@ fn cmd_build_image(
 
     let options = oci_erofs::BuildOptions {
         timestamp,
-        uuid,
+        uuid: uuid.clone(),
         all_root: true,
         volume_label: volume_label.map(str::to_string),
     };
@@ -275,19 +275,72 @@ fn cmd_build_image(
         // matching the real kernel feature exactly) -- sealing always
         // happens last, only after the image itself has been written
         // successfully and completely, never before.
-        oci_erofs::verity::enable(output).with_context(|| {
-            format!(
-                "sealing {} with fs-verity (its own destination filesystem may not support it \
-                 at all -- fs-verity is not universal)",
-                output.display()
-            )
-        })?;
-        let digest = oci_erofs::verity::measure(output)
-            .with_context(|| format!("reading back {}'s own fs-verity digest", output.display()))?
-            .expect("verity::enable just succeeded, so measure must find a real digest now");
-        println!("verity: {}", hex_encode(&digest));
+        match oci_erofs::verity::enable(output) {
+            Ok(()) => {
+                let digest = oci_erofs::verity::measure(output)
+                    .with_context(|| {
+                        format!("reading back {}'s own fs-verity digest", output.display())
+                    })?
+                    .expect(
+                        "verity::enable just succeeded, so measure must find a real digest now",
+                    );
+                println!("verity: {}", hex_encode(&digest));
+            }
+            // Real, checked-directly fallback for a destination
+            // filesystem that doesn't support fs-verity at all
+            // (`EOPNOTSUPP`) -- `oci_erofs::dmverity`'s own module
+            // doc comment names exactly this scenario as its own
+            // reason for existing. Any *other* error (permission
+            // denied, disk full, ...) still propagates as a real,
+            // hard failure below -- only "this specific feature isn't
+            // supported here" falls back, nothing else.
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                let hash_tree_path = detached_hash_tree_path(output);
+                // Same deterministic-not-random reasoning `timestamp`/
+                // `uuid` above already established: the manifest
+                // digest's own UUID (reused verbatim -- the same
+                // image always gets the same identifier either way)
+                // and its own full 64-hex-character digest as the
+                // salt (any even-length hex string `veritysetup`
+                // itself accepts works; reusing the digest directly
+                // needs no separate derivation at all).
+                let dmverity_options = oci_erofs::dmverity::FormatOptions {
+                    uuid,
+                    salt: record.manifest_digest.hex().to_string(),
+                };
+                let root_hash =
+                    oci_erofs::dmverity::format(output, &hash_tree_path, &dmverity_options)
+                        .with_context(|| {
+                            format!(
+                                "sealing {} with a detached dm-verity hash tree at {} (fs-verity \
+                                 itself is unsupported on this destination filesystem)",
+                                output.display(),
+                                hash_tree_path.display()
+                            )
+                        })?;
+                println!("dm-verity: {root_hash}");
+                println!("dm-verity-hash-tree: {}", hash_tree_path.display());
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("sealing {} with fs-verity", output.display()));
+            }
+        }
     }
     Ok(())
+}
+
+/// Where a detached dm-verity hash tree for `output` lives — a plain
+/// sibling file, `<output>.verity` (this project's own convention, no
+/// real prior-art naming to match: `veritysetup`'s own docs never
+/// prescribe one, since the data and hash-tree devices are ordinarily
+/// two entirely separate block devices in a real dm-verity setup, not
+/// two files sharing a directory the way this project's own detached-
+/// file-level usage does).
+fn detached_hash_tree_path(output: &Path) -> PathBuf {
+    let mut name = output.as_os_str().to_owned();
+    name.push(".verity");
+    PathBuf::from(name)
 }
 
 /// Lowercase hex, no external crate needed for 32 fixed bytes — same

@@ -371,3 +371,115 @@ fn build_image_without_seal_prints_no_verity_line_and_stays_writable() {
         .and_then(|mut f| std::io::Write::write_all(&mut f, b"still writable"))
         .expect("an unsealed file should still accept a real write");
 }
+
+fn veritysetup_available() -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("veritysetup"))
+        .any(|p| p.is_file())
+}
+
+/// `--seal` against a destination filesystem that doesn't support
+/// fs-verity (an ordinary tempdir — never a real fs-verity-capable
+/// mount the way `build_image_seal_makes_the_output_genuinely_
+/// immutable_and_prints_a_real_digest`'s own dedicated loopback ext4
+/// fixture is) falls back to a real, detached dm-verity hash tree
+/// instead of failing outright — verified directly: the printed root
+/// hash actually matches the real hash tree `veritysetup verify`
+/// itself computes, and the output erofs image stays perfectly
+/// ordinary and writable afterward (unlike fs-verity sealing, a
+/// detached dm-verity hash tree never touches the data file's own
+/// permissions at all — confirmed directly against a real installed
+/// `veritysetup`).
+#[test]
+fn build_image_seal_falls_back_to_dm_verity_when_fs_verity_is_unsupported() {
+    if !mkfs_erofs_available() {
+        eprintln!("skipping: mkfs.erofs not installed");
+        return;
+    }
+    if !veritysetup_available() {
+        eprintln!("skipping: veritysetup not installed");
+        return;
+    }
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociboot-test/build-image-dmverity:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let output_dir = tempfile::tempdir().unwrap();
+    let output_path = output_dir.path().join("deployment.erofs");
+    let build = ociboot(
+        storage_dir.path(),
+        &[
+            "build-image",
+            "ociboot-test/build-image-dmverity:latest",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--seal",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&build.stdout);
+
+    // An ordinary tempdir is not expected to be fs-verity-capable, so
+    // the dm-verity fallback should be the one that actually ran --
+    // but tolerate the (unlikely, environment-dependent) case that
+    // this particular test host's own tmpdir genuinely does support
+    // fs-verity, in which case falling back was correctly never
+    // needed at all, and there's nothing further this test can check.
+    let Some(root_hash) = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("dm-verity: "))
+    else {
+        eprintln!(
+            "note: fs-verity itself succeeded on this host's own tempdir (no fallback needed): \
+             {stdout:?}"
+        );
+        return;
+    };
+    let hash_tree_line = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("dm-verity-hash-tree: "))
+        .expect("a dm-verity: line should always come with its own hash-tree path line");
+    let hash_tree_path = Path::new(hash_tree_line);
+    assert!(
+        hash_tree_path.is_file(),
+        "the printed hash-tree path should be a real file: {hash_tree_line}"
+    );
+
+    let verify = Command::new("veritysetup")
+        .arg("verify")
+        .arg(&output_path)
+        .arg(hash_tree_path)
+        .arg(root_hash)
+        .status()
+        .unwrap();
+    assert!(
+        verify.success(),
+        "the printed root hash should verify successfully against the real hash tree"
+    );
+
+    // Unlike fs-verity, a detached dm-verity hash tree never touches
+    // the data file's own permissions at all -- the erofs image
+    // itself is still perfectly ordinary and writable.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&output_path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, b"still writable"))
+        .expect("dm-verity sealing should never make the data file itself immutable");
+}
