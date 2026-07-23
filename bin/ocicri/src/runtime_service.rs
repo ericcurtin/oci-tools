@@ -1,13 +1,14 @@
 //! The real `RuntimeService` gRPC implementation — see this crate's
 //! own module doc comment (`main.rs`) for the exact scope of this
-//! first slice: `Version`/`Status` are genuinely implemented; every
-//! other one of the real CRI v1 `RuntimeService`'s remaining 32 RPCs
-//! (pod sandbox/container lifecycle, exec/attach/port-forward, stats,
-//! events, ...) returns a real, honest `Status::unimplemented` rather
-//! than silently accepting a request it can't actually act on —
-//! matching this project's own established "narrow first slice,
-//! document the rest" pattern used everywhere else (e.g. `ociboot
-//! build-image` before `install to-disk`).
+//! first slice: `Version`/`Status`/`RuntimeConfig`/
+//! `UpdateRuntimeConfig` are genuinely implemented; every other one of
+//! the real CRI v1 `RuntimeService`'s remaining 30 RPCs (pod sandbox/
+//! container lifecycle, exec/attach/port-forward, stats, events, ...)
+//! returns a real, honest `Status::unimplemented` rather than silently
+//! accepting a request it can't actually act on — matching this
+//! project's own established "narrow first slice, document the rest"
+//! pattern used everywhere else (e.g. `ociboot build-image` before
+//! `install to-disk`).
 //!
 //! `ImageService` (the CRI's other, smaller service — `ListImages`/
 //! `PullImage`/... ) isn't wired up into the server at all yet; it's
@@ -61,7 +62,7 @@ pub struct RuntimeServiceImpl;
 fn unimplemented<T>(name: &str) -> Result<Response<T>, Status> {
     Err(Status::unimplemented(format!(
         "ocicri: {name} is not implemented yet (milestone 7, a real, narrow first slice: only \
-         Version/Status are answered so far)"
+         Version/Status/RuntimeConfig/UpdateRuntimeConfig are answered so far)"
     )))
 }
 
@@ -266,11 +267,24 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         unimplemented("StreamPodSandboxStats")
     }
 
+    /// A real, unconditional no-op — matching real `cri-o`'s own
+    /// identical implementation exactly (`server/update_runtime_
+    /// config.go`, checked directly: it doesn't even read the request
+    /// body, just returns an empty response). This RPC exists to push
+    /// a kubelet-allocated pod CIDR into the runtime for the old
+    /// *kubenet* network plugin era; kubenet was removed from
+    /// Kubernetes years ago, and modern CNI plugins get their own IP
+    /// allocation through their own IPAM, never through this RPC — so
+    /// silently discarding the given `pod_cidr` is genuinely the
+    /// correct, current behavior, not a shortcut around anything this
+    /// project doesn't support yet (real `cri-o` reaches the exact
+    /// same conclusion, on a codebase with every real networking
+    /// capability this project's own `ocicri` doesn't have).
     async fn update_runtime_config(
         &self,
         _request: Request<cri::UpdateRuntimeConfigRequest>,
     ) -> Result<Response<cri::UpdateRuntimeConfigResponse>, Status> {
-        unimplemented("UpdateRuntimeConfig")
+        Ok(Response::new(cri::UpdateRuntimeConfigResponse {}))
     }
 
     /// A real, mostly-static response — checked directly against real
@@ -398,11 +412,33 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         unimplemented("StreamPodSandboxMetrics")
     }
 
+    /// Reports the real cgroup driver this project's own container-
+    /// orchestration binary (`ociman run`/`create`) actually,
+    /// unconditionally uses today: the **systemd** driver (a real
+    /// transient scope via `oci_runtime_core::systemd_cgroup`,
+    /// checked directly in `bin/ociman/src/main.rs` — `ociman` never
+    /// falls through to plain cgroupfs at all, regardless of the
+    /// spec's own `cgroupsPath`). `ocirun run` itself uses plain
+    /// cgroupfs instead (`CgroupSetup::FromSpec`, matching real
+    /// `runc`/`crun`'s own spec-driven behavior) — but `ocirun` is the
+    /// low-level OCI runtime layer, not what a real kubelet is asking
+    /// about here; the CRI-facing answer is about this project's own
+    /// container-orchestration behavior, the same one `ociman`
+    /// already establishes. This also matches real `cri-o`'s own
+    /// checked-directly default (`internal/config/cgmgr/
+    /// cgmgr_linux.go`'s own `DefaultCgroupManager = systemd`,
+    /// confirmed by `crio.conf`'s own shipped default) — not a
+    /// coincidence: both this project and real `cri-o` land on
+    /// systemd as the sane default for a real systemd-based host.
     async fn runtime_config(
         &self,
         _request: Request<cri::RuntimeConfigRequest>,
     ) -> Result<Response<cri::RuntimeConfigResponse>, Status> {
-        unimplemented("RuntimeConfig")
+        Ok(Response::new(cri::RuntimeConfigResponse {
+            linux: Some(cri::LinuxRuntimeConfiguration {
+                cgroup_driver: cri::CgroupDriver::Systemd as i32,
+            }),
+        }))
     }
 
     async fn update_pod_sandbox_resources(

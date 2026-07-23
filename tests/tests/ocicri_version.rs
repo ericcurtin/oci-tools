@@ -11,7 +11,9 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 use oci_cri_types::runtime_service_client::RuntimeServiceClient;
-use oci_cri_types::{StatusRequest, VersionRequest};
+use oci_cri_types::{
+    CgroupDriver, RuntimeConfigRequest, StatusRequest, UpdateRuntimeConfigRequest, VersionRequest,
+};
 use oci_tools_tests::bin_path;
 
 /// A running `ocicri` server, killed on drop so a failing test (or an
@@ -161,6 +163,51 @@ async fn status_verbose_populates_a_real_non_empty_info_map() {
     assert!(!response.info.is_empty());
     assert_eq!(response.info.get("runtimeName").unwrap(), "ocicri");
     assert!(!response.info.get("runtimeVersion").unwrap().is_empty());
+}
+
+/// `RuntimeConfig` reports the real cgroup driver `ociman run`/
+/// `create` actually, unconditionally uses today (systemd) — see
+/// `docs/design/0229`.
+#[tokio::test]
+async fn runtime_config_reports_the_real_systemd_cgroup_driver() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("ocicri.sock");
+    let _server = spawn_server(&socket_path);
+    wait_for_socket(&socket_path);
+
+    let mut client = connect(socket_path).await;
+    let response = client
+        .runtime_config(RuntimeConfigRequest {})
+        .await
+        .expect("RuntimeConfig RPC failed")
+        .into_inner();
+
+    let linux = response.linux.expect("linux config should be present");
+    assert_eq!(linux.cgroup_driver, CgroupDriver::Systemd as i32);
+}
+
+/// `UpdateRuntimeConfig` is a real, unconditional no-op — matching
+/// real `cri-o` exactly (it discards the given pod CIDR silently,
+/// see `docs/design/0229`) — succeeds regardless of what's in the
+/// request.
+#[tokio::test]
+async fn update_runtime_config_is_a_real_unconditional_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("ocicri.sock");
+    let _server = spawn_server(&socket_path);
+    wait_for_socket(&socket_path);
+
+    let mut client = connect(socket_path).await;
+    client
+        .update_runtime_config(UpdateRuntimeConfigRequest {
+            runtime_config: Some(oci_cri_types::RuntimeConfig {
+                network_config: Some(oci_cri_types::NetworkConfig {
+                    pod_cidr: "10.244.0.0/16".to_string(),
+                }),
+            }),
+        })
+        .await
+        .expect("UpdateRuntimeConfig should always succeed");
 }
 
 /// Every other real RPC returns a real, honest `Unimplemented` gRPC
