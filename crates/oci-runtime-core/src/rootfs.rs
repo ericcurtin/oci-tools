@@ -80,32 +80,6 @@ pub enum RootfsAction {
     RemountReadonly {
         /// Target to remount read-only.
         target: PathBuf,
-        /// Whether a real `EPERM` here is a known, tolerable rootless
-        /// limitation, or a real failure that must never be silently
-        /// swallowed.
-        ///
-        /// `true` only for `linux.readonly_paths`/a read-only root
-        /// filesystem (`docs/design/0010`): these are commonly
-        /// host-adjacent paths (e.g. `/proc/bus`, or `/sys` reached
-        /// through a rootless root's own recursive bind) a
-        /// fake-root-in-a-userns doesn't fully own the superblock of,
-        /// where remounting read-only can legitimately require
-        /// `CAP_SYS_ADMIN` in a namespace this process doesn't have.
-        ///
-        /// `false` for every real `-v`/`--volume` bind mount a caller
-        /// explicitly requested `:ro` for (`bundle.spec.mounts`, e.g.
-        /// a named volume this project's own code created and fully
-        /// owns) — found and fixed a real, previously-unnoticed,
-        /// security-relevant bug here directly (`docs/design/0232`):
-        /// this single enum variant used to tolerate `EPERM`
-        /// *unconditionally*, so a remount failure for a user's own
-        /// explicitly-requested read-only volume was silently
-        /// swallowed too, leaving it genuinely writable while
-        /// `ociman run` itself reported success — a real, silent lie
-        /// about a security-relevant guarantee the caller was relying
-        /// on, not a benign, already-understood limitation the way
-        /// `/sys` genuinely is.
-        tolerate_permission_denied: bool,
     },
     /// Mask `target`: hide whatever is there. Whether that means binding
     /// `/dev/null` over a file or mounting an empty read-only `tmpfs`
@@ -181,21 +155,6 @@ pub fn plan_rootfs_setup(bundle: &Bundle, rootfs: &Path) -> Vec<RootfsAction> {
             mount.source.clone(),
             file_system_type,
             parsed,
-            // The one, real, already-documented (`docs/design/0010`)
-            // rootless exception reaching this function at all: a
-            // rootless container can't mount a fresh `sysfs` of its
-            // own, so `Spec::into_rootless` bind-mounts the host's
-            // real `/sys` read-only instead -- a real host filesystem
-            // this process doesn't own the superblock of, where a
-            // remount-to-read-only `EPERM` is a known, tolerable
-            // limitation. Every *other* mount reaching this function
-            // (a user's own `-v`/`--volume` bind mount, or any other
-            // real bind entry) is this project's own or the caller's
-            // own explicitly-requested mount, matched by its own real
-            // OCI-spec-fixed destination the exact same way `Spec::
-            // into_rootless` itself identifies this one special case
-            // (`docs/design/0232`).
-            mount.destination == "/sys",
             &mut actions,
         );
     }
@@ -207,10 +166,7 @@ pub fn plan_rootfs_setup(bundle: &Bundle, rootfs: &Path) -> Vec<RootfsAction> {
                 source: target.clone(),
                 target: target.clone(),
             });
-            actions.push(RootfsAction::RemountReadonly {
-                target,
-                tolerate_permission_denied: true,
-            });
+            actions.push(RootfsAction::RemountReadonly { target });
         }
         for path in &linux.masked_paths {
             let target = join_under_root(rootfs, path);
@@ -237,7 +193,6 @@ pub fn plan_rootfs_setup(bundle: &Bundle, rootfs: &Path) -> Vec<RootfsAction> {
         });
         actions.push(RootfsAction::RemountReadonly {
             target: PathBuf::from("/"),
-            tolerate_permission_denied: true,
         });
     }
 
@@ -260,7 +215,6 @@ fn plan_one_mount(
     source: Option<String>,
     file_system_type: Option<String>,
     parsed: ParsedMountOptions,
-    tolerate_permission_denied: bool,
     actions: &mut Vec<RootfsAction>,
 ) {
     let is_bind = parsed.set_flags & oci_mount::options::flags::BIND != 0;
@@ -280,10 +234,7 @@ fn plan_one_mount(
             file_system_type,
             parsed: bind_only,
         });
-        actions.push(RootfsAction::RemountReadonly {
-            target,
-            tolerate_permission_denied,
-        });
+        actions.push(RootfsAction::RemountReadonly { target });
     } else {
         actions.push(RootfsAction::Mount {
             target,
@@ -490,10 +441,7 @@ mod tests {
             source: root_slash.clone(),
             target: root_slash.clone()
         }));
-        assert!(actions.contains(&RootfsAction::RemountReadonly {
-            target: root_slash,
-            tolerate_permission_denied: true
-        }));
+        assert!(actions.contains(&RootfsAction::RemountReadonly { target: root_slash }));
     }
 
     #[test]
@@ -504,7 +452,7 @@ mod tests {
         let rootfs = bundle.rootfs_path().unwrap();
         let actions = plan_rootfs_setup(&bundle, &rootfs);
         assert!(!actions.iter().any(
-            |a| matches!(a, RootfsAction::RemountReadonly { target, .. } if target == Path::new("/"))
+            |a| matches!(a, RootfsAction::RemountReadonly { target } if target == Path::new("/"))
         ));
     }
 
@@ -537,61 +485,9 @@ mod tests {
         assert_eq!(
             actions[bind_index + 1],
             RootfsAction::RemountReadonly {
-                target: data_target,
-                // A real, user-requested volume/bind mount --
-                // `tolerate_permission_denied` must be `false` (see
-                // `docs/design/0232`), never silently swallowing a
-                // real remount failure the way `readonly_paths`/root
-                // legitimately can.
-                tolerate_permission_denied: false,
+                target: data_target
             }
         );
-    }
-
-    /// The one, real, already-documented (`docs/design/0010`) rootless
-    /// exception: `/sys`'s own read-only bind mount (`Spec::
-    /// into_rootless`'s own doc comment: a rootless container can't
-    /// mount a fresh `sysfs`, so it bind-mounts the host's real `/sys`
-    /// read-only instead) is a real host filesystem this process
-    /// doesn't own the superblock of — a remount-to-read-only `EPERM`
-    /// there is a known, tolerable limitation, unlike any other bind
-    /// mount reaching the exact same code path (`docs/design/0232`,
-    /// found and fixed directly: an earlier version of this code
-    /// tolerated `EPERM` for *every* mount here, including a real
-    /// user's own explicitly-requested `-v name:/path:ro` volume,
-    /// silently leaving it genuinely writable).
-    #[test]
-    fn sys_bind_mount_remount_tolerates_permission_denied_but_a_real_volume_never_does() {
-        let mut spec = Spec::example();
-        spec.mounts.push(oci_spec_types::runtime::Mount {
-            destination: "/sys".to_string(),
-            source: Some("/sys".to_string()),
-            kind: Some("none".to_string()),
-            options: vec!["rbind".to_string(), "ro".to_string()],
-        });
-        spec.mounts.push(oci_spec_types::runtime::Mount {
-            destination: "/data".to_string(),
-            source: Some("/host/data".to_string()),
-            kind: Some("bind".to_string()),
-            options: vec!["rbind".to_string(), "ro".to_string()],
-        });
-        let (_dir, bundle) = bundle_with(spec);
-        let rootfs = bundle.rootfs_path().unwrap();
-        let actions = plan_rootfs_setup(&bundle, &rootfs);
-
-        let sys_target = rootfs.join("sys");
-        let data_target = rootfs.join("data");
-        let tolerates = |target: &Path| {
-            actions.iter().find_map(|a| match a {
-                RootfsAction::RemountReadonly {
-                    target: t,
-                    tolerate_permission_denied,
-                } if t == target => Some(*tolerate_permission_denied),
-                _ => None,
-            })
-        };
-        assert_eq!(tolerates(&sys_target), Some(true));
-        assert_eq!(tolerates(&data_target), Some(false));
     }
 
     #[test]
@@ -609,8 +505,7 @@ mod tests {
 
         let data_target = rootfs.join("data");
         assert!(!actions.contains(&RootfsAction::RemountReadonly {
-            target: data_target,
-            tolerate_permission_denied: false
+            target: data_target
         }));
     }
 

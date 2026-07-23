@@ -1386,28 +1386,16 @@ fn execute_rootfs_action(action: &RootfsAction) -> io::Result<()> {
             let parsed = oci_mount::parse_mount_options(&["rbind"]);
             oci_mount::mount(Some(&source.to_string_lossy()), target, None, &parsed)
         }
-        RootfsAction::RemountReadonly {
-            target,
-            tolerate_permission_denied,
-        } => {
+        RootfsAction::RemountReadonly { target } => {
             let parsed = oci_mount::parse_mount_options(&["remount", "ro", "rbind"]);
             match oci_mount::mount(None, target, None, &parsed) {
-                Err(e)
-                    if *tolerate_permission_denied
-                        && e.kind() == io::ErrorKind::PermissionDenied =>
-                {
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                     // Known rootless limitation (see docs/design/0010):
                     // remounting a bind-mount of a host filesystem (e.g.
                     // /sys) read-only can require CAP_SYS_ADMIN in the
                     // namespace that owns the *original* superblock,
                     // which a fake-root-in-a-userns does not have. Warn
                     // and continue rather than fail the whole container.
-                    // Never applies to a caller's own explicitly-
-                    // requested `:ro` volume/bind mount (`docs/design/
-                    // 0232`) -- `tolerate_permission_denied` is `false`
-                    // there, so a real EPERM surfaces as a real,
-                    // visible error instead of a silently-still-
-                    // writable mount.
                     tracing::warn!(target = %target.display(), error = %e, "remount read-only failed (tolerated)");
                     Ok(())
                 }

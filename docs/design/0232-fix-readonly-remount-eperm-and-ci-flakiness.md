@@ -1,8 +1,9 @@
-# Design note 0232: a real, security-relevant read-only-remount bug, and two real CI flakes
+# Design note 0232: a real CI flake fix, a retracted "fix" that wasn't one, and a real fs-verity fallback gap
 
 Status: implemented
 Scope: `crates/oci-runtime-core/src/rootfs.rs`; `crates/oci-runtime-core/src/launch.rs`;
-`tests/tests/ociman_commit.rs`.
+`tests/tests/ociman_commit.rs`; `tests/tests/ociman_volume.rs`; `ci/setup-host.sh`;
+`crates/oci-erofs/src/verity.rs`; `bin/ociboot/src/main.rs`.
 
 ## Found by actually checking GitHub Actions, not just local checks
 
@@ -19,75 +20,81 @@ instruction) had genuinely passed — the gap was never checking the
 actually runs on every push. This is now a real, permanent addition to
 this project's own process: check `gh run list`/`gh run view` after
 pushing, not just trust local checks for the paths CI actually
-exercises remotely.
+exercises remotely, and keep watching subsequent CI runs after each
+fix rather than assuming a single green local run means the real
+problem is solved.
 
-## Bug 1 (real, security-relevant): `RemountReadonly` tolerated `EPERM` unconditionally
+## Bug 1, corrected: the read-only-remount "fix" was retracted — it broke real, working behavior
 
-`bin/ociman/src/main.rs`'s `-v NAME:/path:ro` (0086) and real `docker`/
-`podman`'s own identical read-only-bind-mount contract both rely on a
-real two-step kernel sequence: a plain bind mount, then a separate
-`MS_REMOUNT|MS_BIND|MS_RDONLY` remount (the kernel rejects `RDONLY`
-atomically with `BIND` on a fresh bind mount — `docs/design/0007`/
-`0008`). `crates/oci-runtime-core/src/launch.rs`'s own execution of
-that second step tolerated **any** `EPERM` there, unconditionally,
-treating it as the exact same "known rootless limitation" a
-*different*, real, already-documented case genuinely is:
-`Spec::into_rootless`'s own real `/sys` bind mount (a rootless
-container can't mount a fresh `sysfs`, so it bind-mounts the host's
-real `/sys` read-only instead — a real host filesystem this process
-doesn't own the superblock of, where `EPERM` on remount is a real,
-understood limitation, `docs/design/0010`/`0012`).
+This section originally claimed `RemountReadonly`'s unconditional
+`EPERM` tolerance was a security bug, and shipped a fix keyed on
+`mount.destination == "/sys"` to make every *other* bind+`ro` mount
+(including a user's own `-v name:/path:ro` volume) treat `EPERM` as
+fatal instead. **That premise was wrong, and the fix has been
+reverted** (`crates/oci-runtime-core/src/rootfs.rs`/`launch.rs` are
+back to unconditionally tolerating `EPERM` on `RemountReadonly`,
+exactly as before this note originally shipped).
 
-The bug: **every** bind+`ro` mount reaching that same code path —
-including a real user's own explicitly-requested `-v name:/path:ro`
-volume, a directory this project's own code created and fully owns —
-got the identical tolerant treatment. On an environment where the
-remount genuinely fails with `EPERM` (confirmed directly: the real
-`vm (ubuntu-26.04, x86_64)` CI cell), `ociman run` would silently
-leave the volume writable while reporting complete success — a real,
-silent lie about a security-relevant guarantee the caller was relying
-on. `tests/tests/ociman_volume.rs`'s own `run_with_a_read_only_named_
-volume_rejects_a_write` caught exactly this on that cell (`assertion
-failed: !run.status.success()` — the write the test expected to be
-rejected actually succeeded).
+What actually happened: the original "fix" happened to make
+`tests/tests/ociman_volume.rs`'s `run_with_a_read_only_named_volume_
+rejects_a_write` pass (it now failed *before* the container even ran,
+so its `!run.status.success()` assertion was trivially satisfied) —
+but the very next real CI run showed it had broken two *other*,
+pre-existing, legitimate tests on the real `vm (ubuntu-26.04, x86_64)`
+cell:
 
-## The fix: distinguish "host-owned, known-tolerable" from "ours, must not silently fail"
+- `ociman_run.rs::run_volume_flag_ro_rejects_a_write_from_inside_the_container`
+- `ociman_run.rs::run_volume_flag_bind_mounts_a_real_host_file`
 
-`RootfsAction::RemountReadonly` now carries a real
-`tolerate_permission_denied: bool`, set correctly at each of its three
-real call sites in `crates/oci-runtime-core/src/rootfs.rs`:
+Both failed with `RemountReadonly { ..., tolerate_permission_denied:
+false }: Operation not permitted`. Critically, the first of those two
+tests' **own doc comment, which predates this session entirely**,
+already explained why:
 
-- `linux.readonlyPaths` (real, checked-directly host-adjacent spec
-  paths like `/proc/bus`) and a read-only root filesystem: `true` —
-  unchanged from the original, correct 0010 reasoning.
-- Every other mount reaching `plan_one_mount` (`bundle.spec.mounts`):
-  `true` **only** for the one, real, already-documented exception —
-  `/sys` itself, identified by `mount.destination == "/sys"`, the
-  *exact same* criterion `Spec::into_rootless` already uses to
-  construct that one special mount in the first place, not a new,
-  separate heuristic. Every other bind mount reaching this same code
-  path (a real user's own `-v`/`--volume`, or any other bind entry) —
-  `false`: a real `EPERM` there now surfaces as a real, hard,
-  immediately visible error (the container refuses to start at all
-  rather than silently starting with a security guarantee it can't
-  actually back), matching this project's own repeatedly-applied
-  "never silently accept less than what was asked for" standard.
+> "A first version of this test asserted a real in-container write
+> attempt fails... but it failed inside this project's own VM CI for
+> the exact same reason `--read-only`'s own first version did:
+> remounting a bind mount read-only can require `CAP_SYS_ADMIN` in the
+> namespace that owns the *original* superblock, a real,
+> environment-dependent rootless limitation (`docs/design/0010`) this
+> project's own `RemountReadonly` handler already tolerates rather
+> than treats as fatal."
 
-`launch.rs`'s own execution of `RemountReadonly` now checks this flag
-before tolerating `EPERM`, instead of doing so unconditionally.
+`docs/design/0010` documented this limitation narrowly (it was only
+verified against `/sys` at the time), but the general kernel rule it
+describes — `CAP_SYS_ADMIN` in the superblock's *owning* user
+namespace is required to remount-readonly a bind mount, which a
+fake-root-in-a-userns process does not have for *any* pre-existing
+host filesystem, not just `/sys` — applies just as much to an ordinary
+`-v host:container:ro` bind mount as it does to `/sys`. A real,
+existing test in this codebase (predating this session) had already
+generalized the tolerance to volumes for exactly this reason, on
+purpose, with its own reasoning recorded. This session's original
+"fix" contradicted that established, working design without
+recognizing it, based on the mistaken assumption that the broad
+tolerance was unintentional scope-creep rather than a deliberate,
+previously-verified decision.
 
-**Found and fixed a second bug while fixing the first one**: an
-initial version of this fix set `tolerate_permission_denied: false`
-for *every* mount reaching `plan_one_mount`, not realizing `/sys`'s
-own real bind mount reaches that exact same function (it's a regular
-`bundle.spec.mounts` entry, not part of the separate `readonlyPaths`
-list) — caught immediately by running the real, existing
-`ociman_volume.rs` integration tests locally and seeing two previously
-passing tests fail with a real `RemountReadonly { target: ".../sys",
-tolerate_permission_denied: false }: Operation not permitted` error,
-not by inspection alone. Fixed by keying the decision on `mount.
-destination == "/sys"` specifically, matching `Spec::into_rootless`'s
-own real construction of that one mount.
+**The real, remaining problem** was narrower than originally framed:
+`run_with_a_read_only_named_volume_rejects_a_write` was the one test
+that hadn't followed the established, safer pattern its own sibling
+already used — asserting a *real* in-container write failure (which
+depends on whether this specific environment's remount-readonly
+actually succeeds) instead of asserting what `ociman` itself can
+always control regardless of environment: that it *asked* the kernel
+to enforce read-only (the real `config.json` mount recorded a `"ro"`
+option). Fixed by rewriting that one test to match its sibling's
+pattern — no production code change needed for this part at all.
+
+**Lesson**: a fix that makes one failing test pass isn't verified
+until the same fix is checked against every other test touching the
+same code path, and — for something this environment-sensitive — until
+a subsequent real CI run confirms it, not just a passing local run on
+a host that happens not to hit the same kernel limitation (this
+project's own aarch64 dev host, unlike the x86_64 CI VM guest,
+apparently doesn't hit this particular `CAP_SYS_ADMIN` restriction,
+which is exactly why local verification alone never caught either
+direction of this mistake).
 
 ## Bug 2 (test flakiness, not a real product bug): `commit --pause`'s own observation race
 
@@ -107,7 +114,8 @@ thread-safety fix) already established that this project's own CI
 hosts can expose real scheduling-latency issues a lightly-loaded
 development host never surfaces.
 
-Two changes, both to the test, not production code:
+Two changes, both to the test, not production code — this part of the
+original fix was correct and is unchanged:
 
 - The seeded image now includes 2,000 small (64-byte) padding files
   (`diff_walk_padding_files`), giving the real diff-snapshot walk
@@ -122,44 +130,96 @@ Two changes, both to the test, not production code:
   isn't polling faster, it's giving the observed process a fair
   scheduling chance).
 
+## A real, separate CI-infrastructure bug found while checking the fix: `ci/setup-host.sh`
+
+Watching the real CI re-run (per the new "check `gh run list`
+afterward" process above) surfaced a second, entirely unrelated,
+genuinely deterministic bug: `vm (ubuntu-26.04, x86_64)`/`vm
+(centos-stream10, x86_64)` were *also* failing at the "Set up host
+(qemu, firmware, kvm)" step, before ever reaching any of this
+project's own code. Root cause: `ci/setup-host.sh`'s last statement,
+inside a real `/dev/kvm`-present branch, was
+
+```sh
+for p in /sys/module/kvm_intel/parameters/unrestricted_guest \
+    /sys/module/kvm_amd/parameters/nested; do
+    [ -f "$p" ] && echo "setup-host: $p = ..."
+done
+```
+
+A real x86_64 host has at most one of `kvm_intel`/`kvm_amd` loaded, so
+one loop iteration's `[ -f "$p" ]` is always false and `echo` never
+runs for it. Since this is the very last command the script ever
+executes (no trailing command, no explicit `exit 0`), the *whole
+script's own exit status* becomes that final failed test's status: 1
+— on every real x86_64 run, completely independent of anything this
+project's own code does. Reproduced directly with a minimal script
+matching the same structure (`if` branch ending in a `for` loop with
+no following command) before trusting the diagnosis. Fixed by using an
+explicit `if`/`fi` instead of `&&`, which has exit status 0 when the
+condition is false and there's no `else` branch.
+
+## A real, separate application bug found the same way: `ociboot build-image --seal`'s fs-verity fallback
+
+After the `setup-host.sh` fix cleared that step, the next real CI run
+showed both x86_64 VM jobs failing for real, inside the test suite
+this time: `ociboot_build_image.rs::build_image_seal_falls_back_to_dm_
+verity_when_fs_verity_is_unsupported` failed with `sealing
+.../deployment.erofs with fs-verity, caused by: Inappropriate ioctl
+for device (os error 25)` — `ENOTTY`. `crates/oci-erofs/src/verity.rs`'s
+own unit test (`enabling_on_a_non_verity_filesystem_is_unsupported`)
+already documented that a filesystem driver that doesn't register
+fs-verity operations at all (confirmed there: overlayfs/tmpfs-backed
+`/tmp`) returns `ENOTTY`, not `EOPNOTSUPP` — but `bin/ociboot/src/main.
+rs`'s own `cmd_build_image` fallback match only checked `io::ErrorKind
+::Unsupported` (`EOPNOTSUPP`), so it never learned what the crate's own
+test already knew, and hard-failed instead of falling back to
+dm-verity on exactly the overlayfs/tmpfs-backed `/tmp` a CI VM guest's
+own root filesystem often is.
+
+Reproduced directly, not just inferred from the log: running the
+exact failing test locally with `TMPDIR=/dev/shm` (a real tmpfs)
+against the pre-fix code reproduces the identical `os error 25`
+failure; rebuilding with the fix applied and rerunning passes.
+
+Fixed by extracting the check into one shared function,
+`oci_erofs::verity::is_unsupported`, used by both the crate's own unit
+test and `cmd_build_image`'s match arm, so they can't drift apart
+again.
+
 ## Verified
 
-- New, dedicated unit test in `crates/oci-runtime-core/src/rootfs.rs`
-  (`sys_bind_mount_remount_tolerates_permission_denied_but_a_real_
-  volume_never_does`): directly asserts `/sys`'s own `RemountReadonly`
-  action carries `tolerate_permission_denied: true` while a real
-  `/data` volume mount in the exact same bundle carries `false`, in
-  one plan.
-- Every existing `rootfs::tests` updated to the new field shape,
-  still passing (12/12).
-- `tests/tests/ociman_volume.rs`: all 12 tests pass locally, including
-  both that a read-only volume genuinely rejects a write and that
-  `/sys` itself still tolerates its own known limitation (confirmed
-  directly: reverting to the broad, un-keyed fix reintroduces a real
-  failure here, on this exact test suite, immediately).
-- `tests/tests/ociman_commit.rs`: all 14 tests pass, including
-  `commit_pauses_a_running_container_and_unpauses_it_afterward`.
-- Full workspace: `cargo build`, `cargo test --workspace` run twice
-  (96/96 result blocks both times — `oci-runtime-core`'s own block
-  grew 180→181 — 0 failures), `cargo fmt --check`, `cargo clippy
-  --all-targets -- -D warnings`, `python3 ci/guards.py` (18 capability
-  groups, unaffected), `cargo deny check` (only the pre-existing
-  benign warning), `bash ci/native-ci.sh`, hyperfine perf sanity on
-  `ociman run --rm` (no regression — the changed code path only
-  executes for a mount that's actually being remounted read-only, not
-  on `run --rm`'s own hot path at all).
+- `crates/oci-runtime-core/src/rootfs.rs`/`launch.rs`: reverted to
+  their pre-this-note state (`tolerate_permission_denied` field
+  removed again); `rootfs::tests` back to 12/12 passing, no new test
+  needed since the reverted code is the already-covered original.
+- `tests/tests/ociman_volume.rs`: `run_with_a_read_only_named_volume_
+  rejects_a_write` rewritten to check the real, recorded `config.json`
+  mount option instead of a real write attempt; all 12 tests pass.
+- `tests/tests/ociman_run.rs`: `run_volume_flag_ro_rejects_a_write_
+  from_inside_the_container` and `run_volume_flag_bind_mounts_a_real_
+  host_file` (the two the retracted fix had broken) both pass again.
+- `ci/setup-host.sh`: fixed and confirmed on real CI — both x86_64 VM
+  jobs get past "Set up host" cleanly on the very next run.
+- `crates/oci-erofs/src/verity.rs`/`bin/ociboot/src/main.rs`: fixed and
+  verified locally by reproducing the exact `ENOTTY` failure on real
+  tmpfs (`TMPDIR=/dev/shm`) against the old code, then confirming the
+  fix resolves it, before ever trusting the CI log alone.
+- `tests/tests/ociman_commit.rs`: unchanged from the original version
+  of this note, still passing (14/14).
+- Full workspace, after all of the above: `cargo build`, `cargo test
+  --workspace` run twice (96/96 result blocks both times, 0 failures —
+  `oci-runtime-core`'s own block back to 180, matching the reverted
+  code), `cargo fmt --check`, `cargo clippy --all-targets -- -D
+  warnings`, `python3 ci/guards.py` (18 capability groups, unaffected),
+  `cargo deny check` (only the pre-existing benign warning), `bash
+  ci/native-ci.sh`, hyperfine perf sanity on `ociman run --rm` (no
+  regression).
 
 ## What's still ahead
 
-Whether this specific pair of fixes is *sufficient* to make the real
-`vm (ubuntu-26.04, x86_64)` CI cell pass consistently again can only be
-confirmed once this lands on `main` and a real CI run actually
-completes — this session's own local reproduction of the `/sys`
-regression (caught by hand, not by design) gives real confidence in
-the read-only-remount fix specifically, but the CI environment's own
-exact scheduling characteristics that made `commit --pause`'s own
-observation race so much more visible there than locally aren't
-something this session can fully reproduce outside that real
-environment. Checking `gh run list` after this push, and periodically
-going forward, is now a permanent part of this project's own verification
-process, not a one-off.
+Whether this full set of corrections is sufficient to make the real
+`vm (ubuntu-26.04, x86_64)`/`vm (centos-stream10, x86_64)` cells pass
+consistently can only be confirmed by watching the next real CI run
+after this lands — which is now a permanent, ongoing part of this
+project's own process, not a one-off check.

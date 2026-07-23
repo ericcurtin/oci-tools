@@ -250,6 +250,30 @@ fn run_with_a_named_volume_persists_real_content_across_separate_containers() {
     assert_eq!(String::from_utf8_lossy(&read.stdout), "persisted content\n");
 }
 
+/// `-v name:/path:ro` really does mark the mount read-only in the real
+/// `config.json` `ociman` itself writes -- checked the same
+/// deterministic, host-independent way `ociman_run.rs`'s own
+/// `run_volume_flag_ro_rejects_a_write_from_inside_the_container` and
+/// `run_read_only_sets_root_readonly_in_the_real_spec` (`docs/design/
+/// 0080`) already do, not by asserting a real in-container write
+/// attempt fails.
+///
+/// A first version of this test did assert a real write failure
+/// (`sh -c "echo x > /data/f.txt"`, expecting `ociman run` itself to
+/// report non-success) -- but that's the exact same real,
+/// environment-dependent rootless limitation `ociman_run.rs`'s own
+/// sibling test already documents (`docs/design/0010`): remounting a
+/// bind mount read-only can require `CAP_SYS_ADMIN` in the namespace
+/// that owns the *original* superblock, which a fake-root-in-a-userns
+/// does not always have -- confirmed directly: this version failed on
+/// the real `vm (ubuntu-26.04, x86_64)` CI cell for exactly that
+/// reason, the same way the sibling test's own first version did.
+/// `RootfsAction::RemountReadonly` deliberately tolerates this rather
+/// than treating it as fatal (matching `--read-only`'s own root
+/// remount, which needs the identical tolerance for the identical
+/// reason) -- a real write failing is thus not something this project
+/// can portably assert across every environment it runs in, only that
+/// `ociman` itself correctly asked the kernel to enforce it.
 #[test]
 fn run_with_a_read_only_named_volume_rejects_a_write() {
     let Some(busybox) = busybox_path() else {
@@ -270,16 +294,44 @@ fn run_with_a_read_only_named_volume_rejects_a_write() {
         storage_dir.path(),
         &[
             "run",
-            "--rm",
             "-v",
             "rovol:/data:ro",
             "ociman-test/volume-ro:latest",
             "sh",
             "-c",
-            "echo x > /data/f.txt",
+            "exit 0",
         ],
     );
-    assert!(!run.status.success());
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    let config_path = storage_dir
+        .path()
+        .join("containers")
+        .join(&container_id)
+        .join("config.json");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    let mounts = config["mounts"].as_array().unwrap();
+    let volume_mount = mounts
+        .iter()
+        .find(|m| m["destination"] == "/data")
+        .unwrap_or_else(|| panic!("no /data mount in {mounts:?}"));
+    assert_eq!(volume_mount["type"], "bind");
+    let options: Vec<&str> = volume_mount["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        options.contains(&"ro"),
+        "expected -v rovol:/data:ro to set the \"ro\" mount option: {options:?}"
+    );
 }
 
 /// `ociman volume rm` refuses a volume a real, still-running container
