@@ -211,6 +211,7 @@ pub fn cmd_build(
     dockerfile: Option<&Path>,
     tag: Option<&str>,
     build_args: &[String],
+    build_arg_files: &[PathBuf],
     target: Option<&str>,
     no_cache: bool,
     tls_verify: bool,
@@ -240,7 +241,19 @@ pub fn cmd_build(
     let tag_reference = tag
         .map(|tag| Reference::parse(tag).with_context(|| format!("parsing tag {tag:?}")))
         .transpose()?;
-    let build_args = parse_build_args(build_args);
+    // `--build-arg-file` entries first (each file, in the order
+    // given), then every `--build-arg` value -- `parse_build_args`'s
+    // own existing "later entry for the same key wins" resolution
+    // (already established for repeated `--build-arg` values) is
+    // exactly the ordering real `podman build --build-arg-file`
+    // needs too, checked directly: an explicit `--build-arg` always
+    // overrides a same-key `--build-arg-file` entry.
+    let mut combined_build_args = Vec::new();
+    for path in build_arg_files {
+        combined_build_args.extend(read_build_arg_file(path)?);
+    }
+    combined_build_args.extend(build_args.iter().cloned());
+    let build_args = parse_build_args(&combined_build_args);
 
     let dockerfile_path = resolve_dockerfile_path(context, dockerfile)?;
     let text = std::fs::read_to_string(&dockerfile_path)
@@ -1190,6 +1203,27 @@ fn parse_build_args(build_args: &[String]) -> std::collections::HashMap<String, 
         }
     }
     resolved
+}
+
+/// Read one `--build-arg-file`'s own lines into the same `KEY=value`/
+/// bare-`KEY` shape [`parse_build_args`] already understands —
+/// matching real `podman build --build-arg-file`/`docker build
+/// --build-arg-file` exactly (checked directly against a real
+/// installed `podman build --build-arg-file`, `~/git/podman/vendor/
+/// go.podman.io/buildah/pkg/cli/build.go`'s own `readBuildArgFile`): a
+/// completely empty line is skipped, and a line whose very first
+/// character is `#` is a comment and skipped too — no leading-
+/// whitespace tolerance at all, a line starting with a space before
+/// the `#` is *not* a comment, matching real buildah's own literal
+/// `arg[0] == '#'` check rather than a trimmed one.
+fn read_build_arg_file(path: &Path) -> anyhow::Result<Vec<String>> {
+    let contents =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(contents
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect())
 }
 
 /// Parse `--label`'s or `--annotation`'s own repeated `KEY=VALUE` (or

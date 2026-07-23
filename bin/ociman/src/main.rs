@@ -598,6 +598,26 @@ enum Command {
         /// comment for the full, checked-directly rules).
         #[arg(long = "build-arg")]
         build_arg: Vec<String>,
+        /// Read additional `--build-arg`-style `KEY=value`/bare-`KEY`
+        /// entries from a file, one per line — matching real `podman
+        /// build --build-arg-file`/`docker build --build-arg-file`
+        /// exactly (checked directly against a real installed
+        /// `podman build --build-arg-file`): a blank line is skipped
+        /// entirely, and a line whose very first character is `#` is
+        /// treated as a comment and skipped too (no leading-whitespace
+        /// tolerance — a line starting with a space before the `#`
+        /// is *not* treated as a comment, matching real buildah's own
+        /// literal `arg[0] == '#'` check exactly). Every file's own
+        /// entries are applied in the order given (repeatable, each
+        /// file read in turn), all of them *before* any `--build-arg`
+        /// value — so a name given both ways ends up with `--build-arg`
+        /// winning, the same "later entry for the same key wins"
+        /// resolution `--build-arg`'s own repeated values already use
+        /// (confirmed directly: `--build-arg-file` naming `FOO=fromfile`
+        /// plus an explicit `--build-arg FOO=fromcli` builds with
+        /// `fromcli`).
+        #[arg(long = "build-arg-file", value_name = "PATH")]
+        build_arg_file: Vec<PathBuf>,
         /// Build only up to and including the named stage (a stage's
         /// own `AS <name>`), rather than the last stage in the file —
         /// matching real `docker build --target`/`podman build
@@ -1637,6 +1657,7 @@ fn main() -> std::process::ExitCode {
                 file,
                 tag,
                 build_arg,
+                build_arg_file,
                 target,
                 no_cache,
                 tls_verify,
@@ -1657,6 +1678,7 @@ fn main() -> std::process::ExitCode {
                 file.as_deref(),
                 tag.as_deref(),
                 &build_arg,
+                &build_arg_file,
                 target.as_deref(),
                 no_cache,
                 tls_verify,

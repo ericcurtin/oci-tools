@@ -7468,3 +7468,317 @@ fn build_label_flag_alone_also_bumps_created() {
          own None: {view:?}"
     );
 }
+
+/// `ociman build --build-arg-file` (0199): matching real `podman
+/// build --build-arg-file`/`docker build --build-arg-file` exactly
+/// (checked directly against a real installed `podman build
+/// --build-arg-file`) — `KEY=value` lines from the file resolve a
+/// declared `ARG`'s own value exactly like an equivalent `--build-arg`
+/// would.
+#[test]
+fn build_arg_file_sets_declared_arg_values() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-arg-file-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-arg-file-base:latest\n\
+         ARG FOO\n\
+         ARG BAR\n\
+         ENV RESULT_FOO=${FOO}\n\
+         ENV RESULT_BAR=${BAR}\n",
+    );
+    std::fs::write(
+        context_dir.path().join("args.conf"),
+        "FOO=fromfile\nBAR=fromfile2\n",
+    )
+    .unwrap();
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-arg-file-result:latest",
+            "--build-arg-file",
+            context_dir.path().join("args.conf").to_str().unwrap(),
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/build-arg-file-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo $RESULT_FOO $RESULT_BAR",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "fromfile fromfile2\n");
+}
+
+/// Blank lines and `#`-prefixed comment lines are both skipped —
+/// checked directly against real buildah's own `readBuildArgFile`
+/// (`arg[0] == '#'`, no leading-whitespace tolerance).
+#[test]
+fn build_arg_file_skips_blank_and_comment_lines() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-arg-file-comments-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-arg-file-comments-base:latest\n\
+         ARG FOO\n\
+         ENV RESULT_FOO=${FOO}\n",
+    );
+    std::fs::write(
+        context_dir.path().join("args.conf"),
+        "# a leading comment\n\n\nFOO=fromfile\n\n# a trailing comment\n",
+    )
+    .unwrap();
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-arg-file-comments-result:latest",
+            "--build-arg-file",
+            context_dir.path().join("args.conf").to_str().unwrap(),
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/build-arg-file-comments-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo $RESULT_FOO",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "fromfile\n");
+}
+
+/// A bare `KEY` line (no `=`) pulls the value from `ociman`'s own
+/// process environment, exactly like a bare `--build-arg KEY` already
+/// does — checked directly against real buildah's own `readBuildArg`.
+#[test]
+fn build_arg_file_bare_key_pulls_from_the_process_environment() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-arg-file-env-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-arg-file-env-base:latest\n\
+         ARG OCIMAN_TEST_BUILD_ARG_FILE_PROBE\n\
+         ENV RESULT=${OCIMAN_TEST_BUILD_ARG_FILE_PROBE}\n",
+    );
+    std::fs::write(
+        context_dir.path().join("args.conf"),
+        "OCIMAN_TEST_BUILD_ARG_FILE_PROBE\n",
+    )
+    .unwrap();
+
+    let build = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .env("OCIMAN_TEST_BUILD_ARG_FILE_PROBE", "from-env")
+        .args([
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-arg-file-env-result:latest",
+            "--build-arg-file",
+            context_dir.path().join("args.conf").to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to spawn ociman");
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/build-arg-file-env-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo $RESULT",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "from-env\n");
+}
+
+/// An explicit `--build-arg` always overrides a same-key
+/// `--build-arg-file` entry — checked directly against a real
+/// `podman build --build-arg-file ... --build-arg FOO=fromcli`.
+#[test]
+fn build_arg_file_is_overridden_by_an_explicit_build_arg() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-arg-file-override-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-arg-file-override-base:latest\n\
+         ARG FOO\n\
+         ENV RESULT=${FOO}\n",
+    );
+    std::fs::write(context_dir.path().join("args.conf"), "FOO=fromfile\n").unwrap();
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-arg-file-override-result:latest",
+            "--build-arg-file",
+            context_dir.path().join("args.conf").to_str().unwrap(),
+            "--build-arg",
+            "FOO=fromcli",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/build-arg-file-override-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo $RESULT",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "fromcli\n",
+        "an explicit --build-arg should override a same-key --build-arg-file entry"
+    );
+}
+
+/// A `--build-arg-file` naming a path that doesn't exist is a clear,
+/// immediate build error.
+#[test]
+fn build_arg_file_nonexistent_path_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-arg-file-missing-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-arg-file-missing-base:latest\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "--build-arg-file",
+            context_dir
+                .path()
+                .join("does-not-exist.conf")
+                .to_str()
+                .unwrap(),
+        ],
+    );
+    assert!(!build.status.success());
+}
