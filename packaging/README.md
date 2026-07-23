@@ -47,6 +47,36 @@ RPM-native CI job (most likely reusing this project's own existing
 CentOS Stream 10 guest for exactly this project's own other CI checks)
 is real, still-ahead follow-up work, not done in this first slice.
 
+## Verified for real, once, inside a genuine CentOS Stream 10 VM
+
+Manually verified end to end (`docs/design/0224`/`0225`) using this
+project's own existing `ci/vm.sh` harness, booting a real CentOS
+Stream 10 aarch64 guest (the same base `ci/run-in-vm.sh` already uses
+for its own CI cell): a real `bash ci/build-rpm.sh` run, a genuine
+`sudo rpm -i` install (not just extract-and-run — this guest has a
+real, non-empty RPM package database), every CLI binary running
+correctly from its real installed `/usr/bin/` path, `rpm -q`/`rpm -ql`
+confirming real package metadata, and a clean `sudo rpm -e` removal
+leaving no residue. Two real, previously-undiscovered blockers found
+and fixed in the process, neither of which the Ubuntu development
+host could ever have surfaced:
+
+* `protoc` isn't dnf-installable on CentOS Stream 10 at all, not even
+  via EPEL — fixed by vendoring it (`protoc-bin-vendored`,
+  `docs/design/0224`), removing the host dependency everywhere, not
+  just for this one distro.
+* A real RPM-native distro auto-generates a `-debugsource`/`-debuginfo`
+  subpackage by default, which failed outright for these Rust
+  binaries' own DWARF shape — fixed with the standard `%global debug_
+  package %{nil}` directive (`docs/design/0225`).
+
+This was a one-off, manual, ad hoc verification (the VM state used for
+it was torn down afterward, not kept as a persistent cache) — a real,
+repeatable, wired-into-CI version of this exact same verification
+(most likely reusing `ci/vm-ci.sh`/`ci/run-in-vm.sh` directly rather
+than the lower-level `ci/vm.sh` primitives used here by hand) is real,
+separate, still-ahead follow-up work.
+
 ## DEB
 
 Milestone 8's own second real slice: `packaging/deb/control` (a
