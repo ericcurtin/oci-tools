@@ -58,6 +58,23 @@ still ahead.
 
 %build
 export PATH="$HOME/.cargo/bin:$PATH"
+# A real, previously-unnoticed bug: a bare `rpmbuild -bb` does not
+# sanitize its own environment, so a caller that happens to have
+# `CARGO_TARGET_DIR` exported already (e.g. `ci/vm-ci.sh`'s own shared
+# cache-disk target dir, still exported in the same shell that later
+# runs `ci/build-rpm.sh`) leaks straight into this section too --
+# silently redirecting cargo's real build output away from this
+# package's own `%install` step's hardcoded, relative `target/release/`
+# path, which then fails with a genuine "No such file or directory"
+# once this section itself has already reported success (confirmed
+# directly: this is exactly what broke the real `vm (centos-stream10,
+# x86_64)` CI cell, never reproduced by running `ci/build-rpm.sh`
+# standalone locally, which never has that variable set in the first
+# place). This package's own build must never depend on the calling
+# environment's own unrelated cargo configuration -- unsetting it here
+# makes cargo fall back to its own real default (`<cwd>/target`),
+# matching exactly what `%install` below already assumes.
+unset CARGO_TARGET_DIR
 cargo build --release --locked --offline
 
 %install
