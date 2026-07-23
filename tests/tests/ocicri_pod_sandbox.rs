@@ -16,7 +16,7 @@ use oci_cri_types::{
     LinuxPodSandboxConfig, LinuxSandboxSecurityContext, ListPodSandboxRequest, NamespaceMode,
     NamespaceOption, PodSandboxConfig, PodSandboxFilter, PodSandboxMetadata, PodSandboxState,
     PodSandboxStateValue, PodSandboxStatusRequest, RemovePodSandboxRequest, RunPodSandboxRequest,
-    StopPodSandboxRequest,
+    StopPodSandboxRequest, StreamPodSandboxesRequest,
 };
 use oci_tools_tests::bin_path;
 
@@ -539,4 +539,98 @@ async fn pod_sandbox_status_echoes_the_requested_namespace_options() {
     assert_eq!(options.network, NamespaceMode::Node as i32);
     assert_eq!(options.pid, NamespaceMode::Container as i32);
     assert_eq!(options.ipc, NamespaceMode::Pod as i32);
+}
+
+/// `StreamPodSandboxes` (`CRIListStreaming`, `docs/design/0234`)
+/// returns the exact same items `ListPodSandbox` reports — in one
+/// message here (far fewer than real cri-o's own 3000-item chunk
+/// size), honoring a filter identically — and streams zero messages
+/// (EOF immediately) for an empty store, matching real cri-o's own
+/// chunking loop simply never iterating.
+#[tokio::test]
+async fn stream_pod_sandboxes_matches_list_and_streams_nothing_when_empty() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("ocicri.sock");
+    let _server = spawn_server(storage_dir.path(), &socket_path);
+    wait_for_socket(&socket_path);
+    let mut client = connect(socket_path).await;
+
+    // Empty store: a real, successful stream with zero messages.
+    let mut empty_stream = client
+        .stream_pod_sandboxes(StreamPodSandboxesRequest { filter: None })
+        .await
+        .expect("StreamPodSandboxes on an empty store should succeed")
+        .into_inner();
+    assert!(
+        empty_stream
+            .message()
+            .await
+            .expect("stream should end cleanly")
+            .is_none(),
+        "an empty store should stream zero messages before EOF"
+    );
+
+    let ready_id = client
+        .run_pod_sandbox(run_request(sandbox_config("stream-a", "uid-sa", 0)))
+        .await
+        .unwrap()
+        .into_inner()
+        .pod_sandbox_id;
+    let stopped_id = client
+        .run_pod_sandbox(run_request(sandbox_config("stream-b", "uid-sb", 0)))
+        .await
+        .unwrap()
+        .into_inner()
+        .pod_sandbox_id;
+    client
+        .stop_pod_sandbox(StopPodSandboxRequest {
+            pod_sandbox_id: stopped_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    // Unfiltered: the same two sandboxes ListPodSandbox reports, in
+    // one message.
+    let listed = client
+        .list_pod_sandbox(ListPodSandboxRequest { filter: None })
+        .await
+        .unwrap()
+        .into_inner()
+        .items;
+    let mut stream = client
+        .stream_pod_sandboxes(StreamPodSandboxesRequest { filter: None })
+        .await
+        .expect("StreamPodSandboxes failed")
+        .into_inner();
+    let mut streamed = Vec::new();
+    while let Some(response) = stream.message().await.expect("stream should end cleanly") {
+        streamed.extend(response.pod_sandboxes);
+    }
+    assert_eq!(streamed, listed, "stream and list must report identically");
+    assert_eq!(streamed.len(), 2);
+
+    // A state filter behaves identically to the list RPC's own.
+    let mut ready_stream = client
+        .stream_pod_sandboxes(StreamPodSandboxesRequest {
+            filter: Some(PodSandboxFilter {
+                state: Some(PodSandboxStateValue {
+                    state: PodSandboxState::SandboxReady as i32,
+                }),
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("filtered StreamPodSandboxes failed")
+        .into_inner();
+    let mut ready_only = Vec::new();
+    while let Some(response) = ready_stream
+        .message()
+        .await
+        .expect("stream should end cleanly")
+    {
+        ready_only.extend(response.pod_sandboxes);
+    }
+    assert_eq!(ready_only.len(), 1, "{ready_only:?}");
+    assert_eq!(ready_only[0].id, ready_id);
 }

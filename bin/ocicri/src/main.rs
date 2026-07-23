@@ -13,11 +13,11 @@
 //! Genuinely implemented so far: `RuntimeService.Version`/`Status`/
 //! `RuntimeConfig`/`UpdateRuntimeConfig`/`ListMetricDescriptors`, the
 //! full pod-sandbox lifecycle (`RunPodSandbox`/`StopPodSandbox`/
-//! `RemovePodSandbox`/`PodSandboxStatus`/`ListPodSandbox` — a real,
-//! persistent, record-keeping state machine with real CRI semantics,
-//! deliberately no infra process/pinned namespaces yet, see
-//! `docs/design/0233`), and all of `ImageService` except the
-//! feature-gated `StreamImages` (`ListImages`/`ImageStatus`/
+//! `RemovePodSandbox`/`PodSandboxStatus`/`ListPodSandbox`/
+//! `StreamPodSandboxes` — a real, persistent, record-keeping state
+//! machine with real CRI semantics, deliberately no infra
+//! process/pinned namespaces yet, see `docs/design/0233`-`0234`), and
+//! all of `ImageService` (`ListImages`/`StreamImages`/`ImageStatus`/
 //! `PullImage`/`RemoveImage`/`ImageFsInfo`, reusing this project's
 //! own already-tested `oci_store`/`oci_registry` primitives directly
 //! — see `image_service.rs`'s own module doc comment). Every
@@ -39,6 +39,7 @@
 mod image_service;
 mod runtime_service;
 mod sandbox;
+mod stream;
 
 use std::path::PathBuf;
 

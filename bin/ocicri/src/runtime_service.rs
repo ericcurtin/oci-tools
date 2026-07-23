@@ -2,9 +2,10 @@
 //! `Status`/`RuntimeConfig`/`UpdateRuntimeConfig`/
 //! `ListMetricDescriptors` plus the full pod-sandbox lifecycle
 //! (`RunPodSandbox`/`StopPodSandbox`/`RemovePodSandbox`/
-//! `PodSandboxStatus`/`ListPodSandbox`, see `docs/design/0233` and
-//! `sandbox.rs`'s own module doc comment for exactly what a sandbox
-//! is — and honestly isn't — here yet) are genuinely implemented;
+//! `PodSandboxStatus`/`ListPodSandbox`/`StreamPodSandboxes`, see
+//! `docs/design/0233`-`0234` and `sandbox.rs`'s own module doc
+//! comment for exactly what a sandbox is — and honestly isn't — here
+//! yet) are genuinely implemented;
 //! every other one of the real CRI v1 `RuntimeService`'s remaining
 //! RPCs (container lifecycle, exec/attach/port-forward, stats,
 //! events, ...) returns a real, honest `Status::unimplemented` rather
@@ -145,6 +146,55 @@ fn matches_filter(record: &sandbox::SandboxRecord, filter: &cri::PodSandboxFilte
         .label_selector
         .iter()
         .all(|(k, v)| record.labels.get(k) == Some(v))
+}
+
+/// The one real filtered-list computation behind both
+/// `ListPodSandbox` and its `CRIListStreaming` sibling
+/// `StreamPodSandboxes` — factored out (a pure, behavior-preserving
+/// move, `docs/design/0234`) exactly like real cri-o's own shared
+/// `listPodSandboxes` helper serving both of its RPCs. Filters
+/// combine with AND (`filterSandboxList`/`filterSandbox`): an `id`
+/// filter that matches nothing (or is ambiguous) yields an empty
+/// list, never an error.
+fn sandbox_list_items(
+    filter: Option<cri::PodSandboxFilter>,
+) -> Result<Vec<cri::PodSandbox>, Status> {
+    let records = match filter.as_ref().map(|f| f.id.as_str()) {
+        Some(id) if !id.is_empty() => {
+            match sandbox::find_by_id_prefix(&sandbox_store_root(), id) {
+                Ok(Some(record)) => vec![record],
+                // "Not finding an ID in a filtered list should not
+                // be considered an error" (real cri-o's own
+                // comment) -- and its truncindex returns an error
+                // for an ambiguous prefix, which lands in the same
+                // warn-and-return-empty path.
+                Ok(None) | Err(sandbox::LookupError::AmbiguousPrefix(_)) => Vec::new(),
+                Err(sandbox::LookupError::Io(e)) => {
+                    return Err(io_error("reading sandbox records", e));
+                }
+            }
+        }
+        _ => sandbox::load_all(&sandbox_store_root())
+            .map_err(|e| io_error("reading sandbox records", e))?,
+    };
+
+    Ok(records
+        .into_iter()
+        .filter(|record| {
+            filter
+                .as_ref()
+                .is_none_or(|filter| matches_filter(record, filter))
+        })
+        .map(|record| cri::PodSandbox {
+            id: record.id.clone(),
+            metadata: Some(metadata_to_proto(&record.metadata)),
+            state: state_to_proto(record.state),
+            created_at: record.created_at_nanos,
+            labels: record.labels,
+            annotations: record.annotations,
+            runtime_handler: String::new(),
+        })
+        .collect())
 }
 
 #[tonic::async_trait]
@@ -429,55 +479,27 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<cri::ListPodSandboxRequest>,
     ) -> Result<Response<cri::ListPodSandboxResponse>, Status> {
-        let filter = request.into_inner().filter;
-
-        let records = match filter.as_ref().map(|f| f.id.as_str()) {
-            Some(id) if !id.is_empty() => {
-                match sandbox::find_by_id_prefix(&sandbox_store_root(), id) {
-                    Ok(Some(record)) => vec![record],
-                    // "Not finding an ID in a filtered list should not
-                    // be considered an error" (real cri-o's own
-                    // comment) -- and its truncindex returns an error
-                    // for an ambiguous prefix, which lands in the same
-                    // warn-and-return-empty path.
-                    Ok(None) | Err(sandbox::LookupError::AmbiguousPrefix(_)) => Vec::new(),
-                    Err(sandbox::LookupError::Io(e)) => {
-                        return Err(io_error("reading sandbox records", e));
-                    }
-                }
-            }
-            _ => sandbox::load_all(&sandbox_store_root())
-                .map_err(|e| io_error("reading sandbox records", e))?,
-        };
-
-        let items = records
-            .into_iter()
-            .filter(|record| {
-                filter
-                    .as_ref()
-                    .is_none_or(|filter| matches_filter(record, filter))
-            })
-            .map(|record| cri::PodSandbox {
-                id: record.id.clone(),
-                metadata: Some(metadata_to_proto(&record.metadata)),
-                state: state_to_proto(record.state),
-                created_at: record.created_at_nanos,
-                labels: record.labels,
-                annotations: record.annotations,
-                runtime_handler: String::new(),
-            })
-            .collect();
-
+        let items = sandbox_list_items(request.into_inner().filter)?;
         Ok(Response::new(cri::ListPodSandboxResponse { items }))
     }
 
     type StreamPodSandboxesStream = BoxStream<cri::StreamPodSandboxesResponse>;
 
+    /// The `CRIListStreaming` variant of `list_pod_sandbox`: the exact
+    /// same filtered-list computation, streamed in chunks of real
+    /// cri-o's own `streamChunkSize` (see `docs/design/0234` and
+    /// `stream.rs`'s own module doc comment — an empty result streams
+    /// zero messages and closes immediately, matching real cri-o's
+    /// own `StreamPodSandboxes` exactly).
     async fn stream_pod_sandboxes(
         &self,
-        _request: Request<cri::StreamPodSandboxesRequest>,
+        request: Request<cri::StreamPodSandboxesRequest>,
     ) -> Result<Response<Self::StreamPodSandboxesStream>, Status> {
-        unimplemented("StreamPodSandboxes")
+        let items = sandbox_list_items(request.into_inner().filter)?;
+        Ok(Response::new(crate::stream::chunked(
+            items,
+            |pod_sandboxes| cri::StreamPodSandboxesResponse { pod_sandboxes },
+        )))
     }
 
     async fn create_container(

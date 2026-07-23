@@ -1,15 +1,14 @@
-//! The real `ImageService` gRPC implementation — `ListImages`/
-//! `ImageStatus`/`PullImage`/`RemoveImage`/`ImageFsInfo` are genuinely
-//! implemented, reusing this project's own already-tested `oci_store`/
-//! `oci_registry` primitives directly (the same ones `ociman images`/
-//! `ociman inspect`/`ociman pull` already use) rather than anything
-//! new. `StreamImages` (a feature-gated, opt-in streaming alternative
-//! to `ListImages` real `cri-o` itself may not even implement —
-//! `CRIListStreaming`, see the proto's own doc comment) returns a
-//! real, honest `Status::unimplemented` naming itself — matching this
-//! project's own established "narrow first slice, document the rest"
-//! pattern (see `runtime_service.rs`'s own module doc comment for the
-//! identical reasoning applied to `RuntimeService`).
+//! The real `ImageService` gRPC implementation — every RPC is now
+//! genuinely implemented: `ListImages`/`ImageStatus`/`PullImage`/
+//! `RemoveImage`/`ImageFsInfo`, reusing this project's own
+//! already-tested `oci_store`/`oci_registry` primitives directly (the
+//! same ones `ociman images`/`ociman inspect`/`ociman pull` already
+//! use) rather than anything new, plus `StreamImages` (the
+//! `CRIListStreaming` streaming sibling of `ListImages` — 0213's own
+//! guess that real `cri-o` "may not even implement it" was re-checked
+//! directly and found outdated, see `docs/design/0234`: cri-o's own
+//! `image_list.go` genuinely implements it, and so does this now,
+//! sharing the exact same filtered-list computation).
 //!
 //! Behavior checked directly against real `cri-o`'s own
 //! implementation (`~/git/cri-o/server/image_list.go`/`image_status.go`/
@@ -251,14 +250,48 @@ fn filesystem_usage(dir: &std::path::Path, now_nanos: i64) -> Result<cri::Filesy
     })
 }
 
-/// A real, honest "not implemented yet" error for every RPC this first
-/// slice doesn't answer — see [`crate::runtime_service::unimplemented`]'s
-/// own identical doc comment.
-fn unimplemented<T>(name: &str) -> Result<Response<T>, Status> {
-    Err(Status::unimplemented(format!(
-        "ocicri: {name} is not implemented yet (milestone 7, a real, narrow first slice: only \
-         ListImages/ImageStatus are answered so far)"
-    )))
+/// The one real filtered-list computation behind both `ListImages`
+/// and its `CRIListStreaming` sibling `StreamImages` — factored out
+/// (a pure, behavior-preserving move, `docs/design/0234`) exactly
+/// like real cri-o's own shared `listImages` helper serving both of
+/// its RPCs. A filter naming one specific image resolves just that
+/// one real image (0 or 1 results) — matching real `cri-o`'s own
+/// identical "historically interpreted as a single image lookup"
+/// behavior (`image_list.go`), never an error for "doesn't exist".
+fn image_list_items(filter: Option<cri::ImageFilter>) -> Result<Vec<cri::Image>, Status> {
+    let store = open_store()?;
+    let filter_spec = filter
+        .and_then(|f| f.image)
+        .map(|s| s.image)
+        .filter(|s| !s.is_empty());
+
+    if let Some(spec) = filter_spec {
+        let images = match oci_store::resolve_by_reference_or_id(&store, &spec)
+            .map_err(|e| store_error("resolving image filter", e))?
+        {
+            Some(resolved) => {
+                let digest = resolved.record().manifest_digest.to_string();
+                let group = store
+                    .list_images()
+                    .map_err(|e| store_error("listing images", e))?
+                    .into_iter()
+                    .filter(|r| r.manifest_digest.to_string() == digest)
+                    .collect::<Vec<_>>();
+                vec![build_image(&store, &group)?]
+            }
+            None => Vec::new(),
+        };
+        return Ok(images);
+    }
+
+    let records = store
+        .list_images()
+        .map_err(|e| store_error("listing images", e))?;
+    let mut images = Vec::new();
+    for group in group_by_digest(records).into_values() {
+        images.push(build_image(&store, &group)?);
+    }
+    Ok(images)
 }
 
 #[tonic::async_trait]
@@ -267,55 +300,26 @@ impl cri::image_service_server::ImageService for ImageServiceImpl {
         &self,
         request: Request<cri::ListImagesRequest>,
     ) -> Result<Response<cri::ListImagesResponse>, Status> {
-        let store = open_store()?;
-        let filter_spec = request
-            .into_inner()
-            .filter
-            .and_then(|f| f.image)
-            .map(|s| s.image)
-            .filter(|s| !s.is_empty());
-
-        // A filter naming one specific image resolves just that one
-        // real image (0 or 1 results) -- matching real `cri-o`'s own
-        // identical "historically interpreted as a single image
-        // lookup" behavior (`listImages`, `image_list.go`), never an
-        // error for "doesn't exist".
-        if let Some(spec) = filter_spec {
-            let images = match oci_store::resolve_by_reference_or_id(&store, &spec)
-                .map_err(|e| store_error("resolving image filter", e))?
-            {
-                Some(resolved) => {
-                    let digest = resolved.record().manifest_digest.to_string();
-                    let group = store
-                        .list_images()
-                        .map_err(|e| store_error("listing images", e))?
-                        .into_iter()
-                        .filter(|r| r.manifest_digest.to_string() == digest)
-                        .collect::<Vec<_>>();
-                    vec![build_image(&store, &group)?]
-                }
-                None => Vec::new(),
-            };
-            return Ok(Response::new(cri::ListImagesResponse { images }));
-        }
-
-        let records = store
-            .list_images()
-            .map_err(|e| store_error("listing images", e))?;
-        let mut images = Vec::new();
-        for group in group_by_digest(records).into_values() {
-            images.push(build_image(&store, &group)?);
-        }
+        let images = image_list_items(request.into_inner().filter)?;
         Ok(Response::new(cri::ListImagesResponse { images }))
     }
 
     type StreamImagesStream = tonic::codegen::BoxStream<cri::StreamImagesResponse>;
 
+    /// The `CRIListStreaming` variant of `list_images`: the exact same
+    /// filtered-list computation, streamed in chunks of real cri-o's
+    /// own `streamChunkSize` (see `docs/design/0234` and `stream.rs`'s
+    /// own module doc comment — an empty result streams zero messages
+    /// and closes immediately, matching real cri-o's own
+    /// `StreamImages`, `image_list.go`, exactly).
     async fn stream_images(
         &self,
-        _request: Request<cri::StreamImagesRequest>,
+        request: Request<cri::StreamImagesRequest>,
     ) -> Result<Response<Self::StreamImagesStream>, Status> {
-        unimplemented("StreamImages")
+        let items = image_list_items(request.into_inner().filter)?;
+        Ok(Response::new(crate::stream::chunked(items, |images| {
+            cri::StreamImagesResponse { images }
+        })))
     }
 
     async fn image_status(

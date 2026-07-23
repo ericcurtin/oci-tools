@@ -15,7 +15,7 @@ use std::time::Duration;
 use oci_cri_types::image_service_client::ImageServiceClient;
 use oci_cri_types::{
     ImageFilter, ImageFsInfoRequest, ImageSpec, ImageStatusRequest, ListImagesRequest,
-    RemoveImageRequest,
+    RemoveImageRequest, StreamImagesRequest,
 };
 use oci_spec_types::image::ContainerConfig;
 use oci_store::{ImageRecord, Store};
@@ -583,4 +583,70 @@ async fn image_fs_info_on_an_empty_store_is_a_real_zero_not_an_error() {
         assert_eq!(fs.inodes_used.as_ref().unwrap().value, 0);
         assert!(fs.timestamp > 0);
     }
+}
+
+/// `StreamImages` (`CRIListStreaming`, `docs/design/0234`) returns
+/// the exact same items `ListImages` reports — in one message here
+/// (far fewer than real cri-o's own 3000-item chunk size) — and
+/// streams zero messages (EOF immediately) for an empty store,
+/// matching real cri-o's own chunking loop simply never iterating.
+#[tokio::test]
+async fn stream_images_matches_list_and_streams_nothing_when_empty() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("ocicri.sock");
+    let _server = spawn_server(storage_dir.path(), &socket_path);
+    wait_for_socket(&socket_path);
+    let mut client = connect(socket_path).await;
+
+    // Empty store: a real, successful stream with zero messages.
+    let mut empty_stream = client
+        .stream_images(StreamImagesRequest { filter: None })
+        .await
+        .expect("StreamImages on an empty store should succeed")
+        .into_inner();
+    assert!(
+        empty_stream
+            .message()
+            .await
+            .expect("stream should end cleanly")
+            .is_none(),
+        "an empty store should stream zero messages before EOF"
+    );
+
+    seed_image(
+        &store,
+        "ocicri-test/stream-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let listed = client
+        .list_images(ListImagesRequest { filter: None })
+        .await
+        .unwrap()
+        .into_inner()
+        .images;
+    let mut stream = client
+        .stream_images(StreamImagesRequest { filter: None })
+        .await
+        .expect("StreamImages failed")
+        .into_inner();
+    let mut streamed = Vec::new();
+    while let Some(response) = stream.message().await.expect("stream should end cleanly") {
+        streamed.extend(response.images);
+    }
+    assert_eq!(streamed, listed, "stream and list must report identically");
+    assert_eq!(streamed.len(), 1);
+    assert_eq!(
+        streamed[0].repo_tags,
+        vec!["docker.io/ocicri-test/stream-base:latest".to_string()]
+    );
 }
