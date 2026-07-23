@@ -7782,3 +7782,210 @@ fn build_arg_file_nonexistent_path_is_a_clear_error() {
     );
     assert!(!build.status.success());
 }
+
+/// `--timestamp <SECONDS>` (0210): every new history entry (`RUN`/
+/// `ENV`/`LABEL`/...) and the built image's own top-level `created`
+/// (which mirrors the last one, per 0197) get exactly this value
+/// instead of the real, live build time -- matching real `podman
+/// build --timestamp` exactly.
+#[test]
+fn build_timestamp_sets_created_on_every_new_history_entry_and_the_top_level_field() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/timestamp-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/timestamp-base:latest\n\
+         RUN echo hi > /hi.txt\n\
+         ENV FOO=bar\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "--timestamp",
+            "1700000000",
+            "-t",
+            "ociman-test/timestamp-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "--json",
+            "ociman-test/timestamp-result:latest",
+        ],
+    );
+    assert!(inspect.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(view["created"], "2023-11-14T22:13:20Z");
+    let history = view["history"].as_array().unwrap();
+    // Every entry *this build* added (RUN, ENV) gets the forced
+    // timestamp; the base image's own already-existing entry (from
+    // `seed_image`, whatever `created` it already had) is untouched --
+    // only new commits are affected, matching real podman exactly.
+    let new_entries: Vec<_> = history
+        .iter()
+        .filter(|e| {
+            let created_by = e["created_by"].as_str().unwrap_or_default();
+            created_by.starts_with("RUN") || created_by.starts_with("ENV")
+        })
+        .collect();
+    assert_eq!(new_entries.len(), 2, "{history:?}");
+    for entry in new_entries {
+        assert_eq!(entry["created"], "2023-11-14T22:13:20Z", "{entry:?}");
+    }
+}
+
+/// With no `--timestamp` at all, behavior is completely unchanged:
+/// every new history entry and the top-level `created` get the real,
+/// current build time, not some leftover or default forced value.
+#[test]
+fn build_without_timestamp_uses_the_real_current_time() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/no-timestamp-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/no-timestamp-base:latest\nENV FOO=bar\n",
+    );
+
+    let before = std::time::SystemTime::now();
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/no-timestamp-result:latest",
+        ],
+    );
+    assert!(build.status.success());
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "--json",
+            "ociman-test/no-timestamp-result:latest",
+        ],
+    );
+    assert!(inspect.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    let created = view["created"].as_str().unwrap();
+    let parsed = oci_spec_types::time::parse_rfc3339_utc(created).unwrap();
+    let elapsed = parsed
+        .duration_since(before)
+        .unwrap_or(std::time::Duration::ZERO);
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "created ({created}) should be roughly \"now\", not some leftover forced value"
+    );
+}
+
+/// The concrete reproducibility guarantee `--timestamp` exists to
+/// deliver: two builds of byte-identical content, run at two genuinely
+/// different real wall-clock moments (a real sleep in between, not
+/// just "fast enough that they'd probably match anyway"), produce the
+/// exact same image digest when given the same `--timestamp` -- both
+/// the "image info" half (`created`/history, this increment) and the
+/// "layer" half (`oci_layer::export`'s own forced mtime, 0209) working
+/// together.
+#[test]
+fn build_timestamp_makes_two_differently_timed_builds_produce_the_same_digest() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/timestamp-repro-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/timestamp-repro-base:latest\nRUN echo hi > /hi.txt\n",
+    );
+
+    let build_once = |tag: &str| -> String {
+        let build = ociman(
+            storage_dir.path(),
+            &[
+                "build",
+                // `--no-cache`: without this, the second build's own
+                // identical `RUN` step would hit the build cache and
+                // reuse the first build's own already-committed layer
+                // outright, which would trivially "match" for the
+                // wrong reason (no second real commit ever happens to
+                // compare against) rather than proving the forced
+                // timestamp itself is what makes two *independently
+                // committed* layers digest-identical.
+                "--no-cache",
+                context_dir.path().to_str().unwrap(),
+                "--timestamp",
+                "1700000000",
+                "-t",
+                tag,
+            ],
+        );
+        assert!(
+            build.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        String::from_utf8_lossy(&build.stdout)
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    };
+
+    let first_digest = build_once("ociman-test/timestamp-repro-1:latest");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let second_digest = build_once("ociman-test/timestamp-repro-2:latest");
+
+    assert_eq!(
+        first_digest, second_digest,
+        "two builds of identical content with the same --timestamp should produce the identical \
+         image digest, regardless of the real time elapsed between them"
+    );
+}

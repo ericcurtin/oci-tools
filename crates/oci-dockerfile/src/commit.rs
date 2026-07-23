@@ -164,15 +164,32 @@ pub fn squash_layer(
     })
 }
 
+/// The real, RFC-3339 `created` timestamp a new [`HistoryEntry`]
+/// should carry: `forced_created` (seconds since the epoch) if given,
+/// else the real, current wall-clock time — the "image info" half of
+/// real `podman build --timestamp`'s own checked-directly behavior
+/// (see `oci_layer::export`'s own doc comment for the "layer" half,
+/// and `docs/design/0209`/`0210` for the full citation trail down to
+/// `containers/storage`).
+fn created_timestamp(forced_created: Option<i64>) -> String {
+    let instant = match forced_created {
+        Some(seconds) => {
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds.max(0) as u64)
+        }
+        None => SystemTime::now(),
+    };
+    format_rfc3339_utc(instant)
+}
+
 /// Record `committed` (as just produced by [`commit_layer`]) into an
 /// image being built: append its own [`Descriptor`] to `layers` (the
 /// manifest's own layer list a future build executor is assembling)
 /// and its own `diff_id`, plus a new non-empty [`HistoryEntry`]
-/// timestamped now, to `config`'s own `rootfs.diff_ids`/`history`
-/// (both bottom-layer-first, matching `layers`' own append order —
-/// this function only ever appends to both together, so the two lists
-/// can never drift out of the relative order the image-spec requires
-/// between them).
+/// timestamped now (or `forced_created`, see [`created_timestamp`]),
+/// to `config`'s own `rootfs.diff_ids`/`history` (both bottom-layer-
+/// first, matching `layers`' own append order — this function only
+/// ever appends to both together, so the two lists can never drift
+/// out of the relative order the image-spec requires between them).
 ///
 /// `created_by` is a free-form description of the instruction that
 /// produced this layer (real `docker build`'s own convention is
@@ -184,11 +201,12 @@ pub fn record_layer(
     layers: &mut Vec<Descriptor>,
     committed: &CommittedLayer,
     created_by: impl Into<String>,
+    forced_created: Option<i64>,
 ) {
     layers.push(committed.descriptor.clone());
     config.rootfs.diff_ids.push(committed.diff_id.clone());
     config.history.push(HistoryEntry {
-        created: Some(format_rfc3339_utc(SystemTime::now())),
+        created: Some(created_timestamp(forced_created)),
         created_by: Some(created_by.into()),
         author: None,
         comment: None,
@@ -203,9 +221,15 @@ pub fn record_layer(
 /// real `docker build`'s own `history` shape exactly (`docker history`
 /// on any real image shows these interleaved with real layer-producing
 /// entries, most with no corresponding layer size at all).
-pub fn record_empty_history(config: &mut ImageConfig, created_by: impl Into<String>) {
+///
+/// `forced_created`: see [`created_timestamp`].
+pub fn record_empty_history(
+    config: &mut ImageConfig,
+    created_by: impl Into<String>,
+    forced_created: Option<i64>,
+) {
     config.history.push(HistoryEntry {
-        created: Some(format_rfc3339_utc(SystemTime::now())),
+        created: Some(created_timestamp(forced_created)),
         created_by: Some(created_by.into()),
         author: None,
         comment: None,
@@ -450,8 +474,8 @@ mod tests {
 
         let mut config = ImageConfig::default();
         let mut layers = Vec::new();
-        record_layer(&mut config, &mut layers, &committed_a, "RUN echo a");
-        record_layer(&mut config, &mut layers, &committed_b, "RUN echo b");
+        record_layer(&mut config, &mut layers, &committed_a, "RUN echo a", None);
+        record_layer(&mut config, &mut layers, &committed_b, "RUN echo b", None);
 
         assert_eq!(layers, vec![committed_a.descriptor, committed_b.descriptor]);
         assert_eq!(
@@ -479,12 +503,56 @@ mod tests {
         let mut config = ImageConfig::default();
         let layers: Vec<Descriptor> = Vec::new();
 
-        record_empty_history(&mut config, "ENV FOO=bar");
+        record_empty_history(&mut config, "ENV FOO=bar", None);
 
         assert!(layers.is_empty());
         assert!(config.rootfs.diff_ids.is_empty());
         assert_eq!(config.history.len(), 1);
         assert!(config.history[0].empty_layer);
         assert_eq!(config.history[0].created_by.as_deref(), Some("ENV FOO=bar"));
+    }
+
+    /// `record_layer`'s own `forced_created` overrides the real,
+    /// current wall-clock time a new history entry would otherwise
+    /// get -- the "image info" half of real `podman build
+    /// --timestamp`'s own behavior (see `created_timestamp`'s own doc
+    /// comment).
+    #[test]
+    fn record_layer_forced_created_overrides_the_real_current_time() {
+        let (_store_dir, store) = temp_store();
+        let root = tempfile::tempdir().unwrap();
+        let before = Snapshot::capture(root.path()).unwrap();
+        write_file(&root.path().join("a.txt"), b"content");
+        let diff = changes(root.path(), &before).unwrap();
+        let committed = commit_layer(&store, root.path(), &diff, Some(1_700_000_000)).unwrap();
+
+        let mut config = ImageConfig::default();
+        let mut layers = Vec::new();
+        record_layer(
+            &mut config,
+            &mut layers,
+            &committed,
+            "RUN echo a",
+            Some(1_700_000_000),
+        );
+
+        assert_eq!(
+            config.history[0].created.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+    }
+
+    /// Same override, for [`record_empty_history`] (e.g. `ENV`/
+    /// `LABEL`/`WORKDIR`, which never call `record_layer` at all).
+    #[test]
+    fn record_empty_history_forced_created_overrides_the_real_current_time() {
+        let mut config = ImageConfig::default();
+
+        record_empty_history(&mut config, "ENV FOO=bar", Some(1_700_000_000));
+
+        assert_eq!(
+            config.history[0].created.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
     }
 }

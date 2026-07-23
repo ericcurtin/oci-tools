@@ -228,6 +228,7 @@ pub fn cmd_build(
     unsetlabel: &[String],
     quiet: bool,
     json: bool,
+    timestamp: Option<i64>,
 ) -> anyhow::Result<()> {
     // Matches real `podman build`'s own identical refusal (checked
     // directly: `Error: cannot specify --squash with --layers and
@@ -458,6 +459,7 @@ pub fn cmd_build(
             stages: &stages,
             built: &built,
             dockerignore: &dockerignore,
+            forced_mtime: timestamp,
         };
         let force_rootfs = copy_from_targets.contains(&stage_index);
         // `--squash`/`--squash-all` only ever apply to the target
@@ -516,6 +518,7 @@ pub fn cmd_build(
         oci_dockerfile::record_empty_history(
             &mut config,
             format!("LABEL {}", format_pairs(&labels)),
+            timestamp,
         );
     }
 
@@ -753,6 +756,14 @@ struct StageContext<'a> {
     /// state exactly like it (computed once in `cmd_build`, read-only
     /// for the rest of the build).
     dockerignore: &'a oci_dockerfile::DockerIgnore,
+    /// `--timestamp`'s own parsed value (seconds since the epoch), if
+    /// given — carried here for exactly the same reason
+    /// `dockerignore` is: every instruction handler already threading
+    /// `stage_ctx` through can reach it without yet another parameter
+    /// of its own. Forwarded verbatim to every `commit_layer`/
+    /// `record_layer`/`record_empty_history` call this stage makes
+    /// (see `docs/design/0209`/`0210`).
+    forced_mtime: Option<i64>,
 }
 
 impl StageContext<'_> {
@@ -1017,16 +1028,18 @@ fn build_stage(
             // the exact same primitive `ociman commit --squash`
             // already established (0174) for the identical "flatten
             // everything, no base layers referenced" operation.
-            oci_dockerfile::squash_layer(store, rootfs_dir_ref, None).with_context(|| {
-                "squashing the target stage's own entire filesystem for --squash-all".to_string()
-            })?
+            oci_dockerfile::squash_layer(store, rootfs_dir_ref, stage_ctx.forced_mtime)
+                .with_context(|| {
+                    "squashing the target stage's own entire filesystem for --squash-all"
+                        .to_string()
+                })?
         } else {
             let before = before_stage_snapshot.as_ref().expect(
                 "squash always captures a before-snapshot in lockstep with the rootfs above",
             );
             let squash_diff = oci_layer::changes(rootfs_dir_ref, before)
                 .context("diffing the target stage's own filesystem for --squash")?;
-            commit_layer(store, rootfs_dir_ref, &squash_diff, None)
+            commit_layer(store, rootfs_dir_ref, &squash_diff, stage_ctx.forced_mtime)
                 .context("committing the squashed layer")?
         };
 
@@ -1381,6 +1394,7 @@ fn apply_instruction(
                 current_args,
                 current_shell,
                 quiet,
+                stage_ctx.forced_mtime,
             )?;
         }
         Instruction::Copy {
@@ -1425,6 +1439,7 @@ fn apply_instruction(
                 rootfs,
                 cache_candidates,
                 stage_ctx.dockerignore,
+                stage_ctx.forced_mtime,
             )?;
         }
         Instruction::From { .. } => {
@@ -1441,7 +1456,11 @@ fn apply_instruction(
         // Docker's own bracketed/quoted JSON-array text.
         Instruction::Shell(words) => {
             *current_shell = words.clone();
-            oci_dockerfile::record_empty_history(config, format!("SHELL {}", words.join(" ")));
+            oci_dockerfile::record_empty_history(
+                config,
+                format!("SHELL {}", words.join(" ")),
+                stage_ctx.forced_mtime,
+            );
         }
         // No config effect of its own -- `expand_stage` already fully
         // resolved every name's own value (override, inline default,
@@ -1465,60 +1484,100 @@ fn apply_instruction(
             for (key, value) in pairs {
                 set_env_var(&mut cc.env, key, value);
             }
-            oci_dockerfile::record_empty_history(config, format!("ENV {}", format_pairs(pairs)));
+            oci_dockerfile::record_empty_history(
+                config,
+                format!("ENV {}", format_pairs(pairs)),
+                stage_ctx.forced_mtime,
+            );
         }
         Instruction::Label(pairs) => {
             let cc = config.config.get_or_insert_with(ContainerConfig::default);
             for (key, value) in pairs {
                 cc.labels.insert(key.clone(), value.clone());
             }
-            oci_dockerfile::record_empty_history(config, format!("LABEL {}", format_pairs(pairs)));
+            oci_dockerfile::record_empty_history(
+                config,
+                format!("LABEL {}", format_pairs(pairs)),
+                stage_ctx.forced_mtime,
+            );
         }
         Instruction::Workdir(dir) => {
             let cc = config.config.get_or_insert_with(ContainerConfig::default);
             let resolved = resolve_workdir(cc.working_dir.as_deref(), dir);
             cc.working_dir = Some(resolved.clone());
-            oci_dockerfile::record_empty_history(config, format!("WORKDIR {resolved}"));
+            oci_dockerfile::record_empty_history(
+                config,
+                format!("WORKDIR {resolved}"),
+                stage_ctx.forced_mtime,
+            );
         }
         Instruction::User(user) => {
             let cc = config.config.get_or_insert_with(ContainerConfig::default);
             cc.user = Some(user.clone());
-            oci_dockerfile::record_empty_history(config, format!("USER {user}"));
+            oci_dockerfile::record_empty_history(
+                config,
+                format!("USER {user}"),
+                stage_ctx.forced_mtime,
+            );
         }
         Instruction::Entrypoint(shell_or_exec) => {
             let args = args_for(shell_or_exec);
             let cc = config.config.get_or_insert_with(ContainerConfig::default);
             cc.entrypoint = Some(args.clone());
-            oci_dockerfile::record_empty_history(config, format!("ENTRYPOINT {}", args.join(" ")));
+            oci_dockerfile::record_empty_history(
+                config,
+                format!("ENTRYPOINT {}", args.join(" ")),
+                stage_ctx.forced_mtime,
+            );
         }
         Instruction::Cmd(shell_or_exec) => {
             let args = args_for(shell_or_exec);
             let cc = config.config.get_or_insert_with(ContainerConfig::default);
             cc.cmd = Some(args.clone());
-            oci_dockerfile::record_empty_history(config, format!("CMD {}", args.join(" ")));
+            oci_dockerfile::record_empty_history(
+                config,
+                format!("CMD {}", args.join(" ")),
+                stage_ctx.forced_mtime,
+            );
         }
         Instruction::Expose(ports) => {
             let cc = config.config.get_or_insert_with(ContainerConfig::default);
             for port in ports {
                 cc.exposed_ports.insert(port.clone(), serde_json::json!({}));
             }
-            oci_dockerfile::record_empty_history(config, format!("EXPOSE {}", ports.join(" ")));
+            oci_dockerfile::record_empty_history(
+                config,
+                format!("EXPOSE {}", ports.join(" ")),
+                stage_ctx.forced_mtime,
+            );
         }
         Instruction::Volume(paths) => {
             let cc = config.config.get_or_insert_with(ContainerConfig::default);
             for path in paths {
                 cc.volumes.insert(path.clone(), serde_json::json!({}));
             }
-            oci_dockerfile::record_empty_history(config, format!("VOLUME {}", paths.join(" ")));
+            oci_dockerfile::record_empty_history(
+                config,
+                format!("VOLUME {}", paths.join(" ")),
+                stage_ctx.forced_mtime,
+            );
         }
         Instruction::StopSignal(sig) => {
             let cc = config.config.get_or_insert_with(ContainerConfig::default);
             cc.stop_signal = Some(sig.clone());
-            oci_dockerfile::record_empty_history(config, format!("STOPSIGNAL {sig}"));
+            oci_dockerfile::record_empty_history(
+                config,
+                format!("STOPSIGNAL {sig}"),
+                stage_ctx.forced_mtime,
+            );
         }
         Instruction::Maintainer(who) => {
             config.author = Some(who.clone());
-            oci_dockerfile::record_empty_history(config, format!("MAINTAINER {who}"));
+            oci_dockerfile::record_empty_history(
+                config,
+                format!("MAINTAINER {who}"),
+                stage_ctx.forced_mtime,
+            );
         }
         Instruction::Healthcheck(cmd) => {
             let cc = config.config.get_or_insert_with(ContainerConfig::default);
@@ -1533,12 +1592,17 @@ fn apply_instruction(
             oci_dockerfile::record_empty_history(
                 config,
                 format!("HEALTHCHECK {}", cmd.test.join(" ")),
+                stage_ctx.forced_mtime,
             );
         }
         Instruction::Onbuild(trigger) => {
             let cc = config.config.get_or_insert_with(ContainerConfig::default);
             cc.on_build.push(trigger.clone());
-            oci_dockerfile::record_empty_history(config, format!("ONBUILD {trigger}"));
+            oci_dockerfile::record_empty_history(
+                config,
+                format!("ONBUILD {trigger}"),
+                stage_ctx.forced_mtime,
+            );
         }
     }
     Ok(())
@@ -1565,6 +1629,7 @@ fn run_instruction(
     current_args: &[(String, String)],
     current_shell: &[String],
     quiet: bool,
+    forced_mtime: Option<i64>,
 ) -> anyhow::Result<()> {
     let args = args_for_run(shell_or_exec, current_shell);
     let command_text = args.join(" ");
@@ -1653,9 +1718,9 @@ fn run_instruction(
 
     let diff = oci_layer::changes(rootfs, &before)
         .with_context(|| format!("diffing rootfs after RUN {command_text}"))?;
-    let committed = commit_layer(store, rootfs, &diff, None)
+    let committed = commit_layer(store, rootfs, &diff, forced_mtime)
         .with_context(|| format!("committing layer for RUN {command_text}"))?;
-    record_layer(config, layers, &committed, created_by);
+    record_layer(config, layers, &committed, created_by, forced_mtime);
     Ok(())
 }
 
@@ -2005,9 +2070,15 @@ fn copy_instruction(
     }
     let diff = oci_layer::changes(rootfs, &before)
         .with_context(|| format!("diffing rootfs after {command_text}"))?;
-    let committed = commit_layer(store, rootfs, &diff, None)
+    let committed = commit_layer(store, rootfs, &diff, stage_ctx.forced_mtime)
         .with_context(|| format!("committing layer for {command_text}"))?;
-    record_layer(config, layers, &committed, created_by);
+    record_layer(
+        config,
+        layers,
+        &committed,
+        created_by,
+        stage_ctx.forced_mtime,
+    );
     Ok(())
 }
 
@@ -2077,6 +2148,7 @@ fn add_instruction(
     rootfs: &Path,
     cache_candidates: &[crate::build_cache::CacheCandidate],
     dockerignore: &oci_dockerfile::DockerIgnore,
+    forced_mtime: Option<i64>,
 ) -> anyhow::Result<()> {
     let chown = flags
         .chown
@@ -2328,9 +2400,9 @@ fn add_instruction(
 
     let diff = oci_layer::changes(rootfs, &before)
         .with_context(|| format!("diffing rootfs after {command_text}"))?;
-    let committed = commit_layer(store, rootfs, &diff, None)
+    let committed = commit_layer(store, rootfs, &diff, forced_mtime)
         .with_context(|| format!("committing layer for {command_text}"))?;
-    record_layer(config, layers, &committed, created_by);
+    record_layer(config, layers, &committed, created_by, forced_mtime);
     Ok(())
 }
 

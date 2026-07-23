@@ -815,6 +815,27 @@ enum Command {
         /// already exactly this minimal.
         #[arg(short = 'q', long = "quiet")]
         quiet: bool,
+        /// Set new timestamps in the built image's own info (`created`,
+        /// every new history entry) and in every newly-committed
+        /// layer's own file mtimes to `SECONDS` after the epoch,
+        /// instead of the real, live wall-clock time each would
+        /// otherwise get — matching real `podman build --timestamp`/
+        /// `buildah build --timestamp` exactly (checked directly
+        /// against buildah's own `commit.go`/`containers/storage`'s
+        /// own `pkg/archive`: this forces `ModTime`/`AccessTime`/
+        /// `ChangeTime` on every layer's own tar entries too, not just
+        /// the image's own metadata — see `docs/design/0209`/`0210`
+        /// for the full citation trail and the shared primitive this
+        /// relies on). A layer reused from the build cache (an exact
+        /// cache hit — no real work done at all) keeps its own
+        /// original, already-recorded timestamp untouched either way,
+        /// matching real podman's own identical behavior: this only
+        /// ever affects a genuinely new commit. For genuinely
+        /// reproducible builds: two builds of byte-identical content
+        /// run at different real times now produce the identical
+        /// image digest when given the same `--timestamp`.
+        #[arg(long = "timestamp", value_name = "SECONDS")]
+        timestamp: Option<i64>,
     },
     /// List images in local storage.
     Images,
@@ -1689,6 +1710,7 @@ fn main() -> std::process::ExitCode {
                 unsetenv,
                 unsetlabel,
                 quiet,
+                timestamp,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
@@ -1711,6 +1733,7 @@ fn main() -> std::process::ExitCode {
                 &unsetlabel,
                 quiet,
                 cli.global.json,
+                timestamp,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),
             Some(Command::Rmi { reference, force }) => cmd_rmi(&reference, force, cli.global.json),
@@ -4976,7 +4999,7 @@ fn commit_inner(
             format!("commit {id}"),
         )
     };
-    oci_dockerfile::record_layer(&mut config, &mut layers, &committed, created_by);
+    oci_dockerfile::record_layer(&mut config, &mut layers, &committed, created_by, None);
     if let Some(message) = message {
         // The OCI image spec's own `history[].comment` field, not a
         // top-level `Comment` -- see `Command::Commit`'s own doc
