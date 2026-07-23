@@ -1,14 +1,14 @@
 //! The real `RuntimeService` gRPC implementation — see this crate's
 //! own module doc comment (`main.rs`) for the exact scope of this
 //! first slice: `Version`/`Status`/`RuntimeConfig`/
-//! `UpdateRuntimeConfig` are genuinely implemented; every other one of
-//! the real CRI v1 `RuntimeService`'s remaining 30 RPCs (pod sandbox/
-//! container lifecycle, exec/attach/port-forward, stats, events, ...)
-//! returns a real, honest `Status::unimplemented` rather than silently
-//! accepting a request it can't actually act on — matching this
-//! project's own established "narrow first slice, document the rest"
-//! pattern used everywhere else (e.g. `ociboot build-image` before
-//! `install to-disk`).
+//! `UpdateRuntimeConfig`/`ListMetricDescriptors` are genuinely
+//! implemented; every other one of the real CRI v1 `RuntimeService`'s
+//! remaining 29 RPCs (pod sandbox/container lifecycle, exec/attach/
+//! port-forward, stats, events, ...) returns a real, honest
+//! `Status::unimplemented` rather than silently accepting a request it
+//! can't actually act on — matching this project's own established
+//! "narrow first slice, document the rest" pattern used everywhere
+//! else (e.g. `ociboot build-image` before `install to-disk`).
 //!
 //! `ImageService` (the CRI's other, smaller service — `ListImages`/
 //! `PullImage`/... ) isn't wired up into the server at all yet; it's
@@ -62,7 +62,8 @@ pub struct RuntimeServiceImpl;
 fn unimplemented<T>(name: &str) -> Result<Response<T>, Status> {
     Err(Status::unimplemented(format!(
         "ocicri: {name} is not implemented yet (milestone 7, a real, narrow first slice: only \
-         Version/Status/RuntimeConfig/UpdateRuntimeConfig are answered so far)"
+         Version/Status/RuntimeConfig/UpdateRuntimeConfig/ListMetricDescriptors are answered so \
+         far)"
     )))
 }
 
@@ -389,11 +390,35 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         unimplemented("GetContainerEvents")
     }
 
+    /// A real, honest empty list — checked directly against real
+    /// `cri-o`'s own implementation (`server/metric_descriptors_
+    /// list.go`): its own descriptor table (`internal/lib/
+    /// statsserver/descriptors.go`) is entirely static/config-driven
+    /// (never touches any real container/sandbox state), gated by
+    /// `crio.conf`'s own `included_pod_metrics` — which *defaults to
+    /// empty*, so a real, unconfigured `cri-o` install already
+    /// answers with almost nothing (one always-on descriptor,
+    /// `container_last_seen`). `ocicri` has no metrics collection
+    /// machinery of its own at all yet — no RPC in `ImageService`/
+    /// `RuntimeService` populates any real per-container metric value
+    /// anywhere (`ListPodSandboxMetrics`/`StreamPodSandboxMetrics`
+    /// remain real, honest `Status::unimplemented`s below) — so
+    /// advertising even that one always-on descriptor here would be a
+    /// real, false claim: a caller could reasonably expect a
+    /// following `ListPodSandboxMetrics` call to actually return a
+    /// value for whatever this RPC just told it exists. An empty list
+    /// is genuinely the most honest possible answer, not a
+    /// placeholder — real cri-o's own architecture already
+    /// establishes that returning nothing here is a normal, valid,
+    /// unconfigured-install response, not an error condition kubelet
+    /// needs to special-case.
     async fn list_metric_descriptors(
         &self,
         _request: Request<cri::ListMetricDescriptorsRequest>,
     ) -> Result<Response<cri::ListMetricDescriptorsResponse>, Status> {
-        unimplemented("ListMetricDescriptors")
+        Ok(Response::new(cri::ListMetricDescriptorsResponse {
+            descriptors: Vec::new(),
+        }))
     }
 
     async fn list_pod_sandbox_metrics(

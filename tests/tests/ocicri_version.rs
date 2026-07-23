@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use oci_cri_types::runtime_service_client::RuntimeServiceClient;
 use oci_cri_types::{
-    CgroupDriver, RuntimeConfigRequest, StatusRequest, UpdateRuntimeConfigRequest, VersionRequest,
+    CgroupDriver, ListMetricDescriptorsRequest, RuntimeConfigRequest, StatusRequest,
+    UpdateRuntimeConfigRequest, VersionRequest,
 };
 use oci_tools_tests::bin_path;
 
@@ -208,6 +209,27 @@ async fn update_runtime_config_is_a_real_unconditional_no_op() {
         })
         .await
         .expect("UpdateRuntimeConfig should always succeed");
+}
+
+/// `ListMetricDescriptors` reports a real, honest empty list — `ocicri`
+/// has no metrics-collection machinery of its own at all yet, so
+/// advertising even real cri-o's own one always-on descriptor would
+/// be a real, false claim (see `docs/design/0231`).
+#[tokio::test]
+async fn list_metric_descriptors_reports_a_real_honest_empty_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("ocicri.sock");
+    let _server = spawn_server(&socket_path);
+    wait_for_socket(&socket_path);
+
+    let mut client = connect(socket_path).await;
+    let response = client
+        .list_metric_descriptors(ListMetricDescriptorsRequest {})
+        .await
+        .expect("ListMetricDescriptors RPC failed")
+        .into_inner();
+
+    assert!(response.descriptors.is_empty());
 }
 
 /// Every other real RPC returns a real, honest `Unimplemented` gRPC
