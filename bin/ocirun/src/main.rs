@@ -440,6 +440,11 @@ fn cmd_run(id: &str, bundle: Option<&Path>, pid_file: Option<&Path>) -> anyhow::
             // stdio their own caller already set up verbatim (see
             // `run_reporting_pid`'s own doc comment, 0187).
             false,
+            // `discard_output: false` — `ocirun run` has no equivalent
+            // of `ociman build -q`'s own quiet mode; a container's own
+            // stdout/stderr are always forwarded verbatim, matching
+            // real `runc run`/`crun run` exactly (0196).
+            false,
             |pid| {
                 if let Some(path) = pid_file {
                     write_pid_file(path, pid);

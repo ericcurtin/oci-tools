@@ -7122,3 +7122,163 @@ fn build_unsetlabel_adds_no_history_entry_of_its_own() {
         "--unsetlabel should never add a history entry of its own"
     );
 }
+
+/// `ociman build -q`/`--quiet` (0196): matching real `podman build -q`
+/// exactly (checked directly against a real installed `podman build
+/// -q`) -- the *only* thing it still prints is the final image
+/// digest; a `RUN` step's own live stdout, which an ordinary
+/// (non-quiet) build passes straight through, is completely
+/// suppressed instead.
+#[test]
+fn build_quiet_suppresses_run_step_output_and_prints_only_the_digest() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/quiet-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/quiet-base:latest\nRUN echo run-output-marker\n",
+    );
+
+    // Without `-q`: the RUN step's own live output and the "tagged:
+    // ..." line are both present, matching this project's own
+    // already-established (pre-0196) default behavior.
+    let loud = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--no-cache",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/quiet-loud:latest",
+        ],
+    );
+    assert!(
+        loud.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&loud.stderr)
+    );
+    let loud_stdout = String::from_utf8_lossy(&loud.stdout);
+    assert!(
+        loud_stdout.contains("run-output-marker"),
+        "without -q, a RUN step's own live output should still be visible: {loud_stdout:?}"
+    );
+    assert!(
+        loud_stdout.contains("tagged:"),
+        "without -q, a tagged build should still print \"tagged: ...\": {loud_stdout:?}"
+    );
+
+    // With `-q`: neither the RUN step's own output nor the "tagged:
+    // ..." line appears -- stdout is *only* the final digest.
+    let quiet = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--no-cache",
+            "-q",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/quiet-result:latest",
+        ],
+    );
+    assert!(
+        quiet.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    let quiet_stdout = String::from_utf8_lossy(&quiet.stdout);
+    assert!(
+        !quiet_stdout.contains("run-output-marker"),
+        "-q should suppress a RUN step's own live output entirely: {quiet_stdout:?}"
+    );
+    assert!(
+        !quiet_stdout.contains("tagged:"),
+        "-q should suppress the \"tagged: ...\" line too, matching a real `podman build -q`'s \
+         own checked-directly output (just the one digest line, nothing else): {quiet_stdout:?}"
+    );
+    let digest = quiet_stdout.trim();
+    assert!(
+        digest.starts_with("sha256:") && !digest.contains('\n'),
+        "-q's own entire stdout should be exactly one digest line: {quiet_stdout:?}"
+    );
+
+    // The image was still actually built and tagged despite the
+    // suppressed messages -- `-q` only silences *output*, never
+    // changes what actually gets built.
+    let inspect = ociman(
+        storage_dir.path(),
+        &["inspect", "--json", "ociman-test/quiet-result:latest"],
+    );
+    assert!(inspect.status.success());
+}
+
+/// `-q` also suppresses the unused-`--build-arg` warning -- checked
+/// directly against a real `podman build -q --build-arg UNUSED=x`,
+/// which prints nothing at all except the final digest, not even
+/// this normally-always-shown warning.
+#[test]
+fn build_quiet_suppresses_unused_build_arg_warning() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/quiet-unused-arg-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/quiet-unused-arg-base:latest\n",
+    );
+
+    let loud = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--build-arg",
+            "UNUSED=xyz",
+            context_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(loud.status.success());
+    let loud_stderr = String::from_utf8_lossy(&loud.stderr);
+    assert!(
+        loud_stderr.contains("[Warning]"),
+        "without -q, an unused --build-arg should still warn: {loud_stderr:?}"
+    );
+
+    let quiet = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "-q",
+            "--build-arg",
+            "UNUSED=xyz",
+            context_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(quiet.status.success());
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    assert!(
+        !quiet_stderr.contains("[Warning]"),
+        "-q should suppress the unused --build-arg warning too: {quiet_stderr:?}"
+    );
+}

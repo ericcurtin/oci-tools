@@ -225,6 +225,7 @@ pub fn cmd_build(
     platform: Option<&str>,
     unsetenv: &[String],
     unsetlabel: &[String],
+    quiet: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     // Matches real `podman build`'s own identical refusal (checked
@@ -477,6 +478,7 @@ pub fn cmd_build(
             add_host,
             squash && is_target,
             squash_all && is_target,
+            quiet,
         )?;
         built.insert(stage_index, built_stage);
     }
@@ -596,7 +598,14 @@ pub fn cmd_build(
             .with_context(|| format!("writing {}", path.display()))?;
     }
 
-    warn_on_unused_build_args(&meta_args, &stages, &build_args);
+    // Suppressed entirely in quiet mode -- matching real `podman
+    // build -q` exactly (checked directly): an unused `--build-arg`
+    // still produces this same warning on an ordinary build, but a
+    // real `podman build -q --build-arg UNUSED=x` prints nothing at
+    // all except the final digest, not even this.
+    if !quiet {
+        warn_on_unused_build_args(&meta_args, &stages, &build_args);
+    }
 
     if json {
         oci_cli_common::output::print_json(&BuildResult {
@@ -607,8 +616,11 @@ pub fn cmd_build(
         println!("{}", manifest_ingested.digest);
         // Matches real `docker build`/`podman build` with no `-t`:
         // just the digest, no "tagged: ..." line at all -- there is
-        // no tag to report.
-        if let Some(tag_reference) = &tag_reference {
+        // no tag to report. Also suppressed by `--quiet` even *with*
+        // a tag -- checked directly against a real `podman build -q
+        // -t <name>`: its own entire output is that one digest line,
+        // nothing else.
+        if !quiet && let Some(tag_reference) = &tag_reference {
             println!("tagged: {tag_reference}");
         }
     }
@@ -755,6 +767,7 @@ fn build_stage(
     add_host: &[String],
     squash: bool,
     squash_all: bool,
+    quiet: bool,
 ) -> anyhow::Result<BuiltStage> {
     let mut config = base_config;
     let mut layers = base_layers;
@@ -924,6 +937,7 @@ fn build_stage(
             &mut current_shell,
             tls_verify,
             pull_policy,
+            quiet,
         )?;
     }
 
@@ -1284,6 +1298,7 @@ fn apply_instruction(
     current_shell: &mut Vec<String>,
     tls_verify: bool,
     pull_policy: crate::PullPolicy,
+    quiet: bool,
 ) -> anyhow::Result<()> {
     match instruction {
         Instruction::Run(shell_or_exec) => {
@@ -1299,6 +1314,7 @@ fn apply_instruction(
                 cache_candidates,
                 current_args,
                 current_shell,
+                quiet,
             )?;
         }
         Instruction::Copy {
@@ -1482,6 +1498,7 @@ fn run_instruction(
     cache_candidates: &[crate::build_cache::CacheCandidate],
     current_args: &[(String, String)],
     current_shell: &[String],
+    quiet: bool,
 ) -> anyhow::Result<()> {
     let args = args_for_run(shell_or_exec, current_shell);
     let command_text = args.join(" ");
@@ -1551,10 +1568,18 @@ fn run_instruction(
     // build` for a Containerfile whose one `RUN` step tries to read
     // it back never sees it, even though the `podman build` process
     // itself did).
+    //
+    // `discard_output: quiet` (`ociman build -q`/`--quiet`, checked
+    // directly against a real `podman build -q`): a quiet build
+    // discards a `RUN` step's own live stdout/stderr entirely rather
+    // than passing it straight through to this process's own --
+    // real `podman build -q`'s only visible output for an otherwise
+    // completely ordinary build is the one final digest line.
     #[allow(unsafe_code)]
-    let exit_code =
-        unsafe { oci_runtime_core::launch::run("ociman-build", &bundle, &validated_rootfs, true) }
-            .with_context(|| format!("running RUN {command_text}"))?;
+    let exit_code = unsafe {
+        oci_runtime_core::launch::run("ociman-build", &bundle, &validated_rootfs, true, quiet)
+    }
+    .with_context(|| format!("running RUN {command_text}"))?;
     anyhow::ensure!(
         exit_code == 0,
         "RUN {command_text} failed with exit code {exit_code}"

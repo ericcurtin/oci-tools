@@ -766,6 +766,19 @@ enum Command {
         /// Repeatable.
         #[arg(long = "unsetlabel", value_name = "KEY")]
         unsetlabel: Vec<String>,
+        /// Refrain from announcing build progress — matching real
+        /// `docker build -q`/`podman build --quiet` exactly (checked
+        /// directly against a real installed `podman build -q`, three
+        /// separate scenarios): the final image digest is still
+        /// printed (that's the *one* thing this doesn't suppress —
+        /// real podman's own `-q` output is that single line and
+        /// nothing else), but a `-t` tag's own "Successfully
+        /// tagged ..." line, a `RUN` step's own live stdout/stderr
+        /// passthrough, and the unused-`--build-arg` warning are all
+        /// suppressed. Has no effect on `--json` output, which was
+        /// already exactly this minimal.
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
     },
     /// List images in local storage.
     Images,
@@ -1612,6 +1625,7 @@ fn main() -> std::process::ExitCode {
                 platform,
                 unsetenv,
                 unsetlabel,
+                quiet,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
@@ -1631,6 +1645,7 @@ fn main() -> std::process::ExitCode {
                 platform.as_deref(),
                 &unsetenv,
                 &unsetlabel,
+                quiet,
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),
@@ -3724,6 +3739,13 @@ fn run_and_finalize(
             Some(log_path),
             cgroup_setup,
             !interactive,
+            // `discard_output: false` — `ociman run`/`ociman create`
+            // have no equivalent of `ociman build -q`'s own quiet
+            // mode; a container's own stdout/stderr are always
+            // forwarded (and, here, tee'd to the persisted log file
+            // too) verbatim, matching real `docker run`/`podman run`
+            // exactly (0196).
+            false,
             record_running,
         )
     }

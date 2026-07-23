@@ -73,12 +73,25 @@ pub const COMMAND_NOT_FOUND_EXIT_CODE: i32 = 127;
 /// directly: a `RUN` step never sees real, live stdin at all, even if
 /// the `build` invocation itself had some piped in).
 ///
+/// `discard_output` (0196, `ociman build -q`/`--quiet`): if true, the
+/// container's own stdout/stderr are both a fresh `/dev/null` rather
+/// than whatever fds 1/2 this calling process itself already has —
+/// see [`run_reporting_pid`]'s own doc comment for why this reuses
+/// the same fields a log-teeing caller sets, and why the two never
+/// actually collide in practice.
+///
 /// # Safety
 ///
 /// Must be called from a single-threaded process — this forks (see
 /// [`crate::process::fork_and_wait`]'s safety note, which this inherits).
 #[allow(unsafe_code)]
-pub unsafe fn run(id: &str, bundle: &Bundle, rootfs: &Path, close_stdin: bool) -> io::Result<i32> {
+pub unsafe fn run(
+    id: &str,
+    bundle: &Bundle,
+    rootfs: &Path,
+    close_stdin: bool,
+    discard_output: bool,
+) -> io::Result<i32> {
     // SAFETY: forwarded from this function's own contract.
     unsafe {
         run_reporting_pid(
@@ -88,6 +101,7 @@ pub unsafe fn run(id: &str, bundle: &Bundle, rootfs: &Path, close_stdin: bool) -
             None,
             CgroupSetup::FromSpec,
             close_stdin,
+            discard_output,
             |_pid| {},
         )
     }
@@ -166,10 +180,25 @@ pub enum CgroupSetup {
 /// defaults to `true`, matching real `docker run`/`podman run`
 /// exactly — checked directly).
 ///
+/// `discard_output` (0196): if true, the container's own stdout/
+/// stderr are both a fresh `/dev/null` instead of whatever fds 1/2
+/// this calling process already has — used by `ociman build -q`/
+/// `--quiet`'s own `RUN` step execution (via plain [`run`], which
+/// always passes `log_path: None`) to suppress a `RUN` step's own
+/// live output. Reuses the very same `stdout_log_fd`/`stderr_log_fd`
+/// fields [`setup_log_tee_pipe`] sets for a *different* caller
+/// (`ociman run --log`, via [`run`]'s own sibling entry point that
+/// passes a real `log_path`) — the two never actually collide, since
+/// `discard_output` is only ever true from `run`'s one call site,
+/// which never has a `log_path` of its own to begin with; if
+/// `log_path` is given, that always wins (checked first below) and
+/// `discard_output` is simply never consulted.
+///
 /// # Safety
 ///
 /// Same contract as [`run`].
 #[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn run_reporting_pid(
     id: &str,
     bundle: &Bundle,
@@ -177,6 +206,7 @@ pub unsafe fn run_reporting_pid(
     log_path: Option<&Path>,
     cgroup_setup: CgroupSetup,
     close_stdin: bool,
+    discard_output: bool,
     on_pid: impl FnOnce(i32),
 ) -> io::Result<i32> {
     let mut child_setup = build_child_setup(bundle, rootfs, id)?;
@@ -202,6 +232,24 @@ pub unsafe fn run_reporting_pid(
     let log_read_fd = log_path
         .map(|_| setup_log_tee_pipe(&mut child_setup))
         .transpose()?;
+    if log_path.is_none() && discard_output {
+        // `.write(true)`, not a plain (read-only) `File::open` — a
+        // real, caught-by-hand bug the first time this was tried: a
+        // read-only `/dev/null` fd dup'd onto stdout/stderr makes the
+        // container's own `write(2)` calls fail with `EBADF`, which is
+        // exactly what turned a plain `RUN echo hi` into a spurious
+        // nonzero exit (the shell's own builtin `echo` reporting the
+        // failed write) the first time this was tested end to end,
+        // even though discarding output was the only thing that
+        // should have changed.
+        let devnull_1 = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .map_err(|e| io::Error::other(format!("opening /dev/null for RUN output: {e}")))?;
+        let devnull_2 = devnull_1.try_clone()?;
+        child_setup.stdout_log_fd = Some(devnull_1.into());
+        child_setup.stderr_log_fd = Some(devnull_2.into());
+    }
 
     // If the systemd driver is in use, the spec's own `cgroupsPath`-
     // derived plan (if any) is entirely superseded, and the child
@@ -855,18 +903,28 @@ struct ChildSetup {
     /// two-phase lifecycle, which has no "attach"/"interactive"
     /// concept either).
     stdin_fd: Option<rustix::fd::OwnedFd>,
-    /// Set by [`run_reporting_pid`] (via [`setup_log_tee_pipe`]) when a
-    /// log path was given: the write end of the pipe whose read end a
-    /// background thread in the *caller's* process tees to both a log
-    /// file and its own stdout. `None` for every other caller (`create`
-    /// never sets these; plain [`run`] leaves them `None` too). A real
-    /// `OwnedFd`, not a plain number, for the same reason
+    /// What the container's own stdout gets dup'd onto instead of
+    /// whatever fd 1 this process itself already has, if anything —
+    /// two different, mutually exclusive reasons [`run_reporting_pid`]
+    /// ever sets this (`None` for every other caller: `create` never
+    /// sets it at all, and plain [`run`] leaves it `None` unless
+    /// `discard_output` is given):
+    /// * A log path was given ([`setup_log_tee_pipe`]): the write end
+    ///   of a pipe whose read end a background thread in the
+    ///   *caller's* process tees to both a log file and its own
+    ///   stdout.
+    /// * `discard_output` was true and no log path was given (0196,
+    ///   `ociman build -q`): a freshly-opened `/dev/null`, so the
+    ///   output is discarded outright rather than shown live.
+    ///
+    /// A real `OwnedFd`, not a plain number, for the same reason
     /// [`Self::pid_pipe_write`] is: see [`setup_log_tee_pipe`]'s own
     /// doc comment.
     stdout_log_fd: Option<rustix::fd::OwnedFd>,
-    /// Same pipe as [`Self::stdout_log_fd`] (a second, `dup`'d write
-    /// end of the very same one) — both streams are combined, not kept
-    /// separate, see `docs/design/0025`.
+    /// Same underlying fd as [`Self::stdout_log_fd`] (a second,
+    /// `dup`'d/cloned write end of the very same pipe or `/dev/null`)
+    /// — both streams are always combined, never kept separate, see
+    /// `docs/design/0025`.
     stderr_log_fd: Option<rustix::fd::OwnedFd>,
     /// Set only when [`CgroupSetup::Systemd`] is in use (`None` for
     /// `create`, and for plain [`run`]'s own `CgroupSetup::FromSpec`):
