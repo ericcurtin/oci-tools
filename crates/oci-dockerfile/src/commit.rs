@@ -74,13 +74,20 @@ pub struct CommittedLayer {
 /// disk, still commits a real, valid, if degenerate, layer) — deciding
 /// whether an empty-diff layer is even worth committing at all is a
 /// build-executor policy choice, not this function's own to make.
+///
+/// `forced_mtime` (seconds since the epoch): see `oci_layer::export`'s
+/// own doc comment for exactly what this overrides and why — `None`
+/// for this project's own default (real, live wall-clock mtimes),
+/// `Some(seconds)` for a future `ociman build --timestamp`'s own
+/// reproducible-builds use.
 pub fn commit_layer(
     store: &Store,
     root: &std::path::Path,
     changes: &[Change],
+    forced_mtime: Option<i64>,
 ) -> Result<CommittedLayer, CommitLayerError> {
     let mut tar_bytes = Vec::new();
-    oci_layer::export(root, changes, &mut tar_bytes).map_err(io_from_layer_error)?;
+    oci_layer::export(root, changes, &mut tar_bytes, forced_mtime).map_err(io_from_layer_error)?;
 
     let mut compressed = Vec::new();
     let diff_id = oci_layer::compress_for_storage(tar_bytes.as_slice(), &mut compressed)
@@ -122,12 +129,16 @@ pub fn commit_layer(
 /// large (matches `bin/ociman/src/archive.rs`'s own identical
 /// scratch-file precedent, `ingest_docker_archive_layer`, chosen for
 /// exactly the same reason).
+///
+/// `forced_mtime`: see [`commit_layer`]'s own doc comment.
 pub fn squash_layer(
     store: &Store,
     root: &std::path::Path,
+    forced_mtime: Option<i64>,
 ) -> Result<CommittedLayer, CommitLayerError> {
     let mut tar_scratch = tempfile::NamedTempFile::new()?;
-    oci_layer::export_tree(root, tar_scratch.as_file_mut()).map_err(io_from_layer_error)?;
+    oci_layer::export_tree(root, tar_scratch.as_file_mut(), forced_mtime)
+        .map_err(io_from_layer_error)?;
     tar_scratch.as_file_mut().seek(SeekFrom::Start(0))?;
 
     let mut compressed_scratch = tempfile::NamedTempFile::new()?;
@@ -244,7 +255,7 @@ mod tests {
         let diff = changes(root.path(), &before).unwrap();
         assert!(!diff.is_empty());
 
-        let committed = commit_layer(&store, root.path(), &diff).unwrap();
+        let committed = commit_layer(&store, root.path(), &diff, None).unwrap();
 
         assert_eq!(committed.descriptor.media_type, MEDIA_TYPE_IMAGE_LAYER_GZIP);
         assert!(store.has_blob(&committed.descriptor.digest));
@@ -258,7 +269,7 @@ mod tests {
         // pass-through of already-compressed bytes, not a
         // reprocessing step of its own.
         let mut expected_tar = Vec::new();
-        oci_layer::export(root.path(), &diff, &mut expected_tar).unwrap();
+        oci_layer::export(root.path(), &diff, &mut expected_tar, None).unwrap();
         let mut expected_compressed = Vec::new();
         let expected_diff_id =
             oci_layer::compress_for_storage(expected_tar.as_slice(), &mut expected_compressed)
@@ -280,7 +291,7 @@ mod tests {
         write_file(&root.path().join("base.txt"), b"from the base image");
         write_file(&root.path().join("new/file.txt"), b"added afterward");
 
-        let committed = squash_layer(&store, root.path()).unwrap();
+        let committed = squash_layer(&store, root.path(), None).unwrap();
 
         assert_eq!(committed.descriptor.media_type, MEDIA_TYPE_IMAGE_LAYER_GZIP);
         assert!(store.has_blob(&committed.descriptor.digest));
@@ -289,7 +300,7 @@ mod tests {
         // root byte-for-byte -- squash_layer is a pure streaming
         // wrapper around it, not a reprocessing step of its own.
         let mut expected_tar = Vec::new();
-        oci_layer::export_tree(root.path(), &mut expected_tar).unwrap();
+        oci_layer::export_tree(root.path(), &mut expected_tar, None).unwrap();
         let mut expected_compressed = Vec::new();
         let expected_diff_id =
             oci_layer::compress_for_storage(expected_tar.as_slice(), &mut expected_compressed)
@@ -312,7 +323,7 @@ mod tests {
         // the one new layer regardless of when it was written.
         let _before = Snapshot::capture(root.path()).unwrap();
 
-        let committed = squash_layer(&store, root.path()).unwrap();
+        let committed = squash_layer(&store, root.path(), None).unwrap();
         let extracted_dir = tempfile::tempdir().unwrap();
         let compressed = store.read_blob(&committed.descriptor.digest).unwrap();
         oci_layer::apply(
@@ -327,12 +338,72 @@ mod tests {
         );
     }
 
+    /// `commit_layer`'s own `forced_mtime` reaches every real file's
+    /// own tar entry: two otherwise-byte-identical diffs, committed at
+    /// two genuinely different real wall-clock moments (simulated by
+    /// two real, deliberately different file mtimes), still produce
+    /// the exact same content-addressed digest when given the same
+    /// `forced_mtime` — the whole point of a future `ociman build
+    /// --timestamp`'s own reproducibility, and the reason
+    /// `oci_layer::export`'s own real, live mtime alone could never
+    /// achieve it.
+    #[test]
+    fn commit_layer_forced_mtime_makes_otherwise_identically_timed_commits_produce_the_same_digest()
+    {
+        let commit_with_mtime_offset = |offset_days: u64| -> Descriptor {
+            let (_store_dir, store) = temp_store();
+            let root = tempfile::tempdir().unwrap();
+            let before = Snapshot::capture(root.path()).unwrap();
+            write_file(&root.path().join("a.txt"), b"identical content");
+            let mtime = SystemTime::now() + std::time::Duration::from_secs(offset_days * 86400);
+            fs::File::open(root.path().join("a.txt"))
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+            let diff = changes(root.path(), &before).unwrap();
+            commit_layer(&store, root.path(), &diff, Some(1_700_000_000))
+                .unwrap()
+                .descriptor
+        };
+
+        let first = commit_with_mtime_offset(1);
+        let second = commit_with_mtime_offset(30);
+        assert_eq!(
+            first.digest, second.digest,
+            "forced_mtime should make two otherwise-identical-content commits digest-identical \
+             regardless of each file's own real, different mtime"
+        );
+    }
+
+    /// Same guarantee, for [`squash_layer`].
+    #[test]
+    fn squash_layer_forced_mtime_makes_otherwise_identically_timed_commits_produce_the_same_digest()
+    {
+        let squash_with_mtime_offset = |offset_days: u64| -> Descriptor {
+            let (_store_dir, store) = temp_store();
+            let root = tempfile::tempdir().unwrap();
+            write_file(&root.path().join("a.txt"), b"identical content");
+            let mtime = SystemTime::now() + std::time::Duration::from_secs(offset_days * 86400);
+            fs::File::open(root.path().join("a.txt"))
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+            squash_layer(&store, root.path(), Some(1_700_000_000))
+                .unwrap()
+                .descriptor
+        };
+
+        let first = squash_with_mtime_offset(1);
+        let second = squash_with_mtime_offset(30);
+        assert_eq!(first.digest, second.digest);
+    }
+
     #[test]
     fn an_empty_change_list_still_commits_a_real_valid_layer() {
         let (_store_dir, store) = temp_store();
         let root = tempfile::tempdir().unwrap();
 
-        let committed = commit_layer(&store, root.path(), &[]).unwrap();
+        let committed = commit_layer(&store, root.path(), &[], None).unwrap();
         assert!(store.has_blob(&committed.descriptor.digest));
         // Real (if degenerate): an empty tar archive is still two
         // 512-byte zero blocks, a well-defined, valid tar stream, not
@@ -348,13 +419,13 @@ mod tests {
 
         write_file(&root.path().join("a.txt"), b"first layer's content");
         let diff_a = changes(root.path(), &before).unwrap();
-        let committed_a = commit_layer(&store, root.path(), &diff_a).unwrap();
+        let committed_a = commit_layer(&store, root.path(), &diff_a, None).unwrap();
 
         let before2 = Snapshot::capture(root.path()).unwrap();
         write_file(&root.path().join("b.txt"), b"second layer's content");
         let diff_b = changes(root.path(), &before2).unwrap();
         assert!(diff_b.iter().all(|c| c.kind != ChangeKind::Deleted));
-        let committed_b = commit_layer(&store, root.path(), &diff_b).unwrap();
+        let committed_b = commit_layer(&store, root.path(), &diff_b, None).unwrap();
 
         assert_ne!(committed_a.descriptor.digest, committed_b.descriptor.digest);
         assert_ne!(committed_a.diff_id, committed_b.diff_id);
@@ -370,12 +441,12 @@ mod tests {
 
         write_file(&root.path().join("a.txt"), b"first");
         let diff_a = changes(root.path(), &before).unwrap();
-        let committed_a = commit_layer(&store, root.path(), &diff_a).unwrap();
+        let committed_a = commit_layer(&store, root.path(), &diff_a, None).unwrap();
 
         let before2 = Snapshot::capture(root.path()).unwrap();
         write_file(&root.path().join("b.txt"), b"second");
         let diff_b = changes(root.path(), &before2).unwrap();
-        let committed_b = commit_layer(&store, root.path(), &diff_b).unwrap();
+        let committed_b = commit_layer(&store, root.path(), &diff_b, None).unwrap();
 
         let mut config = ImageConfig::default();
         let mut layers = Vec::new();

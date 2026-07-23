@@ -4770,14 +4770,14 @@ fn cmd_export(id: &str, output: Option<&Path>) -> anyhow::Result<()> {
             let file = std::fs::File::create(path)
                 .with_context(|| format!("creating {}", path.display()))?;
             let mut writer = std::io::BufWriter::new(file);
-            oci_layer::export_tree(&root, &mut writer)
+            oci_layer::export_tree(&root, &mut writer, None)
                 .with_context(|| format!("exporting container {id:?}"))?;
             writer.flush().context("flushing archive file")
         }
         None => {
             let stdout = std::io::stdout();
             let mut writer = std::io::BufWriter::new(stdout.lock());
-            oci_layer::export_tree(&root, &mut writer)
+            oci_layer::export_tree(&root, &mut writer, None)
                 .with_context(|| format!("exporting container {id:?}"))?;
             writer.flush().context("flushing archive to stdout")
         }
@@ -4943,7 +4943,7 @@ fn commit_inner(
         // `squash` field doc comment for the citation).
         config.rootfs.diff_ids.clear();
         config.history.clear();
-        let committed = oci_dockerfile::squash_layer(&store, root).with_context(|| {
+        let committed = oci_dockerfile::squash_layer(&store, root, None).with_context(|| {
             format!("squashing container {id:?}'s own filesystem into one layer")
         })?;
         (
@@ -4968,7 +4968,7 @@ fn commit_inner(
         let base_manifest = store
             .image_manifest(&base_record)
             .with_context(|| format!("reading manifest for {base_reference}"))?;
-        let committed = oci_dockerfile::commit_layer(&store, root, &changes)
+        let committed = oci_dockerfile::commit_layer(&store, root, &changes, None)
             .with_context(|| format!("committing a new layer for container {id:?}"))?;
         (
             base_manifest.layers.clone(),

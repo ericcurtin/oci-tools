@@ -219,7 +219,7 @@ mod tests {
         let changes = crate::changes(source.path(), &before).unwrap();
 
         let mut tar_bytes = Vec::new();
-        crate::export(source.path(), &changes, &mut tar_bytes).unwrap();
+        crate::export(source.path(), &changes, &mut tar_bytes, None).unwrap();
 
         let mut compressed = Vec::new();
         compress_for_storage(tar_bytes.as_slice(), &mut compressed).unwrap();

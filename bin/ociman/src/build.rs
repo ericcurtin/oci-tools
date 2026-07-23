@@ -1017,7 +1017,7 @@ fn build_stage(
             // the exact same primitive `ociman commit --squash`
             // already established (0174) for the identical "flatten
             // everything, no base layers referenced" operation.
-            oci_dockerfile::squash_layer(store, rootfs_dir_ref).with_context(|| {
+            oci_dockerfile::squash_layer(store, rootfs_dir_ref, None).with_context(|| {
                 "squashing the target stage's own entire filesystem for --squash-all".to_string()
             })?
         } else {
@@ -1026,7 +1026,7 @@ fn build_stage(
             );
             let squash_diff = oci_layer::changes(rootfs_dir_ref, before)
                 .context("diffing the target stage's own filesystem for --squash")?;
-            commit_layer(store, rootfs_dir_ref, &squash_diff)
+            commit_layer(store, rootfs_dir_ref, &squash_diff, None)
                 .context("committing the squashed layer")?
         };
 
@@ -1653,7 +1653,7 @@ fn run_instruction(
 
     let diff = oci_layer::changes(rootfs, &before)
         .with_context(|| format!("diffing rootfs after RUN {command_text}"))?;
-    let committed = commit_layer(store, rootfs, &diff)
+    let committed = commit_layer(store, rootfs, &diff, None)
         .with_context(|| format!("committing layer for RUN {command_text}"))?;
     record_layer(config, layers, &committed, created_by);
     Ok(())
@@ -2005,7 +2005,7 @@ fn copy_instruction(
     }
     let diff = oci_layer::changes(rootfs, &before)
         .with_context(|| format!("diffing rootfs after {command_text}"))?;
-    let committed = commit_layer(store, rootfs, &diff)
+    let committed = commit_layer(store, rootfs, &diff, None)
         .with_context(|| format!("committing layer for {command_text}"))?;
     record_layer(config, layers, &committed, created_by);
     Ok(())
@@ -2328,7 +2328,7 @@ fn add_instruction(
 
     let diff = oci_layer::changes(rootfs, &before)
         .with_context(|| format!("diffing rootfs after {command_text}"))?;
-    let committed = commit_layer(store, rootfs, &diff)
+    let committed = commit_layer(store, rootfs, &diff, None)
         .with_context(|| format!("committing layer for {command_text}"))?;
     record_layer(config, layers, &committed, created_by);
     Ok(())

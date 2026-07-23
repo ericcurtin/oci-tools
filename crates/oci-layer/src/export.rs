@@ -63,7 +63,25 @@ use crate::{LayerError, Result, WHITEOUT_PREFIX};
 /// `changes` (as computed by [`crate::diff::changes`]) read live from
 /// `root`. See this module's own doc comment for the whiteout
 /// convention and scope limits.
-pub fn export(root: &Path, changes: &[Change], writer: impl Write) -> Result<()> {
+///
+/// `forced_mtime` (seconds since the epoch), if given, overrides every
+/// written entry's own real, live mtime with this one fixed value
+/// instead — the "layer" half of real `podman build --timestamp`'s own
+/// checked-directly behavior (`~/git/podman/vendor/go.podman.io/
+/// buildah/commit.go`'s own `destinationTimestamp`, which flows all
+/// the way down to `containers/storage`'s own `pkg/archive`, whose
+/// `TarOptions.Timestamp` sets exactly `ModTime`/`AccessTime`/
+/// `ChangeTime` on every header when set): two otherwise-identical
+/// builds run at different real wall-clock times would otherwise still
+/// produce different layer digests purely from each file's own real
+/// mtime, defeating reproducibility even though every byte of real
+/// content is identical.
+pub fn export(
+    root: &Path,
+    changes: &[Change],
+    writer: impl Write,
+    forced_mtime: Option<i64>,
+) -> Result<()> {
     let mut builder = tar::Builder::new(writer);
     // Every entry is read fresh via `lstat`/`readlink` below (a
     // symlink is archived *as* a symlink, matching `crate::diff`'s own
@@ -75,10 +93,14 @@ pub fn export(root: &Path, changes: &[Change], writer: impl Write) -> Result<()>
 
     for change in changes {
         match change.kind {
-            ChangeKind::Deleted => write_whiteout(&mut builder, &change.path)?,
-            ChangeKind::Added | ChangeKind::Modified => {
-                write_entry(&mut builder, root, &change.path, &mut seen_inodes)?
-            }
+            ChangeKind::Deleted => write_whiteout(&mut builder, &change.path, forced_mtime)?,
+            ChangeKind::Added | ChangeKind::Modified => write_entry(
+                &mut builder,
+                root,
+                &change.path,
+                &mut seen_inodes,
+                forced_mtime,
+            )?,
         }
     }
 
@@ -114,7 +136,10 @@ pub fn export(root: &Path, changes: &[Change], writer: impl Write) -> Result<()>
 /// (an empty directory, exactly what a real storage-driver-level
 /// export would also show for a mount point it doesn't otherwise
 /// track), but never recursed into.
-pub fn export_tree(root: &Path, writer: impl Write) -> Result<()> {
+///
+/// `forced_mtime`: see [`export`]'s own doc comment for exactly what
+/// this overrides and why.
+pub fn export_tree(root: &Path, writer: impl Write, forced_mtime: Option<i64>) -> Result<()> {
     let mut builder = tar::Builder::new(writer);
     builder.follow_symlinks(false);
 
@@ -123,7 +148,7 @@ pub fn export_tree(root: &Path, writer: impl Write) -> Result<()> {
     collect_paths(root, Path::new(""), root_dev, &mut paths)?;
     let mut seen_inodes = std::collections::HashMap::new();
     for path in &paths {
-        write_entry(&mut builder, root, path, &mut seen_inodes)?;
+        write_entry(&mut builder, root, path, &mut seen_inodes, forced_mtime)?;
     }
 
     let mut writer = builder.into_inner().map_err(LayerError::Io)?;
@@ -158,7 +183,11 @@ fn collect_paths(
     Ok(())
 }
 
-fn write_whiteout(builder: &mut tar::Builder<impl Write>, path: &Path) -> Result<()> {
+fn write_whiteout(
+    builder: &mut tar::Builder<impl Write>,
+    path: &Path,
+    forced_mtime: Option<i64>,
+) -> Result<()> {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         // `crate::diff` never emits a `Deleted` change for the tree's
         // own root (which has no file name of its own) or for a
@@ -178,6 +207,9 @@ fn write_whiteout(builder: &mut tar::Builder<impl Write>, path: &Path) -> Result
     header.set_entry_type(tar::EntryType::Regular);
     header.set_mode(0o000);
     header.set_size(0);
+    if let Some(mtime) = forced_mtime {
+        header.set_mtime(mtime as u64);
+    }
     builder
         .append_data(&mut header, whiteout_path, io::empty())
         .map_err(LayerError::Io)
@@ -199,6 +231,7 @@ fn write_entry(
     root: &Path,
     path: &Path,
     seen_inodes: &mut std::collections::HashMap<(u64, u64), PathBuf>,
+    forced_mtime: Option<i64>,
 ) -> Result<()> {
     let full = root.join(path);
     let metadata = match fs::symlink_metadata(&full) {
@@ -220,6 +253,9 @@ fn write_entry(
             header.set_entry_type(tar::EntryType::Link);
             header.set_mode(metadata.mode() & 0o7777);
             header.set_size(0);
+            if let Some(mtime) = forced_mtime {
+                header.set_mtime(mtime as u64);
+            }
             return match builder.append_link(&mut header, path, first_path) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -229,11 +265,52 @@ fn write_entry(
         seen_inodes.insert(key, path.to_path_buf());
     }
 
-    match builder.append_path_with_name(&full, path) {
+    // Built manually (rather than the simpler `tar::Builder::
+    // append_path_with_name` this used to call directly) purely so
+    // `forced_mtime` has a header to override before it's written --
+    // `Header::set_metadata` fills in the exact same mode/uid/gid/
+    // mtime/entry_type/size fields from `metadata` that `append_path_
+    // with_name`'s own internal `append_file`/`append_fs` do (both
+    // call the identical `HeaderMode::Complete` path), so this
+    // produces byte-identical output to before whenever `forced_mtime`
+    // is `None`.
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata(&metadata);
+    if let Some(mtime) = forced_mtime {
+        header.set_mtime(mtime as u64);
+    }
+
+    if file_type.is_symlink() {
+        let target = match fs::read_link(&full) {
+            Ok(target) => target,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        return match builder.append_link(&mut header, path, &target) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        };
+    }
+
+    if file_type.is_dir() {
+        return match builder.append_data(&mut header, path, io::empty()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        };
+    }
+
+    let file = match fs::File::open(&full) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    match builder.append_data(&mut header, path, file) {
         Ok(()) => Ok(()),
         // The narrower race between the `symlink_metadata` call just
-        // above and `tar`'s own internal re-read of the same path --
-        // see this module's own doc comment on vanished source files.
+        // above and this function's own later read -- see this
+        // module's own doc comment on vanished source files.
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
@@ -253,7 +330,7 @@ mod tests {
 
     fn export_bytes(root: &Path, changes: &[Change]) -> Vec<u8> {
         let mut out = Vec::new();
-        export(root, changes, &mut out).unwrap();
+        export(root, changes, &mut out, None).unwrap();
         out
     }
 
@@ -438,7 +515,7 @@ mod tests {
 
     fn export_tree_bytes(root: &Path) -> Vec<u8> {
         let mut out = Vec::new();
-        export_tree(root, &mut out).unwrap();
+        export_tree(root, &mut out, None).unwrap();
         out
     }
 
@@ -566,5 +643,174 @@ mod tests {
         let archive_bytes = export_tree_bytes(dir.path());
         let mut archive = tar::Archive::new(archive_bytes.as_slice());
         assert_eq!(archive.entries().unwrap().count(), 0);
+    }
+
+    /// `forced_mtime` overrides a real file's own real, live mtime --
+    /// the "layer" half of real `podman build --timestamp`'s own
+    /// behavior (see `export`'s own doc comment). Confirmed against a
+    /// file whose real mtime is set far in the future, so the forced
+    /// value can only be reaching the archive from `forced_mtime`
+    /// itself, never accidentally matching the real one by chance.
+    #[test]
+    fn forced_mtime_overrides_a_regular_files_own_real_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = Snapshot::default();
+        write_file(&dir.path().join("f.txt"), b"content");
+        let far_future = std::time::SystemTime::now() + std::time::Duration::from_secs(365 * 86400);
+        fs::File::open(dir.path().join("f.txt"))
+            .unwrap()
+            .set_modified(far_future)
+            .unwrap();
+        let changes = changes(dir.path(), &before).unwrap();
+        assert!(!changes.is_empty());
+
+        let mut out = Vec::new();
+        export(dir.path(), &changes, &mut out, Some(1_700_000_000)).unwrap();
+        let mut archive = tar::Archive::new(out.as_slice());
+        let entries: Vec<_> = archive.entries().unwrap().map(|e| e.unwrap()).collect();
+        let entry = entries
+            .iter()
+            .find(|e| e.path().unwrap().to_str().unwrap() == "f.txt")
+            .unwrap();
+        assert_eq!(entry.header().mtime().unwrap(), 1_700_000_000);
+    }
+
+    /// Same override, for a directory entry (size-0, no real content
+    /// to write, but still a real header of its own with a real mtime
+    /// field).
+    #[test]
+    fn forced_mtime_overrides_a_directorys_own_real_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = Snapshot::capture(dir.path()).unwrap();
+        fs::create_dir(dir.path().join("newdir")).unwrap();
+        let changes = changes(dir.path(), &before).unwrap();
+
+        let mut out = Vec::new();
+        export(dir.path(), &changes, &mut out, Some(1_700_000_000)).unwrap();
+        let mut archive = tar::Archive::new(out.as_slice());
+        let entries: Vec<_> = archive.entries().unwrap().map(|e| e.unwrap()).collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].header().mtime().unwrap(), 1_700_000_000);
+    }
+
+    /// Same override, for a symlink entry.
+    #[test]
+    fn forced_mtime_overrides_a_symlinks_own_real_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("real.txt"), b"actual content");
+        let before = Snapshot::capture(dir.path()).unwrap();
+        std::os::unix::fs::symlink("real.txt", dir.path().join("link")).unwrap();
+        let changes = changes(dir.path(), &before).unwrap();
+
+        let mut out = Vec::new();
+        export(dir.path(), &changes, &mut out, Some(1_700_000_000)).unwrap();
+        let mut archive = tar::Archive::new(out.as_slice());
+        let entries: Vec<_> = archive.entries().unwrap().map(|e| e.unwrap()).collect();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].header().entry_type().is_symlink());
+        assert_eq!(entries[0].header().mtime().unwrap(), 1_700_000_000);
+        assert_eq!(
+            entries[0].link_name().unwrap().unwrap(),
+            PathBuf::from("real.txt")
+        );
+    }
+
+    /// Same override, for a hardlink entry (the `seen_inodes` fast
+    /// path in `write_entry`, its own separate header-construction
+    /// branch).
+    #[test]
+    fn forced_mtime_overrides_a_hardlink_entrys_own_real_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("real-binary"), b"shared content");
+        fs::hard_link(dir.path().join("real-binary"), dir.path().join("applet")).unwrap();
+
+        let mut out = Vec::new();
+        export_tree(dir.path(), &mut out, Some(1_700_000_000)).unwrap();
+        let mut archive = tar::Archive::new(out.as_slice());
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            assert_eq!(
+                entry.header().mtime().unwrap(),
+                1_700_000_000,
+                "{:?}",
+                entry.path().unwrap()
+            );
+        }
+    }
+
+    /// A whiteout entry's own header gets the same override too.
+    #[test]
+    fn forced_mtime_overrides_a_whiteout_entrys_own_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("gone.txt"), b"gone");
+        let before = Snapshot::capture(dir.path()).unwrap();
+        fs::remove_file(dir.path().join("gone.txt")).unwrap();
+        let changes = changes(dir.path(), &before).unwrap();
+
+        let mut out = Vec::new();
+        export(dir.path(), &changes, &mut out, Some(1_700_000_000)).unwrap();
+        let mut archive = tar::Archive::new(out.as_slice());
+        let entries: Vec<_> = archive.entries().unwrap().map(|e| e.unwrap()).collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].header().mtime().unwrap(), 1_700_000_000);
+    }
+
+    /// Two builds of the same content at two genuinely different real
+    /// wall-clock moments (simulated here by two real files with
+    /// deliberately different real mtimes) still produce byte-
+    /// identical layer tars when the same `forced_mtime` is given to
+    /// both -- the whole point of the flag, and what an unmodified
+    /// real mtime could never achieve.
+    #[test]
+    fn two_exports_of_differently_timed_but_otherwise_identical_content_are_byte_identical_with_forced_mtime()
+     {
+        let make_export = |mtime_offset_days: u64| -> Vec<u8> {
+            let dir = tempfile::tempdir().unwrap();
+            write_file(&dir.path().join("f.txt"), b"identical content");
+            let mtime = std::time::SystemTime::now()
+                + std::time::Duration::from_secs(mtime_offset_days * 86400);
+            fs::File::open(dir.path().join("f.txt"))
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+            let mut perms = fs::metadata(dir.path().join("f.txt"))
+                .unwrap()
+                .permissions();
+            perms.set_mode(0o644);
+            fs::set_permissions(dir.path().join("f.txt"), perms).unwrap();
+
+            let mut out = Vec::new();
+            export_tree(dir.path(), &mut out, Some(1_700_000_000)).unwrap();
+            out
+        };
+
+        let first = make_export(1);
+        let second = make_export(30);
+        assert_eq!(
+            first, second,
+            "forced_mtime should make otherwise-identical content byte-for-byte identical \
+             regardless of each file's own real, different mtime"
+        );
+    }
+
+    /// With no `forced_mtime` at all (`None`), behavior is completely
+    /// unchanged from before this override existed: a real file's own
+    /// real mtime is what ends up in the archive, verbatim.
+    #[test]
+    fn no_forced_mtime_preserves_a_files_own_real_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("f.txt"), b"content");
+        let real_mtime =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        fs::File::open(dir.path().join("f.txt"))
+            .unwrap()
+            .set_modified(real_mtime)
+            .unwrap();
+
+        let archive_bytes = export_tree_bytes(dir.path());
+        let mut archive = tar::Archive::new(archive_bytes.as_slice());
+        let entries: Vec<_> = archive.entries().unwrap().map(|e| e.unwrap()).collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].header().mtime().unwrap(), 1_600_000_000);
     }
 }
