@@ -5,13 +5,18 @@
 //! Shared by `ociman pull`/`images`/`inspect` today; `ocicri`'s
 //! ImageService and `ociboot upgrade`/`switch` reuse it later — every
 //! binary that needs to pull an image goes through exactly this code path,
-//! never re-implements it.
+//! never re-implements it. [`resolve_or_pull`] (0204) is the next level
+//! up: "the image I'm about to use, resolved against local storage and
+//! possibly freshly pulled according to a policy" — `ociman run`/
+//! `create`/`build`'s own shared need, moved here from being `ociman`-
+//! private so `ocibox create` and `ocicri`'s own ImageService can reuse
+//! the exact same policy decision tree without reimplementing it.
 
 use oci_spec_types::image::{ImageManifest, Manifest, Platform};
 use oci_spec_types::{Digest, Reference};
 use oci_store::{ImageRecord, Store};
 
-use crate::{Client, RegistryError};
+use crate::{Client, Credentials, RegistryError};
 
 /// Errors from [`pull`].
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +50,131 @@ pub enum PullError {
         /// or empty.
         variant: String,
     },
+    /// [`resolve_or_pull`]'s own [`PullPolicy::Never`] and `reference`
+    /// isn't already in local storage — deliberately generic wording
+    /// (never a specific "run `<binary> pull` first" suggestion baked
+    /// in here, since that command name differs per caller binary);
+    /// a caller that wants one should match this variant specifically
+    /// and add its own.
+    #[error("{reference}: no such image in local storage")]
+    NotFoundLocally {
+        /// The reference that was being resolved.
+        reference: String,
+    },
+}
+
+/// Real image-pull policy — matching real `podman run --pull`/`podman
+/// build --pull` exactly (checked directly against a real installed
+/// `podman`): [`Missing`](Self::Missing) pulls only if the reference
+/// isn't already in local storage; [`Always`](Self::Always) pulls
+/// unconditionally, even when already present (confirmed directly: a
+/// real `podman run --pull always`/`podman build --pull=always`
+/// against an already-pulled image still shows a real "Trying to
+/// pull..." line); [`Never`](Self::Never) never pulls at all, failing
+/// with a clear error if the reference isn't already present;
+/// [`Newer`](Self::Newer) pulls only if the registry's own current
+/// manifest has a *different digest* than what's already stored
+/// locally — never a timestamp comparison, checked directly against
+/// real podman/buildah's own current source
+/// (`hasDifferentDigestWithSystemContext`, `~/git/podman/vendor/
+/// go.podman.io/common/libimage/image.go`) — a real registry request
+/// is always made when something is already present (there's no
+/// cheaper way to know without one), but never a real blob download
+/// unless the digest actually differs. This project's own CLI-facing
+/// enums (e.g. `ociman`'s own `PullPolicy`, which additionally derives
+/// `clap::ValueEnum`) stay defined per-binary and convert into this
+/// one at the CLI boundary — shared library crates deliberately never
+/// depend on `clap` at all (this project's own established
+/// convention, `oci-cli-common` alone among `crates/` needs it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullPolicy {
+    /// Pull unconditionally, even if already present locally.
+    Always,
+    /// Pull only if not already present locally (the default almost
+    /// every caller wants).
+    Missing,
+    /// Never pull; a clear [`PullError::NotFoundLocally`] if nothing
+    /// is already present.
+    Never,
+    /// Pull only if the registry's own current manifest has a
+    /// different digest than what's already stored locally.
+    Newer,
+}
+
+/// A real registry client for `registry_host`, honoring `tls_verify`
+/// the same way `docker pull --tls-verify=false`/`podman pull
+/// --tls-verify=false` do — plain HTTP only for that one host when
+/// `false` (the escape hatch a local/private development registry
+/// commonly needs, scoped to just the one registry actually being
+/// talked to, never a blanket "every registry is insecure" toggle),
+/// HTTPS-with-credentials otherwise.
+pub fn client_for(registry_host: &str, tls_verify: bool) -> Client {
+    let credentials = Credentials::load();
+    if tls_verify {
+        Client::with_credentials(credentials)
+    } else {
+        Client::with_options(credentials, std::iter::once(registry_host.to_string()))
+    }
+}
+
+/// [`pull`], but resolving its own [`Client`] from `reference`'s own
+/// registry host and `tls_verify` first (via [`client_for`]) — the
+/// "just pull it, unconditionally, no policy decision needed" building
+/// block both [`resolve_or_pull`] and any caller not going through a
+/// policy at all (e.g. `ociman pull` itself) share.
+pub fn pull_unconditionally(
+    store: &Store,
+    reference: &Reference,
+    tls_verify: bool,
+) -> Result<ImageRecord, PullError> {
+    let mut client = client_for(reference.registry_host(), tls_verify);
+    pull(&mut client, store, reference, &Platform::host())
+}
+
+/// Look `reference` up in `store`, pulling it according to
+/// `pull_policy` if needed — every binary that needs "the image I'm
+/// about to use, resolved and possibly freshly pulled" goes through
+/// this one decision tree (see this module's own doc comment).
+///
+/// `pull_now` performs the actual unconditional pull whenever the
+/// policy decides one is needed (may be called zero, one, or — for
+/// [`PullPolicy::Newer`], if the registry check itself fails — zero
+/// times) — injected rather than always calling [`pull_unconditionally`]
+/// directly so a caller that wants its own progress UI around a real
+/// pull (`ociman`'s own spinner, e.g.) can wrap it there; a caller with
+/// no such UI can simply pass `|| pull_unconditionally(store,
+/// reference, tls_verify)` verbatim.
+pub fn resolve_or_pull(
+    store: &Store,
+    reference: &Reference,
+    pull_policy: PullPolicy,
+    tls_verify: bool,
+    mut pull_now: impl FnMut() -> Result<ImageRecord, PullError>,
+) -> Result<ImageRecord, PullError> {
+    let local = store.resolve_image(&reference.to_string())?;
+    match pull_policy {
+        PullPolicy::Never => local.ok_or_else(|| PullError::NotFoundLocally {
+            reference: reference.to_string(),
+        }),
+        PullPolicy::Missing => match local {
+            Some(record) => Ok(record),
+            None => pull_now(),
+        },
+        PullPolicy::Always => pull_now(),
+        PullPolicy::Newer => {
+            let Some(record) = local else {
+                return pull_now();
+            };
+            let mut client = client_for(reference.registry_host(), tls_verify);
+            let different = has_different_digest(
+                &mut client,
+                reference,
+                &Platform::host(),
+                &record.manifest_digest,
+            )?;
+            if different { pull_now() } else { Ok(record) }
+        }
+    }
 }
 
 /// Resolve `reference` (for `platform`) down to the single, real
@@ -426,5 +556,96 @@ mod tests {
             has_different_digest(&mut client, &reference, &Platform::host(), &manifest_digest)
                 .unwrap();
         assert!(!different);
+    }
+
+    /// [`resolve_or_pull`]'s own policy decision tree needs no real
+    /// registry at all for `Never`/`Missing`/`Always` (only `Newer`
+    /// ever makes a real registry request, already covered by
+    /// `has_different_digest`'s own tests above) — `pull_now` is a
+    /// plain counting closure here, confirming exactly how many times
+    /// (zero, or exactly one) each policy actually invokes it.
+    fn fake_record(reference: &Reference) -> ImageRecord {
+        ImageRecord {
+            reference: reference.to_string(),
+            manifest_digest: sha256(b"fake"),
+        }
+    }
+
+    #[test]
+    fn resolve_or_pull_never_returns_the_local_record_without_calling_pull_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let reference = Reference::parse("example.com/testrepo:latest").unwrap();
+        let local = fake_record(&reference);
+        store.put_image(&local).unwrap();
+
+        let mut pull_now_calls = 0;
+        let record = resolve_or_pull(&store, &reference, PullPolicy::Never, true, || {
+            pull_now_calls += 1;
+            unreachable!("Never must not pull when already present locally")
+        })
+        .unwrap();
+        assert_eq!(record, local);
+        assert_eq!(pull_now_calls, 0);
+    }
+
+    #[test]
+    fn resolve_or_pull_never_errors_clearly_when_nothing_is_stored_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let reference = Reference::parse("example.com/testrepo:latest").unwrap();
+
+        let err = resolve_or_pull(&store, &reference, PullPolicy::Never, true, || {
+            unreachable!("Never must never pull at all")
+        })
+        .unwrap_err();
+        assert!(matches!(err, PullError::NotFoundLocally { .. }));
+    }
+
+    #[test]
+    fn resolve_or_pull_missing_returns_the_local_record_without_pulling() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let reference = Reference::parse("example.com/testrepo:latest").unwrap();
+        let local = fake_record(&reference);
+        store.put_image(&local).unwrap();
+
+        let record = resolve_or_pull(&store, &reference, PullPolicy::Missing, true, || {
+            unreachable!("Missing must not pull when already present locally")
+        })
+        .unwrap();
+        assert_eq!(record, local);
+    }
+
+    #[test]
+    fn resolve_or_pull_missing_calls_pull_now_exactly_once_when_nothing_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let reference = Reference::parse("example.com/testrepo:latest").unwrap();
+
+        let mut pull_now_calls = 0;
+        let record = resolve_or_pull(&store, &reference, PullPolicy::Missing, true, || {
+            pull_now_calls += 1;
+            Ok(fake_record(&reference))
+        })
+        .unwrap();
+        assert_eq!(record.reference, reference.to_string());
+        assert_eq!(pull_now_calls, 1);
+    }
+
+    #[test]
+    fn resolve_or_pull_always_calls_pull_now_even_when_already_present_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let reference = Reference::parse("example.com/testrepo:latest").unwrap();
+        store.put_image(&fake_record(&reference)).unwrap();
+
+        let mut pull_now_calls = 0;
+        resolve_or_pull(&store, &reference, PullPolicy::Always, true, || {
+            pull_now_calls += 1;
+            Ok(fake_record(&reference))
+        })
+        .unwrap();
+        assert_eq!(pull_now_calls, 1);
     }
 }

@@ -190,6 +190,22 @@ enum PullPolicy {
     Newer,
 }
 
+/// This binary's own CLI-facing `PullPolicy` (needs its own
+/// `clap::ValueEnum` derive, which the now-shared `oci_registry::
+/// PullPolicy` deliberately doesn't have — see that type's own doc
+/// comment) converts trivially into the shared one every actual pull
+/// decision is made against (0204).
+impl From<PullPolicy> for oci_registry::PullPolicy {
+    fn from(value: PullPolicy) -> Self {
+        match value {
+            PullPolicy::Always => oci_registry::PullPolicy::Always,
+            PullPolicy::Missing => oci_registry::PullPolicy::Missing,
+            PullPolicy::Never => oci_registry::PullPolicy::Never,
+            PullPolicy::Newer => oci_registry::PullPolicy::Newer,
+        }
+    }
+}
+
 /// `ociman save --format`'s own archive format. `DockerArchive` (0167)
 /// is the default, matching real `podman save`/`docker save`'s own
 /// default exactly; `OciArchive` (0165) was this project's own first
@@ -1880,33 +1896,12 @@ impl ImageView {
     }
 }
 
-/// A real registry client, talking plain HTTP (never HTTPS) to
-/// `registry_host` specifically when `tls_verify` is `false` —
-/// matching real `docker pull --tls-verify=false`/`podman pull
-/// --tls-verify=false`'s own behavior exactly: the escape hatch a
-/// local/private development registry commonly needs, scoped to just
-/// the one registry actually being talked to (not a blanket "every
-/// registry is insecure" toggle).
-fn registry_client(registry_host: &str, tls_verify: bool) -> oci_registry::Client {
-    let credentials = oci_registry::Credentials::load();
-    if tls_verify {
-        oci_registry::Client::with_credentials(credentials)
-    } else {
-        oci_registry::Client::with_options(credentials, std::iter::once(registry_host.to_string()))
-    }
-}
-
 fn cmd_pull(reference_str: &str, tls_verify: bool, json: bool) -> anyhow::Result<()> {
     let reference = Reference::parse(reference_str)
         .with_context(|| format!("parsing image reference {reference_str:?}"))?;
     let store = open_store()?;
-    let mut client = registry_client(reference.registry_host(), tls_verify);
-
-    let progress = oci_cli_common::progress::spinner(format!("pulling {}", reference.familiar()));
-    let result = oci_registry::pull_image(&mut client, &store, &reference, &Platform::host())
-        .with_context(|| format!("pulling {reference}"));
-    progress.finish_and_clear();
-    let record: ImageRecord = result?;
+    let record: ImageRecord = pull_unconditionally(&store, &reference, tls_verify)
+        .with_context(|| format!("pulling {reference}"))?;
 
     let summary = store
         .image_summary(&record)
@@ -1948,7 +1943,7 @@ fn cmd_push(reference_str: &str, tls_verify: bool, json: bool) -> anyhow::Result
     );
     let reference = Reference::parse(&record.reference)
         .with_context(|| format!("parsing image reference {:?}", record.reference))?;
-    let mut client = registry_client(reference.registry_host(), tls_verify);
+    let mut client = oci_registry::client_for(reference.registry_host(), tls_verify);
 
     let progress = oci_cli_common::progress::spinner(format!("pushing {}", reference.familiar()));
     let result = oci_registry::push_image(&mut client, &store, &reference, record)
@@ -6549,64 +6544,48 @@ fn print_new_log_bytes(file: &mut std::fs::File) -> anyhow::Result<()> {
 }
 
 /// Look `reference` up in local storage, pulling it according to
-/// `pull_policy` (mirrors `cmd_pull`, minus the summary printing).
-/// `tls_verify` matches `Command::Pull`'s own identical flag — see
-/// `registry_client`'s own doc comment.
+/// `pull_policy` (mirrors `cmd_pull`, minus the summary printing) — a
+/// thin `ociman`-flavored wrapper around the now-shared
+/// `oci_registry::resolve_or_pull` (0204: moved there so `ocibox
+/// create`/`ocicri`'s own future ImageService can reuse the exact same
+/// pull-policy decision tree without reimplementing it), adding back
+/// two things that stay `ociman`-specific: the real progress spinner
+/// around an actual pull (the shared function takes the "how to
+/// really pull" step as an injected closure precisely so a UI-less
+/// library crate never has to know spinners exist at all), and this
+/// binary's own particular "run `ociman pull` first" suggestion for
+/// the one error case (`--pull never` with nothing already stored)
+/// where a binary-specific hint actually helps — the shared error
+/// variant's own message is deliberately generic, since that exact
+/// suggestion would be wrong for any other caller binary.
 fn resolve_or_pull(
     store: &Store,
     reference: &Reference,
     tls_verify: bool,
     pull_policy: PullPolicy,
 ) -> anyhow::Result<ImageRecord> {
-    let local = store
-        .resolve_image(&reference.to_string())
-        .with_context(|| format!("looking up {reference} in local storage"))?;
-    match pull_policy {
-        PullPolicy::Never => local.ok_or_else(|| {
+    oci_registry::resolve_or_pull(store, reference, pull_policy.into(), tls_verify, || {
+        pull_unconditionally(store, reference, tls_verify)
+    })
+    .map_err(|e| match e {
+        oci_registry::PullError::NotFoundLocally { reference } => {
             anyhow::anyhow!("{reference}: no such image in local storage (run `ociman pull` first)")
-        }),
-        PullPolicy::Missing => {
-            if let Some(record) = local {
-                return Ok(record);
-            }
-            pull_unconditionally(store, reference, tls_verify)
         }
-        PullPolicy::Always => pull_unconditionally(store, reference, tls_verify),
-        PullPolicy::Newer => {
-            let Some(record) = local else {
-                return pull_unconditionally(store, reference, tls_verify);
-            };
-            let mut client = registry_client(reference.registry_host(), tls_verify);
-            let different = oci_registry::has_different_digest(
-                &mut client,
-                reference,
-                &Platform::host(),
-                &record.manifest_digest,
-            )
-            .with_context(|| format!("checking whether {reference} has a newer manifest"))?;
-            if different {
-                pull_unconditionally(store, reference, tls_verify)
-            } else {
-                Ok(record)
-            }
-        }
-    }
+        other => anyhow::Error::new(other).context(format!("resolving {reference}")),
+    })
 }
 
 /// The actual, unconditional pull `resolve_or_pull` performs whenever
-/// its own `pull_policy` decides one is needed — split out so
-/// `PullPolicy::Always` (which always calls this, local copy or not)
-/// and `PullPolicy::Missing` (which only calls this when nothing
-/// local exists yet) share the exact same real pull path.
+/// its own `pull_policy` decides one is needed — a thin wrapper around
+/// the now-shared `oci_registry::pull_unconditionally` (0204) adding
+/// back `ociman`'s own progress spinner around the real pull.
 fn pull_unconditionally(
     store: &Store,
     reference: &Reference,
     tls_verify: bool,
-) -> anyhow::Result<ImageRecord> {
-    let mut client = registry_client(reference.registry_host(), tls_verify);
+) -> Result<ImageRecord, oci_registry::PullError> {
     let progress = oci_cli_common::progress::spinner(format!("pulling {}", reference.familiar()));
-    let result = oci_registry::pull_image(&mut client, store, reference, &Platform::host())
-        .with_context(|| format!("pulling {reference}"));
+    let result = oci_registry::pull_unconditionally(store, reference, tls_verify);
     progress.finish_and_clear();
     result
 }
