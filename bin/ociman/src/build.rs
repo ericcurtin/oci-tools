@@ -222,6 +222,7 @@ pub fn cmd_build(
     add_host: &[String],
     squash: bool,
     squash_all: bool,
+    platform: Option<&str>,
     json: bool,
 ) -> anyhow::Result<()> {
     // Matches real `podman build`'s own identical refusal (checked
@@ -333,6 +334,51 @@ pub fn cmd_build(
                 (scratch_base_config(), Vec::new(), None)
             }
             None => {
+                // A per-stage `FROM --platform=` always wins over the
+                // whole build's own `--platform` (checked directly
+                // against real BuildKit's own `convert.go`: `st.
+                // Platform`, only ever set when that one stage's own
+                // `FROM` line gave one, takes priority; the build-wide
+                // value only ever fills in for a stage that doesn't).
+                // This project has no real cross-architecture
+                // emulation of any kind, so a resolved platform that
+                // doesn't match this host is a clear, immediate error
+                // rather than the silent, wrong substitution this
+                // project used to make before this check existed (the
+                // value was parsed but never read anywhere at all) —
+                // see `docs/design/0193`.
+                if let Some(requested) = stage.platform.as_deref().or(platform) {
+                    let requested_platform = parse_platform_spec(requested)?;
+                    let host = Platform::host();
+                    // `requested_platform` (what the caller asked for)
+                    // is the *selection criterion* here, `host` (what
+                    // this process is actually running on) the
+                    // candidate being checked against it -- the same
+                    // direction `Platform::matches`'s own doc comment
+                    // describes for picking a manifest-list entry,
+                    // just with the host standing in for that entry.
+                    // Getting this backwards (checking `host.matches(&
+                    // requested_platform)` instead) was a real,
+                    // previously-hit bug caught by hand while first
+                    // verifying this exact check end to end: an
+                    // explicit `--platform linux/arm64` on a real
+                    // aarch64 host incorrectly refused to match itself,
+                    // because the host's own real `variant` (`Some
+                    // ("v8")`, `Platform::host`'s own doc comment) has
+                    // no counterpart in a bare `linux/arm64` request
+                    // that never mentions a variant at all -- which
+                    // `matches`'s own semantics correctly treat as "no
+                    // variant requirement" only when the *requester*
+                    // is the one left unspecified, not the host.
+                    anyhow::ensure!(
+                        requested_platform.matches(&host),
+                        "ociman build: --platform {requested:?} does not match this host \
+                         ({}/{}) -- building for a non-host platform is not supported yet (no \
+                         real cross-architecture emulation)",
+                        host.os,
+                        host.architecture,
+                    );
+                }
                 let base_reference = Reference::parse(&stage.base_name).with_context(|| {
                     format!("parsing base image reference {:?}", stage.base_name)
                 })?;
@@ -970,6 +1016,39 @@ fn unused_build_arg_names<'a>(
         .collect();
     unused.sort_unstable();
     unused
+}
+
+/// Parse a `--platform`/`FROM --platform=` value (`os/arch[/variant]`,
+/// e.g. `linux/amd64`, `linux/arm64/v8`) into a real [`Platform`] —
+/// matching real BuildKit's own `platforms.Parse` accepted shape for
+/// the common, explicit `os/arch[/variant]` form (a bare `arch`, with
+/// no `os/` prefix, or the special `local`/`$BUILDPLATFORM`-style
+/// values real BuildKit also accepts, are deliberately not supported
+/// here — every real Containerfile this project needs to build in
+/// practice already spells out the full `linux/<arch>` form).
+fn parse_platform_spec(value: &str) -> anyhow::Result<Platform> {
+    let mut parts = value.split('/');
+    let os = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("ociman build: invalid --platform value {value:?}"))?;
+    let architecture = parts.next().ok_or_else(|| {
+        anyhow::anyhow!(
+            "ociman build: --platform value {value:?} is missing an architecture (expected \
+             os/arch[/variant], e.g. linux/amd64)"
+        )
+    })?;
+    let variant = parts.next().map(str::to_string);
+    anyhow::ensure!(
+        parts.next().is_none(),
+        "ociman build: invalid --platform value {value:?} (expected os/arch[/variant])"
+    );
+    Ok(Platform {
+        os: os.to_string(),
+        architecture: architecture.to_string(),
+        variant,
+        os_version: None,
+    })
 }
 
 /// Parse `ociman build --build-arg`'s own raw `KEY=value`/bare `KEY`

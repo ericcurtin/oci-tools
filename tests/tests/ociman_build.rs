@@ -6411,3 +6411,175 @@ fn build_run_step_never_sees_real_host_stdin() {
         "a RUN step should never see real host stdin, piped into the build invocation or not"
     );
 }
+
+/// The `GOARCH`-style name for the architecture these tests are
+/// actually running on — matches `oci_spec_types::image::Platform::
+/// host`'s own internal `host_arch()` naming exactly, so these tests
+/// stay portable regardless of which real host architecture runs
+/// them (this project's own CI matrix covers both x86_64 and
+/// aarch64).
+fn host_goarch() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "amd64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        panic!("unsupported test host architecture");
+    }
+}
+
+/// `ociman build --platform <host's own real platform>` (0193): builds
+/// completely normally — the common case a real Containerfile pinning
+/// its own platform explicitly (even when it happens to already match)
+/// must not break.
+#[test]
+fn build_platform_matching_the_real_host_succeeds() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/platform-match-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/platform-match-base:latest\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--platform",
+            &format!("linux/{}", host_goarch()),
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/platform-match-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+/// `ociman build --platform` naming a *different* architecture is a
+/// real, previously-unnoticed bug this closes: before this flag (and
+/// the check backing it) existed, a `FROM --platform=` value was
+/// parsed but never read anywhere at all, so a Containerfile
+/// requesting a non-host platform silently got the host platform
+/// instead — this project has no real cross-architecture emulation of
+/// any kind, so a mismatch is now a clear, immediate error instead.
+#[test]
+fn build_platform_mismatch_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/platform-mismatch-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/platform-mismatch-base:latest\n",
+    );
+
+    // Deliberately the *other* real architecture this project supports
+    // at all, never the host's own -- guaranteed to be a real mismatch
+    // regardless of which host runs this test.
+    let other_arch = if host_goarch() == "amd64" {
+        "arm64"
+    } else {
+        "amd64"
+    };
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--platform",
+            &format!("linux/{other_arch}"),
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/platform-mismatch-result:latest",
+        ],
+    );
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains(&format!("linux/{other_arch}")) && stderr.contains("does not match"),
+        "{stderr}"
+    );
+}
+
+/// A per-stage `FROM --platform=` always wins over the whole build's
+/// own `--platform` flag — matching real BuildKit's own identical
+/// precedence exactly (checked directly against
+/// `~/git/moby/vendor/.../dockerfile2llb/convert.go`): even a
+/// `--platform` that *does* match the host is overridden by a
+/// mismatched per-stage value, which must still be the one clear error
+/// that actually surfaces.
+#[test]
+fn build_from_platform_overrides_a_matching_global_platform_flag() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/platform-precedence-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let other_arch = if host_goarch() == "amd64" {
+        "arm64"
+    } else {
+        "amd64"
+    };
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!(
+            "FROM --platform=linux/{other_arch} ociman-test/platform-precedence-base:latest\n"
+        ),
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--platform",
+            &format!("linux/{}", host_goarch()),
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/platform-precedence-result:latest",
+        ],
+    );
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains(&format!("linux/{other_arch}")) && stderr.contains("does not match"),
+        "the per-stage FROM --platform= should override a matching global --platform flag, \
+         still surfacing as the one clear error: {stderr}"
+    );
+}

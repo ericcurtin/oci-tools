@@ -690,6 +690,26 @@ enum Command {
         /// refusal.
         #[arg(long)]
         squash_all: bool,
+        /// Default target platform (`os/arch[/variant]`, e.g.
+        /// `linux/amd64`, `linux/arm64/v8`) for every stage's own
+        /// `FROM`, overridden by that stage's own `FROM --platform=`
+        /// when given — matching real `docker build --platform`/
+        /// `podman build --platform`'s own identical precedence
+        /// (checked directly against real BuildKit's own `convert.go`:
+        /// a per-stage `FROM --platform=` always wins over this global
+        /// default, which only ever fills in for a stage that doesn't
+        /// specify its own). This project has no real cross-
+        /// architecture emulation of any kind, so a resolved platform
+        /// that doesn't match this host is a clear, immediate error
+        /// rather than a silent, wrong substitution — a real,
+        /// previously-unnoticed gap this closes: before this flag (and
+        /// this check) existed, a `FROM --platform=` value was parsed
+        /// but never actually read anywhere, so a Containerfile
+        /// requesting a non-host platform silently got the host
+        /// platform instead, with no warning or error at all (see
+        /// `docs/design/0193`).
+        #[arg(long = "platform")]
+        platform: Option<String>,
     },
     /// List images in local storage.
     Images,
@@ -1533,6 +1553,7 @@ fn main() -> std::process::ExitCode {
                 add_host,
                 squash,
                 squash_all,
+                platform,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
@@ -1549,6 +1570,7 @@ fn main() -> std::process::ExitCode {
                 &add_host,
                 squash,
                 squash_all,
+                platform.as_deref(),
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),
