@@ -768,6 +768,32 @@ enum Command {
         /// own default exactly.
         #[arg(short, long)]
         all: bool,
+        /// Only reclaim an image whose own config also matches this —
+        /// matching real `docker system prune --filter`/`podman
+        /// system prune --filter` for the one key implemented so far,
+        /// `label=<key>`/`label=<key>=<value>`/`label!=<key>`/
+        /// `label!=<key>=<value>` (any other key is a clear error
+        /// rather than silently ignored — real docker/podman also
+        /// support `until=`/`dangling=`/`reference=`/..., not
+        /// implemented here yet). Repeatable; multiple `label=`/
+        /// `label!=` values are OR'd together (an image qualifies if
+        /// *any* of them matches) — checked directly against a real,
+        /// installed `podman image prune` (4.9.3), not assumed from
+        /// its own vendored source alone: a naive reading of
+        /// `~/git/container-libs/common/libimage/filters.go`'s own
+        /// `applyFilters` looks like every filter must match (AND),
+        /// but a real, repeatable, from-a-clean-state test — two
+        /// `--filter label=` values, only one of which actually
+        /// matches a given image — removed it anyway, both with and
+        /// without a completely label-less image in the same batch,
+        /// confirming OR, not AND, for repeated same-key values
+        /// (the installed binary's own real behavior is the ground
+        /// truth here, not necessarily whatever a freshly cloned
+        /// reference repo's own `HEAD` happens to say, if the two have
+        /// drifted apart). With no `--filter` at all, every candidate
+        /// image qualifies, exactly as before this flag existed.
+        #[arg(long = "filter")]
+        filter: Vec<String>,
     },
     /// Print low-level JSON for a container or an image — matching
     /// real `podman inspect`/`docker inspect`'s own default
@@ -1529,7 +1555,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Rmi { reference, force }) => cmd_rmi(&reference, force, cli.global.json),
             Some(Command::Tag { source, target }) => cmd_tag(&source, &target, cli.global.json),
             Some(Command::History { reference }) => cmd_history(&reference, cli.global.json),
-            Some(Command::Prune { all }) => cmd_prune(cli.global.json, all),
+            Some(Command::Prune { all, filter }) => cmd_prune(cli.global.json, all, &filter),
             Some(Command::Inspect { reference }) => cmd_inspect(&reference, cli.global.json),
             Some(Command::Run {
                 args,
@@ -2764,8 +2790,64 @@ fn prune_build_scratch(store: &Store) -> anyhow::Result<(usize, u64)> {
 /// (or, with `all`, no longer used by anything at all — see
 /// [`Command::Prune`]'s own doc comment for the exact policy either
 /// way), run only when explicitly asked, never implicitly.
-fn cmd_prune(json: bool, all: bool) -> anyhow::Result<()> {
+/// One parsed `--filter label=`/`label!=` value — see `Command::
+/// Prune`'s own doc comment for the exact real semantics this
+/// matches (checked directly, not assumed).
+struct LabelFilter {
+    key: String,
+    /// `None` for a bare `label=<key>` (matches any value for that
+    /// key); `Some` for `label=<key>=<value>` (matches only that
+    /// exact value).
+    value: Option<String>,
+    /// `label!=` instead of `label=`.
+    negate: bool,
+}
+
+impl LabelFilter {
+    fn matches(&self, labels: &std::collections::BTreeMap<String, String>) -> bool {
+        let positive = match &self.value {
+            Some(want) => labels.get(&self.key).is_some_and(|v| v == want),
+            None => labels.contains_key(&self.key),
+        };
+        if self.negate { !positive } else { positive }
+    }
+}
+
+/// Parse `ociman prune`'s own `--filter` values. Only the `label=`/
+/// `label!=` key is implemented — see `Command::Prune`'s own doc
+/// comment for real docker/podman's own additional keys this doesn't
+/// support yet, and the exact real multi-value combination semantics
+/// (OR, not AND) this matches.
+fn parse_prune_filters(filters: &[String]) -> anyhow::Result<Vec<LabelFilter>> {
+    filters
+        .iter()
+        .map(|f| {
+            let (rest, negate) = match f.strip_prefix("label!=") {
+                Some(rest) => (rest, true),
+                None => match f.strip_prefix("label=") {
+                    Some(rest) => (rest, false),
+                    None => anyhow::bail!(
+                        "ociman prune: --filter {f:?} is not yet supported (only \
+                         label=<key>[=<value>] or label!=<key>[=<value>] are)"
+                    ),
+                },
+            };
+            anyhow::ensure!(
+                !rest.is_empty(),
+                "ociman prune: --filter {f:?} is missing a label key"
+            );
+            let (key, value) = match rest.split_once('=') {
+                Some((k, v)) => (k.to_string(), Some(v.to_string())),
+                None => (rest.to_string(), None),
+            };
+            Ok(LabelFilter { key, value, negate })
+        })
+        .collect()
+}
+
+fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
     let store = open_store()?;
+    let label_filters = parse_prune_filters(filter)?;
 
     // A dangling (untagged, `is_untagged_reference`, 0179) image not
     // currently in use by any container is reclaimed even *without*
@@ -2806,6 +2888,15 @@ fn cmd_prune(json: bool, all: bool) -> anyhow::Result<()> {
         }
         if !all && !is_untagged_reference(&record.reference) {
             continue;
+        }
+        if !label_filters.is_empty() {
+            let config = store
+                .image_config(&record)
+                .with_context(|| format!("reading config for {}", record.reference))?;
+            let labels = &config.config.unwrap_or_default().labels;
+            if !label_filters.iter().any(|f| f.matches(labels)) {
+                continue;
+            }
         }
         store
             .remove_image(&record.reference)

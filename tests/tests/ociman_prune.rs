@@ -627,3 +627,255 @@ fn prune_reclaims_an_old_build_scratch_entry() {
     );
     assert!(!entry.exists());
 }
+
+/// `ociman prune --filter label=<key>=<value>` (0192): only reclaims a
+/// dangling image whose own config actually has that exact label —
+/// checked directly against a real, installed `podman image prune
+/// --filter label=`, not assumed.
+#[test]
+fn prune_filter_label_with_value_only_removes_a_matching_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/prune-filter-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/prune-filter-base:latest\nLABEL env=prod\n",
+    )
+    .unwrap();
+    let build = ociman(
+        storage_dir.path(),
+        &["build", context_dir.path().to_str().unwrap()],
+    );
+    assert!(build.status.success());
+    let digest = String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+
+    // A mismatched value: the image survives.
+    let prune_no_match = ociman(
+        storage_dir.path(),
+        &["--json", "prune", "--filter", "label=env=staging"],
+    );
+    assert!(
+        prune_no_match.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune_no_match.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&prune_no_match.stdout).unwrap();
+    assert_eq!(
+        view["images_removed"],
+        serde_json::json!([]),
+        "a mismatched label value should never reclaim the image: {view:?}"
+    );
+
+    // The exact matching value: the image is reclaimed.
+    let prune_match = ociman(
+        storage_dir.path(),
+        &["--json", "prune", "--filter", "label=env=prod"],
+    );
+    assert!(
+        prune_match.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune_match.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&prune_match.stdout).unwrap();
+    assert_eq!(view["images_removed"], serde_json::json!([digest]));
+}
+
+/// `ociman prune --filter label=<key>` (no value, bare form): matches
+/// any value for that key.
+#[test]
+fn prune_filter_label_bare_key_matches_any_value() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/prune-filter-bare-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/prune-filter-bare-base:latest\nLABEL env=anything\n",
+    )
+    .unwrap();
+    let build = ociman(
+        storage_dir.path(),
+        &["build", context_dir.path().to_str().unwrap()],
+    );
+    assert!(build.status.success());
+    let digest = String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+
+    let prune = ociman(
+        storage_dir.path(),
+        &["--json", "prune", "--filter", "label=env"],
+    );
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(view["images_removed"], serde_json::json!([digest]));
+}
+
+/// `ociman prune --filter label!=<key>=<value>` (negation): reclaims
+/// an image whose own label does *not* match the given value.
+#[test]
+fn prune_filter_label_negated_removes_a_non_matching_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/prune-filter-negate-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/prune-filter-negate-base:latest\nLABEL env=prod\n",
+    )
+    .unwrap();
+    let build = ociman(
+        storage_dir.path(),
+        &["build", context_dir.path().to_str().unwrap()],
+    );
+    assert!(build.status.success());
+    let digest = String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+
+    // The real value ("prod") negated should keep it.
+    let prune_kept = ociman(
+        storage_dir.path(),
+        &["--json", "prune", "--filter", "label!=env=prod"],
+    );
+    assert!(prune_kept.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&prune_kept.stdout).unwrap();
+    assert_eq!(view["images_removed"], serde_json::json!([]));
+
+    // A *different* value negated should remove it.
+    let prune_removed = ociman(
+        storage_dir.path(),
+        &["--json", "prune", "--filter", "label!=env=staging"],
+    );
+    assert!(prune_removed.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&prune_removed.stdout).unwrap();
+    assert_eq!(view["images_removed"], serde_json::json!([digest]));
+}
+
+/// Multiple `--filter label=` values are OR'd together (0192) —
+/// checked directly against a real, installed `podman image prune
+/// --filter` (not assumed from its own vendored source, which reads
+/// like AND on a first pass but does not match the installed binary's
+/// own real, repeatable, from-a-clean-state behavior): an image
+/// qualifies for removal if *any* of the given `label=`/`label!=`
+/// filters matches, not only if *all* of them do.
+#[test]
+fn prune_filter_multiple_label_values_are_ored_together() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/prune-filter-or-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/prune-filter-or-base:latest\nLABEL env=prod\nLABEL team=infra\n",
+    )
+    .unwrap();
+    let build = ociman(
+        storage_dir.path(),
+        &["build", context_dir.path().to_str().unwrap()],
+    );
+    assert!(build.status.success());
+    let digest = String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Only the first filter matches (env=prod); the second
+    // (team=wrong) does not -- still removed, matching OR semantics.
+    let prune = ociman(
+        storage_dir.path(),
+        &[
+            "--json",
+            "prune",
+            "--filter",
+            "label=env=prod",
+            "--filter",
+            "label=team=wrong",
+        ],
+    );
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(
+        view["images_removed"],
+        serde_json::json!([digest]),
+        "one matching label filter among several should be enough to reclaim the image \
+         (OR, not AND): {view:?}"
+    );
+}
+
+/// An unsupported `--filter` key is a clear, immediate error, matching
+/// real docker/podman's own identical refusal for a genuinely unknown
+/// filter.
+#[test]
+fn prune_filter_unsupported_key_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["prune", "--filter", "until=24h"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("until=24h"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
