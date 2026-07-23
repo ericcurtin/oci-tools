@@ -1078,6 +1078,30 @@ enum Command {
         #[arg(short, long)]
         attach: bool,
     },
+    /// Attach to an already-*running* container's own live output and
+    /// block until it exits, this command's own exit code then
+    /// becoming the container's own real exit code — matching real
+    /// `docker attach`/`podman attach`'s own observable output
+    /// behavior exactly.
+    ///
+    /// Deliberately output-only, unlike real `docker attach`/`podman
+    /// attach` (which forward this process's own real stdin into the
+    /// container by default, `--no-stdin` to disable): this project's
+    /// own current architecture only ever wires up a container's
+    /// stdin once, at its original `run`/`create` time (the same
+    /// `-i`/`--interactive` decision already documented in
+    /// [`Command::Run`]'s own doc comment) — there is no live channel
+    /// an already-detached, already-running container's own stdin
+    /// could be reattached to later, the same real, still-deferred
+    /// gap `cmd_start`'s own doc comment already names directly. No
+    /// `--no-stdin`/`--detach-keys`/`--sig-proxy` flags are offered at
+    /// all here, rather than silently accepting and ignoring them —
+    /// matching this project's own established "never accept a flag
+    /// this command can't actually honor" convention.
+    Attach {
+        /// The container's ID or `--name`.
+        id: String,
+    },
     /// Restart a container: stop it first if it's currently running
     /// (same signal/timeout escalation as `ociman stop`), then start
     /// it again — matching real `docker restart`/`podman restart`
@@ -1758,6 +1782,7 @@ fn main() -> std::process::ExitCode {
             }) => cmd_create(args, rm, interactive),
             Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
             Some(Command::Start { id, attach }) => cmd_start(&id, attach),
+            Some(Command::Attach { id }) => cmd_attach(&id),
             Some(Command::Restart { id, time }) => cmd_restart(&id, time),
             Some(Command::Rm { id, force }) => cmd_rm(&id, force),
             Some(Command::Cp {
@@ -5370,6 +5395,30 @@ fn cmd_start(id: &str, attach: bool) -> anyhow::Result<()> {
         std::process::exit(exit_code);
     }
     Ok(())
+}
+
+/// `ociman attach`: see [`Command::Attach`]'s own doc comment for the
+/// full scope (output-only; real stdin forwarding is a separate,
+/// still-deferred gap this project's own current architecture can't
+/// honor for an already-running container).
+///
+/// Reuses [`attach_and_wait_for_exit`] verbatim — it already polls the
+/// *raw* on-disk status (not tied to having just launched the
+/// container in this same process), so attaching to a container an
+/// entirely separate, earlier invocation started works identically to
+/// `cmd_start`'s own `--attach` path.
+fn cmd_attach(id: &str) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let resolved = resolve_container_id(&containers, id)?;
+    let state = containers.load(&resolved)?;
+    let status = state.effective_status();
+    anyhow::ensure!(
+        status == Status::Running,
+        "you can only attach to a running container (container {id:?}'s own current status is \
+         {status})"
+    );
+    let exit_code = attach_and_wait_for_exit(&containers, &resolved)?;
+    std::process::exit(exit_code);
 }
 
 /// Stream a just-(re)started container's own live output to stdout,
