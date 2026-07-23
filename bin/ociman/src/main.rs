@@ -1264,9 +1264,12 @@ enum Command {
         /// to `KILL`.
         #[arg(short, long, default_value_t = 10)]
         time: u64,
-        /// Signal to send initially (name or number).
-        #[arg(short, long, default_value = "TERM")]
-        signal: String,
+        /// Signal to send initially (name or number). Defaults to the
+        /// image's own declared `STOPSIGNAL` (0244), else `TERM` —
+        /// matching real `docker stop`/`podman stop`, which honor a
+        /// Containerfile's `STOPSIGNAL` unless overridden.
+        #[arg(short, long)]
+        signal: Option<String>,
     },
     /// Send a signal to a running container's own init process — one
     /// immediate send, no grace period, no escalation (unlike `stop`),
@@ -1810,7 +1813,7 @@ fn main() -> std::process::ExitCode {
                 squash,
                 cli.global.json,
             ),
-            Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, &signal),
+            Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, signal.as_deref()),
             Some(Command::Kill { id, signal }) => cmd_kill(&id, &signal),
             Some(Command::Pause { id }) => cmd_pause(&id),
             Some(Command::Unpause { id }) => cmd_unpause(&id),
@@ -5124,10 +5127,33 @@ fn reset_failed_systemd_scope(container_id: &str, state: &oci_runtime_core::Pers
 /// doc comment for the exact policy): a no-op on one that's already
 /// stopped, matching real `docker stop`/`podman stop`'s own
 /// idempotent behavior rather than erroring on a redundant call.
-fn cmd_stop(id: &str, time_secs: u64, signal: &str) -> anyhow::Result<()> {
+fn cmd_stop(id: &str, time_secs: u64, signal: Option<&str>) -> anyhow::Result<()> {
     stop_container(id, time_secs, signal, true)?;
     println!("{id}");
     Ok(())
+}
+
+/// The image's own declared `STOPSIGNAL`, if the container's image
+/// still resolves locally and declares one (0244) — `None` for every
+/// other case (no image annotation on an `ocirun`-style bundle, image
+/// since removed, no `STOPSIGNAL` declared), which callers map to the
+/// `TERM` default. Never an error: a stop must work even when the
+/// image is long gone (real `podman stop` keeps the signal on the
+/// container record for the same reason; this project's own container
+/// state predates 0244 and reads it from the image instead, same
+/// observable behavior while the image exists).
+fn stop_signal_from_image(state: &oci_runtime_core::PersistedState) -> Option<String> {
+    let reference = state.annotations.get(ANNOTATION_IMAGE)?;
+    let store = open_store().ok()?;
+    let resolved = oci_store::resolve_by_reference_or_id(&store, reference)
+        .ok()
+        .flatten()?;
+    store
+        .image_config(resolved.record())
+        .ok()?
+        .config?
+        .stop_signal
+        .filter(|s| !s.is_empty())
 }
 
 /// After a container's own process has genuinely exited, its detached
@@ -5167,7 +5193,12 @@ fn wait_for_keeper_to_finalize(containers: &StateStore, resolved: &str) {
 /// for the stop half and again for the start half (same reasoning
 /// `remove_container`'s own doc comment already established for
 /// `cmd_rm`/`cmd_rmi --force`).
-fn stop_container(id: &str, time_secs: u64, signal: &str, reset_scope: bool) -> anyhow::Result<()> {
+fn stop_container(
+    id: &str,
+    time_secs: u64,
+    signal: Option<&str>,
+    reset_scope: bool,
+) -> anyhow::Result<()> {
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)?;
     let state = containers.load(&resolved)?;
@@ -5191,8 +5222,29 @@ fn stop_container(id: &str, time_secs: u64, signal: &str, reset_scope: bool) -> 
         .pid
         .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
 
-    let sig = oci_runtime_core::signal::parse(signal)
-        .with_context(|| format!("parsing signal {signal:?}"))?;
+    // An explicit `--signal` always wins; otherwise the image's own
+    // declared STOPSIGNAL (0244), else TERM -- matching real
+    // `docker stop`/`podman stop`. A declared-but-unparsable value
+    // falls back to TERM with a warning rather than failing the stop,
+    // matching real cri-o's own `StopSignal()` tolerance exactly.
+    let resolved_signal = match signal {
+        Some(explicit) => explicit.to_string(),
+        None => stop_signal_from_image(&state).unwrap_or_else(|| "TERM".to_string()),
+    };
+    let sig = match oci_runtime_core::signal::parse(&resolved_signal) {
+        Ok(sig) => sig,
+        Err(e) if signal.is_none() => {
+            tracing::warn!(
+                signal = %resolved_signal,
+                error = %e,
+                "image declares an unparsable STOPSIGNAL; using TERM"
+            );
+            oci_runtime_core::signal::parse("TERM").expect("TERM always parses")
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("parsing signal {resolved_signal:?}"));
+        }
+    };
     let _ = oci_runtime_core::process::kill(pid, sig);
 
     // Re-send the same signal a few more times, early on — a real,
@@ -5564,7 +5616,7 @@ fn cmd_restart(id: &str, time_secs: u64) -> anyhow::Result<()> {
         false
     };
 
-    stop_container(id, time_secs, "TERM", false)?;
+    stop_container(id, time_secs, None, false)?;
 
     if had_auto_remove && let Ok(mut state) = containers.load(&resolved) {
         state

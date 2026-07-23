@@ -1116,6 +1116,9 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             finished_at_nanos: None,
             exit_code: None,
             log_path,
+            // The image's own STOPSIGNAL (0244) -- image_config was
+            // already read above for the bundle spec.
+            stop_signal: image_config.stop_signal.clone().filter(|s| !s.is_empty()),
         };
         if let Err(e) = container::save(&root, &record) {
             // Never leave an orphaned bundle behind a failed record
@@ -1290,7 +1293,16 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         // stop signal, then up to `timeout` seconds for a voluntary
         // exit.
         if let (Some(pid), true) = (pid, request.timeout > 0) {
-            let _ = oci_runtime_core::process::kill(pid, libc::SIGTERM);
+            // The image's own STOPSIGNAL when declared (0244), else
+            // SIGTERM -- with real cri-o's own garbage-tolerant TERM
+            // fallback for an unparsable declaration
+            // (`Container::StopSignal`, checked directly).
+            let graceful_signal = record
+                .stop_signal
+                .as_deref()
+                .and_then(|s| oci_runtime_core::signal::parse(s).ok())
+                .unwrap_or(libc::SIGTERM);
+            let _ = oci_runtime_core::process::kill(pid, graceful_signal);
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_secs(request.timeout.min(600) as u64);
             while std::time::Instant::now() < deadline {

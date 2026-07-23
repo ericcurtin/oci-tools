@@ -108,6 +108,16 @@ pub struct ContainerRecord {
     /// means no logging.
     #[serde(default)]
     pub log_path: Option<String>,
+    /// The image's own declared `STOPSIGNAL` (0244), captured at
+    /// create time (the same moment the image config is already read
+    /// for the bundle spec) — `StopContainer`'s graceful phase sends
+    /// this instead of `SIGTERM` when present. Stored as the image's
+    /// own string form; parsed at stop time with real cri-o's own
+    /// garbage-tolerant TERM fallback (`Container::StopSignal`,
+    /// checked directly). `None` (also for pre-0244 records) means
+    /// the `SIGTERM` default.
+    #[serde(default)]
+    pub stop_signal: Option<String>,
 }
 
 impl Record for ContainerRecord {
@@ -183,6 +193,7 @@ mod tests {
             finished_at_nanos: None,
             exit_code: None,
             log_path: None,
+            stop_signal: None,
         }
     }
 

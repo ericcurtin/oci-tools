@@ -1626,3 +1626,83 @@ async fn reopen_container_log_rotates_to_a_fresh_file() {
             .unwrap();
     }
 }
+
+/// `StopContainer`'s graceful phase sends the image's own declared
+/// `STOPSIGNAL` (`docs/design/0244`) instead of `SIGTERM` — the
+/// container's USR1 trap exit code (43) proves which signal actually
+/// arrived, exactly like real cri-o's own `GetStopSignal` behavior.
+#[tokio::test]
+async fn stop_container_honors_the_images_stopsignal() {
+    let Some((storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let stopsignal_image = "docker.io/ocicri-test/stopsignal:latest";
+    let busybox = busybox_path().unwrap();
+    let store = Store::open(storage.path()).unwrap();
+    seed_image(
+        &store,
+        stopsignal_image,
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig {
+            stop_signal: Some("SIGUSR1".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let mut config = container_config("usr1-stopper", 0);
+    config.image = Some(ImageSpec {
+        image: stopsignal_image.to_string(),
+        ..Default::default()
+    });
+    // Distinct exit codes per signal; `touch /ready` after the traps
+    // (the same pre-exec-race guard 0238's own stop test documents).
+    config.command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "trap 'exit 43' USR1; trap 'exit 21' TERM; touch /ready; while true; do sleep 0.2; done"
+            .to_string(),
+    ];
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id,
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+    let ready = bundle_dir(storage.path(), &container_id).join("rootfs/ready");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "traps never installed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    client
+        .stop_container(oci_cri_types::StopContainerRequest {
+            container_id: container_id.clone(),
+            timeout: 30,
+        })
+        .await
+        .expect("StopContainer failed");
+    let status = wait_for_state(&mut client, &container_id, ContainerState::ContainerExited).await;
+    assert_eq!(
+        status.exit_code, 43,
+        "the USR1 trap's own exit code proves STOPSIGNAL was sent: {status:?}"
+    );
+}

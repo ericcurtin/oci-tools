@@ -260,3 +260,104 @@ fn stop_of_a_nonexistent_container_is_a_clear_error() {
     let out = ociman(storage_dir.path(), &["stop", "does-not-exist"]);
     assert!(!out.status.success());
 }
+
+/// `ociman stop` with no explicit `--signal` honors the image's own
+/// declared `STOPSIGNAL` (`docs/design/0244`) — matching real
+/// `docker stop`/`podman stop`: the container's USR1 trap (its
+/// distinctive `exit 43`) proves the image-declared signal, not
+/// `TERM`, was what actually arrived. An explicit `--signal TERM`
+/// still overrides it (the TERM trap's own `exit 21` proves that
+/// side).
+#[test]
+fn stop_honors_the_images_declared_stopsignal() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stopsignal:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig {
+            stop_signal: Some("SIGUSR1".to_string()),
+            ..Default::default()
+        },
+    );
+
+    // Distinct exit codes per signal: whichever trap fires tells us
+    // exactly which signal was delivered.
+    let script = "trap 'exit 43' USR1; trap 'exit 21' TERM; while true; do sleep 0.2; done";
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/stopsignal:latest",
+        &["/bin/sh", "-c", script],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    // No --signal: the image's own STOPSIGNAL (USR1) is what lands.
+    let stop = ociman(storage_dir.path(), &["stop", "--time", "60", &id]);
+    assert!(
+        stop.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    run.wait().unwrap();
+    let ps = ociman(storage_dir.path(), &["ps", "-a", "--json"]);
+    let views: serde_json::Value = serde_json::from_slice(&ps.stdout).unwrap();
+    let entry = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == id)
+        .expect("container should be listed")
+        .clone();
+    assert_eq!(entry["status"], "stopped");
+    assert_eq!(
+        entry["exit_code"], 43,
+        "the USR1 trap's own code proves STOPSIGNAL was honored: {entry:?}"
+    );
+    ociman(storage_dir.path(), &["rm", &id]);
+
+    // Explicit --signal TERM: overrides the image's STOPSIGNAL.
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/stopsignal:latest",
+        &["/bin/sh", "-c", script],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+    let stop = ociman(
+        storage_dir.path(),
+        &["stop", "--time", "60", "--signal", "TERM", &id],
+    );
+    assert!(
+        stop.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    run.wait().unwrap();
+    let ps = ociman(storage_dir.path(), &["ps", "-a", "--json"]);
+    let views: serde_json::Value = serde_json::from_slice(&ps.stdout).unwrap();
+    let entry = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == id)
+        .expect("container should be listed")
+        .clone();
+    assert_eq!(
+        entry["exit_code"], 21,
+        "an explicit --signal overrides STOPSIGNAL: {entry:?}"
+    );
+    ociman(storage_dir.path(), &["rm", &id]);
+}
