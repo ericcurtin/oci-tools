@@ -10,21 +10,21 @@
 //! setup is CRI-specific in a way a real `crictl`/kubelet couldn't
 //! talk to).
 //!
-//! This is a real, narrow first slice, not a placeholder: the server
-//! genuinely listens, accepts real gRPC connections, and answers
-//! `RuntimeService.Version` (kubelet's own first connectivity/
-//! compatibility check against any runtime) with real, honest values
-//! — see `runtime_service.rs`'s own module doc comment for exactly
-//! why `Version` was chosen as the one RPC to implement first, and
-//! why every other one of `RuntimeService`'s 33 other RPCs
-//! deliberately returns a real `Status::unimplemented` naming itself,
-//! rather than accepting a request this project can't actually act on
-//! yet. `ImageService`'s own `ListImages`/`ImageStatus` (0213) are
-//! genuinely implemented too, reusing this project's own already-
-//! tested `oci_store` resolution/summary primitives directly (see
-//! `image_service.rs`'s own module doc comment) — `PullImage`/
-//! `RemoveImage`/`ImageFsInfo`/`StreamImages` remain real, honest
-//! `Status::unimplemented`s, still ahead.
+//! Genuinely implemented so far: `RuntimeService.Version`/`Status`/
+//! `RuntimeConfig`/`UpdateRuntimeConfig`/`ListMetricDescriptors`, the
+//! full pod-sandbox lifecycle (`RunPodSandbox`/`StopPodSandbox`/
+//! `RemovePodSandbox`/`PodSandboxStatus`/`ListPodSandbox` — a real,
+//! persistent, record-keeping state machine with real CRI semantics,
+//! deliberately no infra process/pinned namespaces yet, see
+//! `docs/design/0233`), and all of `ImageService` except the
+//! feature-gated `StreamImages` (`ListImages`/`ImageStatus`/
+//! `PullImage`/`RemoveImage`/`ImageFsInfo`, reusing this project's
+//! own already-tested `oci_store`/`oci_registry` primitives directly
+//! — see `image_service.rs`'s own module doc comment). Every
+//! remaining RPC (container lifecycle, exec/attach/port-forward,
+//! stats, events, ...) deliberately returns a real
+//! `Status::unimplemented` naming itself, rather than accepting a
+//! request this project can't actually act on yet.
 //!
 //! Unlike every other binary in this workspace, `ocicri` is a real,
 //! long-lived server process, not a short-lived CLI invocation — the
@@ -38,6 +38,7 @@
 
 mod image_service;
 mod runtime_service;
+mod sandbox;
 
 use std::path::PathBuf;
 
@@ -119,7 +120,7 @@ async fn serve(socket_path: &std::path::Path) -> anyhow::Result<()> {
 
     tonic::transport::Server::builder()
         .add_service(cri::runtime_service_server::RuntimeServiceServer::new(
-            runtime_service::RuntimeServiceImpl,
+            runtime_service::RuntimeServiceImpl::default(),
         ))
         .add_service(cri::image_service_server::ImageServiceServer::new(
             image_service::ImageServiceImpl,

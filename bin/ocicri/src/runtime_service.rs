@@ -1,23 +1,23 @@
-//! The real `RuntimeService` gRPC implementation — see this crate's
-//! own module doc comment (`main.rs`) for the exact scope of this
-//! first slice: `Version`/`Status`/`RuntimeConfig`/
-//! `UpdateRuntimeConfig`/`ListMetricDescriptors` are genuinely
-//! implemented; every other one of the real CRI v1 `RuntimeService`'s
-//! remaining 29 RPCs (pod sandbox/container lifecycle, exec/attach/
-//! port-forward, stats, events, ...) returns a real, honest
-//! `Status::unimplemented` rather than silently accepting a request it
-//! can't actually act on — matching this project's own established
-//! "narrow first slice, document the rest" pattern used everywhere
-//! else (e.g. `ociboot build-image` before `install to-disk`).
-//!
-//! `ImageService` (the CRI's other, smaller service — `ListImages`/
-//! `PullImage`/... ) isn't wired up into the server at all yet; it's
-//! its own separate, still-ahead increment.
+//! The real `RuntimeService` gRPC implementation — `Version`/
+//! `Status`/`RuntimeConfig`/`UpdateRuntimeConfig`/
+//! `ListMetricDescriptors` plus the full pod-sandbox lifecycle
+//! (`RunPodSandbox`/`StopPodSandbox`/`RemovePodSandbox`/
+//! `PodSandboxStatus`/`ListPodSandbox`, see `docs/design/0233` and
+//! `sandbox.rs`'s own module doc comment for exactly what a sandbox
+//! is — and honestly isn't — here yet) are genuinely implemented;
+//! every other one of the real CRI v1 `RuntimeService`'s remaining
+//! RPCs (container lifecycle, exec/attach/port-forward, stats,
+//! events, ...) returns a real, honest `Status::unimplemented` rather
+//! than silently accepting a request it can't actually act on —
+//! matching this project's own established "narrow first slice,
+//! document the rest" pattern used everywhere else (e.g. `ociboot
+//! build-image` before `install to-disk`).
 
 use tonic::codegen::BoxStream;
 use tonic::{Request, Response, Status};
 
 use crate::cri;
+use crate::sandbox;
 
 /// `Version`'s own `runtime_name`, matching this project's own real
 /// binary name (not `"cri-o"` — a real, honest identification of what
@@ -48,23 +48,103 @@ const RUNTIME_API_VERSION: &str = "v1";
 const RUNTIME_READY_CONDITION: &str = "RuntimeReady";
 const NETWORK_READY_CONDITION: &str = "NetworkReady";
 
-/// The real `RuntimeService` state — empty for now (`Version` needs
-/// none at all); will grow real `oci_store`/`oci_runtime_core` state
-/// once pod sandbox/container lifecycle RPCs are implemented.
+/// The kubelet-default labels `populateSandboxLabels` (real cri-o,
+/// `server/sandbox_run_linux.go`) fills in when a client (`crictl`)
+/// didn't — checked directly against the real
+/// `k8s.io/kubelet/pkg/types` constants.
+const POD_NAME_LABEL: &str = "io.kubernetes.pod.name";
+const POD_NAMESPACE_LABEL: &str = "io.kubernetes.pod.namespace";
+const POD_UID_LABEL: &str = "io.kubernetes.pod.uid";
+
+/// The real `RuntimeService` state: one lock serializing mutating
+/// pod-sandbox RPCs, so two concurrent `RunPodSandbox` calls with the
+/// same metadata can't both miss the duplicate-name check and write
+/// two records for one pod (real cri-o's own equivalent is its
+/// name-registrar's `ReservePodName`). Reads (`PodSandboxStatus`/
+/// `ListPodSandbox`) stay lock-free plain file reads, the same model
+/// `ImageService` already uses against `oci_store`.
 #[derive(Debug, Default)]
-pub struct RuntimeServiceImpl;
+pub struct RuntimeServiceImpl {
+    sandbox_mutation_lock: std::sync::Mutex<()>,
+}
 
 /// A real, honest "not implemented yet" error for every RPC this first
 /// slice doesn't answer — `name` is the real RPC name (matching
-/// `proto/api.proto`'s own `rpc` name, e.g. `"RunPodSandbox"`) so a
+/// `proto/api.proto`'s own `rpc` name, e.g. `"CreateContainer"`) so a
 /// real caller's own error message actually names what it tried to
 /// call, not a generic "not implemented" with no further information.
 fn unimplemented<T>(name: &str) -> Result<Response<T>, Status> {
     Err(Status::unimplemented(format!(
-        "ocicri: {name} is not implemented yet (milestone 7, a real, narrow first slice: only \
-         Version/Status/RuntimeConfig/UpdateRuntimeConfig/ListMetricDescriptors are answered so \
+        "ocicri: {name} is not implemented yet (milestone 7: Version/Status/RuntimeConfig/\
+         UpdateRuntimeConfig/ListMetricDescriptors and the pod-sandbox lifecycle are answered so \
          far)"
     )))
+}
+
+/// The sandbox record directory under this process's own real storage
+/// root — resolved per call, like `ImageService`'s own `open_store`,
+/// so tests can point one spawned server at its own private root via
+/// `OCI_TOOLS_STORAGE_ROOT`.
+fn sandbox_store_root() -> std::path::PathBuf {
+    sandbox::sandbox_root(&oci_cli_common::storage::default_root())
+}
+
+fn io_error(context: &str, e: std::io::Error) -> Status {
+    Status::internal(format!("{context}: {e}"))
+}
+
+fn now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+fn state_to_proto(state: sandbox::SandboxState) -> i32 {
+    match state {
+        sandbox::SandboxState::Ready => cri::PodSandboxState::SandboxReady as i32,
+        sandbox::SandboxState::NotReady => cri::PodSandboxState::SandboxNotready as i32,
+    }
+}
+
+fn metadata_to_proto(metadata: &sandbox::SandboxMetadata) -> cri::PodSandboxMetadata {
+    cri::PodSandboxMetadata {
+        name: metadata.name.clone(),
+        uid: metadata.uid.clone(),
+        namespace: metadata.namespace.clone(),
+        attempt: metadata.attempt,
+    }
+}
+
+/// Resolves one sandbox for a mutating/status RPC. `Ok(None)` is the
+/// real "not found" case each caller maps per its own real cri-o
+/// semantics (silent success for stop/remove, `NotFound` for status —
+/// see `docs/design/0233`); an ambiguous prefix is a client-input
+/// problem (`InvalidArgument`), distinct from both.
+fn find_sandbox(id: &str) -> Result<Option<sandbox::SandboxRecord>, Status> {
+    match sandbox::find_by_id_prefix(&sandbox_store_root(), id) {
+        Ok(found) => Ok(found),
+        Err(sandbox::LookupError::AmbiguousPrefix(prefix)) => Err(Status::invalid_argument(
+            format!("sandbox ID {prefix:?} is ambiguous: matches more than one sandbox"),
+        )),
+        Err(sandbox::LookupError::Io(e)) => Err(io_error("reading sandbox records", e)),
+    }
+}
+
+/// Whether `record` passes the given list filter's `state`/
+/// `label_selector` criteria (ANDed, matching real cri-o's own
+/// `filterSandbox`: a state filter compares exactly; a label selector
+/// requires every given key/value pair to match).
+fn matches_filter(record: &sandbox::SandboxRecord, filter: &cri::PodSandboxFilter) -> bool {
+    if let Some(state) = &filter.state
+        && state.state != state_to_proto(record.state)
+    {
+        return false;
+    }
+    filter
+        .label_selector
+        .iter()
+        .all(|(k, v)| record.labels.get(k) == Some(v))
 }
 
 #[tonic::async_trait]
@@ -85,39 +165,310 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         }))
     }
 
+    /// Creates a real, persistent pod-sandbox record with real CRI
+    /// name/ID/state semantics, checked directly against real cri-o's
+    /// own `runPodSandbox`/`sandboxBuilder` — and deliberately no
+    /// infra ("pause") process or pinned namespaces yet (see
+    /// `sandbox.rs`'s own module doc comment and `docs/design/0233`
+    /// for exactly why that's real cri-o's own ordinary
+    /// `drop_infra_ctr` shape too, minus the namespace pinning this
+    /// project defers until it has real pod networking).
     async fn run_pod_sandbox(
         &self,
-        _request: Request<cri::RunPodSandboxRequest>,
+        request: Request<cri::RunPodSandboxRequest>,
     ) -> Result<Response<cri::RunPodSandboxResponse>, Status> {
-        unimplemented("RunPodSandbox")
+        let request = request.into_inner();
+
+        // Real cri-o validates a non-empty handler against its own
+        // configured runtime table; ocicri has no configurable
+        // runtime-handler concept at all (`Status` already reports
+        // exactly one default handler, `name: ""`), so any non-empty
+        // handler is unknown by definition -- and the proto itself
+        // demands rejection for an unknown handler.
+        if !request.runtime_handler.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "unknown runtime handler {:?}: ocicri only supports the default handler \
+                 (empty string)",
+                request.runtime_handler
+            )));
+        }
+
+        // The same validations, in the same order, as real cri-o's own
+        // `sandboxBuilder.SetConfig`/`GenerateNameAndID` (its own
+        // error strings, too, where they're reasonable English).
+        let config = request
+            .config
+            .ok_or_else(|| Status::invalid_argument("config is nil"))?;
+        let metadata = config
+            .metadata
+            .ok_or_else(|| Status::invalid_argument("metadata is nil"))?;
+        if metadata.name.is_empty() {
+            return Err(Status::invalid_argument(
+                "metadata.Name should not be empty",
+            ));
+        }
+        if metadata.namespace.is_empty() {
+            return Err(Status::invalid_argument(
+                "cannot generate pod name without namespace",
+            ));
+        }
+        if metadata.uid.is_empty() {
+            return Err(Status::invalid_argument(
+                "cannot generate pod name without uid in metadata",
+            ));
+        }
+
+        // Real cri-o's own unique pod name, exactly
+        // (`GenerateNameAndID`'s own strings.Join).
+        let name = format!(
+            "k8s_{}_{}_{}_{}",
+            metadata.name, metadata.namespace, metadata.uid, metadata.attempt
+        );
+
+        let root = sandbox_store_root();
+        let _guard = self
+            .sandbox_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // A duplicate request (same name/namespace/uid/attempt)
+        // returns the *existing* sandbox's ID as a success -- real
+        // cri-o's own `reservePodNameOrGetExisting` "this is actually
+        // a duplicate request. Just return that sandbox" branch; real
+        // kubelet retries after a lost response depend on this.
+        if let Some(existing) =
+            sandbox::find_by_name(&root, &name).map_err(|e| io_error("resolving pod name", e))?
+        {
+            return Ok(Response::new(cri::RunPodSandboxResponse {
+                pod_sandbox_id: existing.id,
+            }));
+        }
+
+        // Labels kubelet always sets but other clients (crictl)
+        // don't, populated only if missing -- matching real cri-o's
+        // own `populateSandboxLabels` exactly.
+        let mut labels = config.labels;
+        for (key, value) in [
+            (POD_NAME_LABEL, &metadata.name),
+            (POD_NAMESPACE_LABEL, &metadata.namespace),
+            (POD_UID_LABEL, &metadata.uid),
+        ] {
+            labels
+                .entry(key.to_string())
+                .or_insert_with(|| value.clone());
+        }
+
+        // The namespace modes the request declared, stored verbatim so
+        // `PodSandboxStatus` can echo them back (real cri-o's own
+        // status echoes the requested options too, not a live probe).
+        let namespace_options = config
+            .linux
+            .and_then(|l| l.security_context)
+            .and_then(|sc| sc.namespace_options)
+            .map(|o| sandbox::NamespaceOptions {
+                network: o.network,
+                pid: o.pid,
+                ipc: o.ipc,
+                target_id: o.target_id,
+            });
+
+        let record = sandbox::SandboxRecord {
+            id: sandbox::generate_id(),
+            name,
+            metadata: sandbox::SandboxMetadata {
+                name: metadata.name,
+                uid: metadata.uid,
+                namespace: metadata.namespace,
+                attempt: metadata.attempt,
+            },
+            labels,
+            annotations: config.annotations,
+            state: sandbox::SandboxState::Ready,
+            created_at_nanos: now_nanos(),
+            namespace_options,
+        };
+        sandbox::save(&root, &record).map_err(|e| io_error("saving sandbox record", e))?;
+
+        Ok(Response::new(cri::RunPodSandboxResponse {
+            pod_sandbox_id: record.id,
+        }))
     }
 
+    /// `SANDBOX_READY` -> `SANDBOX_NOTREADY`, idempotently. An empty
+    /// ID is a real error (real cri-o's own `sandbox.ErrIDEmpty`); an
+    /// unknown ID is a silent, empty success (real cri-o's own
+    /// explicit comment: "the CRI interface ... expects to not error
+    /// out in not found cases").
     async fn stop_pod_sandbox(
         &self,
-        _request: Request<cri::StopPodSandboxRequest>,
+        request: Request<cri::StopPodSandboxRequest>,
     ) -> Result<Response<cri::StopPodSandboxResponse>, Status> {
-        unimplemented("StopPodSandbox")
+        let id = request.into_inner().pod_sandbox_id;
+        if id.is_empty() {
+            // Real cri-o's own `ErrIDEmpty` message, verbatim.
+            return Err(Status::invalid_argument("PodSandboxId should not be empty"));
+        }
+
+        let _guard = self
+            .sandbox_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(mut record) = find_sandbox(&id)? else {
+            return Ok(Response::new(cri::StopPodSandboxResponse {}));
+        };
+        // Idempotent for an already-stopped sandbox, matching real
+        // cri-o's own `sb.Stopped()` early return.
+        if record.state == sandbox::SandboxState::Ready {
+            record.state = sandbox::SandboxState::NotReady;
+            sandbox::save(&sandbox_store_root(), &record)
+                .map_err(|e| io_error("saving sandbox record", e))?;
+        }
+        Ok(Response::new(cri::StopPodSandboxResponse {}))
     }
 
+    /// Unconditional/forceful removal (the proto: running containers
+    /// "must be forcibly terminated and removed"; real cri-o's own
+    /// `removePodSandbox` never requires a prior stop) -- here that
+    /// means deleting the record whether `READY` or `NOTREADY`. Same
+    /// empty-ID error and silent not-found success as stop.
     async fn remove_pod_sandbox(
         &self,
-        _request: Request<cri::RemovePodSandboxRequest>,
+        request: Request<cri::RemovePodSandboxRequest>,
     ) -> Result<Response<cri::RemovePodSandboxResponse>, Status> {
-        unimplemented("RemovePodSandbox")
+        let id = request.into_inner().pod_sandbox_id;
+        if id.is_empty() {
+            return Err(Status::invalid_argument("PodSandboxId should not be empty"));
+        }
+
+        let _guard = self
+            .sandbox_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(record) = find_sandbox(&id)? else {
+            return Ok(Response::new(cri::RemovePodSandboxResponse {}));
+        };
+        sandbox::remove(&sandbox_store_root(), &record.id)
+            .map_err(|e| io_error("removing sandbox record", e))?;
+        Ok(Response::new(cri::RemovePodSandboxResponse {}))
     }
 
+    /// Unlike stop/remove, an unknown (or empty) ID here is a real
+    /// gRPC `NotFound` -- real cri-o wraps every lookup failure in
+    /// this RPC in `codes.NotFound` ("could not find pod %q").
     async fn pod_sandbox_status(
         &self,
-        _request: Request<cri::PodSandboxStatusRequest>,
+        request: Request<cri::PodSandboxStatusRequest>,
     ) -> Result<Response<cri::PodSandboxStatusResponse>, Status> {
-        unimplemented("PodSandboxStatus")
+        let request = request.into_inner();
+        let id = request.pod_sandbox_id;
+        let Some(record) = find_sandbox(&id)? else {
+            return Err(Status::not_found(format!("could not find pod {id:?}")));
+        };
+
+        // `linux.namespaces.options` echoes what the request itself
+        // declared (stored verbatim at creation) -- matching real
+        // cri-o, whose own status echoes `sb.NamespaceOptions()`, the
+        // requested config, not a live probe.
+        let linux = record
+            .namespace_options
+            .as_ref()
+            .map(|o| cri::LinuxPodSandboxStatus {
+                namespaces: Some(cri::Namespace {
+                    options: Some(cri::NamespaceOption {
+                        network: o.network,
+                        pid: o.pid,
+                        ipc: o.ipc,
+                        target_id: o.target_id.clone(),
+                        userns_options: None,
+                    }),
+                }),
+            });
+
+        // Verbose info: one "info" key holding a JSON blob, matching
+        // real cri-o's own shape (`createSandboxInfo`) with honestly
+        // less inside it -- there is no infra-container runtime spec
+        // here to marshal, and fabricating one would be a false claim,
+        // so the stored record itself is the debug payload.
+        let mut info = std::collections::HashMap::new();
+        if request.verbose {
+            info.insert(
+                "info".to_string(),
+                serde_json::to_string(&record).unwrap_or_default(),
+            );
+        }
+
+        Ok(Response::new(cri::PodSandboxStatusResponse {
+            status: Some(cri::PodSandboxStatus {
+                id: record.id.clone(),
+                metadata: Some(metadata_to_proto(&record.metadata)),
+                state: state_to_proto(record.state),
+                created_at: record.created_at_nanos,
+                // Real cri-o always sets an (empty until a CNI
+                // provides an IP) network status message; ocicri has
+                // no CNI at all, so an empty message is both
+                // shape-identical and honest.
+                network: Some(cri::PodSandboxNetworkStatus::default()),
+                linux,
+                labels: record.labels.clone(),
+                annotations: record.annotations.clone(),
+                runtime_handler: String::new(),
+            }),
+            info,
+            // Only populated by real cri-o when its own pod-events
+            // feature is enabled; ocicri has no event machinery yet.
+            containers_statuses: Vec::new(),
+            timestamp: 0,
+        }))
     }
 
+    /// Filters combine with AND, matching real cri-o's own
+    /// `filterSandboxList`/`filterSandbox`: an `id` filter that
+    /// matches nothing (or is ambiguous) yields an empty list, never
+    /// an error.
     async fn list_pod_sandbox(
         &self,
-        _request: Request<cri::ListPodSandboxRequest>,
+        request: Request<cri::ListPodSandboxRequest>,
     ) -> Result<Response<cri::ListPodSandboxResponse>, Status> {
-        unimplemented("ListPodSandbox")
+        let filter = request.into_inner().filter;
+
+        let records = match filter.as_ref().map(|f| f.id.as_str()) {
+            Some(id) if !id.is_empty() => {
+                match sandbox::find_by_id_prefix(&sandbox_store_root(), id) {
+                    Ok(Some(record)) => vec![record],
+                    // "Not finding an ID in a filtered list should not
+                    // be considered an error" (real cri-o's own
+                    // comment) -- and its truncindex returns an error
+                    // for an ambiguous prefix, which lands in the same
+                    // warn-and-return-empty path.
+                    Ok(None) | Err(sandbox::LookupError::AmbiguousPrefix(_)) => Vec::new(),
+                    Err(sandbox::LookupError::Io(e)) => {
+                        return Err(io_error("reading sandbox records", e));
+                    }
+                }
+            }
+            _ => sandbox::load_all(&sandbox_store_root())
+                .map_err(|e| io_error("reading sandbox records", e))?,
+        };
+
+        let items = records
+            .into_iter()
+            .filter(|record| {
+                filter
+                    .as_ref()
+                    .is_none_or(|filter| matches_filter(record, filter))
+            })
+            .map(|record| cri::PodSandbox {
+                id: record.id.clone(),
+                metadata: Some(metadata_to_proto(&record.metadata)),
+                state: state_to_proto(record.state),
+                created_at: record.created_at_nanos,
+                labels: record.labels,
+                annotations: record.annotations,
+                runtime_handler: String::new(),
+            })
+            .collect();
+
+        Ok(Response::new(cri::ListPodSandboxResponse { items }))
     }
 
     type StreamPodSandboxesStream = BoxStream<cri::StreamPodSandboxesResponse>;
@@ -481,7 +832,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_reports_real_honest_values() {
-        let service = RuntimeServiceImpl;
+        let service = RuntimeServiceImpl::default();
         let response = service
             .version(Request::new(cri::VersionRequest {
                 version: "0.1.0".to_string(),
@@ -503,7 +854,31 @@ mod tests {
 
     #[tokio::test]
     async fn every_other_rpc_is_a_real_honest_unimplemented_status() {
-        let service = RuntimeServiceImpl;
+        let service = RuntimeServiceImpl::default();
+        let status = service
+            .create_container(Request::new(cri::CreateContainerRequest {
+                pod_sandbox_id: String::new(),
+                config: None,
+                sandbox_config: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+        assert!(status.message().contains("CreateContainer"), "{status:?}");
+    }
+
+    // `run_pod_sandbox`'s own real create/duplicate/stop/remove/
+    // status/list lifecycle cases are covered by the real, socket-
+    // connecting integration tests in `tests/tests/ocicri_pod_
+    // sandbox.rs` instead of here: the sandbox store reads the real
+    // process-global `OCI_TOOLS_STORAGE_ROOT` environment variable
+    // directly (the same reasoning `image_service.rs`'s own tests
+    // already document) -- the request-shape validations below need
+    // no store access at all, so they're safe here.
+
+    #[tokio::test]
+    async fn run_pod_sandbox_with_no_config_at_all_is_invalid_argument() {
+        let service = RuntimeServiceImpl::default();
         let status = service
             .run_pod_sandbox(Request::new(cri::RunPodSandboxRequest {
                 config: None,
@@ -511,7 +886,51 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unimplemented);
-        assert!(status.message().contains("RunPodSandbox"), "{status:?}");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("config is nil"), "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn run_pod_sandbox_with_a_nonempty_runtime_handler_is_rejected() {
+        let service = RuntimeServiceImpl::default();
+        let status = service
+            .run_pod_sandbox(Request::new(cri::RunPodSandboxRequest {
+                config: None,
+                runtime_handler: "kata".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("unknown runtime handler"),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_and_remove_with_an_empty_id_are_real_errors() {
+        let service = RuntimeServiceImpl::default();
+        let status = service
+            .stop_pod_sandbox(Request::new(cri::StopPodSandboxRequest {
+                pod_sandbox_id: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        // Real cri-o's own `ErrIDEmpty` message, verbatim.
+        assert!(
+            status
+                .message()
+                .contains("PodSandboxId should not be empty"),
+            "{status:?}"
+        );
+
+        let status = service
+            .remove_pod_sandbox(Request::new(cri::RemovePodSandboxRequest {
+                pod_sandbox_id: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 }

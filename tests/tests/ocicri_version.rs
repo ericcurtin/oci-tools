@@ -247,10 +247,10 @@ async fn an_unimplemented_rpc_is_a_real_honest_status_over_the_wire() {
 
     let mut client = connect(socket_path).await;
     let status = client
-        .list_pod_sandbox(oci_cri_types::ListPodSandboxRequest { filter: None })
+        .list_containers(oci_cri_types::ListContainersRequest { filter: None })
         .await
-        .expect_err("ListPodSandbox should be a real, honest error, not a success");
+        .expect_err("ListContainers should be a real, honest error, not a success");
 
     assert_eq!(status.code(), tonic::Code::Unimplemented);
-    assert!(status.message().contains("ListPodSandbox"), "{status:?}");
+    assert!(status.message().contains("ListContainers"), "{status:?}");
 }
