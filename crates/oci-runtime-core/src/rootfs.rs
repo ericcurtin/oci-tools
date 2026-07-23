@@ -115,6 +115,20 @@ pub enum RootfsAction {
     /// validated bundle never has one without the other, but this module
     /// doesn't assume `validate` already ran).
     SetHostname(String),
+    /// Populate a freshly-mounted tmpfs `/dev` with the OCI runtime
+    /// spec's own mandated default device nodes and standard symlinks
+    /// (`docs/design/0239`, see [`populate_dev`]) — planned only when
+    /// the bundle itself mounts a tmpfs at `/dev` (a bind-mounted host
+    /// `/dev`, or no `/dev` mount at all, is left completely alone,
+    /// matching real runc/crun), and ordered after every `spec.mounts`
+    /// entry (so `dev/pts` exists for the `ptmx` symlink) but before
+    /// `pivot_root` (so the host's own `/dev/*` nodes are still
+    /// reachable as rootless bind-mount fallback sources).
+    PopulateDev {
+        /// The container's own `/dev` directory (inside the
+        /// not-yet-pivoted rootfs).
+        dev_dir: PathBuf,
+    },
 }
 
 /// The directory name `pivot_root`'s old root gets relocated to, created
@@ -157,6 +171,20 @@ pub fn plan_rootfs_setup(bundle: &Bundle, rootfs: &Path) -> Vec<RootfsAction> {
             parsed,
             &mut actions,
         );
+    }
+
+    // The spec's default devices/symlinks, only for a container-managed
+    // (tmpfs) /dev -- see `RootfsAction::PopulateDev`'s own doc comment
+    // for the exact conditions and ordering constraints.
+    if bundle
+        .spec
+        .mounts
+        .iter()
+        .any(|m| m.destination == "/dev" && m.kind.as_deref() == Some("tmpfs"))
+    {
+        actions.push(RootfsAction::PopulateDev {
+            dev_dir: join_under_root(rootfs, "/dev"),
+        });
     }
 
     if let Some(linux) = &bundle.spec.linux {
@@ -293,6 +321,117 @@ fn has_uts_namespace(bundle: &Bundle) -> bool {
         .is_some_and(|l| l.namespaces.iter().any(|ns| ns.kind == NamespaceType::Uts))
 }
 
+/// The OCI runtime spec's own mandated default device nodes
+/// (`config-linux.md`, "Default Devices"), matching real crun's own
+/// table byte for byte (`src/libcrun/linux.c`'s `needed_devs`,
+/// checked directly): `(name, major, minor)`, every one a character
+/// device, mode `0666`. `/dev/console` is deliberately absent — real
+/// runtimes only create it when `process.terminal` is set, and this
+/// project has no terminal allocation at this layer yet.
+const DEFAULT_DEVICES: &[(&str, u32, u32)] = &[
+    ("null", 1, 3),
+    ("zero", 1, 5),
+    ("full", 1, 7),
+    ("tty", 5, 0),
+    ("random", 1, 8),
+    ("urandom", 1, 9),
+];
+
+/// The spec's own "Default Symlinks" plus the two conventional extras
+/// real crun creates (`symlinks` in its `linux.c`, checked directly):
+/// `(target, name, force)` — `force` (only `ptmx`) removes an existing
+/// entry first; the rest are skipped if the image already provides
+/// one. `core -> /proc/kcore` dangles when `/proc/kcore` doesn't exist
+/// (e.g. rootless), exactly like real crun's/podman's own containers.
+const DEV_SYMLINKS: &[(&str, &str, bool)] = &[
+    ("/proc/self/fd", "fd", false),
+    ("/proc/self/fd/0", "stdin", false),
+    ("/proc/self/fd/1", "stdout", false),
+    ("/proc/self/fd/2", "stderr", false),
+    ("/proc/kcore", "core", false),
+    ("pts/ptmx", "ptmx", true),
+];
+
+/// Populates a freshly-mounted tmpfs `/dev` with [`DEFAULT_DEVICES`]
+/// and [`DEV_SYMLINKS`] — the [`RootfsAction::PopulateDev`] executor
+/// (`docs/design/0239`).
+///
+/// Each device is created with a real `mknod(2)` (plus an explicit
+/// `chmod` to `0666`, since `mknod` itself is subject to the caller's
+/// umask — the same explicit re-chmod real crun does); where `mknod`
+/// is denied (`EPERM` — the ordinary rootless/user-namespace case, in
+/// which even a mapped root may not create device nodes), the host's
+/// own same-named node is bind-mounted over an empty file instead,
+/// exactly real runc/crun's own documented rootless fallback. This
+/// runs pre-`pivot_root`, so `/dev/<name>` still resolves to the
+/// *host* device as the bind source (the same trick
+/// [`RootfsAction::MaskPath`]'s own `/dev/null` bind already relies
+/// on).
+///
+/// A node the image (or an earlier mount) already provides is left
+/// untouched — matching real runc/crun, which only create what's
+/// *missing*.
+pub fn populate_dev(dev_dir: &Path) -> std::io::Result<()> {
+    for &(name, major, minor) in DEFAULT_DEVICES {
+        let path = dev_dir.join(name);
+        if path.symlink_metadata().is_ok() {
+            continue; // Already provided; never second-guess it.
+        }
+        match rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::FileType::CharacterDevice,
+            rustix::fs::Mode::from_raw_mode(0o666),
+            rustix::fs::makedev(major, minor),
+        ) {
+            Ok(()) => {
+                // mknod honors the umask; the spec's 0666 is
+                // unconditional (crun re-chmods for the same reason).
+                rustix::fs::chmod(&path, rustix::fs::Mode::from_raw_mode(0o666))
+                    .map_err(std::io::Error::from)?;
+            }
+            Err(rustix::io::Errno::PERM) => {
+                // Rootless: bind the host's own node instead.
+                std::fs::write(&path, b"")?;
+                let parsed = oci_mount::parse_mount_options(&["rbind"]);
+                oci_mount::mount(Some(&format!("/dev/{name}")), &path, None, &parsed).map_err(
+                    |e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("bind-mounting host /dev/{name}: {e}"),
+                        )
+                    },
+                )?;
+            }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::Error::from(e).kind(),
+                    format!("mknod {}: {e}", path.display()),
+                ));
+            }
+        }
+    }
+
+    for &(target, name, force) in DEV_SYMLINKS {
+        let path = dev_dir.join(name);
+        if force {
+            let _ = std::fs::remove_file(&path);
+        }
+        match std::os::unix::fs::symlink(target, &path) {
+            Ok(()) => {}
+            // A non-forced entry the image already provides stays.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("symlinking {} -> {target}: {e}", path.display()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +462,109 @@ mod tests {
                 rootfs: rootfs.clone()
             }
         );
+    }
+
+    /// `Spec::example()` mounts a tmpfs at `/dev`, so the plan gains a
+    /// `PopulateDev` (0239) — ordered after every spec mount (so
+    /// `dev/pts` exists for the `ptmx` symlink) and before
+    /// `PivotRoot` (so the host's own `/dev/*` nodes are still
+    /// reachable as rootless bind sources).
+    #[test]
+    fn plans_populate_dev_for_a_tmpfs_dev_after_mounts_before_pivot() {
+        let (_dir, bundle) = bundle_with(Spec::example());
+        let rootfs = bundle.rootfs_path().unwrap();
+        let actions = plan_rootfs_setup(&bundle, &rootfs);
+
+        let populate_at = actions
+            .iter()
+            .position(|a| matches!(a, RootfsAction::PopulateDev { .. }))
+            .expect("a tmpfs /dev should be populated");
+        assert_eq!(
+            actions[populate_at],
+            RootfsAction::PopulateDev {
+                dev_dir: rootfs.join("dev")
+            }
+        );
+        let last_mount_at = actions
+            .iter()
+            .rposition(|a| matches!(a, RootfsAction::Mount { .. }))
+            .unwrap();
+        let pivot_at = actions
+            .iter()
+            .position(|a| matches!(a, RootfsAction::PivotRoot { .. }))
+            .unwrap();
+        assert!(last_mount_at < populate_at && populate_at < pivot_at);
+    }
+
+    /// A bundle that bind-mounts a real host `/dev` (or mounts no
+    /// `/dev` at all) gets no `PopulateDev`: only a container-managed
+    /// tmpfs `/dev` is ever populated, matching real runc/crun.
+    #[test]
+    fn does_not_populate_a_bind_mounted_or_absent_dev() {
+        let mut spec = Spec::example();
+        spec.mounts.retain(|m| !m.destination.starts_with("/dev"));
+        let (_dir, bundle) = bundle_with(spec.clone());
+        let rootfs = bundle.rootfs_path().unwrap();
+        let actions = plan_rootfs_setup(&bundle, &rootfs);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, RootfsAction::PopulateDev { .. })),
+            "no /dev mount at all -> no population"
+        );
+
+        spec.mounts.push(oci_spec_types::runtime::Mount {
+            destination: "/dev".to_string(),
+            source: Some("/dev".to_string()),
+            kind: Some("bind".to_string()),
+            options: vec!["rbind".to_string()],
+        });
+        let (_dir, bundle) = bundle_with(spec);
+        let rootfs = bundle.rootfs_path().unwrap();
+        let actions = plan_rootfs_setup(&bundle, &rootfs);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, RootfsAction::PopulateDev { .. })),
+            "a bind-mounted host /dev is left completely alone"
+        );
+    }
+
+    /// `populate_dev` itself, run against a plain directory (no real
+    /// mount namespace needed): rootless `mknod` is denied here, so
+    /// every node comes from the bind fallback — which needs real
+    /// mount privileges this plain unit test doesn't have either, so
+    /// only the symlink half is directly assertable; the device half
+    /// (both the mknod path as real root and the bind fallback
+    /// rootless) is covered end to end by
+    /// `tests/tests/ociman_run.rs`'s own real-container test instead.
+    #[test]
+    fn populate_dev_creates_the_standard_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev = dir.path().join("dev");
+        fs::create_dir(&dev).unwrap();
+        // Pre-create every device node's name as a plain file: "already
+        // provided" entries are never second-guessed, which also keeps
+        // this unit test off the mknod/bind paths it can't exercise.
+        for (name, _, _) in DEFAULT_DEVICES {
+            fs::write(dev.join(name), b"").unwrap();
+        }
+        // An image-provided symlink survives (non-forced)...
+        std::os::unix::fs::symlink("image-chose-this", dev.join("stdin")).unwrap();
+        // ...while a stale ptmx is replaced (forced).
+        std::os::unix::fs::symlink("stale", dev.join("ptmx")).unwrap();
+
+        populate_dev(&dev).unwrap();
+
+        for (target, name, _) in DEV_SYMLINKS {
+            let link = fs::read_link(dev.join(name))
+                .unwrap_or_else(|e| panic!("{name} should be a symlink: {e}"));
+            if *name == "stdin" {
+                assert_eq!(link, Path::new("image-chose-this"));
+            } else {
+                assert_eq!(link, Path::new(target), "{name}");
+            }
+        }
     }
 
     #[test]

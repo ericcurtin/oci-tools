@@ -2982,3 +2982,57 @@ fn run_default_seccomp_profile_is_active_and_no_new_privileges_is_false_together
          {combined:?}"
     );
 }
+
+/// A container's tmpfs `/dev` is populated with the OCI runtime
+/// spec's own mandated default device nodes and standard symlinks
+/// (`docs/design/0239`) — *real* character devices (the rootless
+/// bind-mount fallback real runc/crun also use, since `mknod` is
+/// denied in a user namespace), not the accidental regular files a
+/// bare tmpfs would give a shell's own `> /dev/null` redirect. The
+/// read-back checks are the actual point: a regular-file "null"
+/// returns what was written to it, a real one is always empty; a
+/// real `/dev/zero` yields NUL bytes.
+#[test]
+fn run_populates_dev_with_real_default_devices_and_symlinks() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/dev-nodes:latest",
+        &busybox,
+        &["sh", "cat", "head", "tr", "readlink"],
+        ContainerConfig::default(),
+    );
+
+    let script = r#"
+set -e
+for d in null zero full tty random urandom; do
+    test -c /dev/$d || { echo "missing char device: $d"; exit 1; }
+done
+for l in fd stdin stdout stderr core ptmx; do
+    test -L /dev/$l || { echo "missing symlink: $l"; exit 1; }
+done
+test "$(readlink /dev/fd)" = /proc/self/fd
+test "$(readlink /dev/ptmx)" = pts/ptmx
+echo swallowed > /dev/null
+test -z "$(cat /dev/null)"
+test "$(head -c 3 /dev/zero | tr '\0' x)" = xxx
+echo DEV-OK
+"#;
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/dev-nodes:latest",
+        &["/bin/sh", "-c", script],
+    );
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "DEV-OK");
+}

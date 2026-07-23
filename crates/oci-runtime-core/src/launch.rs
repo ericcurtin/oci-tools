@@ -1432,5 +1432,6 @@ fn execute_rootfs_action(action: &RootfsAction) -> io::Result<()> {
         RootfsAction::SetHostname(name) => {
             rustix::system::sethostname(name.as_bytes()).map_err(io::Error::from)
         }
+        RootfsAction::PopulateDev { dev_dir } => rootfs::populate_dev(dev_dir),
     }
 }
