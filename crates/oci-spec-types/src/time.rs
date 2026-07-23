@@ -42,6 +42,31 @@ pub fn format_rfc3339_utc(time: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+/// [`format_rfc3339_utc`] with nanosecond precision —
+/// `YYYY-MM-DDTHH:MM:SS.NNNNNNNNNZ`, the exact timestamp shape the
+/// Kubernetes CRI logging format requires on every line (checked
+/// against real conmon's own output and the kubelet log parser's own
+/// test fixtures: `2016-10-06T00:17:09.669794202Z stdout F ...`).
+/// Same hand-rolled civil-calendar math, same pre-epoch clamping.
+pub fn format_rfc3339_nanos_utc(time: SystemTime) -> String {
+    let duration = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs() as i64;
+    let nanos = duration.subsec_nanos();
+
+    let days = secs.div_euclid(86_400);
+    let time_of_day = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (
+        time_of_day / 3600,
+        (time_of_day / 60) % 60,
+        time_of_day % 60,
+    );
+    let (year, month, day) = civil_from_days(days);
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos:09}Z")
+}
+
 /// Days-since-1970-01-01 -> (year, month, day). See module docs for the
 /// source algorithm.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -117,6 +142,27 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn nanos_variant_formats_the_cri_logging_shape() {
+        assert_eq!(
+            format_rfc3339_nanos_utc(std::time::UNIX_EPOCH),
+            "1970-01-01T00:00:00.000000000Z"
+        );
+        // The exact example timestamp the Kubernetes CRI logging
+        // format documentation itself uses.
+        let t = std::time::UNIX_EPOCH + Duration::new(1_475_713_029, 669_794_202);
+        assert_eq!(
+            format_rfc3339_nanos_utc(t),
+            "2016-10-06T00:17:09.669794202Z"
+        );
+        // Pre-epoch clamps like the second-precision variant.
+        let before = std::time::UNIX_EPOCH - Duration::from_secs(5);
+        assert_eq!(
+            format_rfc3339_nanos_utc(before),
+            "1970-01-01T00:00:00.000000000Z"
+        );
+    }
 
     #[test]
     fn epoch_formats_correctly() {

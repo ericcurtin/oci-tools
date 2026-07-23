@@ -1084,6 +1084,19 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             }
         })?;
 
+        // The CRI log path (0242): kubelet's own convention is the
+        // sandbox config's `log_directory` joined with the container
+        // config's `log_path` -- only when both are given (crictl
+        // routinely gives neither), matching real cri-o's own
+        // `filepath.Join(sb.LogDir(), containerConfig.GetLogPath())`.
+        let log_path = (!sandbox_config.log_directory.is_empty() && !config.log_path.is_empty())
+            .then(|| {
+                std::path::Path::new(&sandbox_config.log_directory)
+                    .join(&config.log_path)
+                    .display()
+                    .to_string()
+            });
+
         let record = container::ContainerRecord {
             id: container_id,
             name,
@@ -1102,6 +1115,7 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             started_at_nanos: None,
             finished_at_nanos: None,
             exit_code: None,
+            log_path,
         };
         if let Err(e) = container::save(&root, &record) {
             // Never leave an orphaned bundle behind a failed record
@@ -1159,10 +1173,18 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         // would have to babysit.
         let exe = std::env::current_exe()
             .map_err(|e| Status::internal(format!("resolving own executable: {e}")))?;
-        let mut child = std::process::Command::new(exe)
+        let mut command = std::process::Command::new(exe);
+        command
             .arg(crate::launcher::LAUNCH_ARGV1)
             .arg(&bundle_dir)
-            .arg(&record.id)
+            .arg(&record.id);
+        // The CRI log path (0242), when kubelet configured one -- the
+        // launcher wires the container's stdout/stderr into its own
+        // logger process writing the real CRI-format file there.
+        if let Some(log_path) = &record.log_path {
+            command.arg(log_path);
+        }
+        let mut child = command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1441,6 +1463,7 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
                 image_id: record.image_ref.clone(),
                 labels: record.labels.clone(),
                 annotations: record.annotations.clone(),
+                log_path: record.log_path.clone().unwrap_or_default(),
                 ..Default::default()
             }),
             info,

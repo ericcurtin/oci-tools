@@ -100,6 +100,14 @@ pub struct ContainerRecord {
     /// real cri-o's own identical fallback.
     #[serde(default)]
     pub exit_code: Option<i32>,
+    /// The absolute CRI log path (0242): the sandbox config's own
+    /// `log_directory` joined with the container config's own
+    /// `log_path`, when kubelet supplied both — where the
+    /// launcher-keeper's logger writes the real CRI-format log file
+    /// once the container starts. `None` (also for pre-0242 records)
+    /// means no logging.
+    #[serde(default)]
+    pub log_path: Option<String>,
 }
 
 impl Record for ContainerRecord {
@@ -174,6 +182,7 @@ mod tests {
             started_at_nanos: None,
             finished_at_nanos: None,
             exit_code: None,
+            log_path: None,
         }
     }
 

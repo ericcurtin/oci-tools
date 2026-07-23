@@ -1338,3 +1338,144 @@ async fn container_stats_report_real_cgroup_usage() {
         .await
         .unwrap();
 }
+
+/// The CRI log path (`docs/design/0242`): a container created with
+/// kubelet's own `log_directory` + `log_path` convention streams its
+/// stdout/stderr into a real, CRI-format log file (`<RFC3339Nano>
+/// <stream> <P|F> <content>` — what `kubectl logs`/`crictl logs`
+/// actually read), complete by the time the exit is observable, with
+/// the joined path reported by `ContainerStatus` — and a container
+/// without log config gets no file at all.
+#[tokio::test]
+async fn container_logs_are_written_in_the_cri_format() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, mut sandbox_config)) =
+        setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let log_dir = tempfile::tempdir().unwrap();
+    sandbox_config.log_directory = log_dir.path().display().to_string();
+
+    let mut config = container_config("logger", 0);
+    config.command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "echo out-line; echo err-line 1>&2; printf no-newline".to_string(),
+    ];
+    // kubelet's own convention routinely nests a subdirectory.
+    config.log_path = "logger/0.log".to_string();
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+
+    let expected_path = log_dir.path().join("logger/0.log");
+    let status = client
+        .container_status(ContainerStatusRequest {
+            container_id: container_id.clone(),
+            verbose: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+        .unwrap();
+    assert_eq!(
+        status.log_path,
+        expected_path.display().to_string(),
+        "ContainerStatus reports the joined path"
+    );
+
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerExited).await;
+
+    // The log file is complete no later than the exit is observable
+    // (the launcher releases its pipe ends before recording the
+    // exit) -- but the logger's own final flush is a separate
+    // process; poll briefly rather than assuming perfect ordering.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let contents = loop {
+        let contents = std::fs::read_to_string(&expected_path).unwrap_or_default();
+        if contents.lines().count() >= 3 {
+            break contents;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "log file never completed; contents so far: {contents:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    let lines: Vec<Vec<&str>> = contents
+        .lines()
+        .map(|l| l.splitn(4, ' ').collect())
+        .collect();
+    assert_eq!(lines.len(), 3, "{contents:?}");
+    for fields in &lines {
+        assert_eq!(fields.len(), 4, "{fields:?}");
+        // RFC3339Nano, e.g. 2016-10-06T00:17:09.669794202Z.
+        assert!(
+            fields[0].len() == 30 && fields[0].ends_with('Z') && fields[0].contains('.'),
+            "timestamp shape: {fields:?}"
+        );
+    }
+    // Entries from *different* streams have no guaranteed relative
+    // order (two pipes, two logger threads -- real conmon behaves
+    // identically; kubelet orders by timestamp), so assert per
+    // stream: within one stream, order is real.
+    let stdout_entries: Vec<(&str, &str)> = lines
+        .iter()
+        .filter(|f| f[1] == "stdout")
+        .map(|f| (f[2], f[3]))
+        .collect();
+    let stderr_entries: Vec<(&str, &str)> = lines
+        .iter()
+        .filter(|f| f[1] == "stderr")
+        .map(|f| (f[2], f[3]))
+        .collect();
+    assert_eq!(
+        stdout_entries,
+        vec![("F", "out-line"), ("P", "no-newline")],
+        "{contents:?}"
+    );
+    assert_eq!(stderr_entries, vec![("F", "err-line")], "{contents:?}");
+
+    // A container with no log config gets no file (and an empty
+    // log_path in its status), exactly as before this increment.
+    let mut config = container_config("no-logs", 0);
+    config.command = vec!["/bin/true".to_string()];
+    let no_log_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id,
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    let status = client
+        .container_status(ContainerStatusRequest {
+            container_id: no_log_id,
+            verbose: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+        .unwrap();
+    assert_eq!(status.log_path, "", "{status:?}");
+}

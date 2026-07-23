@@ -32,4 +32,4 @@ pub mod time;
 
 pub use digest::{Algorithm, Digest};
 pub use reference::Reference;
-pub use time::format_rfc3339_utc;
+pub use time::{format_rfc3339_nanos_utc, format_rfc3339_utc};

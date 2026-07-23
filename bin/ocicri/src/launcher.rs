@@ -188,8 +188,10 @@ pub fn main(args: &[String]) -> ! {
 fn run(args: &[String]) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
-    let [bundle_dir, container_id] = args else {
-        anyhow::bail!("usage: ocicri {LAUNCH_ARGV1} <BUNDLE_DIR> <CONTAINER_ID>");
+    let (bundle_dir, container_id, log_path) = match args {
+        [bundle_dir, container_id] => (bundle_dir, container_id, None),
+        [bundle_dir, container_id, log_path] => (bundle_dir, container_id, Some(log_path)),
+        _ => anyhow::bail!("usage: ocicri {LAUNCH_ARGV1} <BUNDLE_DIR> <CONTAINER_ID> [LOG_PATH]"),
     };
     let dir = Path::new(bundle_dir);
 
@@ -199,6 +201,21 @@ fn run(args: &[String]) -> anyhow::Result<()> {
     // detachment `ociman`'s own keeper performs, for the same reason.
     // Failure (already a session leader, unlikely) is tolerated.
     let _ = rustix::process::setsid();
+
+    // CRI logging (`docs/design/0242`): when kubelet gave this
+    // container a log path, the container's own stdout/stderr become
+    // real pipes into a dedicated logger process -- this project's
+    // own version of the other half of conmon's job (the first half,
+    // keeping the exit code, is this process itself). Set up
+    // *before* `run_reporting_pid`'s own fork, while this process is
+    // still single-threaded: the logger is a forked process, never a
+    // thread, for exactly that reason.
+    let discard_output = if let Some(log_path) = log_path {
+        setup_cri_logging(Path::new(log_path)).context("setting up CRI logging")?;
+        false // The container inherits the pipe fds now on 1/2.
+    } else {
+        true // No log path: discard, as before.
+    };
 
     let bundle = oci_runtime_core::Bundle::load(dir)
         .with_context(|| format!("loading bundle from {}", dir.display()))?;
@@ -232,16 +249,30 @@ fn run(args: &[String]) -> anyhow::Result<()> {
                 resources: None,
             },
             // No attach/interactive concept at this layer (real CRI
-            // streaming attach is its own future RPC); output capture
-            // to the CRI log path is a documented later increment.
+            // streaming attach is its own future RPC). Output goes to
+            // the CRI log pipes when a log path was given (fds 1/2
+            // are already the pipes by now -- see `setup_cri_logging`)
+            // and is discarded otherwise.
             true,
-            true,
+            discard_output,
             |pid| {
                 let _ = write_atomic(&dir_for_pid, PID_FILENAME, pid.to_string().as_bytes());
             },
         )
     }
     .context("launching container")?;
+
+    // Release this process's own copies of the log pipes (fds 1/2)
+    // *before* recording the exit, so the logger sees EOF and
+    // finishes the log file no later than the exit becomes visible --
+    // a reader acting on the recorded exit never races a
+    // still-incomplete log.
+    if log_path.is_some()
+        && let Ok(devnull) = std::fs::OpenOptions::new().write(true).open("/dev/null")
+    {
+        let _ = rustix::stdio::dup2_stdout(&devnull);
+        let _ = rustix::stdio::dup2_stderr(&devnull);
+    }
 
     let exit = ExitRecord {
         exit_code,
@@ -252,6 +283,158 @@ fn run(args: &[String]) -> anyhow::Result<()> {
     };
     write_atomic(dir, EXIT_FILENAME, &serde_json::to_vec_pretty(&exit)?)
         .context("writing exit record")?;
+    Ok(())
+}
+
+/// The Kubernetes CRI logging format, one line:
+/// `<RFC3339Nano> <stream> <P|F> <content>\n` — checked against real
+/// conmon's own output and the kubelet parser's fixtures
+/// (`2016-10-06T00:17:09.669794202Z stdout F log content`). `F` is a
+/// full (newline-terminated) line; `P` a partial one (cut by a
+/// too-long line or EOF), which the reader reassembles.
+fn format_cri_log_line(timestamp: &str, stream: &str, complete: bool, content: &[u8]) -> Vec<u8> {
+    let tag = if complete { "F" } else { "P" };
+    let mut line = Vec::with_capacity(timestamp.len() + stream.len() + content.len() + 8);
+    line.extend_from_slice(timestamp.as_bytes());
+    line.push(b' ');
+    line.extend_from_slice(stream.as_bytes());
+    line.push(b' ');
+    line.extend_from_slice(tag.as_bytes());
+    line.push(b' ');
+    line.extend_from_slice(content);
+    line.push(b'\n');
+    line
+}
+
+/// A single line longer than this is cut into `P` (partial) entries —
+/// real conmon's own `STDIO_BUF_SIZE`-driven behavior (it emits a
+/// partial entry whenever a read fills its buffer without a newline).
+const CRI_LOG_MAX_LINE: usize = 8192;
+
+/// Copies one stream's pipe into CRI-format lines. Runs on its own
+/// thread inside the logger process (which, unlike this launcher at
+/// its own fork points, is free to spawn threads — it never forks).
+fn copy_stream_as_cri(
+    pipe: std::os::fd::OwnedFd,
+    stream: &str,
+    file: &std::sync::Mutex<std::fs::File>,
+) {
+    use std::io::{Read, Write};
+    let mut reader = std::io::BufReader::new(std::fs::File::from(pipe));
+    let mut pending: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        pending.extend_from_slice(&chunk[..n]);
+        // Emit complete lines up to the cap; anything longer gets cut
+        // into `P` chunks *before* its own eventual newline is even
+        // looked at (checked in that order deliberately -- with bytes
+        // accumulating across reads, a newline can arrive after the
+        // cap is already exceeded, and the cap must still win).
+        loop {
+            let newline_at = pending.iter().position(|&b| b == b'\n');
+            match newline_at {
+                Some(at) if at <= CRI_LOG_MAX_LINE => {
+                    let rest = pending.split_off(at + 1);
+                    pending.pop(); // The newline itself isn't content.
+                    let ts = oci_spec_types::format_rfc3339_nanos_utc(std::time::SystemTime::now());
+                    if let Ok(mut f) = file.lock() {
+                        let _ = f.write_all(&format_cri_log_line(&ts, stream, true, &pending));
+                    }
+                    pending = rest;
+                }
+                _ if pending.len() >= CRI_LOG_MAX_LINE => {
+                    let rest = pending.split_off(CRI_LOG_MAX_LINE);
+                    let ts = oci_spec_types::format_rfc3339_nanos_utc(std::time::SystemTime::now());
+                    if let Ok(mut f) = file.lock() {
+                        let _ = f.write_all(&format_cri_log_line(&ts, stream, false, &pending));
+                    }
+                    pending = rest;
+                }
+                _ => break,
+            }
+        }
+    }
+    // EOF with an unterminated tail: a real partial entry, exactly
+    // what the CRI format's own `P` tag exists for.
+    if !pending.is_empty() {
+        let ts = oci_spec_types::format_rfc3339_nanos_utc(std::time::SystemTime::now());
+        if let Ok(mut f) = file.lock() {
+            let _ = f.write_all(&format_cri_log_line(&ts, stream, false, &pending));
+        }
+    }
+}
+
+/// Wires this (still single-threaded) launcher's own fds 1/2 to fresh
+/// pipes and forks the logger process that turns them into a real
+/// CRI-format log file at `log_path` — so the container, which
+/// inherits 1/2 through `run_reporting_pid`, streams straight into
+/// the logger with no thread ever existing in *this* process before
+/// its own container fork.
+///
+/// The logger: closes its own inherited copies of the write ends
+/// (else it would never see EOF), creates the log file (and parent
+/// directories — kubelet's own `<sandbox log_directory>/<container
+/// log_path>` routinely has a `<name>/` subdirectory), and drains
+/// both streams until EOF, which arrives once the container *and*
+/// this launcher have both let go (the launcher does so explicitly
+/// right before recording the exit).
+fn setup_cri_logging(log_path: &Path) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let (stdout_read, stdout_write) =
+        rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).context("creating pipe")?;
+    let (stderr_read, stderr_write) =
+        rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).context("creating pipe")?;
+
+    // Wire this launcher's own fds 1/2 to the write ends *first*
+    // (then drop the originals -- 1/2 themselves keep the pipes
+    // open), so the fork below only needs to move the read ends into
+    // the logger's closure and the parent needs nothing back from it.
+    rustix::stdio::dup2_stdout(&stdout_write).context("wiring stdout pipe")?;
+    rustix::stdio::dup2_stderr(&stderr_write).context("wiring stderr pipe")?;
+    drop(stdout_write);
+    drop(stderr_write);
+
+    let log_path = log_path.to_path_buf();
+    // SAFETY: single-threaded (see this function's own doc comment) --
+    // the same contract every other fork in this file already
+    // documents.
+    #[allow(unsafe_code)]
+    unsafe {
+        oci_runtime_core::process::fork(move || {
+            // Release this logger's own inherited copies of the write
+            // ends (its fds 1/2, wired just above in the parent) --
+            // holding them would mean never seeing EOF on the reads.
+            if let Ok(devnull) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+                let _ = rustix::stdio::dup2_stdout(&devnull);
+                let _ = rustix::stdio::dup2_stderr(&devnull);
+            }
+            if let Some(parent) = log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let Ok(file) = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&log_path)
+            else {
+                std::process::exit(1);
+            };
+            let file = std::sync::Mutex::new(file);
+            std::thread::scope(|scope| {
+                scope.spawn(|| copy_stream_as_cri(stdout_read, "stdout", &file));
+                copy_stream_as_cri(stderr_read, "stderr", &file);
+            });
+            std::process::exit(0);
+        })
+    }
+    .context("forking the CRI logger")?;
     Ok(())
 }
 
@@ -320,4 +503,73 @@ pub fn read_pid(bundle_dir: &Path) -> Option<i32> {
     std::fs::read_to_string(bundle_dir.join(PID_FILENAME))
         .ok()
         .and_then(|s| s.trim().parse().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cri_log_lines_have_the_exact_documented_shape() {
+        assert_eq!(
+            format_cri_log_line(
+                "2016-10-06T00:17:09.669794202Z",
+                "stdout",
+                true,
+                b"log content"
+            ),
+            b"2016-10-06T00:17:09.669794202Z stdout F log content\n"
+        );
+        assert_eq!(
+            format_cri_log_line(
+                "2016-10-06T00:17:09.669794202Z",
+                "stderr",
+                false,
+                b"partial"
+            ),
+            b"2016-10-06T00:17:09.669794202Z stderr P partial\n"
+        );
+    }
+
+    /// `copy_stream_as_cri` against a real pipe: complete lines get
+    /// `F` entries, an oversize line is cut into `P` chunks plus its
+    /// terminated tail, and an unterminated EOF tail becomes a final
+    /// `P` — the exact reassembly contract kubelet's own log parser
+    /// expects.
+    #[test]
+    fn copy_stream_splits_full_partial_and_oversize_lines() {
+        use std::io::Write as _;
+
+        let (read, write) = rustix::pipe::pipe().unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let sink = std::sync::Mutex::new(file.reopen().unwrap());
+
+        let mut writer = std::fs::File::from(write);
+        let long = vec![b'x'; CRI_LOG_MAX_LINE + 5];
+        writer.write_all(b"hello\n").unwrap();
+        writer.write_all(&long).unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer.write_all(b"tail-without-newline").unwrap();
+        drop(writer); // EOF.
+
+        copy_stream_as_cri(read, "stdout", &sink);
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 4, "{contents:?}");
+        let fields: Vec<Vec<&str>> = lines.iter().map(|l| l.splitn(4, ' ').collect()).collect();
+        // Every line: RFC3339Nano timestamp, stream, tag, content.
+        for f in &fields {
+            assert_eq!(f[1], "stdout");
+            assert!(f[0].ends_with('Z') && f[0].contains('.'), "{f:?}");
+        }
+        assert_eq!((fields[0][2], fields[0][3]), ("F", "hello"));
+        // The oversize line: one P chunk of exactly the cutoff, then
+        // the terminated remainder as F.
+        assert_eq!(fields[1][2], "P");
+        assert_eq!(fields[1][3].len(), CRI_LOG_MAX_LINE);
+        assert_eq!((fields[2][2], fields[2][3]), ("F", "xxxxx"));
+        // The unterminated EOF tail.
+        assert_eq!((fields[3][2], fields[3][3]), ("P", "tail-without-newline"));
+    }
 }
