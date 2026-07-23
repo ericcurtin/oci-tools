@@ -1,0 +1,13 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: oci-tools
+Upstream-Contact: The oci-tools contributors <oci-tools@example.invalid>
+Source: https://github.com/ericcurtin/oci-tools
+
+Files: *
+Copyright: The oci-tools contributors
+License: Apache-2.0
+
+License: Apache-2.0
+ See /usr/share/doc/oci-tools/LICENSE (installed alongside this file)
+ for the full license text, or
+ https://www.apache.org/licenses/LICENSE-2.0 .

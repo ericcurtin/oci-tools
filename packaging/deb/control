@@ -1,0 +1,29 @@
+Package: oci-tools
+Version: @VERSION@
+Section: admin
+Priority: optional
+Architecture: @ARCH@
+Depends: @DEPENDS@
+Maintainer: The oci-tools contributors <oci-tools@example.invalid>
+Homepage: https://github.com/ericcurtin/oci-tools
+Description: Pure-Rust reimplementation of the container and bootable-container stack
+ oci-tools is a pure-Rust, monorepo reimplementation of the container
+ and bootable-container stack:
+ .
+  * ocirun       - OCI runtime (runc/crun-CLI-compatible)
+  * ociman       - daemonless container engine (podman equivalent)
+  * ocicri       - Kubernetes CRI server (cri-o equivalent)
+  * ocibox       - pet containers with home/user/host integration
+                    (distrobox equivalent)
+  * ociboot      - bootable-container OS manager (bootc-inspired,
+                    no ostree/composefs dependency)
+  * ociboot-init - tiny initramfs helper that mounts ociboot
+                    deployments (installed for a future dracut/
+                    initramfs-tools integration to pick up; see
+                    packaging/README.md)
+ .
+ This is this project's own first, real packaging slice: it installs
+ the six real, already-tested release binaries built from this exact
+ source tree, with no systemd units, no initramfs-tools integration,
+ and no sub-packages yet -- see packaging/README.md for exactly what's
+ still ahead.
