@@ -1139,7 +1139,10 @@ dependencies = [
 name = "ociboot-init"
 version = "0.1.0"
 dependencies = [
+ "oci-bls",
  "oci-build-info",
+ "oci-erofs",
+ "oci-mount",
 ]
 
 [[package]]

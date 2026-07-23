@@ -9,10 +9,17 @@ rust-version.workspace = true
 authors.workspace = true
 publish = false
 
-# Runtime-dependency-free by design: this binary must build as a tiny static
-# executable for the initramfs. Do not add clap/tracing/oci-cli-common here;
-# only the build-time git-hash helper is shared.
+# External-dependency-light by design: this binary must build as a tiny
+# static executable for the initramfs. Do not add clap/tracing/anyhow/
+# oci-cli-common here; argument handling stays manual. Workspace *library*
+# crates whose own dependency weight is just libc/rustix are fine -- the
+# mount logic (0246) deliberately reuses the same shared oci-bls cmdline
+# parser, oci-erofs fs-verity ioctls, and oci-mount loop/mount syscalls
+# every other binary uses rather than duplicating any of them.
 [dependencies]
+oci-bls.workspace = true
+oci-erofs.workspace = true
+oci-mount.workspace = true
 
 [build-dependencies]
 oci-build-info.workspace = true
