@@ -78,8 +78,8 @@ pub struct RuntimeServiceImpl {
 fn unimplemented<T>(name: &str) -> Result<Response<T>, Status> {
     Err(Status::unimplemented(format!(
         "ocicri: {name} is not implemented yet (milestone 7: Version/Status/RuntimeConfig/\
-         UpdateRuntimeConfig/ListMetricDescriptors, the pod-sandbox lifecycle, and \
-         CreateContainer/ContainerStatus/ListContainers/RemoveContainer are answered so far)"
+         UpdateRuntimeConfig/ListMetricDescriptors, the pod-sandbox lifecycle, and the container \
+         lifecycle (create/start/stop/remove/status/list) are answered so far)"
     )))
 }
 
@@ -204,6 +204,105 @@ fn sandbox_list_items(
         .collect())
 }
 
+/// Whether a process with this pid is currently alive (the same
+/// `kill(pid, 0)`-based check `oci_runtime_core::process::alive`
+/// provides, shared with `ociman`'s own status logic).
+fn pid_alive(pid: i32) -> bool {
+    oci_runtime_core::process::alive(pid)
+}
+
+/// Brings one container record up to date with what its launcher-
+/// keeper actually recorded (`docs/design/0238`): a `RUNNING` record
+/// whose launcher has written `exit.json` (or whose pid is simply
+/// gone) becomes `EXITED`, persisted. Callers hold the mutation lock.
+/// Everything else passes through unchanged — `CREATED` records have
+/// no process to reconcile against, and `EXITED` is terminal.
+fn reconcile_container(
+    mut record: container::ContainerRecord,
+) -> Result<container::ContainerRecord, Status> {
+    if record.state != container::ContainerState::Running {
+        return Ok(record);
+    }
+    let bundle_dir =
+        crate::bundle::bundle_dir(&oci_cli_common::storage::default_root(), &record.id);
+    let exit = crate::launcher::read_exit(&bundle_dir)
+        .map_err(|e| Status::internal(format!("reading exit record: {e}")))?;
+    match exit {
+        Some(exit) => {
+            record.state = container::ContainerState::Exited;
+            record.exit_code = Some(exit.exit_code);
+            record.finished_at_nanos = Some(exit.finished_at_nanos);
+        }
+        None => {
+            let alive = record.pid.is_some_and(pid_alive);
+            if alive {
+                return Ok(record);
+            }
+            // The pid is gone but no exit record exists (yet). The
+            // launcher writes it moments after the container dies --
+            // give it a real chance before declaring the code lost
+            // (real cri-o's own status path re-polls its own exit
+            // files the same way).
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if let Some(exit) = crate::launcher::read_exit(&bundle_dir)
+                    .map_err(|e| Status::internal(format!("reading exit record: {e}")))?
+                {
+                    record.state = container::ContainerState::Exited;
+                    record.exit_code = Some(exit.exit_code);
+                    record.finished_at_nanos = Some(exit.finished_at_nanos);
+                    container::save(&container_store_root(), &record)
+                        .map_err(|e| io_error("saving container record", e))?;
+                    return Ok(record);
+                }
+            }
+            // Genuinely lost (launcher itself killed before it could
+            // record anything): exited, code unknown -- reported as
+            // -1, real cri-o's own identical `ExitCode == nil`
+            // fallback.
+            record.state = container::ContainerState::Exited;
+            record.exit_code = None;
+            record.finished_at_nanos = Some(now_nanos());
+        }
+    }
+    container::save(&container_store_root(), &record)
+        .map_err(|e| io_error("saving container record", e))?;
+    Ok(record)
+}
+
+/// Force-terminates one container's process if it's still running and
+/// waits for the launcher's exit record — the forceful half shared by
+/// `RemoveContainer` (the proto: running containers "must be forcibly
+/// ... removed"), `StopPodSandbox` and `RemovePodSandbox`'s container
+/// cascades. Idempotent for anything not running.
+fn force_kill_and_reconcile(
+    record: container::ContainerRecord,
+) -> Result<container::ContainerRecord, Status> {
+    let record = reconcile_container(record)?;
+    if record.state != container::ContainerState::Running {
+        return Ok(record);
+    }
+    if let Some(pid) = record.pid {
+        // SIGKILL straight away -- this is the forceful path. The
+        // same numeric-signal `kill(2)` wrapper `ociman kill` uses.
+        let _ = oci_runtime_core::process::kill(pid, libc::SIGKILL);
+    }
+    // The kill is asynchronous; wait for the launcher to record the
+    // exit (bounded -- SIGKILL cannot be ignored, so this converges
+    // fast in practice).
+    for _ in 0..100 {
+        let reconciled = reconcile_container(record.clone())?;
+        if reconciled.state != container::ContainerState::Running {
+            return Ok(reconciled);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Err(Status::internal(format!(
+        "container {} did not exit after SIGKILL",
+        record.id
+    )))
+}
+
 fn container_state_to_proto(state: container::ContainerState) -> i32 {
     match state {
         container::ContainerState::Created => cri::ContainerState::ContainerCreated as i32,
@@ -299,6 +398,14 @@ fn container_list_items(
         }
         _ => container::load_all(&root).map_err(|e| io_error("reading container records", e))?,
     };
+
+    // Reconcile before filtering: a state filter must see the real,
+    // current state (a RUNNING record whose process already exited is
+    // genuinely EXITED, whether or not anything asked about it yet).
+    let records = records
+        .into_iter()
+        .map(reconcile_container)
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(records
         .into_iter()
@@ -490,6 +597,18 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         // Idempotent for an already-stopped sandbox, matching real
         // cri-o's own `sb.Stopped()` early return.
         if record.state == sandbox::SandboxState::Ready {
+            // "If there are any running containers in the sandbox,
+            // they should be forcibly terminated" (the proto) --
+            // real cri-o's own `stopPodSandbox` stops every container
+            // first (0238).
+            let container_root = container_store_root();
+            for c in container::load_all(&container_root)
+                .map_err(|e| io_error("reading container records", e))?
+            {
+                if c.sandbox_id == record.id {
+                    force_kill_and_reconcile(c)?;
+                }
+            }
             record.state = sandbox::SandboxState::NotReady;
             sandbox::save(&sandbox_store_root(), &record)
                 .map_err(|e| io_error("saving sandbox record", e))?;
@@ -519,15 +638,16 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             return Ok(Response::new(cri::RemovePodSandboxResponse {}));
         };
         // "If there are any containers in the sandbox, they must be
-        // forcibly ... removed" (the proto) -- real cri-o's own
-        // `removePodSandbox` deletes every container in the sandbox
-        // first, and so does this (0236), now that container records
-        // exist at all.
+        // forcibly terminated and removed" (the proto) -- real
+        // cri-o's own `removePodSandbox` deletes every container in
+        // the sandbox first, and so does this (0236); a still-running
+        // one is SIGKILLed first (0238).
         let container_root = container_store_root();
         for c in container::load_all(&container_root)
             .map_err(|e| io_error("reading container records", e))?
         {
             if c.sandbox_id == record.id {
+                force_kill_and_reconcile(c.clone())?;
                 crate::bundle::remove(&oci_cli_common::storage::default_root(), &c.id)
                     .map_err(|e| io_error("removing container bundle", e))?;
                 container::remove(&container_root, &c.id)
@@ -806,6 +926,10 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             annotations: config.annotations,
             state: container::ContainerState::Created,
             created_at_nanos: now_nanos(),
+            pid: None,
+            started_at_nanos: None,
+            finished_at_nanos: None,
+            exit_code: None,
         };
         if let Err(e) = container::save(&root, &record) {
             // Never leave an orphaned bundle behind a failed record
@@ -819,18 +943,190 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         }))
     }
 
+    /// Actually starts the container (`docs/design/0238`): spawns the
+    /// per-container launcher-keeper (`launcher.rs`, this project's
+    /// own conmon equivalent — a fresh, single-threaded re-exec of
+    /// this same binary, since `oci_runtime_core::launch`'s
+    /// fork-safety contract is unsatisfiable from a tokio server),
+    /// waits for the real pid, and records `RUNNING`. Only a
+    /// `CONTAINER_CREATED` container can be started — real cri-o's
+    /// own verbatim "is not in created state" error otherwise; an
+    /// unknown ID is a real `NotFound` (its `container_start.go`).
     async fn start_container(
         &self,
-        _request: Request<cri::StartContainerRequest>,
+        request: Request<cri::StartContainerRequest>,
     ) -> Result<Response<cri::StartContainerResponse>, Status> {
-        unimplemented("StartContainer")
+        let id = request.into_inner().container_id;
+        let record = {
+            let _guard = self
+                .sandbox_mutation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(record) = find_container(&id)? else {
+                return Err(Status::not_found(format!(
+                    "could not find container {id:?}"
+                )));
+            };
+            let record = reconcile_container(record)?;
+            if record.state != container::ContainerState::Created {
+                return Err(Status::failed_precondition(format!(
+                    "container {} is not in created state: {:?}",
+                    record.id, record.state
+                )));
+            }
+            record
+        };
+
+        let bundle_dir =
+            crate::bundle::bundle_dir(&oci_cli_common::storage::default_root(), &record.id);
+
+        // Spawn the launcher-keeper: a fresh re-exec of this binary
+        // (fork+immediate-exec, safe from a multithreaded parent).
+        // Null stdio: the launcher's own failure reporting goes
+        // through its `start-error` file, never a pipe this server
+        // would have to babysit.
+        let exe = std::env::current_exe()
+            .map_err(|e| Status::internal(format!("resolving own executable: {e}")))?;
+        let mut child = std::process::Command::new(exe)
+            .arg(crate::launcher::LAUNCH_ARGV1)
+            .arg(&bundle_dir)
+            .arg(&record.id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| Status::internal(format!("spawning container launcher: {e}")))?;
+
+        // Reap the launcher whenever it eventually exits (its own
+        // lifetime is the container's, not this RPC's) so it never
+        // lingers as a zombie child of this long-lived server.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        // Wait (bounded) for the launcher to report the real pid --
+        // or a real start failure. Async sleeps: never park a tokio
+        // worker thread.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let pid = loop {
+            if let Some(pid) = crate::launcher::read_pid(&bundle_dir) {
+                break pid;
+            }
+            if let Some(reason) = crate::launcher::read_start_error(&bundle_dir) {
+                return Err(Status::internal(format!(
+                    "starting container {}: {reason}",
+                    record.id
+                )));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Status::internal(format!(
+                    "starting container {}: launcher reported neither a pid nor an error in time",
+                    record.id
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+
+        {
+            let _guard = self
+                .sandbox_mutation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut record = record;
+            record.state = container::ContainerState::Running;
+            record.pid = Some(pid);
+            record.started_at_nanos = Some(now_nanos());
+            container::save(&container_store_root(), &record)
+                .map_err(|e| io_error("saving container record", e))?;
+        }
+        Ok(Response::new(cri::StartContainerResponse {}))
     }
 
+    /// Real cri-o's own stop semantics, checked directly
+    /// (`server/container_stop.go`, `internal/oci/runtime_oci.go`):
+    /// unknown ID is a silent, idempotent success ("must not return
+    /// an error if the container has already been stopped");
+    /// a container with no living process (never started, or already
+    /// exited) just gets its finished state settled; a running one
+    /// gets the stop signal (SIGTERM — per-image `STOPSIGNAL` is a
+    /// documented later increment), `timeout` seconds to comply, then
+    /// SIGKILL.
     async fn stop_container(
         &self,
-        _request: Request<cri::StopContainerRequest>,
+        request: Request<cri::StopContainerRequest>,
     ) -> Result<Response<cri::StopContainerResponse>, Status> {
-        unimplemented("StopContainer")
+        let request = request.into_inner();
+        let id = request.container_id;
+        if id.is_empty() {
+            return Err(Status::invalid_argument("ContainerId should not be empty"));
+        }
+
+        let record = {
+            let _guard = self
+                .sandbox_mutation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(record) = find_container(&id)? else {
+                return Ok(Response::new(cri::StopContainerResponse {}));
+            };
+            let mut record = reconcile_container(record)?;
+            match record.state {
+                container::ContainerState::Exited => {
+                    return Ok(Response::new(cri::StopContainerResponse {}));
+                }
+                container::ContainerState::Created => {
+                    // No process ever existed -- settle the state,
+                    // matching real cri-o's own `Living()`-fails path
+                    // (`c.state.Finished = time.Now()`, no exit code).
+                    record.state = container::ContainerState::Exited;
+                    record.finished_at_nanos = Some(now_nanos());
+                    container::save(&container_store_root(), &record)
+                        .map_err(|e| io_error("saving container record", e))?;
+                    return Ok(Response::new(cri::StopContainerResponse {}));
+                }
+                container::ContainerState::Running => record,
+            }
+        };
+
+        let bundle_dir =
+            crate::bundle::bundle_dir(&oci_cli_common::storage::default_root(), &record.id);
+        let pid = record.pid;
+
+        // Grace period first (only if the caller granted one): the
+        // stop signal, then up to `timeout` seconds for a voluntary
+        // exit.
+        if let (Some(pid), true) = (pid, request.timeout > 0) {
+            let _ = oci_runtime_core::process::kill(pid, libc::SIGTERM);
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(request.timeout.min(600) as u64);
+            while std::time::Instant::now() < deadline {
+                if crate::launcher::read_exit(&bundle_dir)
+                    .map_err(|e| Status::internal(format!("reading exit record: {e}")))?
+                    .is_some()
+                    || !pid_alive(pid)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        // Forceful half (a no-op if the grace period already worked):
+        // SIGKILL, then settle the record from the launcher's own
+        // exit file. Runs on the blocking pool -- `force_kill_and_
+        // reconcile` polls with real sleeps.
+        let settled = tokio::task::spawn_blocking(move || force_kill_and_reconcile(record))
+            .await
+            .map_err(|e| Status::internal(format!("stop task panicked: {e}")))??;
+        {
+            let _guard = self
+                .sandbox_mutation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            container::save(&container_store_root(), &settled)
+                .map_err(|e| io_error("saving container record", e))?;
+        }
+        Ok(Response::new(cri::StopContainerResponse {}))
     }
 
     /// Idempotent, forceful removal — the proto: "must not return an
@@ -848,10 +1144,28 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             return Err(Status::invalid_argument("ContainerId should not be empty"));
         }
 
+        let record = {
+            let _guard = self
+                .sandbox_mutation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(record) = find_container(&id)? else {
+                return Ok(Response::new(cri::RemoveContainerResponse {}));
+            };
+            record
+        };
+        // Forceful: a still-running container is SIGKILLed first (the
+        // proto's own contract), on the blocking pool (the kill wait
+        // polls with real sleeps).
+        tokio::task::spawn_blocking(move || force_kill_and_reconcile(record))
+            .await
+            .map_err(|e| Status::internal(format!("remove task panicked: {e}")))??;
+
         let _guard = self
             .sandbox_mutation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Re-resolve under the lock: the settle above ran unlocked.
         let Some(record) = find_container(&id)? else {
             return Ok(Response::new(cri::RemoveContainerResponse {}));
         };
@@ -897,10 +1211,17 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
     ) -> Result<Response<cri::ContainerStatusResponse>, Status> {
         let request = request.into_inner();
         let id = request.container_id;
-        let Some(record) = find_container(&id)? else {
-            return Err(Status::not_found(format!(
-                "could not find container {id:?}"
-            )));
+        let record = {
+            let _guard = self
+                .sandbox_mutation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(record) = find_container(&id)? else {
+                return Err(Status::not_found(format!(
+                    "could not find container {id:?}"
+                )));
+            };
+            reconcile_container(record)?
         };
 
         // Verbose info: one "info" key holding a JSON blob, the same
@@ -915,12 +1236,31 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             );
         }
 
+        // Exit reporting for an EXITED container, matching real
+        // cri-o's own status switch (`container_status.go`): a real
+        // recorded exit code (or its own identical `-1` fallback when
+        // none was ever recorded), and the kubelet-conventional
+        // `Completed`/`Error` reason real cri-o's own containers
+        // report.
+        let (exit_code, reason) = match record.state {
+            container::ContainerState::Exited => match record.exit_code {
+                Some(0) => (0, "Completed".to_string()),
+                Some(code) => (code, "Error".to_string()),
+                None => (-1, "Error".to_string()),
+            },
+            _ => (0, String::new()),
+        };
+
         Ok(Response::new(cri::ContainerStatusResponse {
             status: Some(cri::ContainerStatus {
                 id: record.id.clone(),
                 metadata: Some(container_metadata_to_proto(&record.metadata)),
                 state: container_state_to_proto(record.state),
                 created_at: record.created_at_nanos,
+                started_at: record.started_at_nanos.unwrap_or(0),
+                finished_at: record.finished_at_nanos.unwrap_or(0),
+                exit_code,
+                reason,
                 image: Some(cri::ImageSpec {
                     image: record.image.clone(),
                     ..Default::default()
@@ -1260,13 +1600,14 @@ mod tests {
     async fn every_other_rpc_is_a_real_honest_unimplemented_status() {
         let service = RuntimeServiceImpl::default();
         let status = service
-            .start_container(Request::new(cri::StartContainerRequest {
-                container_id: String::new(),
+            .port_forward(Request::new(cri::PortForwardRequest {
+                pod_sandbox_id: String::new(),
+                port: Vec::new(),
             }))
             .await
             .unwrap_err();
         assert_eq!(status.code(), tonic::Code::Unimplemented);
-        assert!(status.message().contains("StartContainer"), "{status:?}");
+        assert!(status.message().contains("PortForward"), "{status:?}");
     }
 
     #[tokio::test]

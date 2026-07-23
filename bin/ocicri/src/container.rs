@@ -82,6 +82,24 @@ pub struct ContainerRecord {
     pub state: ContainerState,
     /// Creation timestamp in nanoseconds since the epoch.
     pub created_at_nanos: i64,
+    /// The container init process's real pid, once started (0238).
+    /// `serde(default)` on these four: a record written before 0238
+    /// simply has none of them, and deserializes as never-started.
+    #[serde(default)]
+    pub pid: Option<i32>,
+    /// When `StartContainer` actually started it, nanoseconds.
+    #[serde(default)]
+    pub started_at_nanos: Option<i64>,
+    /// When it actually exited, nanoseconds.
+    #[serde(default)]
+    pub finished_at_nanos: Option<i64>,
+    /// The real exit code the launcher's own `waitpid` reported
+    /// (`128 + signal` for a signal death, `oci_runtime_core::
+    /// process::exit_code`'s own documented convention). `None` for
+    /// "exited, but the code was never recorded" — reported as `-1`,
+    /// real cri-o's own identical fallback.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
 }
 
 impl Record for ContainerRecord {
@@ -152,6 +170,10 @@ mod tests {
             annotations: std::collections::HashMap::new(),
             state: ContainerState::Created,
             created_at_nanos,
+            pid: None,
+            started_at_nanos: None,
+            finished_at_nanos: None,
+            exit_code: None,
         }
     }
 

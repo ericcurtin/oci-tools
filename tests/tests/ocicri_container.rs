@@ -127,7 +127,15 @@ async fn setup() -> Option<(
     let busybox = busybox_path()?;
     let storage_dir = tempfile::tempdir().unwrap();
     let store = Store::open(storage_dir.path()).unwrap();
-    seed_image(&store, IMAGE, &busybox, &["sh"], ContainerConfig::default());
+    // `sleep`/`true` alongside `sh`: the start/stop lifecycle tests
+    // (0238) run real containers from this image.
+    seed_image(
+        &store,
+        IMAGE,
+        &busybox,
+        &["sh", "sleep", "true"],
+        ContainerConfig::default(),
+    );
 
     let socket_dir = tempfile::tempdir().unwrap();
     let socket_path = socket_dir.path().join("ocicri.sock");
@@ -683,4 +691,307 @@ async fn remove_pod_sandbox_cascades_and_records_survive_restart() {
         .into_inner()
         .containers;
     assert!(remaining.is_empty(), "{remaining:?}");
+}
+
+/// Polls `ContainerStatus` until the reported state matches (or a
+/// deadline passes).
+async fn wait_for_state(
+    client: &mut RuntimeServiceClient<tonic::transport::Channel>,
+    container_id: &str,
+    want: ContainerState,
+) -> oci_cri_types::ContainerStatus {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = client
+            .container_status(ContainerStatusRequest {
+                container_id: container_id.to_string(),
+                verbose: false,
+            })
+            .await
+            .expect("ContainerStatus failed")
+            .into_inner()
+            .status
+            .expect("status should be present");
+        if status.state == want as i32 {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "container {container_id} never reached {want:?}; last status: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A real, started container (0238): `/bin/true` runs to completion,
+/// and the reported status carries a real pid-backed lifecycle —
+/// RUNNING (or already EXITED for something this fast), then EXITED
+/// with a real exit code 0, `Completed`, and real timestamps. A
+/// second start of the same container is real cri-o's own "is not in
+/// created state" error.
+#[tokio::test]
+async fn start_runs_a_real_container_to_completion() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let mut config = container_config("runs-true", 0);
+    config.command = vec!["/bin/true".to_string()];
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .expect("StartContainer failed");
+
+    let status = wait_for_state(&mut client, &container_id, ContainerState::ContainerExited).await;
+    assert_eq!(status.exit_code, 0, "{status:?}");
+    assert_eq!(status.reason, "Completed", "{status:?}");
+    assert!(status.started_at > 0, "{status:?}");
+    assert!(status.finished_at >= status.started_at, "{status:?}");
+
+    // Starting it again: real cri-o's own error, verbatim shape.
+    let err = client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .expect_err("a second start should be rejected");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("is not in created state"), "{err:?}");
+}
+
+/// A long-running container is genuinely RUNNING (live pid), then
+/// `StopContainer` with a grace period ends it via SIGTERM — proven
+/// by a real TERM trap inside the container (its own chosen exit
+/// code comes back, not SIGKILL's), since a handler-less pid 1
+/// simply *ignores* SIGTERM (a real kernel rule for init processes;
+/// real `docker stop` on a handler-less pid 1 waits out its whole
+/// grace period and SIGKILLs for the exact same reason) — and a
+/// second stop is a silent, idempotent success. Stopping a
+/// never-started container settles it as exited with no recorded
+/// code (reported -1), real cri-o's own no-living-process path.
+#[tokio::test]
+async fn stop_terminates_a_running_container_and_is_idempotent() {
+    let Some((storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let mut config = container_config("sleeper", 0);
+    // The TERM trap makes pid 1 exit voluntarily with its own code
+    // (see this test's own doc comment). Two real subtleties, both
+    // found the hard way wiring this test up:
+    //
+    // * A *foreground* sleep loop, deliberately: busybox `sh`
+    //   redirects a backgrounded job's stdin from `/dev/null`, which
+    //   this project's own containers don't populate in `/dev` yet (a
+    //   `sleep 300 & wait` variant exited 0 instantly because the
+    //   background spawn itself failed). The trap still runs promptly
+    //   (busybox delivers it once the current foreground `sleep 1`
+    //   returns, well inside the stop grace period).
+    // * `touch /ready` *after* the trap: a pid-namespace init that
+    //   hasn't installed a handler yet silently *discards* SIGTERM
+    //   from the parent namespace (a real kernel rule for init
+    //   processes, not a bug anywhere) — and `RUNNING` is reported
+    //   from the moment the pid exists, which is before the container
+    //   has even exec'd. Stopping the instant `RUNNING` appears can
+    //   therefore race the trap installation; the test waits for the
+    //   container's own real signal (`/ready` in its rootfs, visible
+    //   on the host through the bundle) before stopping.
+    config.command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "trap 'exit 42' TERM; touch /ready; while true; do sleep 1; done".to_string(),
+    ];
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .expect("StartContainer failed");
+    let status = wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+    assert!(status.started_at > 0);
+    assert_eq!(status.finished_at, 0, "still running: {status:?}");
+
+    // Wait for the container's own trap-installed signal (see the
+    // command's own comment above) before stopping.
+    let ready = bundle_dir(storage.path(), &container_id).join("rootfs/ready");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "container never touched /ready"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    client
+        .stop_container(oci_cri_types::StopContainerRequest {
+            container_id: container_id.clone(),
+            timeout: 10,
+        })
+        .await
+        .expect("StopContainer failed");
+    let status = wait_for_state(&mut client, &container_id, ContainerState::ContainerExited).await;
+    assert_eq!(
+        status.exit_code, 42,
+        "the TERM trap's own exit code proves the graceful path ran: {status:?}"
+    );
+    assert_eq!(status.reason, "Error", "{status:?}");
+
+    // Idempotent second stop.
+    client
+        .stop_container(oci_cri_types::StopContainerRequest {
+            container_id: container_id.clone(),
+            timeout: 10,
+        })
+        .await
+        .expect("a second StopContainer should silently succeed");
+
+    // Stopping a never-started container settles it (no exit code
+    // was ever produced, reported as -1).
+    let mut config = container_config("never-started", 0);
+    config.command = vec!["/bin/true".to_string()];
+    let created_only = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id,
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    client
+        .stop_container(oci_cri_types::StopContainerRequest {
+            container_id: created_only.clone(),
+            timeout: 5,
+        })
+        .await
+        .expect("stopping a created container should succeed");
+    let status = wait_for_state(&mut client, &created_only, ContainerState::ContainerExited).await;
+    assert_eq!(status.exit_code, -1, "{status:?}");
+    assert!(status.finished_at > 0, "{status:?}");
+}
+
+/// `RemoveContainer` of a running container is forceful (the proto's
+/// own contract): the real process is killed, the record and bundle
+/// removed — and the state filter sees a genuinely reconciled view
+/// (a RUNNING record whose process exited lists as EXITED).
+#[tokio::test]
+async fn remove_forcefully_kills_a_running_container() {
+    let Some((storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let mut config = container_config("doomed", 0);
+    config.command = vec!["/bin/sleep".to_string(), "300".to_string()];
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+
+    client
+        .remove_container(RemoveContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .expect("forceful RemoveContainer of a running container should succeed");
+    assert!(
+        !bundle_dir(storage.path(), &container_id).exists(),
+        "bundle should be gone"
+    );
+    let not_found = client
+        .container_status(ContainerStatusRequest {
+            container_id,
+            verbose: false,
+        })
+        .await
+        .expect_err("removed container should be gone");
+    assert_eq!(not_found.code(), tonic::Code::NotFound);
+}
+
+/// `StopPodSandbox` forcibly terminates the sandbox's own running
+/// containers (the proto's contract, real cri-o's own
+/// `stopPodSandbox` loop).
+#[tokio::test]
+async fn stop_pod_sandbox_terminates_its_running_containers() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let mut config = container_config("pod-sleeper", 0);
+    config.command = vec!["/bin/sleep".to_string(), "300".to_string()];
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+
+    client
+        .stop_pod_sandbox(StopPodSandboxRequest {
+            pod_sandbox_id: sandbox_id,
+        })
+        .await
+        .expect("StopPodSandbox failed");
+    let status = wait_for_state(&mut client, &container_id, ContainerState::ContainerExited).await;
+    assert_eq!(
+        status.exit_code,
+        128 + 9,
+        "the sandbox stop is forceful (SIGKILL): {status:?}"
+    );
 }

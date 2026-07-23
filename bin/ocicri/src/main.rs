@@ -17,19 +17,20 @@
 //! `StreamPodSandboxes` — a real, persistent, record-keeping state
 //! machine with real CRI semantics, deliberately no infra
 //! process/pinned namespaces yet, see `docs/design/0233`-`0234`), the
-//! container lifecycle's own record slice (`CreateContainer`/
-//! `ContainerStatus`/`ListContainers`/`RemoveContainer` — every
-//! record honestly `CONTAINER_CREATED` until `StartContainer` itself
-//! exists, with a real, verified launch-ready bundle prepared at
-//! create time, see `docs/design/0236`-`0237`), and all of `ImageService`
+//! full container lifecycle (`CreateContainer` with a real, verified
+//! launch-ready bundle prepared at create time, `StartContainer`/
+//! `StopContainer` running real container processes via the
+//! per-container launcher-keeper — this project's own conmon
+//! equivalent — plus `ContainerStatus`/`ListContainers`/
+//! `RemoveContainer` reconciling against the keeper's own real exit
+//! records, see `docs/design/0236`-`0238`), and all of `ImageService`
 //! (`ListImages`/`StreamImages`/`ImageStatus`/`PullImage`/
 //! `RemoveImage`/`ImageFsInfo`, reusing this project's own
 //! already-tested `oci_store`/`oci_registry` primitives directly —
 //! see `image_service.rs`'s own module doc comment). Every remaining
-//! RPC (start/stop, exec/attach/port-forward, stats, events, ...)
-//! deliberately returns a real `Status::unimplemented` naming
-//! itself, rather than accepting a request this project can't
-//! actually act on yet.
+//! RPC (exec/attach/port-forward, stats, events, ...) deliberately
+//! returns a real `Status::unimplemented` naming itself, rather than
+//! accepting a request this project can't actually act on yet.
 //!
 //! Unlike every other binary in this workspace, `ocicri` is a real,
 //! long-lived server process, not a short-lived CLI invocation — the
@@ -44,6 +45,7 @@
 mod bundle;
 mod container;
 mod image_service;
+mod launcher;
 mod records;
 mod runtime_service;
 mod sandbox;
@@ -84,6 +86,18 @@ fn default_socket_path() -> PathBuf {
 }
 
 fn main() -> std::process::ExitCode {
+    // The internal per-container launcher-keeper re-exec
+    // (`docs/design/0238`, see `launcher.rs`'s own module doc
+    // comment) -- intercepted before clap or tokio ever run, so the
+    // launcher process is genuinely single-threaded at its own
+    // `oci_runtime_core::launch` call, exactly like `runc init`'s own
+    // hidden re-exec entry point. Never reachable from any real CLI
+    // surface (`__launch` appears in no help text).
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(launcher::LAUNCH_ARGV1) {
+        launcher::main(&args[2..]);
+    }
+
     oci_cli_common::run_main(|| {
         let cli = Cli::parse();
         oci_cli_common::logging::init(&cli.global)?;
