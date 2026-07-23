@@ -7831,11 +7831,7 @@ fn build_timestamp_sets_created_on_every_new_history_entry_and_the_top_level_fie
 
     let inspect = ociman(
         storage_dir.path(),
-        &[
-            "inspect",
-            "--json",
-            "ociman-test/timestamp-result:latest",
-        ],
+        &["inspect", "--json", "ociman-test/timestamp-result:latest"],
     );
     assert!(inspect.status.success());
     let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();

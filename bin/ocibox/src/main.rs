@@ -22,7 +22,12 @@
 //! `docs/design/0207` for why not yet) — matches this project's own
 //! established "narrow first slice, document the rest" pattern (e.g.
 //! `ociboot build-image` before `ociboot`'s own eventual `install
-//! to-disk`). `stop`/`upgrade`/`export` are still ahead.
+//! to-disk`). `ephemeral` (0211) rounds the family out further: a
+//! disposable box, created under a real, random name, entered once,
+//! then always removed again — a pure composition of `create`/
+//! `enter`/`rm`, matching real `distrobox ephemeral` exactly, no new
+//! namespace/mount/launch code at all. `stop`/`upgrade`/`export` are
+//! still ahead.
 
 use std::path::{Path, PathBuf};
 
@@ -147,6 +152,37 @@ enum Command {
         /// if empty.
         command: Vec<String>,
     },
+    /// Create a temporary box, run one command (or a default shell)
+    /// inside it, and always remove it again afterward — matching
+    /// real `distrobox ephemeral` exactly (checked directly against
+    /// its own real Go implementation, `~/git/distrobox/internal/
+    /// cli/ephemeral.go`/`pkg/commands/ephemeral.go`): a pure
+    /// composition of this project's own already-existing `create`/
+    /// `enter`/`rm` primitives, no new namespace/mount/launch code of
+    /// its own at all. Unlike `create`, never takes an explicit
+    /// `--name` — a real, random, collision-checked `ocibox-<hex>`
+    /// name is always generated instead, since the whole point is a
+    /// disposable box nobody needs to remember the name of.
+    ///
+    /// The box is removed even if the command inside it exits
+    /// nonzero, or `enter` itself fails outright (e.g. a spec-build
+    /// error) — matching real `distrobox ephemeral`'s own identical
+    /// `defer`-based cleanup; a cleanup failure is only ever a
+    /// warning, never masking the command's own real result.
+    Ephemeral {
+        /// Image reference to base the box on (`--image`/`-i`,
+        /// matching `ocibox create`'s own identical flag).
+        #[arg(long = "image", short = 'i', value_name = "REFERENCE")]
+        image: String,
+        /// Pull `--image` even if a local copy already exists,
+        /// matching `ocibox create --pull`'s own identical flag.
+        #[arg(long, short = 'p')]
+        pull: bool,
+        /// The command to run inside the box, and its own arguments —
+        /// defaults to a shell (see `ocibox enter`'s own doc comment)
+        /// if empty.
+        command: Vec<String>,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -166,6 +202,11 @@ fn main() -> std::process::ExitCode {
                 all,
             }) => cmd_rm(name.as_deref(), all),
             Some(Command::Enter { name, command }) => cmd_enter(&name, &command),
+            Some(Command::Ephemeral {
+                image,
+                pull,
+                command,
+            }) => cmd_ephemeral(&image, pull, &command),
             None => anyhow::bail!(
                 "no subcommand given (try `ocibox create --image ... --name ...`); \
                  the rest of milestone 7 (`stop`/...) arrives later"
@@ -236,6 +277,19 @@ struct BoxRecord {
 }
 
 fn cmd_create(image: &str, name: &str, pull: bool) -> anyhow::Result<()> {
+    create_box(image, name, pull)?;
+    println!("{name}");
+    Ok(())
+}
+
+/// The real create logic `cmd_create`/`cmd_ephemeral` both share —
+/// factored out purely so `ephemeral` (whose own generated name isn't
+/// something worth printing to stdout the way `create`'s own
+/// user-chosen `--name` is, matching real `distrobox ephemeral`'s own
+/// identical "no extra id line before dropping into the shell"
+/// output) can reuse every bit of real resolve/extract/persist logic
+/// without also inheriting `cmd_create`'s own final `println!`.
+fn create_box(image: &str, name: &str, pull: bool) -> anyhow::Result<()> {
     validate_box_name(name)?;
 
     let box_dir = boxes_root().join(name);
@@ -294,7 +348,6 @@ fn cmd_create(image: &str, name: &str, pull: bool) -> anyhow::Result<()> {
     )
     .with_context(|| format!("writing {}", box_json_path.display()))?;
 
-    println!("{name}");
     Ok(())
 }
 
@@ -500,6 +553,24 @@ fn enter_spec(
 /// module's own doc comment and [`Command::Enter`]'s own doc comment
 /// for exactly what this first slice does and doesn't do yet.
 fn cmd_enter(name: &str, command: &[String]) -> anyhow::Result<()> {
+    let exit_code = enter_and_get_exit_code(name, command)?;
+    // The container's own exit code becomes ours, matching `ocirun
+    // run`'s own identical real bypass of `oci_cli_common::run_main`'s
+    // usual `Ok(())`-means-success mapping: exit code 0 must mean "the
+    // command inside the box exited 0", not merely "`ocibox` itself
+    // didn't error" (see `bin/ocirun/src/main.rs`'s own `cmd_run` for
+    // the exact same reasoning, quoted directly).
+    std::process::exit(exit_code);
+}
+
+/// The real "build a spec, launch, wait" logic `cmd_enter`/
+/// `cmd_ephemeral` both share — factored out (returning the real exit
+/// code rather than calling `std::process::exit` itself, unlike
+/// `cmd_enter`) purely so `cmd_ephemeral` can run its own cleanup
+/// (removing the ephemeral box) *after* the command inside it finishes
+/// but *before* this process actually exits, which a direct
+/// `std::process::exit` call here would make impossible.
+fn enter_and_get_exit_code(name: &str, command: &[String]) -> anyhow::Result<i32> {
     validate_box_name(name)?;
     let box_dir = boxes_root().join(name);
     anyhow::ensure!(box_dir.is_dir(), "{name}: no such box");
@@ -540,14 +611,7 @@ fn cmd_enter(name: &str, command: &[String]) -> anyhow::Result<()> {
     let exit_code =
         unsafe { oci_runtime_core::launch::run(name, &bundle, &validated_rootfs, false, false) }
             .with_context(|| format!("running inside box {name}"))?;
-
-    // The container's own exit code becomes ours, matching `ocirun
-    // run`'s own identical real bypass of `oci_cli_common::run_main`'s
-    // usual `Ok(())`-means-success mapping: exit code 0 must mean "the
-    // command inside the box exited 0", not merely "`ocibox` itself
-    // didn't error" (see `bin/ocirun/src/main.rs`'s own `cmd_run` for
-    // the exact same reasoning, quoted directly).
-    std::process::exit(exit_code);
+    Ok(exit_code)
 }
 
 /// Removes exactly one box's own directory (its rootfs and persisted
@@ -607,6 +671,71 @@ fn cmd_rm(name: Option<&str>, all: bool) -> anyhow::Result<()> {
                 None => Ok(()),
             }
         }
+    }
+}
+
+/// A real, random `ocibox-<12 hex chars>` box name for [`cmd_ephemeral`]
+/// — matching real `distrobox ephemeral`'s own identical purpose (a
+/// disposable name nobody chooses or needs to remember), a small,
+/// deliberate, dependency-free duplicate of `ociman`'s own `short_id`
+/// pattern (hashing the real current time, this process's own pid,
+/// and `attempt` so two calls in the same process never collide with
+/// each other either) rather than pulling in a `rand` crate this
+/// workspace has no other use for.
+fn random_box_name(attempt: u32) -> String {
+    let seed = format!(
+        "{:?}-{}-{attempt}",
+        std::time::SystemTime::now(),
+        std::process::id()
+    );
+    let digest = oci_spec_types::digest::sha256(seed.as_bytes());
+    format!("ocibox-{}", &digest.hex()[..12])
+}
+
+/// A [`random_box_name`] that doesn't already collide with an
+/// existing box — retried up to `MAX_ATTEMPTS` times, matching real
+/// `distrobox ephemeral`'s own identical retry count
+/// (`ephemeralMaxNameGenAttempts` in `~/git/distrobox/pkg/commands/
+/// ephemeral.go`) before giving up with a clear error (astronomically
+/// unlikely in practice — a real collision would need another
+/// `ocibox` process to have hashed the exact same time+pid+attempt
+/// triple first).
+fn unique_random_box_name() -> anyhow::Result<String> {
+    const MAX_ATTEMPTS: u32 = 10;
+    for attempt in 0..MAX_ATTEMPTS {
+        let name = random_box_name(attempt);
+        if !boxes_root().join(&name).exists() {
+            return Ok(name);
+        }
+    }
+    anyhow::bail!("failed to generate a unique ephemeral box name after {MAX_ATTEMPTS} attempts")
+}
+
+/// `ocibox ephemeral`: create a box under a real, random, collision-
+/// checked name, enter it, then always remove it again — see
+/// [`Command::Ephemeral`]'s own doc comment for the exact real
+/// `distrobox ephemeral` behavior this matches and why no new
+/// namespace/mount/launch code was needed to build it at all.
+fn cmd_ephemeral(image: &str, pull: bool, command: &[String]) -> anyhow::Result<()> {
+    let name = unique_random_box_name()?;
+    create_box(image, &name, pull).with_context(|| format!("creating ephemeral box {name}"))?;
+
+    let result = enter_and_get_exit_code(&name, command);
+
+    // Always attempted, regardless of whether the command inside the
+    // box succeeded, failed, or `enter` itself errored outright (e.g.
+    // a spec-build failure) — matching real `distrobox ephemeral`'s
+    // own identical `defer`-based cleanup. A cleanup failure is only
+    // ever reported as a warning: it must never replace or hide
+    // `result`'s own real outcome, which is what this command is
+    // actually supposed to report.
+    if let Err(e) = remove_one_box(&name) {
+        eprintln!("warning: ocibox ephemeral: failed to remove {name}: {e:#}");
+    }
+
+    match result {
+        Ok(exit_code) => std::process::exit(exit_code),
+        Err(e) => Err(e),
     }
 }
 
