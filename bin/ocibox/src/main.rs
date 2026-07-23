@@ -13,14 +13,16 @@
 //! which additionally integrates X11/Wayland/audio/nvidia passthrough,
 //! init-hooks, and additional-package installation, none of which
 //! this project attempts yet. `list`/`rm` (0206) round out the family
-//! enough to actually manage what `create` makes. Actually *launching*
-//! a box (the real namespace/mount/home-bind-mount setup, via the
-//! exact same shared `oci_runtime_core::launch::create`/
-//! `oci_runtime_core::exec_fifo` two-phase lifecycle `ociman create`/
-//! `ocirun start` already use) is `ocibox enter`'s own job, still
-//! ahead — matches this project's own established "narrow first
-//! slice, document the rest" pattern (e.g. `ociboot build-image`
-//! before `ociboot`'s own eventual `install to-disk`).
+//! enough to actually manage what `create` makes. `enter` (0207)
+//! actually launches a box — a single foreground fork+exec+wait per
+//! invocation via the exact same shared `oci_runtime_core::launch`/
+//! `Bundle`/`validate` two-phase lifecycle `ociman run`/`ocirun run`
+//! already use, deliberately *not* yet real `distrobox enter`'s own
+//! persistent-background-container-across-sessions model (see
+//! `docs/design/0207` for why not yet) — matches this project's own
+//! established "narrow first slice, document the rest" pattern (e.g.
+//! `ociboot build-image` before `ociboot`'s own eventual `install
+//! to-disk`). `stop`/`upgrade`/`export` are still ahead.
 
 use std::path::{Path, PathBuf};
 
@@ -104,6 +106,37 @@ enum Command {
         #[arg(long, short = 'f')]
         force: bool,
     },
+    /// Enter a box: runs a real, live, interactive command inside its
+    /// own already-extracted rootfs — rootless namespaces (matching
+    /// `ociman run`'s own established default), the real host `$HOME`
+    /// bind-mounted at the same path if it resolves to a real,
+    /// existing directory, real stdio passthrough (no PTY allocation —
+    /// a real, already-documented, project-wide gap, `oci_runtime_
+    /// core`'s own doc comment, not something new introduced here).
+    /// With no `COMMAND`, defaults to `/bin/bash` if the rootfs has
+    /// one, else `/bin/sh`, else a clear error naming neither found.
+    ///
+    /// Deliberately **not** yet the real, persistent "create once,
+    /// enter many times, background processes survive between
+    /// sessions" experience real `distrobox enter` delivers: each
+    /// `ocibox enter` call is its own independent, foreground
+    /// container process (matching `ocirun run`'s own simplest
+    /// create-start-wait-in-one model) — the box's own *rootfs*
+    /// persists across separate `enter` calls (any file written stays
+    /// there), but no container process itself stays running between
+    /// them. A real, honestly-documented limitation, not silently
+    /// papered over — true cross-session persistence needs `create`
+    /// to also launch a genuinely long-lived keeper process the box
+    /// stays subordinate to, deferred to its own future increment.
+    Enter {
+        /// The box's own name, exactly as given to `ocibox create
+        /// --name`.
+        name: String,
+        /// The command to run inside the box, and its own arguments —
+        /// defaults to a shell (see this command's own doc comment)
+        /// if empty.
+        command: Vec<String>,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -118,9 +151,10 @@ fn main() -> std::process::ExitCode {
             Some(Command::Create { image, name, pull }) => cmd_create(&image, &name, pull),
             Some(Command::List) => cmd_list(cli.global.json),
             Some(Command::Rm { name, force: _ }) => cmd_rm(&name),
+            Some(Command::Enter { name, command }) => cmd_enter(&name, &command),
             None => anyhow::bail!(
                 "no subcommand given (try `ocibox create --image ... --name ...`); \
-                 the rest of milestone 7 (`enter`/`stop`/...) arrives later"
+                 the rest of milestone 7 (`stop`/...) arrives later"
             ),
         }
     })
@@ -160,14 +194,31 @@ fn validate_box_name(name: &str) -> anyhow::Result<()> {
 
 /// A box's own persisted metadata (`<boxes_root>/<name>/box.json`) —
 /// deliberately minimal so far (just enough for `ocibox list` to
-/// enumerate real boxes): the image it was created from, the real
-/// manifest digest that resolved to at creation time, and when.
+/// enumerate real boxes, and for `ocibox enter` to build a real
+/// launch spec): the image it was created from, the real manifest
+/// digest that resolved to at creation time, when, and (0207) the
+/// source image's own declared `env`/`working_dir` — captured once
+/// here at `create` time rather than re-read from the image's own
+/// config at `enter` time, since the source image could have since
+/// been removed from the store entirely (`ociman rmi`+`prune`) without
+/// that affecting this already-created box at all.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BoxRecord {
     name: String,
     image: String,
     manifest_digest: String,
     created: String,
+    /// The source image's own declared default environment
+    /// (`ContainerConfig::env`), empty if it declared none. Older
+    /// `box.json` files predating this field deserialize this as
+    /// empty via `#[serde(default)]`, matching this project's own
+    /// established forward-compatible-record convention.
+    #[serde(default)]
+    env: Vec<String>,
+    /// The source image's own declared default working directory
+    /// (`ContainerConfig::working_dir`), if any.
+    #[serde(default)]
+    working_dir: Option<String>,
 }
 
 fn cmd_create(image: &str, name: &str, pull: bool) -> anyhow::Result<()> {
@@ -197,6 +248,10 @@ fn cmd_create(image: &str, name: &str, pull: bool) -> anyhow::Result<()> {
     let manifest = store
         .image_manifest(&record)
         .with_context(|| format!("reading manifest for {reference}"))?;
+    let config = store
+        .image_config(&record)
+        .with_context(|| format!("reading config for {reference}"))?;
+    let container_config = config.config.unwrap_or_default();
 
     let rootfs = box_dir.join("rootfs");
     std::fs::create_dir_all(&rootfs).with_context(|| format!("creating {}", rootfs.display()))?;
@@ -215,6 +270,8 @@ fn cmd_create(image: &str, name: &str, pull: bool) -> anyhow::Result<()> {
         image: reference.to_string(),
         manifest_digest: record.manifest_digest.to_string(),
         created: oci_spec_types::time::format_rfc3339_utc(std::time::SystemTime::now()),
+        env: container_config.env,
+        working_dir: container_config.working_dir,
     };
     let box_json_path = box_dir.join("box.json");
     std::fs::write(
@@ -314,6 +371,171 @@ fn cmd_list(json: bool) -> anyhow::Result<()> {
 /// doesn't exist at all is a clear, real error (matching real
 /// `distrobox rm`'s own identical refusal for an unknown name), not a
 /// silent no-op.
+/// Fallback `PATH` for a box whose source image declared no default
+/// `env` at all — matching real `podman`'s own identical fallback
+/// (`ociman`'s own `DEFAULT_ENV_WHEN_IMAGE_DECLARES_NONE`, kept as its
+/// own small, deliberate duplicate here for the same "four lines,
+/// not worth a cross-binary dependency" reasoning `validate_box_name`
+/// already gives).
+const DEFAULT_ENV_WHEN_BOX_DECLARES_NONE: &str =
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Picks a default command to run when `ocibox enter` is given no
+/// explicit `COMMAND`: `/bin/bash` if the box's own rootfs has one,
+/// else `/bin/sh`, else a clear, real error naming neither — rather
+/// than a puzzling "No such file or directory" failure surfacing from
+/// deep inside the already-launched container itself.
+fn default_shell_args(rootfs: &Path) -> anyhow::Result<Vec<String>> {
+    for candidate in ["bin/bash", "bin/sh"] {
+        if rootfs.join(candidate).is_file() {
+            return Ok(vec![format!("/{candidate}")]);
+        }
+    }
+    anyhow::bail!(
+        "no default shell found in this box's own rootfs (neither /bin/bash nor /bin/sh \
+         exists); give an explicit command instead: `ocibox enter <NAME> -- <command>`"
+    );
+}
+
+/// Builds the real rootless [`oci_spec_types::runtime::Spec`] a box's
+/// own `enter` session launches with — closely mirrors `ociman
+/// build`'s own `run_step_spec` (a real, writable rootfs, the same
+/// `podman`-default capability set and seccomp profile every other
+/// real container this project runs gets), simplified for `ocibox`'s
+/// own narrower needs: no per-run resource limits/entrypoint
+/// overrides, and uid/gid left at `User::default()`'s own `0`/`0`
+/// (root *inside* the rootless-mapped user namespace, matching every
+/// other command in this project that has no `--user` equivalent of
+/// its own yet — a real host-user-account setup inside the rootfs,
+/// unlike real `distrobox enter`'s own init script, is out of scope
+/// for this first slice, see this module's own doc comment).
+fn enter_spec(
+    record: &BoxRecord,
+    args: Vec<String>,
+) -> anyhow::Result<oci_spec_types::runtime::Spec> {
+    let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
+    let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
+    // A real interactive session needs a writable rootfs to do
+    // anything useful at all — same fix, same reasoning, as
+    // `run_step_spec`'s/`synthesize_spec`'s own identical override.
+    spec.root
+        .as_mut()
+        .expect("Spec::example always sets root")
+        .readonly = false;
+
+    // Only added if `$HOME` resolves to a real, existing host
+    // directory — deliberately conditional (unlike real `distrobox
+    // enter`'s own unconditional host-home bind mount, which also
+    // creates a matching host user account inside the rootfs first;
+    // this project doesn't do that yet), so `ocibox enter` still
+    // works from an environment with no usable `$HOME` at all rather
+    // than failing outright.
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_dir());
+
+    let process = spec
+        .process
+        .as_mut()
+        .expect("Spec::example always sets process");
+    process.args = args;
+    process.terminal = false;
+    process.env = if record.env.is_empty() {
+        vec![DEFAULT_ENV_WHEN_BOX_DECLARES_NONE.to_string()]
+    } else {
+        record.env.clone()
+    };
+    process.cwd = home
+        .as_ref()
+        .map(|h| h.to_string_lossy().into_owned())
+        .or_else(|| record.working_dir.clone().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "/".to_string());
+
+    if let Some(capabilities) = process.capabilities.as_mut() {
+        let podman_caps = oci_spec_types::runtime::podman_default_capabilities();
+        capabilities.bounding = podman_caps.clone();
+        capabilities.effective = podman_caps.clone();
+        capabilities.permitted = podman_caps;
+    }
+
+    if let Some(home) = home {
+        let home_str = home.to_string_lossy().into_owned();
+        spec.mounts.push(oci_spec_types::runtime::Mount {
+            destination: home_str.clone(),
+            source: Some(home_str),
+            kind: Some("bind".to_string()),
+            options: vec!["rbind".to_string()],
+        });
+    }
+
+    let linux = spec
+        .linux
+        .as_mut()
+        .expect("Spec::example always sets linux");
+    linux.seccomp = Some(oci_runtime_core::seccomp::filter_to_supported_syscalls(
+        &oci_runtime_core::seccomp::default_profile(),
+    ));
+
+    Ok(spec)
+}
+
+/// `ocibox enter`: runs a real, live command inside an already-created
+/// box's own rootfs, using the exact same shared `oci_runtime_core::
+/// launch`/`Bundle`/`validate` two-phase lifecycle primitives every
+/// other real container this project launches uses — see this
+/// module's own doc comment and [`Command::Enter`]'s own doc comment
+/// for exactly what this first slice does and doesn't do yet.
+fn cmd_enter(name: &str, command: &[String]) -> anyhow::Result<()> {
+    validate_box_name(name)?;
+    let box_dir = boxes_root().join(name);
+    anyhow::ensure!(box_dir.is_dir(), "{name}: no such box");
+    let rootfs = box_dir.join("rootfs");
+
+    let box_json_path = box_dir.join("box.json");
+    let bytes = std::fs::read(&box_json_path)
+        .with_context(|| format!("reading {}", box_json_path.display()))?;
+    let record: BoxRecord = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {}", box_json_path.display()))?;
+
+    let args = if command.is_empty() {
+        default_shell_args(&rootfs)?
+    } else {
+        command.to_vec()
+    };
+
+    let spec = enter_spec(&record, args).with_context(|| format!("preparing spec for {name}"))?;
+    let config_path = box_dir.join(oci_runtime_core::bundle::CONFIG_FILENAME);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&spec)?)
+        .with_context(|| format!("writing {}", config_path.display()))?;
+
+    let bundle = oci_runtime_core::Bundle::load(&box_dir)
+        .with_context(|| format!("loading bundle from {}", box_dir.display()))?;
+    let validated_rootfs =
+        oci_runtime_core::validate::validate(&bundle).context("config.json failed validation")?;
+
+    // SAFETY: `ocibox`'s own process has not spawned any additional
+    // threads by this point (argument parsing and reading `box.json`
+    // don't), matching `ocirun run`'s/`ociman build`'s own identical
+    // safety note for this same entry point.
+    //
+    // `close_stdin: false`/`discard_output: false`: a real, live,
+    // interactive session — `ocibox enter`'s whole point — unlike
+    // `ociman build`'s own `RUN` steps, which always close stdin and
+    // may discard output under `--quiet`.
+    #[allow(unsafe_code)]
+    let exit_code =
+        unsafe { oci_runtime_core::launch::run(name, &bundle, &validated_rootfs, false, false) }
+            .with_context(|| format!("running inside box {name}"))?;
+
+    // The container's own exit code becomes ours, matching `ocirun
+    // run`'s own identical real bypass of `oci_cli_common::run_main`'s
+    // usual `Ok(())`-means-success mapping: exit code 0 must mean "the
+    // command inside the box exited 0", not merely "`ocibox` itself
+    // didn't error" (see `bin/ocirun/src/main.rs`'s own `cmd_run` for
+    // the exact same reasoning, quoted directly).
+    std::process::exit(exit_code);
+}
+
 fn cmd_rm(name: &str) -> anyhow::Result<()> {
     // Validated for exactly the same reason `cmd_create` validates its
     // own `--name` before ever joining it onto `boxes_root()` — a

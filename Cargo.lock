@@ -900,6 +900,7 @@ dependencies = [
  "oci-cli-common",
  "oci-layer",
  "oci-registry",
+ "oci-runtime-core",
  "oci-spec-types",
  "oci-store",
  "serde",

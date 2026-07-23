@@ -15,6 +15,7 @@ clap.workspace = true
 oci-cli-common.workspace = true
 oci-layer.workspace = true
 oci-registry.workspace = true
+oci-runtime-core.workspace = true
 oci-spec-types.workspace = true
 oci-store.workspace = true
 serde.workspace = true
