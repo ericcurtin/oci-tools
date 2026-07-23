@@ -146,6 +146,40 @@ enum Command {
         #[arg(long)]
         seal: bool,
     },
+    /// Mark a real BLS entry's own boot as successful — the exact
+    /// operation the real UAPI Boot Loader Specification's own "Boot
+    /// counting" section assigns to the operating system itself, not
+    /// the boot loader (checked directly against the spec's own
+    /// text, fetched fresh rather than assumed: "Each time the boot
+    /// loader tries to boot an entry, it decreases this count by
+    /// one. If the operating system considers the boot as
+    /// successful, it removes the counter altogether and the entry
+    /// becomes 'good'" — the *decrement* on every boot attempt is a
+    /// real bootloader's own job (`grub2-bls`/`systemd-boot`'s own
+    /// internal C code, already handled long before `ociboot`/
+    /// `ociboot-init` ever run), never `ociboot`'s to reimplement;
+    /// this command owns exactly the other half, the one the spec
+    /// explicitly leaves to "the operating system": confirming success
+    /// and permanently disabling counting for that entry.
+    ///
+    /// Strips the entry file name's own `+<tries_left>[-<tries_done>]`
+    /// counting suffix entirely (a real, atomic rename — see
+    /// `oci_bls::boot_count`'s own module doc comment for why a
+    /// rename, not a content rewrite, is the spec's own chosen
+    /// mechanism), so it's never decremented or considered "bad"
+    /// again. A harmless no-op (clearly reported, not an error) if
+    /// the entry has no counting suffix at all already — a "good"
+    /// entry that was never boot-counted to begin with, or one
+    /// already blessed by an earlier call.
+    Bless {
+        /// The real, on-disk BLS entry file to bless (see
+        /// `scan_entries`'s own doc comment for where these normally
+        /// live: `$BOOT/loader/entries/*.conf`) — always a real path,
+        /// same "no implicit default" convention `ociboot grubenv
+        /// --file` already established.
+        #[arg(long, value_name = "FILE")]
+        entry: PathBuf,
+    },
 }
 
 /// `ociboot grubenv`'s own subcommands — real `grub-editenv`'s own
@@ -187,6 +221,7 @@ fn main() -> std::process::ExitCode {
                 volume_label,
                 seal,
             }) => cmd_build_image(&reference, &output, volume_label.as_deref(), seal),
+            Some(Command::Bless { entry }) => cmd_bless(&entry),
             None => anyhow::bail!(
                 "no subcommand given (try `ociboot list`); \
                  the rest of `install to-disk` arrives with milestone 5"
@@ -428,6 +463,30 @@ fn cmd_grubenv(file: &Path, action: GrubenvAction) -> anyhow::Result<()> {
                 .with_context(|| format!("writing {}", file.display()))?;
         }
     }
+    Ok(())
+}
+
+/// `ociboot bless`: see [`Command::Bless`]'s own doc comment for the
+/// exact spec-defined operation and scope. Idempotent: blessing an
+/// already-good (or never-counted) entry a second time is a harmless
+/// no-op, not an error — matches this project's own established
+/// preference (e.g. `ociman build --unsetenv` naming a variable
+/// that's already absent) for a command whose whole point is "make
+/// sure X holds" to succeed quietly when X already does.
+fn cmd_bless(entry: &Path) -> anyhow::Result<()> {
+    let file_name = entry
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("{}: not a valid file path", entry.display()))?;
+    let stem = file_name.strip_suffix(".conf").unwrap_or(file_name);
+    let Some((base, _count)) = oci_bls::parse_suffix(stem) else {
+        println!("{}: not boot-counted, nothing to do", entry.display());
+        return Ok(());
+    };
+    let new_path = entry.with_file_name(format!("{base}.conf"));
+    std::fs::rename(entry, &new_path)
+        .with_context(|| format!("renaming {} to {}", entry.display(), new_path.display()))?;
+    println!("{}", new_path.display());
     Ok(())
 }
 
