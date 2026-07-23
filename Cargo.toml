@@ -56,6 +56,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server", "transport"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
+# `oci-cri-types`'s own build-time-only `protoc` dependency, vendored
+# rather than requiring the host to have a system `protoc` package
+# installed at all -- found a real, direct blocker this was papering
+# over on this dev host (which happens to have Ubuntu's own
+# `protobuf-compiler` package installed already): CentOS Stream 10
+# ships no dnf-installable `protoc` binary at all, even via EPEL, only
+# the runtime `libprotobuf` library (see docs/design/0224).
+protoc-bin-vendored = "3.2"
 prost = "0.14"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "signal", "macros"] }
 tokio-stream = { version = "0.1", default-features = false, features = ["net"] }
