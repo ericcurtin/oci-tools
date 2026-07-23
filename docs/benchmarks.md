@@ -6,7 +6,7 @@ time." Since 0012 (`ocirun run`'s own first increment), every
 performance-sensitive change has been measured directly against a real
 installed `crun`/`runc`/`podman`/`docker`, by hand, with `hyperfine` —
 see the many `docs/design/NNNN-performance-reverification-N.md` notes
-(0018, 0105, 0113, 0120, 0139, 0150, 0161, 0170, 0176, 0183) for the
+(0018, 0105, 0113, 0120, 0139, 0150, 0161, 0170, 0176, 0183, 0221) for the
 full, individual, dated results.
 
 `ci/bench.sh` consolidates that same, previously ad hoc (re-typed by
@@ -70,6 +70,10 @@ Absolute numbers vary session to session (host load, exact tool
 versions) and will differ on any other host entirely — the relative
 gap holding steady release after release, re-verified repeatedly
 rather than assumed to still be true forever, is the actual point.
+Most recently reconfirmed (`docs/design/0221`, same tool versions, 37
+commits later, none touching this path): every figure above still a
+decisive win, some sessions faster/slower than others purely from host
+load, never from a real regression.
 `ociman commit` isn't wired into `ci/bench.sh` yet (see below).
 
 ## What this doesn't cover yet
