@@ -32,6 +32,20 @@ ci/bench.sh
   this project's own goal names destroy time as its own, separate
   benchmark, not just whatever's left over inside a combined `run`
   figure.
+* **`ociman commit` vs `podman commit`** — the exact methodology
+  every performance-reverification note since 0161 used by hand (see
+  `docs/design/0176`'s own "Method" section, and `0235` for the
+  wiring): one real, already-stopped container per tool (`sh -c "echo
+  hi > /f.txt"`, a real, nonempty diff layer), reused every sample,
+  each sample re-committing over the same tag — a real, no-error
+  operation for both tools, with the content-identical layer
+  deduplicating in both stores so repeated runs don't grow them. The
+  ociman half runs against a scratch storage root (cleaned up with
+  the run) whose rootless-overlay probe marker is pre-seeded `false`,
+  seeded offline via `ociman save`/`load` — the plain-`Extract`
+  forcing every hand-run measurement implicitly relied on, since
+  `ociman commit` rejects an overlay-rootfs container (`0146`), now
+  encoded in the script (see `0235` for the full story).
 
 Every comparison is opportunistic: any one real equivalent (or
 `busybox`, or an already-pulled image) that isn't actually installed
@@ -74,15 +88,13 @@ Most recently reconfirmed (`docs/design/0221`, same tool versions, 37
 commits later, none touching this path): every figure above still a
 decisive win, some sessions faster/slower than others purely from host
 load, never from a real regression.
-`ociman commit` isn't wired into `ci/bench.sh` yet (see below).
 
 ## What this doesn't cover yet
 
-* `ociman commit`, `ociman create -d`/create-only timing, and every
-  other individual `docs/design/*-performance-reverification-*` figure
-  that isn't one of the three comparisons above — real, still-ahead
-  follow-up work to fold into the script rather than leaving them
-  hand-run-only.
+* `ociman create -d`/create-only timing, and every other individual
+  `docs/design/*-performance-reverification-*` figure that isn't one
+  of the four comparisons above — real, still-ahead follow-up work to
+  fold into the script rather than leaving them hand-run-only.
 * Not wired into `.github/workflows/ci.yml`, deliberately: a shared,
   possibly-contended CI runner (and one that may not even have crun/
   runc/podman/docker installed at all) is a poor host for a benchmark

@@ -43,10 +43,25 @@ ocirun="$repo/target/release/ocirun"
 ociman="$repo/target/release/ociman"
 
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/oci-tools-bench.XXXXXX")
+commit_tag=localhost/oci-tools-bench-commit:latest
 cleanup() {
+    # The ociman half of the commit comparison lives entirely inside
+    # $workdir (a scratch storage root), so removing $workdir is its
+    # whole cleanup -- the default ociman store is never touched.
     rm -rf "$workdir"
     "$ociman" rm -f benchbox >/dev/null 2>&1 || true
-    if need podman; then podman rm -f benchbox >/dev/null 2>&1 || true; fi
+    if need podman; then
+        podman rm -f benchbox >/dev/null 2>&1 || true
+        podman rm -f benchcommit >/dev/null 2>&1 || true
+        podman rmi "$commit_tag" >/dev/null 2>&1 || true
+        # Deliberately no `podman image prune` here: it would sweep
+        # dangling images this script didn't create. The re-commits
+        # leave a few tiny dangling configs behind in podman's own
+        # store (the committed *layer* is content-identical every
+        # sample so it deduplicates; only each commit's own
+        # `created`-timestamped config differs); `podman image prune`
+        # reclaims them whenever the host wants.
+    fi
     if need docker; then docker rm -f benchbox >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
@@ -129,6 +144,56 @@ if need podman && podman image exists "$image" 2>/dev/null; then
         --prepare "podman create --name benchbox $image true >/dev/null"
         --command-name "podman rm" "podman rm --force benchbox"
     )
+fi
+if [ "${#hf_args[@]}" -gt 0 ]; then
+    hyperfine --warmup 3 "${hf_args[@]}"
+fi
+
+echo
+echo "### ociman vs podman: commit (an already-stopped container, re-committed over the same tag) ###"
+# The exact methodology every performance-reverification note since
+# 0161 has used by hand (see docs/design/0176's own "Method" section):
+# one real, already-stopped container per tool (`sh -c "echo hi >
+# /f.txt"`, a real, nonempty diff layer), reused every sample, each
+# sample re-committing over the same tag -- a real, no-error operation
+# for both tools. The committed layer is content-identical every
+# sample so it deduplicates in both stores.
+#
+# "Forcing plain-Extract rootfs setup" (those notes' own words) needs
+# one real step this script has to encode so it doesn't get
+# re-discovered by hand again (it was, wiring this up): on a host
+# where the rootless-overlay rootfs optimization (0108/0146) is
+# supported -- this project's own dev hosts included -- a container in
+# the *default* store gets an overlay rootfs, and `ociman commit`
+# rejects exactly that with a clear "not supported yet" error
+# (docs/design/0146). So the ociman half runs against a scratch
+# storage root under $workdir (cleaned up with it) whose
+# `.rootless-overlay-supported` marker (see ociman's own
+# rootfs_setup.rs) is pre-seeded `false`, forcing the same
+# plain-Extract container every hand-run measurement used. The image
+# is copied into that scratch store offline via `ociman save`/`load`
+# (no network), from the same already-pulled default-store image every
+# other section already requires.
+commit_store="$workdir/commit-store"
+hf_args=()
+if "$ociman" images 2>/dev/null | grep -q "^$image "; then
+    mkdir -p "$commit_store"
+    echo false >"$commit_store/.rootless-overlay-supported"
+    "$ociman" save -o "$workdir/commit-image.tar" "$image" >/dev/null
+    OCI_TOOLS_STORAGE_ROOT="$commit_store" "$ociman" load -i "$workdir/commit-image.tar" >/dev/null
+    OCI_TOOLS_STORAGE_ROOT="$commit_store" \
+        "$ociman" run --name benchcommit "$image" sh -c 'echo hi > /f.txt' >/dev/null
+    hf_args+=(--command-name "ociman commit" \
+        "OCI_TOOLS_STORAGE_ROOT=$commit_store $ociman commit benchcommit $commit_tag")
+else
+    echo "bench: $image not already pulled into ociman's own store, skipping (run 'ociman pull $image' first)" >&2
+fi
+if need podman && podman image exists "$image" 2>/dev/null; then
+    podman rm -f benchcommit >/dev/null 2>&1 || true
+    podman run --name benchcommit "$image" sh -c 'echo hi > /f.txt' >/dev/null
+    hf_args+=(--command-name "podman commit" "podman commit benchcommit $commit_tag")
+else
+    need podman && echo "bench: $image not already pulled into podman's own store, skipping" >&2
 fi
 if [ "${#hf_args[@]}" -gt 0 ]; then
     hyperfine --warmup 3 "${hf_args[@]}"
