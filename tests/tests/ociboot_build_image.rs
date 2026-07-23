@@ -178,3 +178,196 @@ fn build_image_of_an_unknown_reference_is_a_clear_error() {
         String::from_utf8_lossy(&build.stderr)
     );
 }
+
+/// Every `--seal` test needs a real fs-verity-capable filesystem,
+/// which a plain tempdir may or may not be -- same real, from-scratch
+/// loopback ext4 (`mkfs.ext4 -O verity`) fixture `oci_erofs::verity`'s
+/// own unit tests already establish, replicated here (rather than
+/// shared across crates) since it's `oci-erofs`'s own private test
+/// helper, not a public API.
+struct VerityFs {
+    _dir: tempfile::TempDir,
+    mountpoint: std::path::PathBuf,
+}
+
+impl Drop for VerityFs {
+    fn drop(&mut self) {
+        let _ = Command::new("sudo")
+            .args(["umount", "-q"])
+            .arg(&self.mountpoint)
+            .output();
+    }
+}
+
+fn verity_capable_ext4() -> Option<VerityFs> {
+    let dir = tempfile::tempdir().ok()?;
+    let image = dir.path().join("verity.img");
+    let mountpoint = dir.path().join("mnt");
+    std::fs::create_dir_all(&mountpoint).ok()?;
+
+    if !Command::new("truncate")
+        .args(["-s", "32M"])
+        .arg(&image)
+        .status()
+        .ok()?
+        .success()
+    {
+        return None;
+    }
+    if !Command::new("mkfs.ext4")
+        .args(["-O", "verity", "-q"])
+        .arg(&image)
+        .status()
+        .ok()?
+        .success()
+    {
+        return None;
+    }
+    if !Command::new("sudo")
+        .args(["mount", "-o", "loop"])
+        .arg(&image)
+        .arg(&mountpoint)
+        .status()
+        .ok()?
+        .success()
+    {
+        return None;
+    }
+    let uid_gid = format!(
+        "{}:{}",
+        rustix::process::getuid().as_raw(),
+        rustix::process::getgid().as_raw()
+    );
+    if !Command::new("sudo")
+        .args(["chown", &uid_gid])
+        .arg(&mountpoint)
+        .status()
+        .ok()?
+        .success()
+    {
+        return None;
+    }
+    Some(VerityFs {
+        _dir: dir,
+        mountpoint,
+    })
+}
+
+/// `ociboot build-image --seal`: seals the freshly built image with
+/// real fs-verity and prints its own real digest — verified directly
+/// (not just that the command succeeded): the file becomes genuinely
+/// immutable at the kernel level afterward (a real write fails with
+/// `EPERM`), and the printed digest is a real, non-placeholder
+/// fs-verity digest (32 real bytes, never all-zero).
+#[test]
+fn build_image_seal_makes_the_output_genuinely_immutable_and_prints_a_real_digest() {
+    if !mkfs_erofs_available() {
+        eprintln!("skipping: mkfs.erofs not installed");
+        return;
+    }
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let Some(verity_fs) = verity_capable_ext4() else {
+        eprintln!("skipping: could not create a real fs-verity-capable ext4 loopback mount");
+        return;
+    };
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociboot-test/build-image-seal:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let output_path = verity_fs.mountpoint.join("deployment.erofs");
+    let build = ociboot(
+        storage_dir.path(),
+        &[
+            "build-image",
+            "ociboot-test/build-image-seal:latest",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--seal",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&build.stdout);
+    let verity_line = stdout
+        .lines()
+        .find(|line| line.starts_with("verity: "))
+        .expect("--seal should print a verity: <digest> line");
+    let digest_hex = verity_line.strip_prefix("verity: ").unwrap();
+    assert_eq!(digest_hex.len(), 64, "should be a 32-byte hex digest");
+    assert!(
+        digest_hex.chars().any(|c| c != '0'),
+        "digest should be a real hash, not all zero: {digest_hex}"
+    );
+
+    // Genuinely immutable now -- a real write fails with EPERM at the
+    // kernel level, not merely "this command didn't happen to modify
+    // it".
+    let write_result = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&output_path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, b"tampered"));
+    assert!(
+        write_result.is_err(),
+        "a sealed file should reject a real write attempt"
+    );
+}
+
+/// Without `--seal` (the default), no `verity: ...` line at all, and
+/// the file is still a perfectly ordinary, writable file afterward --
+/// confirms `--seal` is genuinely opt-in, not accidentally always-on.
+#[test]
+fn build_image_without_seal_prints_no_verity_line_and_stays_writable() {
+    if !mkfs_erofs_available() {
+        eprintln!("skipping: mkfs.erofs not installed");
+        return;
+    }
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociboot-test/build-image-noseal:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let output_dir = tempfile::tempdir().unwrap();
+    let output_path = output_dir.path().join("deployment.erofs");
+    let build = ociboot(
+        storage_dir.path(),
+        &[
+            "build-image",
+            "ociboot-test/build-image-noseal:latest",
+            "--output",
+            output_path.to_str().unwrap(),
+        ],
+    );
+    assert!(build.status.success());
+    assert!(
+        !String::from_utf8_lossy(&build.stdout).contains("verity:"),
+        "without --seal there should be no verity: line at all"
+    );
+    // An ordinary, unsealed file: a real write still succeeds.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&output_path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, b"still writable"))
+        .expect("an unsealed file should still accept a real write");
+}

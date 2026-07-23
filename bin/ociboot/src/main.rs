@@ -125,6 +125,26 @@ enum Command {
         /// — rejected by the real binary itself if longer).
         #[arg(long, value_name = "LABEL")]
         volume_label: Option<String>,
+        /// Seal the built image with fs-verity right after writing it
+        /// (`oci_erofs::verity::enable`) and print its own real
+        /// fs-verity digest alongside the output path — deliberately
+        /// **opt-in**, not the default: fs-verity is a real, kernel-
+        /// enforced, one-way "this file can never be modified again"
+        /// operation (real bootc/composefs's own always-on model, but
+        /// this project's own bind-mounted `--output` destination is
+        /// not always a real fs-verity-capable filesystem the way a
+        /// real target installation disk almost always would be —
+        /// `/tmp` on many development/CI hosts is tmpfs/overlayfs,
+        /// which doesn't support it at all). Without this flag,
+        /// exactly today's behavior (just the erofs image, unsealed).
+        /// With it, a destination filesystem that doesn't support
+        /// fs-verity is a clear, real error (the kernel's own
+        /// `EOPNOTSUPP`) rather than a silent no-op — asking for
+        /// sealing and silently not getting it would be a false sense
+        /// of security, never acceptable for something this security-
+        /// relevant.
+        #[arg(long)]
+        seal: bool,
     },
 }
 
@@ -165,7 +185,8 @@ fn main() -> std::process::ExitCode {
                 reference,
                 output,
                 volume_label,
-            }) => cmd_build_image(&reference, &output, volume_label.as_deref()),
+                seal,
+            }) => cmd_build_image(&reference, &output, volume_label.as_deref(), seal),
             None => anyhow::bail!(
                 "no subcommand given (try `ociboot list`); \
                  the rest of `install to-disk` arrives with milestone 5"
@@ -192,6 +213,7 @@ fn cmd_build_image(
     reference: &str,
     output: &Path,
     volume_label: Option<&str>,
+    seal: bool,
 ) -> anyhow::Result<()> {
     let store = open_store()?;
     // `Store::resolve_image` does an exact string match against
@@ -247,7 +269,32 @@ fn cmd_build_image(
         .with_context(|| format!("building erofs image at {}", output.display()))?;
 
     println!("{}", output.display());
+
+    if seal {
+        // No "disable" operation exists for fs-verity (by design,
+        // matching the real kernel feature exactly) -- sealing always
+        // happens last, only after the image itself has been written
+        // successfully and completely, never before.
+        oci_erofs::verity::enable(output).with_context(|| {
+            format!(
+                "sealing {} with fs-verity (its own destination filesystem may not support it \
+                 at all -- fs-verity is not universal)",
+                output.display()
+            )
+        })?;
+        let digest = oci_erofs::verity::measure(output)
+            .with_context(|| format!("reading back {}'s own fs-verity digest", output.display()))?
+            .expect("verity::enable just succeeded, so measure must find a real digest now");
+        println!("verity: {}", hex_encode(&digest));
+    }
     Ok(())
+}
+
+/// Lowercase hex, no external crate needed for 32 fixed bytes — same
+/// "small, self-contained, no new dependency for something this
+/// simple" reasoning already established elsewhere in this workspace.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A deterministic (never random), `mkfs.erofs -U`-shaped UUID string
