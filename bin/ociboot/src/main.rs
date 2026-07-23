@@ -375,14 +375,21 @@ fn cmd_build_image(
                 println!("verity: {}", hex_encode(&digest));
             }
             // Real, checked-directly fallback for a destination
-            // filesystem that doesn't support fs-verity at all
-            // (`EOPNOTSUPP`) -- `oci_erofs::dmverity`'s own module
-            // doc comment names exactly this scenario as its own
-            // reason for existing. Any *other* error (permission
-            // denied, disk full, ...) still propagates as a real,
-            // hard failure below -- only "this specific feature isn't
-            // supported here" falls back, nothing else.
-            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            // filesystem that doesn't support fs-verity at all --
+            // `oci_erofs::verity::is_unsupported` recognizes both real
+            // errnos the kernel can return for this depending on the
+            // underlying filesystem driver (`EOPNOTSUPP` or `ENOTTY`,
+            // see its own doc comment; the overlayfs/tmpfs-backed
+            // `/tmp` a CI VM guest's own root filesystem often is
+            // returns the latter, not the former, which this match
+            // once missed entirely, hard-failing instead of falling
+            // back). `oci_erofs::dmverity`'s own module doc comment
+            // names exactly this scenario as its own reason for
+            // existing. Any *other* error (permission denied, disk
+            // full, ...) still propagates as a real, hard failure
+            // below -- only "this specific feature isn't supported
+            // here" falls back, nothing else.
+            Err(e) if oci_erofs::verity::is_unsupported(&e) => {
                 let hash_tree_path = detached_hash_tree_path(output);
                 // Same deterministic-not-random reasoning `timestamp`/
                 // `uuid` above already established: the manifest

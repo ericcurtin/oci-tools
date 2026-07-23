@@ -119,6 +119,31 @@ const FS_IOC_ENABLE_VERITY: libc::c_ulong = ioc(
 /// in Rust's own `size_of::<FsverityDigest>()`.
 const FS_IOC_MEASURE_VERITY: libc::c_ulong = ioc(IOC_READ | IOC_WRITE, b'f' as u32, 134, 4);
 
+/// Does `e` mean "fs-verity is not supported here"?
+///
+/// A real caller ([`enable`]) can return either of two distinct
+/// errno values for this, depending on the underlying filesystem
+/// driver: `EOPNOTSUPP` (`std`'s own `io::ErrorKind::Unsupported`)
+/// when the filesystem *type* understands the fs-verity ioctls but
+/// this particular instance wasn't built with the feature bit set (a
+/// plain `mkfs.ext4` image without `-O verity`), or `ENOTTY` (`std`
+/// has no dedicated `ErrorKind` for this one, so it stays
+/// `Uncategorized`) when the filesystem driver doesn't register
+/// fs-verity operations at all — confirmed directly on a real host:
+/// overlayfs/tmpfs-backed `/tmp` returns `ENOTTY`, not `EOPNOTSUPP`. A
+/// caller wanting to fall back to another mechanism (this crate's own
+/// [`crate::dmverity`]) needs to treat both the same way; this
+/// function is the single place that decides, so [`enable`]'s own
+/// callers and this module's tests never drift apart on which errno
+/// means what (a real gap once existed here: `ociboot build-image
+/// --seal`'s own fallback only checked `Unsupported`, so it
+/// hard-failed instead of falling back on exactly the
+/// overlayfs/tmpfs-backed CI VM guests this function now also
+/// recognizes).
+pub fn is_unsupported(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Unsupported || e.raw_os_error() == Some(libc::ENOTTY)
+}
+
 /// Enable fs-verity on `path`, sealing it with a SHA-256 Merkle tree
 /// at the containing filesystem's own native block size (queried via
 /// `fstatfs`, never assumed -- fs-verity requires an exact match or
@@ -129,10 +154,10 @@ const FS_IOC_MEASURE_VERITY: libc::c_ulong = ioc(IOC_READ | IOC_WRITE, b'f' as u
 /// the kernel level for the rest of its lifetime. Calling this again
 /// on an already-sealed file returns `io::ErrorKind::AlreadyExists`
 /// (the kernel's own `EEXIST`). Calling this on a filesystem that
-/// doesn't support fs-verity at all returns
-/// `io::ErrorKind::Unsupported` (`EOPNOTSUPP`) -- the caller (this
-/// crate's planned dm-verity fallback) can match on that specifically
-/// rather than treating every failure alike.
+/// doesn't support fs-verity at all returns an error [`is_unsupported`]
+/// recognizes -- the caller (this crate's own dm-verity fallback) can
+/// match on that specifically rather than treating every failure
+/// alike.
 pub fn enable(path: &Path) -> io::Result<()> {
     let fd = open(path, OFlags::RDONLY, Mode::empty())?;
     let block_size = fstatfs(&fd)?.f_bsize as u32;
@@ -416,19 +441,11 @@ mod tests {
         std::fs::write(&file, b"data\n").unwrap();
 
         match enable(&file) {
-            // `EOPNOTSUPP`: the filesystem *type* understands the
-            // fs-verity ioctls but this particular instance wasn't
-            // built with the feature bit set (confirmed directly: a
-            // plain `mkfs.ext4` image without `-O verity` behaves this
-            // way).
-            Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
-            // `ENOTTY`: the underlying filesystem driver doesn't
-            // register fs-verity operations at all (confirmed
-            // directly on this very host: overlayfs/tmpfs-backed
-            // `/tmp` returns this rather than `EOPNOTSUPP`) -- `std`
-            // has no dedicated `ErrorKind` for it, so it stays
-            // `Uncategorized` and is matched by raw errno instead.
-            Err(e) if e.raw_os_error() == Some(libc::ENOTTY) => {}
+            // Either of the two real "not supported here" errnos
+            // `is_unsupported` recognizes (`EOPNOTSUPP` or `ENOTTY`,
+            // depending on the underlying filesystem driver -- see
+            // its own doc comment).
+            Err(e) if is_unsupported(&e) => {}
             // A test host whose /tmp genuinely does support fs-verity
             // (e.g. it's already an ext4 mount with the feature
             // enabled) would make this assertion meaningless either
