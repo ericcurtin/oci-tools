@@ -898,6 +898,12 @@ dependencies = [
  "anyhow",
  "clap",
  "oci-cli-common",
+ "oci-layer",
+ "oci-registry",
+ "oci-spec-types",
+ "oci-store",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 
