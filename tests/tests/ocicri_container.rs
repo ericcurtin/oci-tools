@@ -97,10 +97,20 @@ fn container_config(name: &str, attempt: u32) -> CriContainerConfig {
             image: IMAGE.to_string(),
             ..Default::default()
         }),
+        // The seeded fixture image declares no Entrypoint/Cmd of its
+        // own, so the CRI config supplies the command -- exactly what
+        // a real kubelet does for a pod spec with `command:` set.
+        command: vec!["/bin/sh".to_string()],
         labels: HashMap::from([("app".to_string(), name.to_string())]),
         annotations: HashMap::from([("test/annotation".to_string(), "kept".to_string())]),
         ..Default::default()
     }
+}
+
+/// The bundle directory `CreateContainer` prepares for one container
+/// (`docs/design/0237`) — under the test's own private storage root.
+fn bundle_dir(storage_root: &Path, container_id: &str) -> std::path::PathBuf {
+    storage_root.join("cri-bundles").join(container_id)
 }
 
 /// Spawns a server against a seeded store and creates one READY
@@ -149,10 +159,12 @@ async fn setup() -> Option<(
 /// The full created-state lifecycle over a real socket: create ->
 /// list (one CREATED) -> status -> remove -> list (empty) -> remove
 /// again (idempotent) -> status (NotFound). Duplicate create returns
-/// the same ID; a new attempt is a new container.
+/// the same ID; a new attempt is a new container. The created
+/// container's own real, launch-ready bundle (0237) exists while the
+/// container does and is gone when it is.
 #[tokio::test]
 async fn container_create_status_list_remove_lifecycle() {
-    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    let Some((storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
     else {
         eprintln!("skipping: busybox not found on $PATH");
         return;
@@ -169,6 +181,23 @@ async fn container_create_status_list_remove_lifecycle() {
         .into_inner()
         .container_id;
     assert_eq!(container_id.len(), 64, "{container_id:?}");
+
+    // A real, launch-ready bundle exists (0237): a dedicated,
+    // extracted rootfs plus a generated config.json whose process
+    // half reflects the CRI config.
+    let bundle = bundle_dir(storage.path(), &container_id);
+    assert!(
+        bundle.join("rootfs/bin/sh").exists(),
+        "the bundle rootfs should be a real extraction of the image"
+    );
+    let spec: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(bundle.join("config.json")).unwrap())
+            .expect("config.json should be real JSON");
+    assert_eq!(spec["process"]["args"], serde_json::json!(["/bin/sh"]));
+    // A writable rootfs: `readonly` is serialized as `false` or
+    // omitted entirely (the field is skipped when false), never
+    // `true`.
+    assert_ne!(spec["root"]["readonly"], serde_json::json!(true));
 
     // Duplicate request: same ID back, matching real cri-o's own
     // duplicate-request branch.
@@ -263,12 +292,16 @@ async fn container_create_status_list_remove_lifecycle() {
         .expect("a second RemoveContainer should be a real, idempotent success");
     let not_found = client
         .container_status(ContainerStatusRequest {
-            container_id,
+            container_id: container_id.clone(),
             verbose: false,
         })
         .await
         .expect_err("status of a removed container should be an error");
     assert_eq!(not_found.code(), tonic::Code::NotFound);
+    assert!(
+        !bundle_dir(storage.path(), &container_id).exists(),
+        "RemoveContainer should remove the bundle too"
+    );
 
     let remaining = client
         .list_containers(ListContainersRequest { filter: None })
@@ -278,6 +311,106 @@ async fn container_create_status_list_remove_lifecycle() {
         .containers;
     assert_eq!(remaining.len(), 1, "{remaining:?}");
     assert_eq!(remaining[0].id, second);
+}
+
+/// The CRI-command/args-versus-image-Entrypoint/Cmd merge (real
+/// cri-o's own `SpecSetProcessArgs` rule) lands in the generated
+/// bundle spec — checked end to end through a real image whose config
+/// declares an Entrypoint, plus the "nothing to run anywhere" error,
+/// which must leave no half-created bundle behind.
+#[tokio::test]
+async fn bundle_spec_merges_image_and_cri_config_and_rejects_no_command() {
+    let Some((storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    // A second image, this one with a real declared Entrypoint and
+    // env, seeded into the same store the running server reads.
+    let entrypoint_image = "docker.io/ocicri-test/with-entrypoint:latest";
+    let busybox = busybox_path().unwrap();
+    let store = Store::open(storage.path()).unwrap();
+    seed_image(
+        &store,
+        entrypoint_image,
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            entrypoint: Some(vec!["/bin/sh".to_string()]),
+            env: vec!["FROM_IMAGE=1".to_string()],
+            ..Default::default()
+        },
+    );
+
+    // CRI args only: image entrypoint + given args (image cmd
+    // ignored), image env first then the kubelet-supplied env.
+    let mut config = container_config("merge", 0);
+    config.image = Some(ImageSpec {
+        image: entrypoint_image.to_string(),
+        ..Default::default()
+    });
+    config.command = Vec::new();
+    config.args = vec!["-c".to_string(), "true".to_string()];
+    config.envs = vec![oci_cri_types::KeyValue {
+        key: "FROM_KUBE".to_string(),
+        value: "2".to_string(),
+    }];
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .expect("CreateContainer with args-only should succeed")
+        .into_inner()
+        .container_id;
+    let spec: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundle_dir(storage.path(), &container_id).join("config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        spec["process"]["args"],
+        serde_json::json!(["/bin/sh", "-c", "true"])
+    );
+    let env: Vec<String> = spec["process"]["env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(env, vec!["FROM_IMAGE=1", "FROM_KUBE=2"]);
+
+    // Nothing to run anywhere: real cri-o's own "no command
+    // specified", and no half-created bundle left behind.
+    let bundles_before: Vec<_> = std::fs::read_dir(storage.path().join("cri-bundles"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    let mut config = container_config("nothing", 0);
+    config.command = Vec::new(); // fixture image has no Entrypoint/Cmd
+    let status = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id,
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .expect_err("a container with nothing to run should be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("no command specified"),
+        "{status:?}"
+    );
+    let bundles_after: Vec<_> = std::fs::read_dir(storage.path().join("cri-bundles"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        bundles_before, bundles_after,
+        "a rejected create must leave no bundle behind"
+    );
 }
 
 /// Validation and precondition rejections, each checked against real
@@ -523,7 +656,8 @@ async fn remove_pod_sandbox_cascades_and_records_survive_restart() {
         .unwrap();
     assert_eq!(status.state, ContainerState::ContainerCreated as i32);
 
-    // Removing the sandbox removes its containers too.
+    // Removing the sandbox removes its containers (and their
+    // bundles) too.
     client2
         .remove_pod_sandbox(RemovePodSandboxRequest {
             pod_sandbox_id: sandbox_id,
@@ -532,12 +666,16 @@ async fn remove_pod_sandbox_cascades_and_records_survive_restart() {
         .expect("RemovePodSandbox failed");
     let not_found = client2
         .container_status(ContainerStatusRequest {
-            container_id,
+            container_id: container_id.clone(),
             verbose: false,
         })
         .await
         .expect_err("the sandbox's container should be gone too");
     assert_eq!(not_found.code(), tonic::Code::NotFound);
+    assert!(
+        !bundle_dir(storage.path(), &container_id).exists(),
+        "RemovePodSandbox should remove the container's bundle too"
+    );
     let remaining = client2
         .list_containers(ListContainersRequest { filter: None })
         .await

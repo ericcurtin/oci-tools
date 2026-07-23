@@ -528,6 +528,8 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             .map_err(|e| io_error("reading container records", e))?
         {
             if c.sandbox_id == record.id {
+                crate::bundle::remove(&oci_cli_common::storage::default_root(), &c.id)
+                    .map_err(|e| io_error("removing container bundle", e))?;
                 container::remove(&container_root, &c.id)
                     .map_err(|e| io_error("removing container record", e))?;
             }
@@ -744,8 +746,54 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             }));
         }
 
+        let container_id = crate::records::generate_id();
+
+        // Prepare the real, launch-ready bundle (dedicated writable
+        // rootfs + generated, validation-round-tripped config.json)
+        // before ever recording the container -- matching real
+        // cri-o's own create-time storage/spec preparation, and
+        // guaranteeing a recorded container always has its bundle
+        // (`docs/design/0237`). `prepare` cleans up after itself on
+        // failure, so a rejected create leaves nothing behind.
+        let manifest = store
+            .image_manifest(resolved.record())
+            .map_err(|e| Status::internal(format!("reading image manifest: {e}")))?;
+        let image_config = store
+            .image_config(resolved.record())
+            .map_err(|e| Status::internal(format!("reading image config: {e}")))?
+            .config
+            .unwrap_or_default();
+        let envs: Vec<String> = config
+            .envs
+            .iter()
+            .map(|kv| format!("{}={}", kv.key, kv.value))
+            .collect();
+        crate::bundle::prepare(
+            &store,
+            &oci_cli_common::storage::default_root(),
+            &container_id,
+            &manifest,
+            &image_config,
+            &crate::bundle::CriProcessConfig {
+                command: &config.command,
+                args: &config.args,
+                envs,
+                working_dir: &config.working_dir,
+            },
+        )
+        .map_err(|e| match e {
+            // Real cri-o's own verbatim error for a container with
+            // nothing to run at all -- a client-input problem.
+            crate::bundle::PrepareError::NoCommand => {
+                Status::invalid_argument("no command specified")
+            }
+            crate::bundle::PrepareError::Other(e) => {
+                Status::internal(format!("preparing container bundle: {e:#}"))
+            }
+        })?;
+
         let record = container::ContainerRecord {
-            id: crate::records::generate_id(),
+            id: container_id,
             name,
             sandbox_id: sb.id,
             metadata: container::ContainerMetadata {
@@ -759,7 +807,12 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             state: container::ContainerState::Created,
             created_at_nanos: now_nanos(),
         };
-        container::save(&root, &record).map_err(|e| io_error("saving container record", e))?;
+        if let Err(e) = container::save(&root, &record) {
+            // Never leave an orphaned bundle behind a failed record
+            // write (the record is what makes the bundle reachable).
+            let _ = crate::bundle::remove(&oci_cli_common::storage::default_root(), &record.id);
+            return Err(io_error("saving container record", e));
+        }
 
         Ok(Response::new(cri::CreateContainerResponse {
             container_id: record.id,
@@ -802,6 +855,8 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         let Some(record) = find_container(&id)? else {
             return Ok(Response::new(cri::RemoveContainerResponse {}));
         };
+        crate::bundle::remove(&oci_cli_common::storage::default_root(), &record.id)
+            .map_err(|e| io_error("removing container bundle", e))?;
         container::remove(&container_store_root(), &record.id)
             .map_err(|e| io_error("removing container record", e))?;
         Ok(Response::new(cri::RemoveContainerResponse {}))

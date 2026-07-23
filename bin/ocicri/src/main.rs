@@ -20,7 +20,8 @@
 //! container lifecycle's own record slice (`CreateContainer`/
 //! `ContainerStatus`/`ListContainers`/`RemoveContainer` — every
 //! record honestly `CONTAINER_CREATED` until `StartContainer` itself
-//! exists, see `docs/design/0236`), and all of `ImageService`
+//! exists, with a real, verified launch-ready bundle prepared at
+//! create time, see `docs/design/0236`-`0237`), and all of `ImageService`
 //! (`ListImages`/`StreamImages`/`ImageStatus`/`PullImage`/
 //! `RemoveImage`/`ImageFsInfo`, reusing this project's own
 //! already-tested `oci_store`/`oci_registry` primitives directly —
@@ -40,6 +41,7 @@
 //! other binary's own hot per-invocation startup path is completely
 //! unaffected.
 
+mod bundle;
 mod container;
 mod image_service;
 mod records;
