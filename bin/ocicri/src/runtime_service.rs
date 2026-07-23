@@ -17,6 +17,7 @@
 use tonic::codegen::BoxStream;
 use tonic::{Request, Response, Status};
 
+use crate::container;
 use crate::cri;
 use crate::sandbox;
 
@@ -77,8 +78,8 @@ pub struct RuntimeServiceImpl {
 fn unimplemented<T>(name: &str) -> Result<Response<T>, Status> {
     Err(Status::unimplemented(format!(
         "ocicri: {name} is not implemented yet (milestone 7: Version/Status/RuntimeConfig/\
-         UpdateRuntimeConfig/ListMetricDescriptors and the pod-sandbox lifecycle are answered so \
-         far)"
+         UpdateRuntimeConfig/ListMetricDescriptors, the pod-sandbox lifecycle, and \
+         CreateContainer/ContainerStatus/ListContainers/RemoveContainer are answered so far)"
     )))
 }
 
@@ -88,6 +89,12 @@ fn unimplemented<T>(name: &str) -> Result<Response<T>, Status> {
 /// `OCI_TOOLS_STORAGE_ROOT`.
 fn sandbox_store_root() -> std::path::PathBuf {
     sandbox::sandbox_root(&oci_cli_common::storage::default_root())
+}
+
+/// The container record directory, same resolution rules as
+/// [`sandbox_store_root`].
+fn container_store_root() -> std::path::PathBuf {
+    container::container_root(&oci_cli_common::storage::default_root())
 }
 
 fn io_error(context: &str, e: std::io::Error) -> Status {
@@ -194,6 +201,120 @@ fn sandbox_list_items(
             annotations: record.annotations,
             runtime_handler: String::new(),
         })
+        .collect())
+}
+
+fn container_state_to_proto(state: container::ContainerState) -> i32 {
+    match state {
+        container::ContainerState::Created => cri::ContainerState::ContainerCreated as i32,
+        container::ContainerState::Running => cri::ContainerState::ContainerRunning as i32,
+        container::ContainerState::Exited => cri::ContainerState::ContainerExited as i32,
+    }
+}
+
+fn container_metadata_to_proto(metadata: &container::ContainerMetadata) -> cri::ContainerMetadata {
+    cri::ContainerMetadata {
+        name: metadata.name.clone(),
+        attempt: metadata.attempt,
+    }
+}
+
+/// Resolves one container for a mutating/status RPC — the container
+/// counterpart of [`find_sandbox`], with the identical per-caller
+/// "not found" mapping rules (`docs/design/0236`).
+fn find_container(id: &str) -> Result<Option<container::ContainerRecord>, Status> {
+    match container::find_by_id_prefix(&container_store_root(), id) {
+        Ok(found) => Ok(found),
+        Err(container::LookupError::AmbiguousPrefix(prefix)) => Err(Status::invalid_argument(
+            format!("container ID {prefix:?} is ambiguous: matches more than one container"),
+        )),
+        Err(container::LookupError::Io(e)) => Err(io_error("reading container records", e)),
+    }
+}
+
+/// Builds the CRI `Container` list message for one record.
+fn container_to_proto(record: container::ContainerRecord) -> cri::Container {
+    cri::Container {
+        id: record.id.clone(),
+        pod_sandbox_id: record.sandbox_id.clone(),
+        metadata: Some(container_metadata_to_proto(&record.metadata)),
+        image: Some(cri::ImageSpec {
+            image: record.image.clone(),
+            ..Default::default()
+        }),
+        image_ref: record.image_ref.clone(),
+        image_id: record.image_ref.clone(),
+        state: container_state_to_proto(record.state),
+        created_at: record.created_at_nanos,
+        labels: record.labels,
+        annotations: record.annotations,
+    }
+}
+
+/// The one real filtered-list computation behind `ListContainers` —
+/// filters combine with AND, matching real cri-o's own
+/// `filterContainerList`/`filterContainer` exactly (checked directly,
+/// `server/container_list.go`): an `id` filter resolves by prefix and
+/// yields an empty list (never an error) on a miss or ambiguity; when
+/// both `id` and `pod_sandbox_id` are given, the resolved container's
+/// own sandbox must *prefix-match* the given sandbox ID (cri-o's own
+/// `strings.HasPrefix(c.Sandbox(), filter.GetPodSandboxId())`); a
+/// `pod_sandbox_id` filter alone resolves the sandbox by prefix and
+/// yields that sandbox's containers (or nothing for an unknown
+/// sandbox); `state`/`label_selector` filter the remainder.
+fn container_list_items(
+    filter: Option<cri::ContainerFilter>,
+) -> Result<Vec<cri::Container>, Status> {
+    let root = container_store_root();
+
+    let records = match filter.as_ref() {
+        Some(f) if !f.id.is_empty() => match container::find_by_id_prefix(&root, &f.id) {
+            Ok(Some(record)) => {
+                if f.pod_sandbox_id.is_empty() || record.sandbox_id.starts_with(&f.pod_sandbox_id) {
+                    vec![record]
+                } else {
+                    Vec::new()
+                }
+            }
+            Ok(None) | Err(container::LookupError::AmbiguousPrefix(_)) => Vec::new(),
+            Err(container::LookupError::Io(e)) => {
+                return Err(io_error("reading container records", e));
+            }
+        },
+        Some(f) if !f.pod_sandbox_id.is_empty() => {
+            // Resolve the sandbox by prefix first, like real cri-o's
+            // own `getPodSandboxFromRequest` in this exact branch --
+            // an unknown sandbox is an empty list, never an error.
+            match sandbox::find_by_id_prefix(&sandbox_store_root(), &f.pod_sandbox_id) {
+                Ok(Some(sb)) => container::load_all(&root)
+                    .map_err(|e| io_error("reading container records", e))?
+                    .into_iter()
+                    .filter(|r| r.sandbox_id == sb.id)
+                    .collect(),
+                Ok(None) | Err(sandbox::LookupError::AmbiguousPrefix(_)) => Vec::new(),
+                Err(sandbox::LookupError::Io(e)) => {
+                    return Err(io_error("reading sandbox records", e));
+                }
+            }
+        }
+        _ => container::load_all(&root).map_err(|e| io_error("reading container records", e))?,
+    };
+
+    Ok(records
+        .into_iter()
+        .filter(|record| {
+            filter.as_ref().is_none_or(|f| {
+                if let Some(state) = &f.state
+                    && state.state != container_state_to_proto(record.state)
+                {
+                    return false;
+                }
+                f.label_selector
+                    .iter()
+                    .all(|(k, v)| record.labels.get(k) == Some(v))
+            })
+        })
+        .map(container_to_proto)
         .collect())
 }
 
@@ -397,6 +518,20 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         let Some(record) = find_sandbox(&id)? else {
             return Ok(Response::new(cri::RemovePodSandboxResponse {}));
         };
+        // "If there are any containers in the sandbox, they must be
+        // forcibly ... removed" (the proto) -- real cri-o's own
+        // `removePodSandbox` deletes every container in the sandbox
+        // first, and so does this (0236), now that container records
+        // exist at all.
+        let container_root = container_store_root();
+        for c in container::load_all(&container_root)
+            .map_err(|e| io_error("reading container records", e))?
+        {
+            if c.sandbox_id == record.id {
+                container::remove(&container_root, &c.id)
+                    .map_err(|e| io_error("removing container record", e))?;
+            }
+        }
         sandbox::remove(&sandbox_store_root(), &record.id)
             .map_err(|e| io_error("removing sandbox record", e))?;
         Ok(Response::new(cri::RemovePodSandboxResponse {}))
@@ -502,11 +637,133 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         )))
     }
 
+    /// Creates a real, persistent container record with real CRI
+    /// name/ID/state semantics, checked directly against real cri-o's
+    /// own `CreateContainer`/`container.SetConfig`/`SetNameAndID`
+    /// (`server/container_create.go`, `internal/factory/container`) —
+    /// and deliberately no process/bundle yet: the record is honestly
+    /// `CONTAINER_CREATED`, and `StartContainer` (where the real
+    /// launch machinery lands, a bigger later increment) is still a
+    /// real, honest `Status::unimplemented`. See `docs/design/0236`.
     async fn create_container(
         &self,
-        _request: Request<cri::CreateContainerRequest>,
+        request: Request<cri::CreateContainerRequest>,
     ) -> Result<Response<cri::CreateContainerResponse>, Status> {
-        unimplemented("CreateContainer")
+        let request = request.into_inner();
+
+        // The same validations, in the same order, as real cri-o's
+        // own `CreateContainer` preamble (its own error strings too).
+        let config = request
+            .config
+            .ok_or_else(|| Status::invalid_argument("config is nil"))?;
+        let image_spec = config
+            .image
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("config image is nil"))?;
+        let sandbox_config = request
+            .sandbox_config
+            .ok_or_else(|| Status::invalid_argument("sandbox config is nil"))?;
+        let pod_metadata = sandbox_config
+            .metadata
+            .ok_or_else(|| Status::invalid_argument("sandbox config metadata is nil"))?;
+
+        // Sandbox lookup: an empty ID is a real error, an unknown one
+        // is "specified sandbox not found" (real cri-o's own message).
+        let sandbox_id = request.pod_sandbox_id;
+        if sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("PodSandboxId should not be empty"));
+        }
+        let Some(sb) = find_sandbox(&sandbox_id)? else {
+            return Err(Status::not_found(format!(
+                "specified sandbox not found: {sandbox_id}"
+            )));
+        };
+        // "CreateContainer failed as the sandbox was stopped" -- real
+        // cri-o's own `sb.Stopped()` check, verbatim.
+        if sb.state == sandbox::SandboxState::NotReady {
+            return Err(Status::failed_precondition(format!(
+                "CreateContainer failed as the sandbox was stopped: {}",
+                sb.id
+            )));
+        }
+
+        // `container.SetConfig`'s own checks (real cri-o's own error
+        // strings).
+        let metadata = config
+            .metadata
+            .ok_or_else(|| Status::invalid_argument("metadata is nil"))?;
+        if metadata.name.is_empty() {
+            return Err(Status::invalid_argument("name is empty"));
+        }
+
+        // The image must already be present locally -- kubelet always
+        // `PullImage`s (per its own pull policy) before creating; an
+        // unpulled image is a clear error, never an implicit pull
+        // (there is no pull-policy input on this RPC at all).
+        let image = image_spec.image.clone();
+        if image.is_empty() {
+            return Err(Status::invalid_argument("image not specified in config"));
+        }
+        let store = oci_store::Store::open(oci_cli_common::storage::default_root())
+            .map_err(|e| Status::internal(format!("opening image storage: {e}")))?;
+        let Some(resolved) = oci_store::resolve_by_reference_or_id(&store, &image)
+            .map_err(|e| Status::internal(format!("resolving image: {e}")))?
+        else {
+            return Err(Status::not_found(format!(
+                "image {image:?} not present locally: pull it first (PullImage)"
+            )));
+        };
+        let image_ref = resolved.record().manifest_digest.to_string();
+
+        // Real cri-o's own unique container name, exactly
+        // (`SetNameAndID`'s own strings.Join -- the pod half comes
+        // from the *request's* own sandbox_config, matching cri-o).
+        let name = format!(
+            "k8s_{}_{}_{}_{}_{}",
+            metadata.name,
+            pod_metadata.name,
+            pod_metadata.namespace,
+            pod_metadata.uid,
+            metadata.attempt
+        );
+
+        let root = container_store_root();
+        let _guard = self
+            .sandbox_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // A duplicate request returns the *existing* container's ID
+        // as a success -- real cri-o's own "this is actually a
+        // duplicate request. Just return that container" branch.
+        if let Some(existing) = container::find_by_name(&root, &name)
+            .map_err(|e| io_error("resolving container name", e))?
+        {
+            return Ok(Response::new(cri::CreateContainerResponse {
+                container_id: existing.id,
+            }));
+        }
+
+        let record = container::ContainerRecord {
+            id: crate::records::generate_id(),
+            name,
+            sandbox_id: sb.id,
+            metadata: container::ContainerMetadata {
+                name: metadata.name,
+                attempt: metadata.attempt,
+            },
+            image,
+            image_ref,
+            labels: config.labels,
+            annotations: config.annotations,
+            state: container::ContainerState::Created,
+            created_at_nanos: now_nanos(),
+        };
+        container::save(&root, &record).map_err(|e| io_error("saving container record", e))?;
+
+        Ok(Response::new(cri::CreateContainerResponse {
+            container_id: record.id,
+        }))
     }
 
     async fn start_container(
@@ -523,18 +780,43 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         unimplemented("StopContainer")
     }
 
+    /// Idempotent, forceful removal — the proto: "must not return an
+    /// error if the container has already been removed", matched by
+    /// real cri-o's own `truncindex.ErrNotExist -> empty response`
+    /// branch (`server/container_remove.go`, checked directly). No
+    /// prior stop is ever required. An empty ID is a real error, the
+    /// same rule the sandbox RPCs already apply.
     async fn remove_container(
         &self,
-        _request: Request<cri::RemoveContainerRequest>,
+        request: Request<cri::RemoveContainerRequest>,
     ) -> Result<Response<cri::RemoveContainerResponse>, Status> {
-        unimplemented("RemoveContainer")
+        let id = request.into_inner().container_id;
+        if id.is_empty() {
+            return Err(Status::invalid_argument("ContainerId should not be empty"));
+        }
+
+        let _guard = self
+            .sandbox_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(record) = find_container(&id)? else {
+            return Ok(Response::new(cri::RemoveContainerResponse {}));
+        };
+        container::remove(&container_store_root(), &record.id)
+            .map_err(|e| io_error("removing container record", e))?;
+        Ok(Response::new(cri::RemoveContainerResponse {}))
     }
 
+    /// Filters combine with AND, matching real cri-o's own
+    /// `filterContainerList`/`filterContainer` — see
+    /// [`container_list_items`]'s own doc comment for each rule's
+    /// exact real-cri-o citation.
     async fn list_containers(
         &self,
-        _request: Request<cri::ListContainersRequest>,
+        request: Request<cri::ListContainersRequest>,
     ) -> Result<Response<cri::ListContainersResponse>, Status> {
-        unimplemented("ListContainers")
+        let containers = container_list_items(request.into_inner().filter)?;
+        Ok(Response::new(cri::ListContainersResponse { containers }))
     }
 
     type StreamContainersStream = BoxStream<cri::StreamContainersResponse>;
@@ -546,11 +828,56 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         unimplemented("StreamContainers")
     }
 
+    /// An unknown (or empty) ID is a real gRPC `NotFound` — real
+    /// cri-o wraps every lookup failure here in `codes.NotFound`
+    /// ("could not find container %q", `server/container_status.go`),
+    /// the same asymmetry-with-remove the sandbox RPCs already
+    /// mirror. Every record this slice can produce is honestly
+    /// `CONTAINER_CREATED`, so no `started_at`/`finished_at`/
+    /// `exit_code` is ever reported (real cri-o sets those only for
+    /// the running/stopped states this slice can't reach yet).
     async fn container_status(
         &self,
-        _request: Request<cri::ContainerStatusRequest>,
+        request: Request<cri::ContainerStatusRequest>,
     ) -> Result<Response<cri::ContainerStatusResponse>, Status> {
-        unimplemented("ContainerStatus")
+        let request = request.into_inner();
+        let id = request.container_id;
+        let Some(record) = find_container(&id)? else {
+            return Err(Status::not_found(format!(
+                "could not find container {id:?}"
+            )));
+        };
+
+        // Verbose info: one "info" key holding a JSON blob, the same
+        // shape (and the same honestly-smaller payload) the sandbox
+        // status RPC already established -- there is no runtime
+        // spec/pid here to marshal until StartContainer exists.
+        let mut info = std::collections::HashMap::new();
+        if request.verbose {
+            info.insert(
+                "info".to_string(),
+                serde_json::to_string(&record).unwrap_or_default(),
+            );
+        }
+
+        Ok(Response::new(cri::ContainerStatusResponse {
+            status: Some(cri::ContainerStatus {
+                id: record.id.clone(),
+                metadata: Some(container_metadata_to_proto(&record.metadata)),
+                state: container_state_to_proto(record.state),
+                created_at: record.created_at_nanos,
+                image: Some(cri::ImageSpec {
+                    image: record.image.clone(),
+                    ..Default::default()
+                }),
+                image_ref: record.image_ref.clone(),
+                image_id: record.image_ref.clone(),
+                labels: record.labels.clone(),
+                annotations: record.annotations.clone(),
+                ..Default::default()
+            }),
+            info,
+        }))
     }
 
     async fn update_container_resources(
@@ -878,6 +1205,19 @@ mod tests {
     async fn every_other_rpc_is_a_real_honest_unimplemented_status() {
         let service = RuntimeServiceImpl::default();
         let status = service
+            .start_container(Request::new(cri::StartContainerRequest {
+                container_id: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+        assert!(status.message().contains("StartContainer"), "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn create_container_with_no_config_at_all_is_invalid_argument() {
+        let service = RuntimeServiceImpl::default();
+        let status = service
             .create_container(Request::new(cri::CreateContainerRequest {
                 pod_sandbox_id: String::new(),
                 config: None,
@@ -885,8 +1225,24 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unimplemented);
-        assert!(status.message().contains("CreateContainer"), "{status:?}");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("config is nil"), "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn remove_container_with_an_empty_id_is_a_real_error() {
+        let service = RuntimeServiceImpl::default();
+        let status = service
+            .remove_container(Request::new(cri::RemoveContainerRequest {
+                container_id: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("ContainerId should not be empty"),
+            "{status:?}"
+        );
     }
 
     // `run_pod_sandbox`'s own real create/duplicate/stop/remove/

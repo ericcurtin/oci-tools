@@ -247,10 +247,14 @@ async fn an_unimplemented_rpc_is_a_real_honest_status_over_the_wire() {
 
     let mut client = connect(socket_path).await;
     let status = client
-        .list_containers(oci_cri_types::ListContainersRequest { filter: None })
+        .exec_sync(oci_cri_types::ExecSyncRequest {
+            container_id: "deadbeef".repeat(8),
+            cmd: vec!["true".to_string()],
+            timeout: 0,
+        })
         .await
-        .expect_err("ListContainers should be a real, honest error, not a success");
+        .expect_err("ExecSync should be a real, honest error, not a success");
 
     assert_eq!(status.code(), tonic::Code::Unimplemented);
-    assert!(status.message().contains("ListContainers"), "{status:?}");
+    assert!(status.message().contains("ExecSync"), "{status:?}");
 }

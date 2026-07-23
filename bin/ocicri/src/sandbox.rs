@@ -22,10 +22,12 @@
 //! pinning is deferred until this project grows real pod networking
 //! and a real `CreateContainer` that could join those namespaces).
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+pub use crate::records::LookupError;
+use crate::records::{self, Record};
 
 /// The real CRI pod-sandbox states, mirroring the proto's own
 /// `PodSandboxState` (`SANDBOX_READY`/`SANDBOX_NOTREADY`) — stored by
@@ -99,93 +101,42 @@ pub struct SandboxRecord {
     pub namespace_options: Option<NamespaceOptions>,
 }
 
+impl Record for SandboxRecord {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn created_at_nanos(&self) -> i64 {
+        self.created_at_nanos
+    }
+}
+
 /// The sandbox record directory under one storage root.
 pub fn sandbox_root(storage_root: &Path) -> PathBuf {
     storage_root.join("cri-sandboxes")
 }
 
-fn record_path(root: &Path, id: &str) -> PathBuf {
-    root.join(format!("{id}.json"))
-}
-
-/// A real, random 64-hex sandbox ID — the exact shape real cri-o's
-/// own `stringid.GenerateNonCryptoID` produces, generated the same
-/// dependency-free way `ociman`'s own `short_id`/`ocibox ephemeral`
-/// already do (hashing the real current time and this process's own
-/// pid), just untruncated — plus a process-global counter so two
-/// calls in the same process can never collide even if the clock's
-/// own resolution ever made their timestamps identical (the same
-/// role `ocibox`'s own `attempt` input plays).
+/// A real, random 64-hex sandbox ID — see
+/// [`crate::records::generate_id`].
 pub fn generate_id() -> String {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seed = format!(
-        "{:?}-{}-sandbox-{}",
-        std::time::SystemTime::now(),
-        std::process::id(),
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
-    oci_spec_types::digest::sha256(seed.as_bytes())
-        .hex()
-        .to_string()
+    records::generate_id()
 }
 
-/// Persists `record` atomically (temp file + rename, the same
-/// technique `oci_store`'s own pointer files use, so a crash mid-write
-/// can never leave a truncated record behind).
+/// Persists `record` atomically — see [`crate::records::save`].
 pub fn save(root: &Path, record: &SandboxRecord) -> std::io::Result<()> {
-    std::fs::create_dir_all(root)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(root)?;
-    tmp.write_all(&serde_json::to_vec_pretty(record)?)?;
-    tmp.persist(record_path(root, &record.id))
-        .map_err(|e| e.error)?;
-    Ok(())
+    records::save(root, record)
 }
 
-/// Loads every stored record, sorted by creation time (newest first,
-/// matching real cri-o's own `ListSandboxes` consumers' expectation of
-/// a stable order; the proto itself mandates none).
+/// Loads every stored record, newest first — see
+/// [`crate::records::load_all`].
 pub fn load_all(root: &Path) -> std::io::Result<Vec<SandboxRecord>> {
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    let mut records = Vec::new();
-    for entry in entries {
-        let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let bytes = std::fs::read(&path)?;
-        let record: SandboxRecord = serde_json::from_slice(&bytes)?;
-        records.push(record);
-    }
-    records.sort_by(|a, b| {
-        b.created_at_nanos
-            .cmp(&a.created_at_nanos)
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    Ok(records)
+    records::load_all(root)
 }
 
-/// Resolves one sandbox by ID prefix — matching real cri-o's own
-/// truncindex-backed lookup (`PodIDIndex().Get`, prefix-based):
-/// `Ok(None)` for no match at all, an `AmbiguousPrefix` error when the
-/// prefix matches more than one distinct sandbox.
+/// Resolves one sandbox by ID prefix (real cri-o's own
+/// `PodIDIndex().Get` truncindex equivalent) — see
+/// [`crate::records::find_by_id_prefix`].
 pub fn find_by_id_prefix(root: &Path, prefix: &str) -> Result<Option<SandboxRecord>, LookupError> {
-    if prefix.is_empty() {
-        return Ok(None);
-    }
-    let mut found: Option<SandboxRecord> = None;
-    for record in load_all(root).map_err(LookupError::Io)? {
-        if record.id.starts_with(prefix) {
-            if found.is_some() {
-                return Err(LookupError::AmbiguousPrefix(prefix.to_string()));
-            }
-            found = Some(record);
-        }
-    }
-    Ok(found)
+    records::find_by_id_prefix(root, prefix)
 }
 
 /// Resolves one sandbox by its unique pod name (the
@@ -196,39 +147,10 @@ pub fn find_by_name(root: &Path, name: &str) -> std::io::Result<Option<SandboxRe
 }
 
 /// Removes one sandbox record by exact ID. Returns whether a record
-/// actually existed.
+/// actually existed — see [`crate::records::remove`].
 pub fn remove(root: &Path, id: &str) -> std::io::Result<bool> {
-    match std::fs::remove_file(record_path(root, id)) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
+    records::remove(root, id)
 }
-
-/// A sandbox lookup failure — either real I/O trouble or a genuinely
-/// ambiguous ID prefix (a client-input problem, reported distinctly so
-/// the RPC layer can map it to `InvalidArgument` rather than a generic
-/// internal error).
-#[derive(Debug)]
-pub enum LookupError {
-    /// Reading the record directory failed.
-    Io(std::io::Error),
-    /// The given prefix matches more than one distinct sandbox.
-    AmbiguousPrefix(String),
-}
-
-impl std::fmt::Display for LookupError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "reading sandbox records: {e}"),
-            Self::AmbiguousPrefix(prefix) => {
-                write!(f, "sandbox ID {prefix:?} is ambiguous")
-            }
-        }
-    }
-}
-
-impl std::error::Error for LookupError {}
 
 #[cfg(test)]
 mod tests {

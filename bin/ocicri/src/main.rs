@@ -16,15 +16,19 @@
 //! `RemovePodSandbox`/`PodSandboxStatus`/`ListPodSandbox`/
 //! `StreamPodSandboxes` — a real, persistent, record-keeping state
 //! machine with real CRI semantics, deliberately no infra
-//! process/pinned namespaces yet, see `docs/design/0233`-`0234`), and
-//! all of `ImageService` (`ListImages`/`StreamImages`/`ImageStatus`/
-//! `PullImage`/`RemoveImage`/`ImageFsInfo`, reusing this project's
-//! own already-tested `oci_store`/`oci_registry` primitives directly
-//! — see `image_service.rs`'s own module doc comment). Every
-//! remaining RPC (container lifecycle, exec/attach/port-forward,
-//! stats, events, ...) deliberately returns a real
-//! `Status::unimplemented` naming itself, rather than accepting a
-//! request this project can't actually act on yet.
+//! process/pinned namespaces yet, see `docs/design/0233`-`0234`), the
+//! container lifecycle's own record slice (`CreateContainer`/
+//! `ContainerStatus`/`ListContainers`/`RemoveContainer` — every
+//! record honestly `CONTAINER_CREATED` until `StartContainer` itself
+//! exists, see `docs/design/0236`), and all of `ImageService`
+//! (`ListImages`/`StreamImages`/`ImageStatus`/`PullImage`/
+//! `RemoveImage`/`ImageFsInfo`, reusing this project's own
+//! already-tested `oci_store`/`oci_registry` primitives directly —
+//! see `image_service.rs`'s own module doc comment). Every remaining
+//! RPC (start/stop, exec/attach/port-forward, stats, events, ...)
+//! deliberately returns a real `Status::unimplemented` naming
+//! itself, rather than accepting a request this project can't
+//! actually act on yet.
 //!
 //! Unlike every other binary in this workspace, `ocicri` is a real,
 //! long-lived server process, not a short-lived CLI invocation — the
@@ -36,7 +40,9 @@
 //! other binary's own hot per-invocation startup path is completely
 //! unaffected.
 
+mod container;
 mod image_service;
+mod records;
 mod runtime_service;
 mod sandbox;
 mod stream;
