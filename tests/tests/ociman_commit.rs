@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use oci_spec_types::image::ContainerConfig;
 use oci_store::Store;
 
-use oci_tools_tests::{bin_path, busybox_path, seed_image};
+use oci_tools_tests::{bin_path, busybox_path, seed_image, seed_image_with_files};
 
 fn ociman(storage_root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin_path("ociman"))
@@ -460,6 +460,25 @@ fn cgroup_is_frozen(cgroup_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// A real, moderately-sized batch of extra base-image files —
+/// deliberately padding out `commit`'s own real diff-snapshot walk
+/// (which has to walk the container's *entire* current rootfs tree,
+/// see `docs/design/0149`) so the real freeze-diff-unfreeze window
+/// `commit --pause` opens is wide enough to reliably observe even
+/// under real CI scheduling contention. Found and fixed directly, not
+/// hypothesized: a bare busybox image's own handful of files let this
+/// window close in well under the polling loop's own real scheduling
+/// latency on a loaded CI runner, causing a real, intermittently
+/// reproducing CI failure across several separate runs (`docs/
+/// design/0232`) — never reproduced on this project's own lightly
+/// loaded development host, exactly the kind of gap only real CI load
+/// surfaces.
+fn diff_walk_padding_files() -> Vec<(String, Vec<u8>)> {
+    (0..2000)
+        .map(|i| (format!("pad/file{i}.bin"), vec![b'x'; 64]))
+        .collect()
+}
+
 /// `--pause` (real podman's own default): the container's own real
 /// cgroup v2 freezer must actually engage for the real duration of the
 /// commit, and be lifted again afterward -- not just "the CLI call
@@ -488,11 +507,17 @@ fn commit_pauses_a_running_container_and_unpauses_it_afterward() {
     )
     .unwrap();
     let store = Store::open(storage_dir.path()).unwrap();
-    seed_image(
+    let padding = diff_walk_padding_files();
+    let padding_refs: Vec<(&str, &[u8])> = padding
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_slice()))
+        .collect();
+    seed_image_with_files(
         &store,
         "ociman-test/commit-pause:latest",
         &busybox,
         &["sh"],
+        &padding_refs,
         ContainerConfig::default(),
     );
 
@@ -537,6 +562,14 @@ fn commit_pauses_a_running_container_and_unpauses_it_afterward() {
         if Instant::now() >= deadline {
             break;
         }
+        // A brief, deliberate yield -- a pure, unthrottled busy-spin
+        // here can starve the very `ociman commit` child process this
+        // loop is trying to observe of real CPU time on a
+        // contended/few-vCPU CI host, which is exactly backwards: the
+        // fix isn't polling *faster*, it's giving the process actually
+        // doing the freeze/diff/unfreeze work a fair scheduling
+        // chance in between checks (`docs/design/0232`).
+        std::thread::sleep(Duration::from_micros(200));
     }
     let status = commit_child
         .wait()
@@ -632,6 +665,14 @@ fn commit_with_pause_false_never_freezes_a_running_container() {
         if Instant::now() >= deadline {
             break;
         }
+        // A brief, deliberate yield -- a pure, unthrottled busy-spin
+        // here can starve the very `ociman commit` child process this
+        // loop is trying to observe of real CPU time on a
+        // contended/few-vCPU CI host, which is exactly backwards: the
+        // fix isn't polling *faster*, it's giving the process actually
+        // doing the freeze/diff/unfreeze work a fair scheduling
+        // chance in between checks (`docs/design/0232`).
+        std::thread::sleep(Duration::from_micros(200));
     }
     let status = commit_child
         .wait()
