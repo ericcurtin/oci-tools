@@ -78,8 +78,8 @@ pub struct RuntimeServiceImpl {
 fn unimplemented<T>(name: &str) -> Result<Response<T>, Status> {
     Err(Status::unimplemented(format!(
         "ocicri: {name} is not implemented yet (milestone 7: Version/Status/RuntimeConfig/\
-         UpdateRuntimeConfig/ListMetricDescriptors, the pod-sandbox lifecycle, and the container \
-         lifecycle (create/start/stop/remove/status/list) are answered so far)"
+         UpdateRuntimeConfig/ListMetricDescriptors, the pod-sandbox lifecycle, the container \
+         lifecycle (create/start/stop/remove/status/list), and ExecSync are answered so far)"
     )))
 }
 
@@ -301,6 +301,15 @@ fn force_kill_and_reconcile(
         "container {} did not exit after SIGKILL",
         record.id
     )))
+}
+
+/// What one `ExecSync` helper run produced — the blocking half's own
+/// result shape (see `exec_sync`).
+struct ExecOutcome {
+    timed_out: bool,
+    exit_code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 fn container_state_to_proto(state: container::ContainerState) -> i32 {
@@ -1289,11 +1298,145 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         unimplemented("ReopenContainerLog")
     }
 
+    /// Runs a command synchronously inside a running container
+    /// (`docs/design/0240`) — kubelet's own exec liveness/readiness
+    /// probes. Semantics checked directly against real cri-o
+    /// (`server/container_execsync.go`, `internal/oci/runtime_oci.
+    /// go`): unknown container a real `NotFound`; a container with no
+    /// living process a `NotFound` too (real cri-o can exec into its
+    /// own *created* containers — their paused init is alive; this
+    /// project's created containers have no process at all yet, so
+    /// only `RUNNING` is exec-able here, documented in the note);
+    /// an empty command its verbatim error; and a timeout is a
+    /// **successful response** with `exit_code: -1` and stderr
+    /// `"command timed out"` (conmon's own `TimedOutMessage`,
+    /// verbatim) — real cri-o's own explicit reasoning: kubelet's
+    /// prober checks the exit code, and a gRPC error would wedge the
+    /// probe in `Unknown` instead of restarting the container.
     async fn exec_sync(
         &self,
-        _request: Request<cri::ExecSyncRequest>,
+        request: Request<cri::ExecSyncRequest>,
     ) -> Result<Response<cri::ExecSyncResponse>, Status> {
-        unimplemented("ExecSync")
+        let request = request.into_inner();
+        let id = request.container_id;
+
+        let record = {
+            let _guard = self
+                .sandbox_mutation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(record) = find_container(&id)? else {
+                return Err(Status::not_found(format!(
+                    "could not find container {id:?}"
+                )));
+            };
+            reconcile_container(record)?
+        };
+        if record.state != container::ContainerState::Running {
+            return Err(Status::not_found(format!(
+                "container {} has no running process to exec into (state: {:?})",
+                record.id, record.state
+            )));
+        }
+        let Some(pid) = record.pid else {
+            return Err(Status::internal(format!(
+                "container {} is RUNNING but has no recorded pid",
+                record.id
+            )));
+        };
+        if request.cmd.is_empty() {
+            // Real cri-o's own message, verbatim.
+            return Err(Status::invalid_argument("exec command cannot be empty"));
+        }
+
+        let bundle_dir =
+            crate::bundle::bundle_dir(&oci_cli_common::storage::default_root(), &record.id);
+        let exe = std::env::current_exe()
+            .map_err(|e| Status::internal(format!("resolving own executable: {e}")))?;
+        let timeout = request.timeout;
+        let cmd = request.cmd;
+
+        // The whole child-wrangling half runs on the blocking pool:
+        // real pipe reads, a try_wait poll loop, and (on timeout) a
+        // whole-process-group SIGKILL -- see `launcher::exec_main`'s
+        // own doc comment for why the helper `setsid`s to make that
+        // group kill cover the namespace-joined exec child too.
+        let outcome = tokio::task::spawn_blocking(move || -> std::io::Result<ExecOutcome> {
+            let mut child = std::process::Command::new(exe)
+                .arg(crate::launcher::EXEC_ARGV1)
+                .arg(&bundle_dir)
+                .arg(pid.to_string())
+                .args(&cmd)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()?;
+
+            // Drain both pipes on their own threads -- reading only
+            // after exit could deadlock once a pipe fills.
+            let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+            let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+            let stdout_reader = std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut stdout_pipe, &mut buf);
+                buf
+            });
+            let stderr_reader = std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut stderr_pipe, &mut buf);
+                buf
+            });
+
+            let deadline = (timeout > 0).then(|| {
+                std::time::Instant::now() + std::time::Duration::from_secs(timeout as u64)
+            });
+            let mut timed_out = false;
+            let status = loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    timed_out = true;
+                    // The helper setsid'd: its pid is its process
+                    // group, so this takes the exec'd command down
+                    // with it.
+                    let _ = oci_runtime_core::process::kill(-(child.id() as i32), libc::SIGKILL);
+                    break child.wait()?;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+
+            let stdout = stdout_reader.join().unwrap_or_default();
+            let stderr = stderr_reader.join().unwrap_or_default();
+            let exit_code = std::os::unix::process::ExitStatusExt::signal(&status)
+                .map(|sig| 128 + sig)
+                .or(status.code())
+                .unwrap_or(-1);
+            Ok(ExecOutcome {
+                timed_out,
+                exit_code,
+                stdout,
+                stderr,
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("exec task panicked: {e}")))?
+        .map_err(|e| Status::internal(format!("running exec helper: {e}")))?;
+
+        if outcome.timed_out {
+            // Real cri-o's own timeout shape, verbatim (see this
+            // method's doc comment).
+            return Ok(Response::new(cri::ExecSyncResponse {
+                stdout: Vec::new(),
+                stderr: b"command timed out".to_vec(),
+                exit_code: -1,
+            }));
+        }
+        Ok(Response::new(cri::ExecSyncResponse {
+            stdout: outcome.stdout,
+            stderr: outcome.stderr,
+            exit_code: outcome.exit_code,
+        }))
     }
 
     async fn exec(

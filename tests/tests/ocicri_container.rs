@@ -995,3 +995,169 @@ async fn stop_pod_sandbox_terminates_its_running_containers() {
         "the sandbox stop is forceful (SIGKILL): {status:?}"
     );
 }
+
+/// `ExecSync` (`docs/design/0240`) runs a real command inside a real
+/// running container: stdout and stderr come back separately, the
+/// command's own exit code comes back verbatim, a timeout is real
+/// cri-o's own *successful* `-1`/"command timed out" response shape
+/// (never a gRPC error — kubelet's prober checks the exit code), and
+/// the non-exec-able states are real `NotFound`s.
+#[tokio::test]
+async fn exec_sync_runs_commands_in_a_running_container() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let mut config = container_config("exec-target", 0);
+    config.command = vec!["/bin/sleep".to_string(), "300".to_string()];
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+
+    // Exec before start: our created containers have no process at
+    // all (0236), so this is a real NotFound.
+    eprintln!("PH A {:?}", std::time::Instant::now());
+    let err = client
+        .exec_sync(oci_cri_types::ExecSyncRequest {
+            container_id: container_id.clone(),
+            cmd: vec!["/bin/true".to_string()],
+            timeout: 0,
+        })
+        .await
+        .expect_err("exec into a never-started container should fail");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+    eprintln!("PH B(started) {:?}", std::time::Instant::now());
+
+    // Real output on both streams, and the command's own exit code.
+    let response = client
+        .exec_sync(oci_cri_types::ExecSyncRequest {
+            container_id: container_id.clone(),
+            cmd: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo out-hi; echo err-hi 1>&2; exit 7".to_string(),
+            ],
+            timeout: 0,
+        })
+        .await
+        .expect("ExecSync failed")
+        .into_inner();
+    assert_eq!(String::from_utf8_lossy(&response.stdout), "out-hi\n");
+    assert_eq!(String::from_utf8_lossy(&response.stderr), "err-hi\n");
+    assert_eq!(response.exit_code, 7);
+    eprintln!("PH C(exec1 done) {:?}", std::time::Instant::now());
+
+    // The exec genuinely ran *inside* the container: its /proc is the
+    // container's own pid namespace, where the sleep init is pid 1.
+    let response = client
+        .exec_sync(oci_cri_types::ExecSyncRequest {
+            container_id: container_id.clone(),
+            cmd: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "cat /proc/1/cmdline | tr '\\0' ' '".to_string(),
+            ],
+            timeout: 0,
+        })
+        .await
+        .expect("ExecSync failed")
+        .into_inner();
+    assert_eq!(response.exit_code, 0, "{response:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&response.stdout).trim(),
+        "/bin/sleep 300",
+        "pid 1 inside the exec's own view must be the container init"
+    );
+    eprintln!("PH D(exec2 done) {:?}", std::time::Instant::now());
+
+    // Timeout: real cri-o's own successful -1/"command timed out"
+    // shape, and it actually returns promptly rather than sleeping 30s.
+    let started = std::time::Instant::now();
+    let response = client
+        .exec_sync(oci_cri_types::ExecSyncRequest {
+            container_id: container_id.clone(),
+            cmd: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 30".to_string(),
+            ],
+            timeout: 1,
+        })
+        .await
+        .expect("a timed-out ExecSync must still be a successful response")
+        .into_inner();
+    assert_eq!(response.exit_code, -1, "{response:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&response.stderr),
+        "command timed out"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the timeout must actually cut the command short"
+    );
+    eprintln!("PH E(timeout done) {:?}", std::time::Instant::now());
+
+    // An empty command is real cri-o's own verbatim error.
+    let err = client
+        .exec_sync(oci_cri_types::ExecSyncRequest {
+            container_id: container_id.clone(),
+            cmd: Vec::new(),
+            timeout: 0,
+        })
+        .await
+        .expect_err("an empty exec command should be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("exec command cannot be empty"),
+        "{err:?}"
+    );
+
+    // Unknown container: NotFound.
+    let err = client
+        .exec_sync(oci_cri_types::ExecSyncRequest {
+            container_id: "deadbeef".repeat(8),
+            cmd: vec!["/bin/true".to_string()],
+            timeout: 0,
+        })
+        .await
+        .expect_err("exec into an unknown container should fail");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+    eprintln!("PH F(stop begins) {:?}", std::time::Instant::now());
+
+    // Exec into an exited container: NotFound too.
+    client
+        .stop_container(oci_cri_types::StopContainerRequest {
+            container_id: container_id.clone(),
+            timeout: 0,
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerExited).await;
+    eprintln!("PH G(stopped) {:?}", std::time::Instant::now());
+    let err = client
+        .exec_sync(oci_cri_types::ExecSyncRequest {
+            container_id,
+            cmd: vec!["/bin/true".to_string()],
+            timeout: 0,
+        })
+        .await
+        .expect_err("exec into an exited container should fail");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+}

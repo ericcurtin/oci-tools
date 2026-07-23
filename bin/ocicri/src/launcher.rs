@@ -49,6 +49,95 @@ use std::path::Path;
 /// hidden-command spirit (it never appears in `--help`).
 pub const LAUNCH_ARGV1: &str = "__launch";
 
+/// The `ExecSync` helper's own argv\[1\] sentinel (`docs/design/0240`)
+/// — same interception, same single-threaded-at-entry reasoning as
+/// [`LAUNCH_ARGV1`]: `oci_runtime_core::exec::exec` forks
+/// (`fork_and_wait`), which the tokio server can never do directly.
+pub const EXEC_ARGV1: &str = "__exec";
+
+/// The exit code [`exec_main`] reports when the exec *setup itself*
+/// failed before the command ever ran (bundle unreadable, `setns`
+/// denied, ...) — the shell's own conventional "command invoked
+/// cannot execute" code, with the real reason on stderr (which the
+/// server already captures and returns verbatim in
+/// `ExecSyncResponse.stderr`, so a kubelet probe sees both a failing
+/// code and a human-readable why). A real command exiting 126 on its
+/// own is indistinguishable, exactly as it is for a real shell.
+pub const EXEC_SETUP_FAILED_CODE: i32 = 126;
+
+/// The `__exec` process's own entire life (`docs/design/0240`): join
+/// the running container of `<PID>` exactly like `ociman exec` does —
+/// the same shared `oci_runtime_core::exec` machinery, the same
+/// "everything comes from the target's own bundle" defaults
+/// (namespaces/user/capabilities/no-new-privileges/cwd/env; the CRI
+/// `ExecSyncRequest` has no per-call overrides for any of these) —
+/// run `<CMD...>`, and exit with its code. stdout/stderr are simply
+/// inherited: the server spawns this helper with real pipes and
+/// captures both directly, no on-disk protocol needed (unlike
+/// [`main`]'s launcher-keeper, nothing here outlives the RPC).
+/// Never returns.
+pub fn exec_main(args: &[String]) -> ! {
+    std::process::exit(match exec_run(args) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("ocicri {EXEC_ARGV1}: {e:#}");
+            EXEC_SETUP_FAILED_CODE
+        }
+    })
+}
+
+fn exec_run(args: &[String]) -> anyhow::Result<i32> {
+    use anyhow::Context as _;
+
+    let [bundle_dir, pid, cmd @ ..] = args else {
+        anyhow::bail!("usage: ocicri {EXEC_ARGV1} <BUNDLE_DIR> <PID> <CMD...>");
+    };
+    anyhow::ensure!(!cmd.is_empty(), "exec command cannot be empty");
+    let pid: i32 = pid.parse().context("parsing target pid")?;
+    wait_until_execed(pid)?;
+
+    // Own process group (`setsid`), so the server can kill this whole
+    // helper *tree* (this process plus the forked, namespace-joined
+    // exec child below) with one negative-pid SIGKILL on timeout --
+    // `setns` changes namespaces, never process-group membership, so
+    // the group stays whole even after the child joins the container.
+    let _ = rustix::process::setsid();
+
+    let bundle = oci_runtime_core::Bundle::load(Path::new(bundle_dir))
+        .with_context(|| format!("loading bundle from {bundle_dir}"))?;
+    let process_spec = bundle
+        .spec
+        .process
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("bundle has no process section"))?;
+    let namespaces: Vec<_> = bundle
+        .spec
+        .linux
+        .as_ref()
+        .map_or(&[][..], |l| &l.namespaces)
+        .iter()
+        .map(|ns| ns.kind)
+        .collect();
+
+    let request = oci_runtime_core::exec::ExecRequest {
+        namespaces,
+        user: process_spec.user.clone(),
+        capabilities: process_spec.capabilities.clone(),
+        no_new_privileges: process_spec.no_new_privileges,
+        cwd: process_spec.cwd.clone(),
+        env: process_spec.env.clone(),
+        args: cmd.to_vec(),
+    };
+
+    // SAFETY: this process is genuinely single-threaded here -- just
+    // exec'd fresh (see `main`'s identical note; nothing above spawns
+    // a thread).
+    #[allow(unsafe_code)]
+    let exit_code = unsafe { oci_runtime_core::exec::exec(pid, request) }
+        .context("executing inside container")?;
+    Ok(exit_code)
+}
+
 /// File names within the bundle directory (see the module doc
 /// comment).
 pub const PID_FILENAME: &str = "pid";
@@ -164,6 +253,51 @@ fn run(args: &[String]) -> anyhow::Result<()> {
     write_atomic(dir, EXIT_FILENAME, &serde_json::to_vec_pretty(&exit)?)
         .context("writing exit record")?;
     Ok(())
+}
+
+/// Blocks until the container process has genuinely `exec`'d its own
+/// command — a real race found the hard way (`docs/design/0240`): the
+/// launcher's own pid file is written the moment the container pid
+/// *exists* (`on_pid`, before the child has finished its rootfs
+/// setup and exec'd), and 0238 already documented that `RUNNING` is
+/// therefore reported pre-exec. An exec that joins the target's
+/// namespaces inside that window sees a half-set-up world (pre-pivot
+/// mount namespace, pre-exec argv at pid 1 — both actually observed
+/// in this project's own test suite as a real flake before this
+/// gate). Real runc doesn't have the window at exactly this point
+/// because its own `create` completes all setup before pausing at
+/// the start fifo; the equivalent safe point here is "the target's
+/// own `/proc/<pid>/cmdline` no longer carries this binary's own
+/// pre-exec argv", which flips at exactly the `execve` that ends
+/// setup — cheap, dependency-free, and checked against nothing but
+/// the kernel's own accounting.
+fn wait_until_execed(pid: i32) -> anyhow::Result<()> {
+    let own_exe = std::env::current_exe()
+        .map(|p| p.into_os_string().into_encoded_bytes())
+        .unwrap_or_default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(bytes) => bytes,
+            Err(_) => anyhow::bail!("container process {pid} exited before exec"),
+        };
+        // An empty cmdline is a zombie: it exited already.
+        anyhow::ensure!(
+            !cmdline.is_empty(),
+            "container process {pid} exited before exec"
+        );
+        // Pre-exec, argv[0] is this same ocicri binary (the launcher
+        // re-exec that forked it); post-exec it's the container's own
+        // command.
+        if own_exe.is_empty() || !cmdline.starts_with(&own_exe) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "container process {pid} never finished starting (still in pre-exec setup)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// Reads a container's exit record, if its launcher has written one

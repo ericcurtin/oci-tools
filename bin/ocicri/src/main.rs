@@ -23,7 +23,9 @@
 //! per-container launcher-keeper — this project's own conmon
 //! equivalent — plus `ContainerStatus`/`ListContainers`/
 //! `RemoveContainer` reconciling against the keeper's own real exit
-//! records, see `docs/design/0236`-`0238`), and all of `ImageService`
+//! records, and `ExecSync` — kubelet's own exec probes — via a second
+//! hidden re-exec entry point, see `docs/design/0236`-`0238`, `0240`),
+//! and all of `ImageService`
 //! (`ListImages`/`StreamImages`/`ImageStatus`/`PullImage`/
 //! `RemoveImage`/`ImageFsInfo`, reusing this project's own
 //! already-tested `oci_store`/`oci_registry` primitives directly —
@@ -96,6 +98,9 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some(launcher::LAUNCH_ARGV1) {
         launcher::main(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some(launcher::EXEC_ARGV1) {
+        launcher::exec_main(&args[2..]);
     }
 
     oci_cli_common::run_main(|| {
