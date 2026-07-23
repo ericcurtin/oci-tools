@@ -6583,3 +6583,282 @@ fn build_from_platform_overrides_a_matching_global_platform_flag() {
          still surfacing as the one clear error: {stderr}"
     );
 }
+
+/// `ociman build --unsetenv <NAME>` (0194): removes an environment
+/// variable from the *final* built image, regardless of whether it
+/// came from the base image's own config or a real `ENV` instruction
+/// in this Containerfile — matching real `docker build --unsetenv`/
+/// `podman build --unsetenv` exactly (checked directly).
+#[test]
+fn build_unsetenv_removes_a_declared_env_var_from_the_final_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/unsetenv-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            env: vec!["FOO=bar".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/unsetenv-base:latest\nENV BAZ=qux\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--unsetenv",
+            "FOO",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/unsetenv-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &["inspect", "--json", "ociman-test/unsetenv-result:latest"],
+    );
+    assert!(inspect.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    let env = view["config"]["Env"].as_array().unwrap();
+    assert!(
+        env.iter().all(|v| v.as_str() != Some("FOO=bar")),
+        "--unsetenv FOO should remove it from the base image's own inherited env: {env:?}"
+    );
+    assert!(
+        env.iter().any(|v| v.as_str() == Some("BAZ=qux")),
+        "a real ENV instruction not named by --unsetenv should be untouched: {env:?}"
+    );
+}
+
+/// `--unsetenv` still removes a variable even when a *later* `ENV`
+/// instruction re-declares it — applied once, after every real
+/// instruction has already run, matching real `podman build
+/// --unsetenv` exactly (checked directly).
+#[test]
+fn build_unsetenv_removes_a_variable_even_if_a_later_env_redeclares_it() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/unsetenv-redeclare-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/unsetenv-redeclare-base:latest\nENV FOO=bar\nENV FOO=overridden\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--unsetenv",
+            "FOO",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/unsetenv-redeclare-result:latest",
+        ],
+    );
+    assert!(build.status.success());
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "--json",
+            "ociman-test/unsetenv-redeclare-result:latest",
+        ],
+    );
+    assert!(inspect.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    // Legitimately absent (not an empty array) once `--unsetenv`
+    // removes the *only* variable this image's own config ever
+    // declared -- `serde`'s own `skip_serializing_if` on an empty
+    // `Vec` (`ContainerConfig::env`), not a bug.
+    let empty = Vec::new();
+    let env = view["config"]["Env"].as_array().unwrap_or(&empty);
+    assert!(
+        env.iter().all(|v| !v.as_str().unwrap().starts_with("FOO=")),
+        "--unsetenv should still win even over a later ENV re-declaring the same name: {env:?}"
+    );
+}
+
+/// `--unsetenv` never adds its own `ociman history` entry — matching
+/// real `podman build --unsetenv`'s own identical behavior exactly
+/// (checked directly): unlike `--label`, which shows up as its own
+/// extra `LABEL` step, an otherwise-identical build with and without
+/// `--unsetenv` produces the exact same history.
+#[test]
+fn build_unsetenv_adds_no_history_entry_of_its_own() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/unsetenv-history-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/unsetenv-history-base:latest\nENV FOO=bar\n",
+    );
+
+    let without = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/unsetenv-history-without:latest",
+        ],
+    );
+    assert!(without.status.success());
+    let with = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--unsetenv",
+            "FOO",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/unsetenv-history-with:latest",
+        ],
+    );
+    assert!(with.status.success());
+
+    let history_without = ociman(
+        storage_dir.path(),
+        &[
+            "history",
+            "--json",
+            "ociman-test/unsetenv-history-without:latest",
+        ],
+    );
+    let history_with = ociman(
+        storage_dir.path(),
+        &[
+            "history",
+            "--json",
+            "ociman-test/unsetenv-history-with:latest",
+        ],
+    );
+    assert!(history_without.status.success());
+    assert!(history_with.status.success());
+    assert_eq!(
+        history_without.stdout, history_with.stdout,
+        "--unsetenv should never add a history entry of its own"
+    );
+}
+
+/// A real, previously-unnoticed discrepancy found by hand while first
+/// verifying `--unsetenv` end to end (0194): unsetting an image's only
+/// declared environment variable used to leave a stray `TERM=xterm`
+/// behind (a leftover from `Spec::example()`'s own placeholder
+/// `process.env`, never actually cleared), instead of matching real
+/// `podman run`'s own identical fallback (a real `PATH`, checked
+/// directly, but never `TERM`).
+#[test]
+fn build_unsetenv_down_to_zero_leaves_only_the_real_podman_style_path_fallback() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/unsetenv-to-zero-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            env: vec![
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+            ],
+            ..Default::default()
+        },
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/unsetenv-to-zero-base:latest\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--unsetenv",
+            "PATH",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/unsetenv-to-zero-result:latest",
+        ],
+    );
+    assert!(build.status.success());
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/unsetenv-to-zero-result:latest",
+            "/bin/sh",
+            "-c",
+            "env",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    // `SHLVL`/`PWD` are the shell's own, legitimate additions (`ash`
+    // sets both on every invocation) -- unrelated to this project's
+    // own env-fallback logic, so only check for the two things that
+    // actually matter here: the real `PATH` fallback present, and no
+    // stray `TERM` (this bug's own exact symptom) anywhere.
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+        "an image left with zero declared env vars should fall back to a real PATH, matching \
+         real podman exactly: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("TERM="),
+        "a stray TERM should never leak in, unlike before this fix: {stdout:?}"
+    );
+}

@@ -110,6 +110,30 @@ const ANNOTATION_INTERACTIVE: &str = "io.oci-tools.interactive";
 /// nothing was ever created under either name anyway).
 const ANNOTATION_SCOPE_NONCE: &str = "io.oci-tools.scope-nonce";
 
+/// The real environment a container gets when its own image config
+/// declares *none at all* (`ContainerConfig.env` empty) — a real,
+/// previously-unnoticed discrepancy found by hand while first
+/// verifying `ociman build --unsetenv` end to end (0194): unsetting an
+/// image's *only* declared environment variable is the first thing
+/// that actually makes this case reachable in practice (almost every
+/// real base image declares at least a `PATH`), and doing so revealed
+/// that `synthesize_spec`/`run_step_spec` were both silently falling
+/// back to *all* of `Spec::example()`'s own placeholder `process.env`
+/// (`PATH=...` *and* `TERM=xterm`) whenever the image's own declared
+/// list was empty, rather than replacing it outright. Checked directly
+/// against a real, installed `podman run`/`ociman build` given the
+/// exact same "declares no env at all" image: real podman *does* still
+/// show a real `PATH` (confirmed: `container-libs`/`libpod`'s own
+/// specgen layer injects one, not `crun`/`runc` themselves — this
+/// project's own `ocirun` intentionally has no equivalent fallback of
+/// its own at all, matching real `crun run`/`runc run` exactly, which
+/// use the bundle's own `process.env` completely verbatim, empty or
+/// not), but never `TERM`. This is that same real fallback, kept
+/// (matching real podman), with the stray `TERM` this project's own
+/// code was incidentally also leaking removed.
+const DEFAULT_ENV_WHEN_IMAGE_DECLARES_NONE: &str =
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 /// Command-line interface.
 #[derive(Debug, Parser)]
 #[command(
@@ -710,6 +734,19 @@ enum Command {
         /// `docs/design/0193`).
         #[arg(long = "platform")]
         platform: Option<String>,
+        /// Remove an environment variable (by bare name, never
+        /// `KEY=value`) from the *final* built image, regardless of
+        /// whether it came from the base image's own config or from
+        /// any `ENV` instruction in this Containerfile — matching real
+        /// `docker build --unsetenv`/`podman build --unsetenv` exactly
+        /// (checked directly): applied once, after every real
+        /// instruction has already run (so a variable re-declared by a
+        /// later `ENV` is still removed), and — unlike `--label`,
+        /// which adds its own extra `ociman history` entry — produces
+        /// no history entry of its own at all, matching real podman's
+        /// own identical, checked-directly behavior. Repeatable.
+        #[arg(long = "unsetenv", value_name = "NAME")]
+        unsetenv: Vec<String>,
     },
     /// List images in local storage.
     Images,
@@ -1554,6 +1591,7 @@ fn main() -> std::process::ExitCode {
                 squash,
                 squash_all,
                 platform,
+                unsetenv,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
@@ -1571,6 +1609,7 @@ fn main() -> std::process::ExitCode {
                 squash,
                 squash_all,
                 platform.as_deref(),
+                &unsetenv,
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),
@@ -6450,9 +6489,11 @@ fn synthesize_spec(
     // create` container reported `NoNewPrivs: 1` unconditionally
     // before this, regardless of any flag at all.
     process.no_new_privileges = no_new_privileges;
-    if !container_config.env.is_empty() {
-        process.env = container_config.env;
-    }
+    process.env = if container_config.env.is_empty() {
+        vec![DEFAULT_ENV_WHEN_IMAGE_DECLARES_NONE.to_string()]
+    } else {
+        container_config.env
+    };
     build::apply_env_overrides(&mut process.env, env);
     // `Spec::example()`'s own capability set is real `runc spec`'s own
     // bare-scaffold default (3 capabilities) -- correct for `ocirun`

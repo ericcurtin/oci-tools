@@ -223,6 +223,7 @@ pub fn cmd_build(
     squash: bool,
     squash_all: bool,
     platform: Option<&str>,
+    unsetenv: &[String],
     json: bool,
 ) -> anyhow::Result<()> {
     // Matches real `podman build`'s own identical refusal (checked
@@ -485,6 +486,26 @@ pub fn cmd_build(
             &mut config,
             format!("LABEL {}", format_pairs(&labels)),
         );
+    }
+
+    // `--unsetenv` also applies *after* every real Containerfile
+    // instruction (so a variable re-declared by a later `ENV` is still
+    // removed) — but, unlike `--label`, adds no history entry of its
+    // own at all, matching real `podman build --unsetenv`'s own
+    // checked-directly behavior exactly (`ociman history` on an
+    // otherwise-identical build with and without `--unsetenv` shows
+    // the exact same entries either way). Removes the variable
+    // regardless of whether it came from the base image's own
+    // inherited config or from an `ENV` instruction in this
+    // Containerfile — both are already merged into the one `env` list
+    // by this point, so there's exactly one place to filter.
+    if !unsetenv.is_empty()
+        && let Some(cc) = config.config.as_mut()
+    {
+        cc.env.retain(|entry| {
+            let key = entry.split_once('=').map_or(entry.as_str(), |(k, _)| k);
+            !unsetenv.iter().any(|name| name == key)
+        });
     }
 
     let config_bytes = serde_json::to_vec(&config).context("serializing image config")?;
@@ -1618,9 +1639,11 @@ fn run_step_spec(
         .unwrap_or_else(|| "/".to_string());
     process.user.uid = uid;
     process.user.gid = gid;
-    if !container_config.env.is_empty() {
-        process.env = container_config.env;
-    }
+    process.env = if container_config.env.is_empty() {
+        vec![crate::DEFAULT_ENV_WHEN_IMAGE_DECLARES_NONE.to_string()]
+    } else {
+        container_config.env
+    };
     // Real Docker/BuildKit rule, checked directly (`dispatchRun`'s own
     // `withEnv(append(stateRunConfig.Env, buildArgs...))`): every
     // currently-declared `ARG` (not already shadowed by a real `ENV`
