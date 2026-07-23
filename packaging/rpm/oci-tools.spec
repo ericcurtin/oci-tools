@@ -15,6 +15,23 @@ Source0:        %{name}-%{version}.tar.gz
 # doesn't block a real local build either way.
 BuildRequires:  gcc
 
+# A real, RPM-native distro (checked directly: CentOS Stream 10, via
+# this project's own ci/vm.sh harness -- not something the Ubuntu
+# development host this spec was originally verified on could ever
+# have surfaced, since a bare Ubuntu `rpmbuild` has none of these
+# distro-specific macros configured at all) tries by default to
+# auto-generate a separate `-debugsource`/`-debuginfo` subpackage from
+# every installed ELF binary's own DWARF debug info. Rust's own DWARF
+# output doesn't shape into the clean, C-source-file-list `find-
+# debuginfo` expects (see docs/design/0225): the real, observed
+# failure is "Empty %files file .../debugsourcefiles.list", not a
+# missing tool or a real packaging mistake -- rustc/cargo's own DWARF
+# emission is simply a different, if valid, shape. This project's own
+# narrow first packaging slice (0216) has no debug-info subpackage in
+# scope anyway, so disabling it outright is the correct fix, not a
+# workaround for a real bug.
+%global debug_package %{nil}
+
 %description
 oci-tools is a pure-Rust, monorepo reimplementation of the container
 and bootable-container stack:
