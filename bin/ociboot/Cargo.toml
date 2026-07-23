@@ -17,6 +17,9 @@ oci-cli-common.workspace = true
 oci-erofs.workspace = true
 oci-spec-types.workspace = true
 oci-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
 tracing.workspace = true
 
 [lints]

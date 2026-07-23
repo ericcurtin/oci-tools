@@ -26,6 +26,8 @@ use anyhow::Context as _;
 use clap::Parser;
 use oci_erofs::ErofsBuilder as _;
 
+mod origin;
+
 /// Command-line interface.
 #[derive(Debug, Parser)]
 #[command(
@@ -302,6 +304,33 @@ fn cmd_build_image(
     oci_erofs::MkfsErofs
         .build(&rootfs_dir, output, &options)
         .with_context(|| format!("building erofs image at {}", output.display()))?;
+
+    // Real provenance, written silently (internal bookkeeping, the
+    // same category as oci_store's own pointer-file writes — not a
+    // user-facing result the way `--seal`'s own digest lines below
+    // are) — see `origin`'s own module doc comment for why this
+    // exists and what still reads it (nothing yet; that's a future
+    // milestone-6 increment's job).
+    let image_version = config
+        .config
+        .as_ref()
+        .and_then(|c| c.labels.get("org.opencontainers.image.version"))
+        .cloned();
+    origin::write(
+        output,
+        &origin::DeploymentOrigin {
+            image_reference: normalized,
+            image_digest: record.manifest_digest.to_string(),
+            image_version,
+            built_at: timestamp,
+        },
+    )
+    .with_context(|| {
+        format!(
+            "writing a deployment origin record for {}",
+            output.display()
+        )
+    })?;
 
     println!("{}", output.display());
 

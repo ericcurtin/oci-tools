@@ -179,6 +179,122 @@ fn build_image_of_an_unknown_reference_is_a_clear_error() {
     );
 }
 
+/// `build-image` also writes a real, silent `<output>.origin.json`
+/// sidecar recording which OCI image reference/digest/version
+/// produced this deployment — the actual prerequisite a future,
+/// honest `ociboot status` (milestone 6, still ahead) will need; see
+/// `bin/ociboot/src/origin.rs`'s own module doc comment for the full
+/// rationale. Silent (no stdout announcement) is itself asserted
+/// here: the exact-stdout-match assertion below is the same one
+/// `build_image_writes_a_real_valid_erofs_image` already makes,
+/// confirming this new write never became a second, competing line of
+/// user-facing output.
+#[test]
+fn build_image_writes_a_real_origin_record_next_to_the_image() {
+    if !mkfs_erofs_available() {
+        eprintln!("skipping: mkfs.erofs not installed");
+        return;
+    }
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    let mut config = ContainerConfig::default();
+    config.labels.insert(
+        "org.opencontainers.image.version".to_string(),
+        "1.2.3".to_string(),
+    );
+    let reference = "ociboot-test/build-image-origin:latest";
+    seed_image(&store, reference, &busybox, &["sh"], config);
+
+    let output_dir = tempfile::tempdir().unwrap();
+    let output_path = output_dir.path().join("deployment.erofs");
+
+    let build = ociboot(
+        storage_dir.path(),
+        &[
+            "build-image",
+            reference,
+            "--output",
+            output_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&build.stdout).trim(),
+        output_path.to_str().unwrap(),
+        "the origin write must stay silent, exactly like every other internal bookkeeping write"
+    );
+
+    let origin_path = output_dir.path().join("deployment.erofs.origin.json");
+    let origin: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&origin_path).unwrap()).unwrap();
+
+    let normalized = oci_spec_types::Reference::parse(reference)
+        .unwrap()
+        .to_string();
+    assert_eq!(origin["image_reference"], normalized);
+    assert_eq!(origin["image_version"], "1.2.3");
+    let record = store.resolve_image(&normalized).unwrap().unwrap();
+    assert_eq!(
+        origin["image_digest"].as_str().unwrap(),
+        record.manifest_digest.to_string()
+    );
+}
+
+/// An image with no `org.opencontainers.image.version` label at all
+/// (the common case, and every other test in this file) records a
+/// real, honest `null` there rather than an empty-string placeholder.
+#[test]
+fn build_image_origin_records_no_version_when_the_image_declares_none() {
+    if !mkfs_erofs_available() {
+        eprintln!("skipping: mkfs.erofs not installed");
+        return;
+    }
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    let reference = "ociboot-test/build-image-origin-no-version:latest";
+    seed_image(
+        &store,
+        reference,
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let output_dir = tempfile::tempdir().unwrap();
+    let output_path = output_dir.path().join("deployment.erofs");
+    let build = ociboot(
+        storage_dir.path(),
+        &[
+            "build-image",
+            reference,
+            "--output",
+            output_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let origin_path = output_dir.path().join("deployment.erofs.origin.json");
+    let origin: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&origin_path).unwrap()).unwrap();
+    assert!(origin["image_version"].is_null());
+}
+
 /// Every `--seal` test needs a real fs-verity-capable filesystem,
 /// which a plain tempdir may or may not be -- same real, from-scratch
 /// loopback ext4 (`mkfs.ext4 -O verity`) fixture `oci_erofs::verity`'s

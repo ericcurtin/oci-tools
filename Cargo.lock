@@ -1128,6 +1128,9 @@ dependencies = [
  "oci-erofs",
  "oci-spec-types",
  "oci-store",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tracing",
 ]
 
