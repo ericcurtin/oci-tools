@@ -227,21 +227,33 @@ pub fn prune(store: &Store, cache_root: &Path) -> Result<CachePruneReport, Store
 /// than risk reintroducing that same hardlink-double-counting bug in
 /// a second, independent implementation.
 pub fn dir_size(dir: &Path) -> std::io::Result<u64> {
-    let mut seen = HashSet::new();
-    dir_size_inner(dir, &mut seen)
+    dir_stats(dir).map(|(bytes, _files)| bytes)
 }
 
-fn dir_size_inner(dir: &Path, seen: &mut HashSet<(u64, u64)>) -> std::io::Result<u64> {
+/// Same real, hardlink-deduplicated walk as [`dir_size`], but also
+/// returns how many distinct real files it found (`(bytes, files)`) —
+/// `ocicri`'s own `ImageFsInfo` RPC needs both a byte total and a real
+/// `inodes_used` count (CRI's own `FilesystemUsage` message), and
+/// this is the exact same walk, not a second, independent one.
+pub fn dir_stats(dir: &Path) -> std::io::Result<(u64, u64)> {
+    let mut seen = HashSet::new();
+    dir_stats_inner(dir, &mut seen)
+}
+
+fn dir_stats_inner(dir: &Path, seen: &mut HashSet<(u64, u64)>) -> std::io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let mut total = 0u64;
+    let mut total_bytes = 0u64;
+    let mut total_files = 0u64;
     for entry in std::fs::read_dir(dir)? {
         let Ok(entry) = entry else { continue };
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
         if file_type.is_dir() {
-            total += dir_size_inner(&entry.path(), seen).unwrap_or(0);
+            let (bytes, files) = dir_stats_inner(&entry.path(), seen).unwrap_or((0, 0));
+            total_bytes += bytes;
+            total_files += files;
         } else if let Ok(metadata) = entry.metadata() {
             // A symlink's own `metadata()` (not `symlink_metadata()`)
             // would follow it and double-count (or reach entirely
@@ -253,11 +265,12 @@ fn dir_size_inner(dir: &Path, seen: &mut HashSet<(u64, u64)>) -> std::io::Result
                 continue;
             }
             if seen.insert((metadata.dev(), metadata.ino())) {
-                total += metadata.len();
+                total_bytes += metadata.len();
+                total_files += 1;
             }
         }
     }
-    Ok(total)
+    Ok((total_bytes, total_files))
 }
 
 #[cfg(test)]
@@ -571,5 +584,39 @@ mod tests {
         // Eleven hardlinked names, one real 4096-byte file -- not
         // eleven times that.
         assert_eq!(report.reclaimed_bytes, 4096);
+    }
+
+    /// [`dir_stats`] gives both the byte total [`dir_size`] itself
+    /// already returns *and* a real, hardlink-deduplicated file count
+    /// in one pass — `ocicri`'s own `ImageFsInfo` RPC needs both.
+    #[test]
+    fn dir_stats_counts_bytes_and_files_with_the_same_hardlink_dedup_as_dir_size() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real"), vec![b'x'; 100]).unwrap();
+        std::fs::hard_link(dir.path().join("real"), dir.path().join("linked")).unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("other"), vec![b'y'; 50]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("real", dir.path().join("a-symlink")).unwrap();
+
+        let (bytes, files) = dir_stats(dir.path()).unwrap();
+        // "real" and "linked" are the same real inode (100 bytes,
+        // counted once); "sub/other" is a second, distinct file (50
+        // bytes); the symlink contributes to neither total.
+        assert_eq!(bytes, 150);
+        assert_eq!(files, 2);
+        assert_eq!(dir_size(dir.path()).unwrap(), bytes);
+    }
+
+    /// An empty directory is a real, honest zero for both — not an
+    /// error, and not confused with a directory that doesn't exist at
+    /// all (this crate's own `Store::open` always creates `blobs_dir`
+    /// eagerly, so `ocicri`'s own `ImageFsInfo` will routinely see
+    /// exactly this shape for a freshly initialized store).
+    #[test]
+    fn dir_stats_of_an_empty_directory_is_a_real_zero_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(dir_stats(dir.path()).unwrap(), (0, 0));
     }
 }

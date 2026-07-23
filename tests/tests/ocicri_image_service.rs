@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use oci_cri_types::image_service_client::ImageServiceClient;
 use oci_cri_types::{
-    ImageFilter, ImageSpec, ImageStatusRequest, ListImagesRequest, RemoveImageRequest,
+    ImageFilter, ImageFsInfoRequest, ImageSpec, ImageStatusRequest, ListImagesRequest,
+    RemoveImageRequest,
 };
 use oci_spec_types::image::ContainerConfig;
 use oci_store::{ImageRecord, Store};
@@ -481,4 +482,105 @@ async fn remove_image_with_no_image_specified_is_a_real_invalid_argument_error()
         .expect_err("no image specified should be a real error");
 
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
+}
+
+/// `ImageFsInfo` on a store holding a real, seeded image reports a
+/// real, non-zero `used_bytes`/`inodes_used` for `image_filesystems`
+/// (the blob store actually holds real bytes now) — checked as an
+/// honest lower bound, not an exact byte count (this project's own
+/// hardlink-deduplicated `oci_store::dir_stats` is deliberately more
+/// precise than real cri-o's own cruder walk, so pinning an exact
+/// number here would just be re-deriving the same arithmetic under
+/// test rather than confirming the RPC's own real behavior).
+#[tokio::test]
+async fn image_fs_info_reports_real_nonzero_usage_once_an_image_is_stored() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocicri-test/fs-info-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("ocicri.sock");
+    let _server = spawn_server(storage_dir.path(), &socket_path);
+    wait_for_socket(&socket_path);
+
+    let mut client = connect(socket_path).await;
+    let response = client
+        .image_fs_info(ImageFsInfoRequest {})
+        .await
+        .expect("ImageFsInfo should succeed")
+        .into_inner();
+
+    assert_eq!(response.image_filesystems.len(), 1);
+    let image_fs = &response.image_filesystems[0];
+    assert!(image_fs.timestamp > 0);
+    assert!(
+        image_fs
+            .fs_id
+            .as_ref()
+            .unwrap()
+            .mountpoint
+            .contains("blobs"),
+        "got: {:?}",
+        image_fs.fs_id
+    );
+    assert!(
+        image_fs.used_bytes.as_ref().unwrap().value > 0,
+        "a real seeded image should occupy real, nonzero bytes in the blob store"
+    );
+    assert!(image_fs.inodes_used.as_ref().unwrap().value > 0);
+
+    // `container_filesystems` is real too (the rootfs cache), just
+    // legitimately empty here -- no container has ever actually run
+    // (nothing has extracted this image's own rootfs into the cache
+    // yet), which this RPC reports as a real, honest zero rather than
+    // an error.
+    assert_eq!(response.container_filesystems.len(), 1);
+    let container_fs = &response.container_filesystems[0];
+    assert!(container_fs.timestamp > 0);
+    assert_eq!(container_fs.used_bytes.as_ref().unwrap().value, 0);
+    assert_eq!(container_fs.inodes_used.as_ref().unwrap().value, 0);
+}
+
+/// `ImageFsInfo` on a completely empty store (nothing pulled, nothing
+/// ever run) is a real, honest all-zero report, not an error — both
+/// `blobs_dir` (created eagerly by `Store::open`) and `cache_root`
+/// (never created until something actually extracts a rootfs) are
+/// covered, the latter exercising the "directory doesn't exist yet"
+/// path directly.
+#[tokio::test]
+async fn image_fs_info_on_an_empty_store_is_a_real_zero_not_an_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("ocicri.sock");
+    let _server = spawn_server(storage_dir.path(), &socket_path);
+    wait_for_socket(&socket_path);
+
+    let mut client = connect(socket_path).await;
+    let response = client
+        .image_fs_info(ImageFsInfoRequest {})
+        .await
+        .expect("ImageFsInfo on an empty store should not be a gRPC error")
+        .into_inner();
+
+    for fs in response
+        .image_filesystems
+        .iter()
+        .chain(response.container_filesystems.iter())
+    {
+        assert_eq!(fs.used_bytes.as_ref().unwrap().value, 0);
+        assert_eq!(fs.inodes_used.as_ref().unwrap().value, 0);
+        assert!(fs.timestamp > 0);
+    }
 }

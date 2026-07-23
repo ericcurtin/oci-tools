@@ -50,7 +50,7 @@ pub use resolve::{
     untagged_reference,
 };
 pub use rootfs_cache::{
-    CachePruneReport, cache_dir_for, cache_root, dir_size, ensure_cached, prune,
+    CachePruneReport, cache_dir_for, cache_root, dir_size, dir_stats, ensure_cached, prune,
 };
 
 /// Errors returned by [`Store`] operations.

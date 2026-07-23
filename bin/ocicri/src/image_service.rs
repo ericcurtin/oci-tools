@@ -1,12 +1,14 @@
 //! The real `ImageService` gRPC implementation — `ListImages`/
-//! `ImageStatus`/`PullImage`/`RemoveImage` are genuinely implemented,
-//! reusing this project's own already-tested `oci_store`/
+//! `ImageStatus`/`PullImage`/`RemoveImage`/`ImageFsInfo` are genuinely
+//! implemented, reusing this project's own already-tested `oci_store`/
 //! `oci_registry` primitives directly (the same ones `ociman images`/
 //! `ociman inspect`/`ociman pull` already use) rather than anything
-//! new. `ImageFsInfo`/`StreamImages` each return a real, honest
-//! `Status::unimplemented` naming itself — matching this project's
-//! own established "narrow first slice, document the rest" pattern
-//! (see `runtime_service.rs`'s own module doc comment for the
+//! new. `StreamImages` (a feature-gated, opt-in streaming alternative
+//! to `ListImages` real `cri-o` itself may not even implement —
+//! `CRIListStreaming`, see the proto's own doc comment) returns a
+//! real, honest `Status::unimplemented` naming itself — matching this
+//! project's own established "narrow first slice, document the rest"
+//! pattern (see `runtime_service.rs`'s own module doc comment for the
 //! identical reasoning applied to `RuntimeService`).
 //!
 //! Behavior checked directly against real `cri-o`'s own
@@ -201,6 +203,52 @@ fn pull_image_blocking(spec: &str) -> Result<String, Status> {
     let record = oci_registry::pull_unconditionally(&store, &reference, true)
         .map_err(|e| Status::unavailable(format!("pulling {reference}: {e}")))?;
     Ok(record.manifest_digest.to_string())
+}
+
+/// Real, on-disk filesystem usage for one real directory — checked
+/// directly against real `cri-o`'s own `getStorageFsInfo`/`utils.
+/// GetDiskUsageStats` (`server/image_fs_info.go`, `utils/
+/// filesystem.go`): a real directory-tree walk summing each entry's
+/// own byte length (never `statfs(2)`), a real, current wall-clock
+/// timestamp (never derived from any file's own mtime).
+///
+/// Unlike real cri-o's own walk (which counts every entry once,
+/// including directories, with no hardlink awareness at all), this
+/// reuses `oci_store::dir_stats` — the exact same real, hardlink-
+/// deduplicated walk `ociman prune` already depends on for a correct
+/// reclaimed-bytes figure (a real bug class, 0106/0111, this RPC has
+/// no reason to reintroduce just to match cri-o's own cruder
+/// arithmetic).
+///
+/// A directory that simply doesn't exist yet (a real, ordinary state
+/// for `oci_store::cache_root` on a store that's never `run`/
+/// `build-image`d anything) is a real, honest zero, not an error —
+/// unlike real cri-o's own test suite, which does expect an error for
+/// a missing directory: that difference is deliberate, since a
+/// missing `cache_root` here is routine, expected state, not
+/// misconfiguration, and a caller (a real kubelet) shouldn't see this
+/// RPC fail just because nothing has been extracted yet. Any other
+/// I/O error (permission denied, ...) still propagates as a real,
+/// honest failure.
+fn filesystem_usage(dir: &std::path::Path, now_nanos: i64) -> Result<cri::FilesystemUsage, Status> {
+    let (bytes, files) = match oci_store::dir_stats(dir) {
+        Ok(stats) => stats,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, 0),
+        Err(e) => {
+            return Err(Status::internal(format!(
+                "computing usage for {}: {e}",
+                dir.display()
+            )));
+        }
+    };
+    Ok(cri::FilesystemUsage {
+        timestamp: now_nanos,
+        fs_id: Some(cri::FilesystemIdentifier {
+            mountpoint: dir.display().to_string(),
+        }),
+        used_bytes: Some(cri::UInt64Value { value: bytes }),
+        inodes_used: Some(cri::UInt64Value { value: files }),
+    })
 }
 
 /// A real, honest "not implemented yet" error for every RPC this first
@@ -417,7 +465,26 @@ impl cri::image_service_server::ImageService for ImageServiceImpl {
         &self,
         _request: Request<cri::ImageFsInfoRequest>,
     ) -> Result<Response<cri::ImageFsInfoResponse>, Status> {
-        unimplemented("ImageFsInfo")
+        let store = open_store()?;
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        // `image_filesystems`: this project's own real, content-
+        // addressed blob store -- every image's actual on-disk bytes.
+        // `container_filesystems`: this project's own real, extracted
+        // rootfs cache -- the closest real analogue to cri-o's own
+        // separate "container filesystem" figure, since running
+        // containers are backed by that cache, not the blob store
+        // directly (see `filesystem_usage`'s own doc comment for the
+        // full reasoning).
+        let image_filesystems = vec![filesystem_usage(&store.blobs_dir(), now_nanos)?];
+        let container_filesystems =
+            vec![filesystem_usage(&oci_store::cache_root(&store), now_nanos)?];
+        Ok(Response::new(cri::ImageFsInfoResponse {
+            image_filesystems,
+            container_filesystems,
+        }))
     }
 }
 
