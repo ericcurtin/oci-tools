@@ -63,6 +63,18 @@ State lives under `~/.cache/oci-tools-ci/` (base images, VM overlay disk,
 build-cache disk `cache-disk.qcow2` carrying rustup/cargo/target between
 runs — delete it for a cold build).
 
+## Benchmarking
+
+```sh
+ci/bench.sh   # ocirun vs crun/runc, ociman vs podman/docker, real hyperfine
+```
+
+Real, direct `hyperfine` comparisons against whatever of crun/runc/podman/
+docker/busybox is actually installed (skips what isn't, rather than
+failing). See `docs/benchmarks.md` for the full methodology and historical
+results. Local/manual use only, like `ci/build-rpm.sh`/`ci/build-deb.sh` —
+not wired into CI (a shared runner is a poor host for wall-clock timing).
+
 ## Version embedding
 
 `--version` embeds the short git hash via `oci-build-info` (a tiny
