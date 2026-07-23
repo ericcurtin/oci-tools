@@ -36,7 +36,9 @@ if [ -e /dev/kvm ]; then
     # x86_64 guests with OVMF by default.
     for p in /sys/module/kvm_intel/parameters/unrestricted_guest \
         /sys/module/kvm_amd/parameters/nested; do
-        [ -f "$p" ] && echo "setup-host: $p = $(cat "$p" 2>/dev/null || echo '?')"
+        if [ -f "$p" ]; then
+            echo "setup-host: $p = $(cat "$p" 2>/dev/null || echo '?')"
+        fi
     done
 else
     echo "setup-host: no /dev/kvm; harness will fall back to TCG"
