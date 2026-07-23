@@ -1,9 +1,9 @@
 //! The real `ImageService` gRPC implementation — `ListImages`/
-//! `ImageStatus`/`PullImage` are genuinely implemented, reusing this
-//! project's own already-tested `oci_store`/`oci_registry` primitives
-//! directly (the same ones `ociman images`/`ociman inspect`/`ociman
-//! pull` already use) rather than anything new. `RemoveImage`/
-//! `ImageFsInfo`/`StreamImages` each return a real, honest
+//! `ImageStatus`/`PullImage`/`RemoveImage` are genuinely implemented,
+//! reusing this project's own already-tested `oci_store`/
+//! `oci_registry` primitives directly (the same ones `ociman images`/
+//! `ociman inspect`/`ociman pull` already use) rather than anything
+//! new. `ImageFsInfo`/`StreamImages` each return a real, honest
 //! `Status::unimplemented` naming itself — matching this project's
 //! own established "narrow first slice, document the rest" pattern
 //! (see `runtime_service.rs`'s own module doc comment for the
@@ -11,13 +11,35 @@
 //!
 //! Behavior checked directly against real `cri-o`'s own
 //! implementation (`~/git/cri-o/server/image_list.go`/`image_status.go`/
-//! `image_pull.go`): a filter naming one specific image resolves just
-//! that one (0 or 1 results, never an error for "not found");
-//! `ImageStatus` of an unresolvable image returns an empty response
-//! (`image: None`), not an error either — only a request naming no
-//! image at all is a real error; `PullImage` is always unconditional
-//! (no pull-policy concept at the CRI layer at all, unlike `ociman run
-//! --pull`).
+//! `image_pull.go`/`image_remove.go`): a filter naming one specific
+//! image resolves just that one (0 or 1 results, never an error for
+//! "not found"); `ImageStatus` of an unresolvable image returns an
+//! empty response (`image: None`), not an error either — only a
+//! request naming no image at all is a real error; `PullImage` is
+//! always unconditional (no pull-policy concept at the CRI layer at
+//! all, unlike `ociman run --pull`); `RemoveImage` of an already-
+//! removed (or never-existing) image is a real, silent, idempotent
+//! success, matching the real proto's own documented contract
+//! ("must not return an error if the image has already been
+//! removed"), and — a genuinely *different* rule than `ociman rmi`'s
+//! own, checked directly against `removeImage`'s own real `UntagImage`
+//! path and the proto's own doc comment on `RemoveImage`
+//! ("removing the image by a single tag will remove all of its tags,
+//! even across different repositories") — removing *any one* tag or
+//! ID resolving to an image removes *every* tag/reference sharing
+//! that same manifest digest, unconditionally, with no `--force`-
+//! style ambiguity gate at all (this RPC has no interactive
+//! confirmation to skip in the first place, the same "nothing to
+//! skip" reasoning this project's own `ocibox rm`/`ephemeral` already
+//! established for an identical reason).
+//!
+//! Real `cri-o`'s own `RemoveImage` additionally refuses to remove an
+//! image any container still references (`volumeInUse`) — not ported
+//! here: this project's own `ocicri` can't create any container via
+//! CRI at all yet (every `RuntimeService` pod-sandbox/container RPC is
+//! still a real, honest `Status::unimplemented`), so there is
+//! currently no possible "in use by a real CRI container" case to
+//! even check against.
 //!
 //! `PullImage`'s own real, unconditional pull runs on a
 //! `tokio::task::spawn_blocking` thread, not directly in its own
@@ -336,9 +358,59 @@ impl cri::image_service_server::ImageService for ImageServiceImpl {
 
     async fn remove_image(
         &self,
-        _request: Request<cri::RemoveImageRequest>,
+        request: Request<cri::RemoveImageRequest>,
     ) -> Result<Response<cri::RemoveImageResponse>, Status> {
-        unimplemented("RemoveImage")
+        let spec = request
+            .into_inner()
+            .image
+            .map(|s| s.image)
+            .filter(|s| !s.is_empty());
+        let Some(spec) = spec else {
+            return Err(Status::invalid_argument("no image specified"));
+        };
+
+        let store = open_store()?;
+        let resolved = match oci_store::resolve_by_reference_or_id(&store, &spec) {
+            Ok(resolved) => resolved,
+            // A short ID prefix genuinely matching more than one
+            // *different* image is a real client-input problem (which
+            // one did the caller actually mean?) -- distinct from
+            // "nothing resolved at all", which is the real, silent,
+            // idempotent-success case below.
+            Err(oci_store::StoreError::AmbiguousId { spec, count }) => {
+                return Err(Status::invalid_argument(format!(
+                    "image ID {spec:?} is ambiguous: matches {count} different images"
+                )));
+            }
+            Err(e) => return Err(store_error("resolving image", e)),
+        };
+
+        // Nothing resolved at all: a real, silent, idempotent success
+        // -- matching the real proto's own documented contract
+        // exactly ("must not return an error if the image has already
+        // been removed").
+        let Some(resolved) = resolved else {
+            return Ok(Response::new(cri::RemoveImageResponse::default()));
+        };
+
+        // Every real reference sharing this same manifest digest is
+        // removed, not just the one `spec` happened to name -- see
+        // this module's own doc comment for the real proto citation
+        // this matches (removing by any one tag/ID removes every tag,
+        // a genuinely different rule than `ociman rmi`'s own).
+        let digest = resolved.record().manifest_digest.to_string();
+        for record in store
+            .list_images()
+            .map_err(|e| store_error("listing images", e))?
+        {
+            if record.manifest_digest.to_string() == digest {
+                store
+                    .remove_image(&record.reference)
+                    .map_err(|e| store_error("removing image", e))?;
+            }
+        }
+
+        Ok(Response::new(cri::RemoveImageResponse::default()))
     }
 
     async fn image_fs_info(
@@ -411,6 +483,21 @@ mod tests {
                 auth: None,
                 sandbox_config: None,
             }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    // `remove_image`'s own real removal/idempotency/sibling-tag cases
+    // are covered by the real, socket-connecting integration tests in
+    // `tests/tests/ocicri_image_service.rs` instead of here, for the
+    // same reason given above -- the "no image specified" argument
+    // check alone needs no store access at all, so it's safe here.
+    #[tokio::test]
+    async fn remove_image_with_no_image_at_all_is_invalid_argument() {
+        let service = ImageServiceImpl;
+        let status = service
+            .remove_image(Request::new(cri::RemoveImageRequest { image: None }))
             .await
             .unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);

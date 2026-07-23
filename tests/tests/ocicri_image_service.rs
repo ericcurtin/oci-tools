@@ -13,9 +13,11 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 use oci_cri_types::image_service_client::ImageServiceClient;
-use oci_cri_types::{ImageFilter, ImageSpec, ImageStatusRequest, ListImagesRequest};
+use oci_cri_types::{
+    ImageFilter, ImageSpec, ImageStatusRequest, ListImagesRequest, RemoveImageRequest,
+};
 use oci_spec_types::image::ContainerConfig;
-use oci_store::Store;
+use oci_store::{ImageRecord, Store};
 use oci_tools_tests::{bin_path, busybox_path, seed_image, seed_image_with_files};
 
 struct Server {
@@ -335,6 +337,146 @@ async fn image_status_with_no_image_specified_is_a_real_invalid_argument_error()
             image: None,
             verbose: false,
         })
+        .await
+        .expect_err("no image specified should be a real error");
+
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn remove_image_removes_a_real_seeded_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocicri-test/remove-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("ocicri.sock");
+    let _server = spawn_server(storage_dir.path(), &socket_path);
+    wait_for_socket(&socket_path);
+
+    let mut client = connect(socket_path).await;
+    client
+        .remove_image(RemoveImageRequest {
+            image: Some(ImageSpec {
+                image: "ocicri-test/remove-base:latest".to_string(),
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("RemoveImage failed");
+
+    let list = client
+        .list_images(ListImagesRequest { filter: None })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(list.images.is_empty(), "{:?}", list.images);
+}
+
+/// The real proto's own documented contract, genuinely different from
+/// `ociman rmi`'s own (no `--force` ambiguity gate at all): removing
+/// *any one* tag resolving to an image removes *every* real reference
+/// sharing that same manifest digest.
+#[tokio::test]
+async fn remove_image_by_one_tag_removes_every_sibling_tag_too() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocicri-test/sibling-a:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let manifest_digest = store
+        .resolve_image("docker.io/ocicri-test/sibling-a:latest")
+        .unwrap()
+        .unwrap()
+        .manifest_digest;
+    store
+        .put_image(&ImageRecord {
+            reference: "docker.io/ocicri-test/sibling-b:latest".to_string(),
+            manifest_digest,
+        })
+        .unwrap();
+
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("ocicri.sock");
+    let _server = spawn_server(storage_dir.path(), &socket_path);
+    wait_for_socket(&socket_path);
+
+    let mut client = connect(socket_path).await;
+    client
+        .remove_image(RemoveImageRequest {
+            image: Some(ImageSpec {
+                image: "ocicri-test/sibling-a:latest".to_string(),
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("RemoveImage failed");
+
+    let list = client
+        .list_images(ListImagesRequest { filter: None })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        list.images.is_empty(),
+        "removing one tag should have removed its sibling tag too: {:?}",
+        list.images
+    );
+}
+
+#[tokio::test]
+async fn remove_image_of_an_already_removed_image_is_a_real_silent_success() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("ocicri.sock");
+    let _server = spawn_server(storage_dir.path(), &socket_path);
+    wait_for_socket(&socket_path);
+
+    let mut client = connect(socket_path).await;
+    client
+        .remove_image(RemoveImageRequest {
+            image: Some(ImageSpec {
+                image: "ocicri-test/does-not-exist:latest".to_string(),
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("RemoveImage of a nonexistent image must be idempotent, not an error");
+}
+
+#[tokio::test]
+async fn remove_image_with_no_image_specified_is_a_real_invalid_argument_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("ocicri.sock");
+    let _server = spawn_server(storage_dir.path(), &socket_path);
+    wait_for_socket(&socket_path);
+
+    let mut client = connect(socket_path).await;
+    let status = client
+        .remove_image(RemoveImageRequest { image: None })
         .await
         .expect_err("no image specified should be a real error");
 
