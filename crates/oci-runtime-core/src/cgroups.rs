@@ -470,6 +470,27 @@ pub fn memory_limit_bytes(cgroup_dir: &Path) -> io::Result<u64> {
     read_single_value_as_u64(&cgroup_dir.join("memory.max"))
 }
 
+/// The raw `memory.current` value, *without* [`memory_usage_bytes`]'s
+/// own inactive-file subtraction — what the CRI's `MemoryUsage.
+/// usage_bytes` field reports (real cri-o's own `memStats.Usage.
+/// Usage`, checked directly against `internal/lib/statsserver/
+/// stats_server_linux.go`), alongside the subtracted form's own
+/// `working_set_bytes`.
+pub fn memory_current_bytes(cgroup_dir: &Path) -> io::Result<u64> {
+    read_single_value_as_u64(&cgroup_dir.join("memory.current"))
+}
+
+/// One named key out of `memory.stat` (`anon`, `pgfault`,
+/// `pgmajfault`, ...) — the remaining raw ingredients real cri-o's
+/// own cgroup-v2 CRI memory stats are computed from (its
+/// `computeMemoryStats`, checked directly: `rss = anon`,
+/// `page_faults = pgfault`, `major_page_faults = pgmajfault`). A key
+/// the kernel hasn't emitted (yet) reads as 0, the same tolerance
+/// [`memory_usage_bytes`]'s own `inactive_file` read already applies.
+pub fn memory_stat_key(cgroup_dir: &Path, key: &str) -> io::Result<u64> {
+    read_stat_key_as_u64(&cgroup_dir.join("memory.stat"), key)
+}
+
 /// The number of tasks (processes+threads) currently in the cgroup —
 /// `pids.current`.
 pub fn pids_current(cgroup_dir: &Path) -> io::Result<u64> {
@@ -1174,6 +1195,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cpu_usage_nanos(dir.path()).unwrap(), 0);
+    }
+
+    #[test]
+    fn memory_current_and_stat_key_read_the_raw_values() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("memory.current"), "5000000\n").unwrap();
+        std::fs::write(
+            dir.path().join("memory.stat"),
+            "anon 4000000\ninactive_file 3000000\npgfault 42\n",
+        )
+        .unwrap();
+        // Raw current: no inactive_file subtraction (that's
+        // `memory_usage_bytes`'s own job).
+        assert_eq!(memory_current_bytes(dir.path()).unwrap(), 5_000_000);
+        assert_eq!(memory_stat_key(dir.path(), "anon").unwrap(), 4_000_000);
+        assert_eq!(memory_stat_key(dir.path(), "pgfault").unwrap(), 42);
+        // A key the kernel hasn't emitted reads as 0, never an error.
+        assert_eq!(memory_stat_key(dir.path(), "pgmajfault").unwrap(), 0);
     }
 
     #[test]

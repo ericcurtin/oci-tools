@@ -79,7 +79,8 @@ fn unimplemented<T>(name: &str) -> Result<Response<T>, Status> {
     Err(Status::unimplemented(format!(
         "ocicri: {name} is not implemented yet (milestone 7: Version/Status/RuntimeConfig/\
          UpdateRuntimeConfig/ListMetricDescriptors, the pod-sandbox lifecycle, the container \
-         lifecycle (create/start/stop/remove/status/list), and ExecSync are answered so far)"
+         lifecycle (create/start/stop/remove/status/list), ExecSync, and container stats are \
+         answered so far)"
     )))
 }
 
@@ -301,6 +302,168 @@ fn force_kill_and_reconcile(
         "container {} did not exit after SIGKILL",
         record.id
     )))
+}
+
+/// Builds one container's real CRI stats (`docs/design/0241`) from
+/// its live cgroup and its bundle rootfs — the same shared
+/// `oci_runtime_core::cgroups` readers `ociman stats` already uses,
+/// mapped onto the CRI message shapes with real cri-o's own cgroup-v2
+/// formulas (`internal/lib/statsserver/stats_server_linux.go`,
+/// checked directly): `usage_core_nano_seconds` from `cpu.stat`,
+/// `working_set_bytes` = current − `inactive_file` (the shared
+/// `memory_usage_bytes` already computes exactly this), `usage_bytes`
+/// raw, `rss = anon`, `pgfault`/`pgmajfault`, `available_bytes` only
+/// when a real limit exists, `pids.current`, and the writable layer's
+/// own real disk usage (the bundle rootfs, via the same
+/// hardlink-aware `oci_store::dir_stats` `ImageFsInfo` uses).
+///
+/// `None` for anything without a live, readable cgroup: a
+/// created/exited container, a pid that died mid-read, or a launch
+/// whose systemd-scope setup fell back to no cgroup at all (the
+/// documented rootless no-D-Bus fallback) — matching real cri-o,
+/// whose own stats server likewise only reports containers with live
+/// cgroup accounting. `usage_nano_cores` is deliberately never
+/// fabricated: real cri-o derives it from *two* samples over time
+/// (its own `updateUsageNanoCores` cache); a single-shot reader has
+/// no honest value to put there, and kubelet computes rates from
+/// `usage_core_nano_seconds` itself.
+fn container_stats_for(record: &container::ContainerRecord) -> Option<cri::ContainerStats> {
+    if record.state != container::ContainerState::Running {
+        return None;
+    }
+    let pid = record.pid?;
+    let cgroup_dir = oci_runtime_core::cgroups::cgroup_dir_for_running_pid(
+        std::path::Path::new("/sys/fs/cgroup"),
+        pid,
+    )
+    .ok()?;
+
+    let now = now_nanos();
+    let cpu_nanos = oci_runtime_core::cgroups::cpu_usage_nanos(&cgroup_dir).ok()?;
+    let working_set = oci_runtime_core::cgroups::memory_usage_bytes(&cgroup_dir).ok()?;
+    let usage_bytes = oci_runtime_core::cgroups::memory_current_bytes(&cgroup_dir).ok()?;
+    let rss = oci_runtime_core::cgroups::memory_stat_key(&cgroup_dir, "anon").unwrap_or(0);
+    let page_faults =
+        oci_runtime_core::cgroups::memory_stat_key(&cgroup_dir, "pgfault").unwrap_or(0);
+    let major_page_faults =
+        oci_runtime_core::cgroups::memory_stat_key(&cgroup_dir, "pgmajfault").unwrap_or(0);
+    let limit = oci_runtime_core::cgroups::memory_limit_bytes(&cgroup_dir).unwrap_or(u64::MAX);
+    let available = (limit != u64::MAX).then(|| limit.saturating_sub(working_set));
+    // (`pids.current` belongs to the CRI's *sandbox* stats message
+    // (`ProcessUsage`), which stays unimplemented -- the container
+    // stats message has no process field at all.)
+
+    let rootfs = crate::bundle::bundle_dir(&oci_cli_common::storage::default_root(), &record.id)
+        .join("rootfs");
+    let writable_layer =
+        oci_store::dir_stats(&rootfs)
+            .ok()
+            .map(|(bytes, files)| cri::FilesystemUsage {
+                timestamp: now,
+                fs_id: Some(cri::FilesystemIdentifier {
+                    mountpoint: rootfs.display().to_string(),
+                }),
+                used_bytes: Some(cri::UInt64Value { value: bytes }),
+                inodes_used: Some(cri::UInt64Value { value: files }),
+            });
+
+    Some(cri::ContainerStats {
+        attributes: Some(cri::ContainerAttributes {
+            id: record.id.clone(),
+            metadata: Some(container_metadata_to_proto(&record.metadata)),
+            labels: record.labels.clone(),
+            annotations: record.annotations.clone(),
+        }),
+        cpu: Some(cri::CpuUsage {
+            timestamp: now,
+            usage_core_nano_seconds: Some(cri::UInt64Value { value: cpu_nanos }),
+            usage_nano_cores: None,
+            // PSI accounting: a real, optional kernel feature real
+            // cri-o itself only reports when available -- not read
+            // here yet (docs/design/0241).
+            psi: None,
+        }),
+        memory: Some(cri::MemoryUsage {
+            timestamp: now,
+            working_set_bytes: Some(cri::UInt64Value { value: working_set }),
+            usage_bytes: Some(cri::UInt64Value { value: usage_bytes }),
+            rss_bytes: Some(cri::UInt64Value { value: rss }),
+            page_faults: Some(cri::UInt64Value { value: page_faults }),
+            major_page_faults: Some(cri::UInt64Value {
+                value: major_page_faults,
+            }),
+            available_bytes: available.map(|value| cri::UInt64Value { value }),
+            psi: None,
+        }),
+        writable_layer,
+        swap: None,
+        io: None,
+    })
+}
+
+/// The filtered stats-list computation behind both
+/// `ListContainerStats` and its `CRIListStreaming` sibling — the
+/// filter is `ContainerStatsFilter` (`id`/`pod_sandbox_id`/
+/// `label_selector`, no state field), with the same AND/prefix rules
+/// as [`container_list_items`]; containers without live cgroup
+/// accounting are silently absent, matching real cri-o's own stats
+/// server.
+fn container_stats_items(
+    filter: Option<cri::ContainerStatsFilter>,
+) -> Result<Vec<cri::ContainerStats>, Status> {
+    // Reuse the container-list resolution by mapping the stats filter
+    // onto the list filter's own identical id/sandbox/label fields.
+    let list_filter = filter.map(|f| cri::ContainerFilter {
+        id: f.id,
+        pod_sandbox_id: f.pod_sandbox_id,
+        label_selector: f.label_selector,
+        state: None,
+    });
+    let root = container_store_root();
+    let records = match list_filter.as_ref() {
+        Some(f) if !f.id.is_empty() => match container::find_by_id_prefix(&root, &f.id) {
+            Ok(Some(record)) => {
+                if f.pod_sandbox_id.is_empty() || record.sandbox_id.starts_with(&f.pod_sandbox_id) {
+                    vec![record]
+                } else {
+                    Vec::new()
+                }
+            }
+            Ok(None) | Err(container::LookupError::AmbiguousPrefix(_)) => Vec::new(),
+            Err(container::LookupError::Io(e)) => {
+                return Err(io_error("reading container records", e));
+            }
+        },
+        Some(f) if !f.pod_sandbox_id.is_empty() => {
+            match sandbox::find_by_id_prefix(&sandbox_store_root(), &f.pod_sandbox_id) {
+                Ok(Some(sb)) => container::load_all(&root)
+                    .map_err(|e| io_error("reading container records", e))?
+                    .into_iter()
+                    .filter(|r| r.sandbox_id == sb.id)
+                    .collect(),
+                Ok(None) | Err(sandbox::LookupError::AmbiguousPrefix(_)) => Vec::new(),
+                Err(sandbox::LookupError::Io(e)) => {
+                    return Err(io_error("reading sandbox records", e));
+                }
+            }
+        }
+        _ => container::load_all(&root).map_err(|e| io_error("reading container records", e))?,
+    };
+
+    Ok(records
+        .into_iter()
+        .map(reconcile_container)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|record| {
+            list_filter.as_ref().is_none_or(|f| {
+                f.label_selector
+                    .iter()
+                    .all(|(k, v)| record.labels.get(k) == Some(v))
+            })
+        })
+        .filter_map(|record| container_stats_for(&record))
+        .collect())
 }
 
 /// What one `ExecSync` helper run produced — the blocking half's own
@@ -1460,27 +1623,59 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         unimplemented("PortForward")
     }
 
+    /// Real, live cgroup-backed stats for one container
+    /// (`docs/design/0241`, see [`container_stats_for`]) — an unknown
+    /// ID is an error (real cri-o's own `ContainerStats`), a known
+    /// container without live cgroup accounting (created/exited, or a
+    /// no-cgroup rootless fallback launch) is a real response with no
+    /// stats, never a fabricated zero row.
     async fn container_stats(
         &self,
-        _request: Request<cri::ContainerStatsRequest>,
+        request: Request<cri::ContainerStatsRequest>,
     ) -> Result<Response<cri::ContainerStatsResponse>, Status> {
-        unimplemented("ContainerStats")
+        let id = request.into_inner().container_id;
+        let record = {
+            let _guard = self
+                .sandbox_mutation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(record) = find_container(&id)? else {
+                return Err(Status::not_found(format!(
+                    "could not find container {id:?}"
+                )));
+            };
+            reconcile_container(record)?
+        };
+        Ok(Response::new(cri::ContainerStatsResponse {
+            stats: container_stats_for(&record),
+        }))
     }
 
+    /// Stats for every container matching the filter — see
+    /// [`container_stats_items`] for the exact filter/absence rules.
     async fn list_container_stats(
         &self,
-        _request: Request<cri::ListContainerStatsRequest>,
+        request: Request<cri::ListContainerStatsRequest>,
     ) -> Result<Response<cri::ListContainerStatsResponse>, Status> {
-        unimplemented("ListContainerStats")
+        let stats = container_stats_items(request.into_inner().filter)?;
+        Ok(Response::new(cri::ListContainerStatsResponse { stats }))
     }
 
     type StreamContainerStatsStream = BoxStream<cri::StreamContainerStatsResponse>;
 
+    /// The `CRIListStreaming` variant of `list_container_stats` — the
+    /// same shared chunking every other streaming list RPC here uses
+    /// (0234).
     async fn stream_container_stats(
         &self,
-        _request: Request<cri::StreamContainerStatsRequest>,
+        request: Request<cri::StreamContainerStatsRequest>,
     ) -> Result<Response<Self::StreamContainerStatsStream>, Status> {
-        unimplemented("StreamContainerStats")
+        let items = container_stats_items(request.into_inner().filter)?;
+        Ok(Response::new(crate::stream::chunked(items, |stats| {
+            cri::StreamContainerStatsResponse {
+                container_stats: stats,
+            }
+        })))
     }
 
     async fn pod_sandbox_stats(

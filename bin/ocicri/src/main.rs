@@ -23,8 +23,9 @@
 //! per-container launcher-keeper — this project's own conmon
 //! equivalent — plus `ContainerStatus`/`ListContainers`/
 //! `RemoveContainer` reconciling against the keeper's own real exit
-//! records, and `ExecSync` — kubelet's own exec probes — via a second
-//! hidden re-exec entry point, see `docs/design/0236`-`0238`, `0240`),
+//! records, `ExecSync` — kubelet's own exec probes — via a second
+//! hidden re-exec entry point, and real cgroup-backed container
+//! stats, see `docs/design/0236`-`0238`, `0240`-`0241`),
 //! and all of `ImageService`
 //! (`ListImages`/`StreamImages`/`ImageStatus`/`PullImage`/
 //! `RemoveImage`/`ImageFsInfo`, reusing this project's own

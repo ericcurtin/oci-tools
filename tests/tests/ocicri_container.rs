@@ -1161,3 +1161,180 @@ async fn exec_sync_runs_commands_in_a_running_container() {
         .expect_err("exec into an exited container should fail");
     assert_eq!(err.code(), tonic::Code::NotFound);
 }
+
+/// Same real, reachable-`systemd --user`-session probe
+/// `ociman_stats.rs`/`ociman_top.rs`'s own tests use — without one,
+/// this project's launches fall back to no cgroup at all (the
+/// documented rootless no-D-Bus fallback), and there is nothing for
+/// the stats RPCs to read.
+fn systemd_user_session_available() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-system-running"])
+        .output()
+        .is_ok_and(|out| !out.stdout.is_empty())
+}
+
+/// `ContainerStats`/`ListContainerStats`/`StreamContainerStats`
+/// (`docs/design/0241`): real, live cgroup-backed usage for a running
+/// container — real cri-o's own cgroup-v2 formulas via the same
+/// shared `oci_runtime_core::cgroups` readers `ociman stats` uses —
+/// with created/exited containers honestly absent rather than
+/// fabricated zero rows, and an unknown ID a real `NotFound`.
+#[tokio::test]
+async fn container_stats_report_real_cgroup_usage() {
+    let Some((storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session (containers get no cgroup)");
+        return;
+    }
+
+    // A created-but-never-started container: no stats, honestly.
+    let created_only = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(container_config("stats-created", 0)),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    let response = client
+        .container_stats(oci_cri_types::ContainerStatsRequest {
+            container_id: created_only.clone(),
+        })
+        .await
+        .expect("stats of a created container should be a real response")
+        .into_inner();
+    assert!(
+        response.stats.is_none(),
+        "a container with no live cgroup gets no stats: {response:?}"
+    );
+
+    // A really-running container: real numbers.
+    let mut config = container_config("stats-runner", 0);
+    config.command = vec!["/bin/sleep".to_string(), "300".to_string()];
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+
+    let stats = client
+        .container_stats(oci_cri_types::ContainerStatsRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .expect("ContainerStats failed")
+        .into_inner()
+        .stats
+        .expect("a running container should have real stats");
+    let attributes = stats.attributes.expect("attributes should be present");
+    assert_eq!(attributes.id, container_id);
+    assert_eq!(
+        attributes.labels.get("app"),
+        Some(&"stats-runner".to_string())
+    );
+    let cpu = stats.cpu.expect("cpu usage should be present");
+    assert!(cpu.timestamp > 0);
+    assert!(
+        cpu.usage_core_nano_seconds.is_some(),
+        "usage_core_nano_seconds should be a real reading: {cpu:?}"
+    );
+    let memory = stats.memory.expect("memory usage should be present");
+    let working_set = memory.working_set_bytes.as_ref().map_or(0, |v| v.value);
+    assert!(
+        working_set > 0,
+        "a live sleep process has real memory: {memory:?}"
+    );
+    assert!(
+        memory.usage_bytes.as_ref().map_or(0, |v| v.value) >= working_set,
+        "raw usage includes what working-set subtracts: {memory:?}"
+    );
+    let writable = stats.writable_layer.expect("writable layer present");
+    assert!(
+        writable.used_bytes.as_ref().map_or(0, |v| v.value) > 0,
+        "the extracted rootfs has real bytes: {writable:?}"
+    );
+    assert!(
+        writable
+            .fs_id
+            .as_ref()
+            .is_some_and(|f| f.mountpoint.starts_with(storage.path().to_str().unwrap())),
+        "the mountpoint is the real bundle rootfs: {writable:?}"
+    );
+
+    // List: only the running container appears (the created-only one
+    // has no live cgroup), and the sandbox filter behaves like the
+    // container list's own.
+    let listed = client
+        .list_container_stats(oci_cri_types::ListContainerStatsRequest { filter: None })
+        .await
+        .expect("ListContainerStats failed")
+        .into_inner()
+        .stats;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(
+        listed[0].attributes.as_ref().unwrap().id,
+        container_id,
+        "only the running container has stats"
+    );
+    let by_sandbox = client
+        .list_container_stats(oci_cri_types::ListContainerStatsRequest {
+            filter: Some(oci_cri_types::ContainerStatsFilter {
+                pod_sandbox_id: sandbox_id[..13].to_string(),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .stats;
+    assert_eq!(by_sandbox.len(), 1, "{by_sandbox:?}");
+
+    // The streaming sibling reports the same set (0234's chunking).
+    let mut stream = client
+        .stream_container_stats(oci_cri_types::StreamContainerStatsRequest { filter: None })
+        .await
+        .expect("StreamContainerStats failed")
+        .into_inner();
+    let mut streamed = Vec::new();
+    while let Some(response) = stream.message().await.expect("stream should end cleanly") {
+        streamed.extend(response.container_stats);
+    }
+    assert_eq!(streamed.len(), 1);
+    assert_eq!(streamed[0].attributes.as_ref().unwrap().id, container_id);
+
+    // Unknown ID: a real NotFound (real cri-o's own single-stats
+    // error), and cleanup.
+    let err = client
+        .container_stats(oci_cri_types::ContainerStatsRequest {
+            container_id: "deadbeef".repeat(8),
+        })
+        .await
+        .expect_err("stats of an unknown container should fail");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+    client
+        .stop_container(oci_cri_types::StopContainerRequest {
+            container_id,
+            timeout: 0,
+        })
+        .await
+        .unwrap();
+}
