@@ -25,8 +25,9 @@
 //! `RemoveContainer` reconciling against the keeper's own real exit
 //! records, `ExecSync` — kubelet's own exec probes — via a second
 //! hidden re-exec entry point, real cgroup-backed container
-//! stats, and real CRI-format log files at kubelet's own log path,
-//! see `docs/design/0236`-`0238`, `0240`-`0242`),
+//! stats, and real CRI-format log files at kubelet's own log path
+//! including `ReopenContainerLog` rotation support, see
+//! `docs/design/0236`-`0238`, `0240`-`0243`),
 //! and all of `ImageService`
 //! (`ListImages`/`StreamImages`/`ImageStatus`/`PullImage`/
 //! `RemoveImage`/`ImageFsInfo`, reusing this project's own

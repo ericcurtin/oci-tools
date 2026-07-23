@@ -1479,3 +1479,150 @@ async fn container_logs_are_written_in_the_cri_format() {
         .unwrap();
     assert_eq!(status.log_path, "", "{status:?}");
 }
+
+/// `ReopenContainerLog` (`docs/design/0243`): after the log file is
+/// renamed away (kubelet's own rotation), the reopen command makes
+/// the logger start a fresh file at the same path — old lines stay
+/// in the renamed file, new lines land in the new one. Non-running
+/// and log-less containers are clear errors (cri-o's own "container
+/// is not running" verbatim for the former).
+#[tokio::test]
+async fn reopen_container_log_rotates_to_a_fresh_file() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, mut sandbox_config)) =
+        setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let log_dir = tempfile::tempdir().unwrap();
+    sandbox_config.log_directory = log_dir.path().display().to_string();
+
+    let mut config = container_config("rotator", 0);
+    config.command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "while true; do echo tick; sleep 1; done".to_string(),
+    ];
+    config.log_path = "rotator.log".to_string();
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+
+    // Reopen before start: cri-o's own verbatim error.
+    let err = client
+        .reopen_container_log(oci_cri_types::ReopenContainerLogRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .expect_err("reopen of a never-started container should fail");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("container is not running"),
+        "{err:?}"
+    );
+
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+
+    // Wait for the first tick, then rotate: rename the file away and
+    // tell the logger to reopen.
+    let log_path = log_dir.path().join("rotator.log");
+    let rotated_path = log_dir.path().join("rotator.log.1");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::fs::read_to_string(&log_path)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        assert!(std::time::Instant::now() < deadline, "no first tick");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    std::fs::rename(&log_path, &rotated_path).unwrap();
+    client
+        .reopen_container_log(oci_cri_types::ReopenContainerLogRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .expect("ReopenContainerLog failed");
+
+    // New lines land in a fresh file at the original path.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if contents.contains(" stdout F tick") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reopened log never received a tick; new: {contents:?}, rotated: {:?}",
+            std::fs::read_to_string(&rotated_path).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The rotated file kept the pre-rotation lines.
+    assert!(
+        std::fs::read_to_string(&rotated_path)
+            .unwrap()
+            .contains(" stdout F tick"),
+        "rotated file should retain old lines"
+    );
+
+    // A running container with no log path has no logger to reopen.
+    let mut config = container_config("no-log-rotator", 0);
+    config.command = vec!["/bin/sleep".to_string(), "300".to_string()];
+    let no_log_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id,
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: no_log_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &no_log_id, ContainerState::ContainerRunning).await;
+    let err = client
+        .reopen_container_log(oci_cri_types::ReopenContainerLogRequest {
+            container_id: no_log_id.clone(),
+        })
+        .await
+        .expect_err("reopen without a log path should fail");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("no log path"), "{err:?}");
+
+    // Unknown container: NotFound. Then clean up both runners.
+    let err = client
+        .reopen_container_log(oci_cri_types::ReopenContainerLogRequest {
+            container_id: "deadbeef".repeat(8),
+        })
+        .await
+        .expect_err("reopen of an unknown container should fail");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+    for id in [container_id, no_log_id] {
+        client
+            .stop_container(oci_cri_types::StopContainerRequest {
+                container_id: id,
+                timeout: 0,
+            })
+            .await
+            .unwrap();
+    }
+}

@@ -79,8 +79,8 @@ fn unimplemented<T>(name: &str) -> Result<Response<T>, Status> {
     Err(Status::unimplemented(format!(
         "ocicri: {name} is not implemented yet (milestone 7: Version/Status/RuntimeConfig/\
          UpdateRuntimeConfig/ListMetricDescriptors, the pod-sandbox lifecycle, the container \
-         lifecycle (create/start/stop/remove/status/list), ExecSync, and container stats are \
-         answered so far)"
+         lifecycle (create/start/stop/remove/status/list), ExecSync, container stats, and \
+         CRI log files including ReopenContainerLog are answered so far)"
     )))
 }
 
@@ -1477,11 +1477,91 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         unimplemented("UpdateContainerResources")
     }
 
+    /// Log rotation's other half (`docs/design/0243`): kubelet renames
+    /// the CRI log file away, then calls this so subsequent lines land
+    /// in a fresh file at the same path. Implemented exactly the way
+    /// real cri-o drives real conmon (checked directly,
+    /// `internal/oci/runtime_oci.go`: a command written to conmon's
+    /// own control fifo in the bundle path): one byte into the
+    /// logger's own `logger-ctl` fifo. Semantics match cri-o's own
+    /// RPC: unknown container an error, "container is not running"
+    /// for anything not running — plus one honest narrowing: a
+    /// running container that was never given a log path has no
+    /// logger (and no log to rotate), a clear error rather than a
+    /// silent success.
     async fn reopen_container_log(
         &self,
-        _request: Request<cri::ReopenContainerLogRequest>,
+        request: Request<cri::ReopenContainerLogRequest>,
     ) -> Result<Response<cri::ReopenContainerLogResponse>, Status> {
-        unimplemented("ReopenContainerLog")
+        let id = request.into_inner().container_id;
+        let record = {
+            let _guard = self
+                .sandbox_mutation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(record) = find_container(&id)? else {
+                return Err(Status::not_found(format!(
+                    "could not find container {id:?}"
+                )));
+            };
+            reconcile_container(record)?
+        };
+        if record.state != container::ContainerState::Running {
+            // Real cri-o's own message, verbatim.
+            return Err(Status::failed_precondition("container is not running"));
+        }
+        if record.log_path.is_none() {
+            return Err(Status::failed_precondition(format!(
+                "container {} has no log path (no logger to reopen)",
+                record.id
+            )));
+        }
+
+        let ctl_path =
+            crate::bundle::bundle_dir(&oci_cli_common::storage::default_root(), &record.id)
+                .join(crate::launcher::LOGGER_CTL_FILENAME);
+        // Nonblocking write-only open: succeeds only while the logger
+        // is actually reading (a real liveness check -- `ENXIO`
+        // otherwise); retried briefly to cover the logger's own
+        // between-commands re-open window. Runs on the blocking pool
+        // (real filesystem waits).
+        tokio::task::spawn_blocking(move || -> Result<(), Status> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match rustix::fs::open(
+                    &ctl_path,
+                    rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::NONBLOCK,
+                    rustix::fs::Mode::empty(),
+                ) {
+                    Ok(fd) => {
+                        rustix::io::write(&fd, b"r").map_err(|e| {
+                            Status::internal(format!("writing reopen command: {e}"))
+                        })?;
+                        return Ok(());
+                    }
+                    // ENXIO: no reader right now -- either the logger
+                    // is between control rounds (retry) or genuinely
+                    // gone (give up at the deadline).
+                    Err(rustix::io::Errno::NXIO) => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(Status::internal(
+                                "the container's logger is not listening (ENXIO)",
+                            ));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(e) => {
+                        return Err(Status::internal(format!(
+                            "opening logger control fifo: {e}"
+                        )));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("reopen task panicked: {e}")))??;
+
+        Ok(Response::new(cri::ReopenContainerLogResponse {}))
     }
 
     /// Runs a command synchronously inside a running container

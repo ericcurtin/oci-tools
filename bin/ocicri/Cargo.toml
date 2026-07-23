@@ -19,7 +19,7 @@ oci-registry.workspace = true
 libc.workspace = true
 oci-runtime-core.workspace = true
 oci-spec-types.workspace = true
-rustix = { workspace = true, features = ["pipe", "process", "stdio"] }
+rustix = { workspace = true, features = ["fs", "pipe", "process", "stdio"] }
 oci-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true

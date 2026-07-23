@@ -144,6 +144,17 @@ pub const PID_FILENAME: &str = "pid";
 pub const EXIT_FILENAME: &str = "exit.json";
 pub const START_ERROR_FILENAME: &str = "start-error";
 
+/// The logger's control FIFO (`docs/design/0243`) — the same
+/// mechanism real conmon uses for its own log-reopen command (cri-o
+/// writes to conmon's `ctl` fifo in the bundle path, checked
+/// directly): any byte written here makes the logger reopen its log
+/// file, which is exactly what `ReopenContainerLog` needs after
+/// kubelet rotates the file away. Opening it for writing with
+/// `O_NONBLOCK` doubles as a real liveness check — `ENXIO` means no
+/// logger is reading (dead, or never existed for a log-less
+/// container).
+pub const LOGGER_CTL_FILENAME: &str = "logger-ctl";
+
 /// What `exit.json` records.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ExitRecord {
@@ -211,7 +222,7 @@ fn run(args: &[String]) -> anyhow::Result<()> {
     // still single-threaded: the logger is a forked process, never a
     // thread, for exactly that reason.
     let discard_output = if let Some(log_path) = log_path {
-        setup_cri_logging(Path::new(log_path)).context("setting up CRI logging")?;
+        setup_cri_logging(dir, Path::new(log_path)).context("setting up CRI logging")?;
         false // The container inherits the pipe fds now on 1/2.
     } else {
         true // No log path: discard, as before.
@@ -384,13 +395,28 @@ fn copy_stream_as_cri(
 /// both streams until EOF, which arrives once the container *and*
 /// this launcher have both let go (the launcher does so explicitly
 /// right before recording the exit).
-fn setup_cri_logging(log_path: &Path) -> anyhow::Result<()> {
+fn setup_cri_logging(bundle_dir: &Path, log_path: &Path) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
     let (stdout_read, stdout_write) =
         rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).context("creating pipe")?;
     let (stderr_read, stderr_write) =
         rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).context("creating pipe")?;
+
+    // The reopen-control FIFO (see `LOGGER_CTL_FILENAME`'s own doc
+    // comment), created before the logger forks so `ReopenContainerLog`
+    // can never race its existence. A leftover from a previous
+    // launcher of this same bundle can't exist (a CRI container is
+    // started at most once), so creation failing is a real error.
+    let ctl_path = bundle_dir.join(LOGGER_CTL_FILENAME);
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &ctl_path,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .context("creating logger control fifo")?;
 
     // Wire this launcher's own fds 1/2 to the write ends *first*
     // (then drop the originals -- 1/2 themselves keep the pipes
@@ -426,7 +452,45 @@ fn setup_cri_logging(log_path: &Path) -> anyhow::Result<()> {
             else {
                 std::process::exit(1);
             };
-            let file = std::sync::Mutex::new(file);
+            let file = std::sync::Arc::new(std::sync::Mutex::new(file));
+
+            // The reopen-control listener (`docs/design/0243`):
+            // deliberately a *detached* thread, never a scoped one --
+            // it blocks forever waiting for the next command, and the
+            // logger's own exit (the scope below ending at stream
+            // EOF, then `process::exit`) must not wait for it.
+            let file_for_ctl = std::sync::Arc::clone(&file);
+            let log_path_for_ctl = log_path.clone();
+            std::thread::spawn(move || {
+                loop {
+                    // Opening blocks until a writer appears; EOF ends
+                    // one round and the loop re-opens for the next.
+                    let Ok(mut ctl) = std::fs::File::open(&ctl_path) else {
+                        return;
+                    };
+                    let mut buf = [0u8; 16];
+                    let got_command =
+                        matches!(std::io::Read::read(&mut ctl, &mut buf), Ok(n) if n > 0);
+                    if !got_command {
+                        continue;
+                    }
+                    // Reopen: a fresh create-or-append handle at the
+                    // same path -- after kubelet renamed the old file
+                    // away, this is the brand-new file its rotation
+                    // expects subsequent lines in. Append (never
+                    // truncate): if nothing actually rotated, the
+                    // existing content must survive.
+                    if let Ok(new_file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log_path_for_ctl)
+                        && let Ok(mut guard) = file_for_ctl.lock()
+                    {
+                        *guard = new_file;
+                    }
+                }
+            });
+
             std::thread::scope(|scope| {
                 scope.spawn(|| copy_stream_as_cri(stdout_read, "stdout", &file));
                 copy_stream_as_cri(stderr_read, "stderr", &file);
