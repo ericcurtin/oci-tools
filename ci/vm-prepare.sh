@@ -26,7 +26,8 @@ if command -v dnf >/dev/null 2>&1; then
         e2fsprogs \
         erofs-utils \
         cryptsetup \
-        grub2-tools
+        grub2-tools \
+        rpm-build
 elif command -v apt-get >/dev/null 2>&1; then
     sudo apt-get update -qq
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \

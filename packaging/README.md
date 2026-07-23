@@ -23,31 +23,41 @@ binaries into place), inspects the result (`rpm -qlp`/`rpm -qip`), and
 extracts + runs every CLI binary's own `--version` as a real smoke
 test.
 
-## Why local-only for now (not wired into `.github/workflows/ci.yml`)
+## Why plain `rpmbuild -bb --nodeps` on a non-RPM-native host
 
 `rpmbuild` itself works fine on any host with `rpm-build` installed
 (confirmed directly, including on this project's own Ubuntu
 development environment) — the *dependency* side is the real
-complication: `BuildRequires`/`Requires` are checked (and, for an
-actual `rpm -i`, enforced) against the **RPM** package database
-specifically. On a non-RPM-native host (Ubuntu/dpkg, both this
-project's own dev environment and GitHub's own `ubuntu-24.04`/
-`ubuntu-24.04-arm` CI runners), that database is empty regardless of
+complication: `BuildRequires` is checked against the **RPM** package
+database specifically. On a non-RPM-native host (Ubuntu/dpkg, this
+project's own dev environment), that database is empty regardless of
 what's genuinely installed via `dpkg` — confirmed directly: `gcc` is a
 real, installed `dpkg` package here, but `rpm -q gcc` still reports
 "not installed". `ci/build-rpm.sh` works around this with a real,
 standard `rpmbuild --nodeps` (only skips the *local* ad-hoc safety
 check; the produced RPM's own `BuildRequires`/`Requires` metadata is
-unaffected and correct for a real RPM-based system), but that same gap
-means a genuine `rpm -i` install-and-run verification can't happen on
-this project's own current CI runners at all — only a real CentOS
-Stream 10 (or Fedora) runner could do that meaningfully. Wiring a real
-RPM-native CI job (most likely reusing this project's own existing
-`ci/vm-ci.sh`/`ci/run-in-vm.sh` VM harness, already booting a real
-CentOS Stream 10 guest for exactly this project's own other CI checks)
-is real, still-ahead follow-up work, not done in this first slice.
+unaffected and correct for a real RPM-based system) — the produced
+RPM package's own content and metadata are unaffected either way.
 
-## Verified for real, once, inside a genuine CentOS Stream 10 VM
+## Now wired into CI for real (`docs/design/0227`)
+
+The `vm-test` matrix's own `centos-stream10` cell (`.github/workflows/
+ci.yml`) — a real CentOS Stream 10 guest, already booted there for its
+own workspace build/test — now also runs `ci/build-rpm.sh` with
+`OCI_RPM_VERIFY_INSTALL=1` (via `ci/vm-ci.sh`), on every push and pull
+request: a real `sudo rpm -i`, every CLI binary's own `--version` from
+its real installed path, and a real `sudo rpm -e` leaving no residue —
+not just extract-and-run. That flag has its own real, automatic safety
+guard (`rpm -q rpm` must already resolve) so it can never be set by
+mistake on a non-RPM-native host and risk writing untracked files
+there — checked directly, the hard way: an earlier draft of this
+project's own assumption that `rpm -i` "refuses" on a non-RPM-native
+host was wrong (see `docs/design/0227`). The `ubuntu-26.04` cell never
+attempts this at all (RPM packaging is CentOS-specific); the built RPM
+is uploaded as its own CI artifact only for the `centos-stream10`
+cell.
+
+## Verified for real, once by hand, then wired into CI for good
 
 Manually verified end to end (`docs/design/0224`/`0225`) using this
 project's own existing `ci/vm.sh` harness, booting a real CentOS
@@ -70,12 +80,10 @@ host could ever have surfaced:
   binaries' own DWARF shape — fixed with the standard `%global debug_
   package %{nil}` directive (`docs/design/0225`).
 
-This was a one-off, manual, ad hoc verification (the VM state used for
-it was torn down afterward, not kept as a persistent cache) — a real,
-repeatable, wired-into-CI version of this exact same verification
-(most likely reusing `ci/vm-ci.sh`/`ci/run-in-vm.sh` directly rather
-than the lower-level `ci/vm.sh` primitives used here by hand) is real,
-separate, still-ahead follow-up work.
+Both blockers had to be fixed before a real, repeatable, wired-into-CI
+version of this same verification became possible at all — see above
+for that (`docs/design/0227`), now live in `.github/workflows/ci.yml`
+itself rather than only ever run by hand.
 
 ## DEB
 

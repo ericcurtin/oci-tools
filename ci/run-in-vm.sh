@@ -77,7 +77,7 @@ echo "run-in-vm: preparing guest (distro packages)"
 "$vm" run -- bash -s <"$here/vm-prepare.sh"
 
 echo "run-in-vm: pushing source tree"
-VM_PUSH_EXCLUDE="./.git ./target ./artifacts ./.vm-scratch" \
+VM_PUSH_EXCLUDE="./.git ./target ./artifacts ./artifacts-rpm ./artifacts-deb ./.vm-scratch" \
     "$vm" push "$repo" oci-tools
 
 echo "run-in-vm: building and testing"
@@ -86,5 +86,15 @@ echo "run-in-vm: building and testing"
 echo "run-in-vm: pulling artifacts"
 "$vm" pull artifacts "$repo/artifacts"
 ls -l "$repo/artifacts"
+
+# Only the centos-stream10 cell's own vm-ci.sh ever creates this (real RPM
+# packaging verification, see ci/vm-ci.sh's own comment) -- checked
+# remotely first so the ubuntu-26.04 cell (which never creates it) doesn't
+# turn a missing, expected-to-be-absent directory into a failed `pull`.
+if "$vm" run -- "test -d oci-tools/artifacts-rpm"; then
+    echo "run-in-vm: pulling RPM package"
+    "$vm" pull oci-tools/artifacts-rpm "$repo/artifacts-rpm"
+    ls -l "$repo/artifacts-rpm"
+fi
 
 echo "run-in-vm: success ($base/$arch)"

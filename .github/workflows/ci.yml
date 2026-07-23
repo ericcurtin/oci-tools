@@ -111,6 +111,19 @@ jobs:
           path: artifacts/
           if-no-files-found: error
 
+      # Only the centos-stream10 cell's own ci/vm-ci.sh ever produces
+      # this (a real RPM-native distro, where ci/build-rpm.sh's own
+      # OCI_RPM_VERIFY_INSTALL=1 -- a genuine rpm -i/--version/rpm -e
+      # round trip, not just extract-and-run -- is both meaningful and
+      # safe; see docs/design/0224/0225/0227).
+      - name: Upload RPM package
+        if: matrix.base == 'centos-stream10'
+        uses: actions/upload-artifact@v7
+        with:
+          name: rpm-${{ matrix.base }}-${{ matrix.arch }}
+          path: artifacts-rpm/
+          if-no-files-found: error
+
   # Real aarch64 architecture coverage, without the nested-VM harness
   # `vm-test` uses for x86_64: builds and tests directly on GitHub's own
   # aarch64 runner (a real CPU, no TCG emulation, no /dev/kvm dependency

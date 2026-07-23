@@ -75,4 +75,21 @@ for bin in ocirun ociman ocicri ocibox ociboot ociboot-init; do
 done
 "$HOME/artifacts/ociman" --version
 
+# --- RPM packaging verification (CentOS Stream 10 only) ---------------------
+# A real, RPM-native distro -- the one guest base where `ci/build-rpm.sh`'s
+# own `OCI_RPM_VERIFY_INSTALL=1` (a genuine `rpm -i`/`--version`/`rpm -e`
+# round trip, not just extract-and-run) is both meaningful and safe (that
+# flag's own real, automatic `rpm -q rpm` safety check -- see
+# ci/build-rpm.sh -- would refuse outright on the Ubuntu 26.04 cell anyway,
+# but there's no reason to even attempt it there). Found and fixed two
+# real, distro-specific blockers getting this far in the first place
+# (`docs/design/0224`/`0225`) -- this is that same verification, now run on
+# every CI push/PR rather than only by hand.
+if [ -r /etc/os-release ] && (. /etc/os-release && [ "$ID" = "centos" ]); then
+    echo "vm-ci: CentOS guest, also verifying RPM packaging"
+    OCI_RPM_VERIFY_INSTALL=1 bash ci/build-rpm.sh
+    mkdir -p "$HOME/artifacts-rpm"
+    cp artifacts-rpm/*.rpm "$HOME/artifacts-rpm/"
+fi
+
 echo "vm-ci: done"
