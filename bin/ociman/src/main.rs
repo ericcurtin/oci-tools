@@ -859,28 +859,54 @@ enum Command {
         all: bool,
         /// Only reclaim an image whose own config also matches this —
         /// matching real `docker system prune --filter`/`podman
-        /// system prune --filter` for the one key implemented so far,
+        /// system prune --filter` for the keys implemented so far:
         /// `label=<key>`/`label=<key>=<value>`/`label!=<key>`/
-        /// `label!=<key>=<value>` (any other key is a clear error
-        /// rather than silently ignored — real docker/podman also
-        /// support `until=`/`dangling=`/`reference=`/..., not
-        /// implemented here yet). Repeatable; multiple `label=`/
-        /// `label!=` values are OR'd together (an image qualifies if
-        /// *any* of them matches) — checked directly against a real,
-        /// installed `podman image prune` (4.9.3), not assumed from
-        /// its own vendored source alone: a naive reading of
-        /// `~/git/container-libs/common/libimage/filters.go`'s own
-        /// `applyFilters` looks like every filter must match (AND),
-        /// but a real, repeatable, from-a-clean-state test — two
-        /// `--filter label=` values, only one of which actually
-        /// matches a given image — removed it anyway, both with and
-        /// without a completely label-less image in the same batch,
-        /// confirming OR, not AND, for repeated same-key values
-        /// (the installed binary's own real behavior is the ground
-        /// truth here, not necessarily whatever a freshly cloned
-        /// reference repo's own `HEAD` happens to say, if the two have
-        /// drifted apart). With no `--filter` at all, every candidate
-        /// image qualifies, exactly as before this flag existed.
+        /// `label!=<key>=<value>`, `until=<duration-or-timestamp>`, and
+        /// `dangling=true`/`dangling=false` (any other key, e.g.
+        /// `reference=`, is a clear error rather than silently
+        /// ignored). Repeatable; different filter *keys* are ANDed
+        /// together (every one given must independently match), but
+        /// multiple `label=`/`label!=` values for the *same* key are
+        /// OR'd (an image qualifies if *any* of them matches) —
+        /// checked directly against a real, installed `podman image
+        /// prune` (4.9.3), not assumed from its own vendored source
+        /// alone: a naive reading of `~/git/container-libs/common/
+        /// libimage/filters.go`'s own `applyFilters` looks like every
+        /// filter must match (AND), but a real, repeatable, from-a-
+        /// clean-state test — two `--filter label=` values, only one
+        /// of which actually matches a given image — removed it
+        /// anyway, both with and without a completely label-less
+        /// image in the same batch, confirming OR, not AND, for
+        /// repeated same-key `label=` values (the installed binary's
+        /// own real behavior is the ground truth here, not
+        /// necessarily whatever a freshly cloned reference repo's own
+        /// `HEAD` happens to say, if the two have drifted apart).
+        /// `until=` accepts either a plain duration (`24h`, `90m`,
+        /// `1h30m`, `10s` — `h`/`m`/`s` units only, optionally
+        /// fractional and combined, not every unit real Go's own
+        /// `time.ParseDuration` accepts) or an RFC3339 timestamp;
+        /// either way an image whose own `created` is at or before
+        /// `now` minus that duration (or the given absolute time) is
+        /// removed — matching real `docker`/`podman`'s own checked-
+        /// directly semantics exactly (`~/git/moby/daemon/images/
+        /// image_prune.go`'s own `getUntilFromPruneFilters`/its use:
+        /// `until = reference.Add(-duration)`, then an image is kept,
+        /// not removed, if its own `created` is missing entirely or
+        /// strictly after that threshold) — relies on `ociman build`'s
+        /// own `created` field actually reflecting real build time
+        /// (`docs/design/0197`, a real, previously-unnoticed bug this
+        /// filter's own implementation surfaced and fixed first).
+        /// `dangling=<bool>` always overrides whatever `--all`/no
+        /// `--all` would otherwise decide on its own (checked
+        /// directly: `--all --filter dangling=true` still only
+        /// removes dangling images, and `--filter dangling=false`
+        /// alone, with no `--all` at all, removes every unused image
+        /// regardless of tag) — giving conflicting `dangling=true` and
+        /// `dangling=false` values together, or more than one `until=`
+        /// value, is a clear error, matching real docker's own
+        /// identical refusal (`GetBoolOrDefault`/`getUntilFromPruneFilters`).
+        /// With no `--filter` at all, every candidate image qualifies,
+        /// exactly as before this flag existed.
         #[arg(long = "filter")]
         filter: Vec<String>,
     },
@@ -2910,25 +2936,77 @@ impl LabelFilter {
     }
 }
 
-/// Parse `ociman prune`'s own `--filter` values. Only the `label=`/
-/// `label!=` key is implemented — see `Command::Prune`'s own doc
-/// comment for real docker/podman's own additional keys this doesn't
-/// support yet, and the exact real multi-value combination semantics
-/// (OR, not AND) this matches.
-fn parse_prune_filters(filters: &[String]) -> anyhow::Result<Vec<LabelFilter>> {
-    filters
-        .iter()
-        .map(|f| {
-            let (rest, negate) = match f.strip_prefix("label!=") {
-                Some(rest) => (rest, true),
-                None => match f.strip_prefix("label=") {
-                    Some(rest) => (rest, false),
-                    None => anyhow::bail!(
-                        "ociman prune: --filter {f:?} is not yet supported (only \
-                         label=<key>[=<value>] or label!=<key>[=<value>] are)"
-                    ),
-                },
-            };
+/// Every `--filter` value `ociman prune` accepts, parsed once up
+/// front — see `Command::Prune`'s own doc comment for the exact real
+/// semantics each one matches (checked directly, not assumed).
+#[derive(Default)]
+struct PruneFilters {
+    /// `label=`/`label!=` — OR'd together (see `LabelFilter::matches`'s
+    /// own call site).
+    labels: Vec<LabelFilter>,
+    /// `until=<duration-or-timestamp>`, parsed into the real
+    /// threshold time itself (`now - duration`, or the absolute
+    /// timestamp verbatim) — at most one value, matching real
+    /// docker/podman's own identical refusal of more than one.
+    until: Option<std::time::SystemTime>,
+    /// `dangling=true`/`dangling=false`, if given — always overrides
+    /// whatever `--all`/no-`--all` would otherwise decide on its own
+    /// (see `cmd_prune`'s own call site). Giving both a true and a
+    /// false value together is a clear error, matching real docker's
+    /// own identical refusal.
+    dangling: Option<bool>,
+}
+
+/// A plain, non-negative Go-`time.ParseDuration`-*like* duration
+/// string: one or more `<number><unit>` pairs back to back (e.g.
+/// `24h`, `90m`, `1h30m`, `2.5h`), `unit` one of `h`/`m`/`s` only —
+/// deliberately narrower than real Go's own parser, which also
+/// accepts `ns`/`us`/`µs`/`ms` and a leading sign; not needed for this
+/// command's own realistic use (every real `until=` example in either
+/// tool's own documentation uses `h` alone), and a clear parse error
+/// for anything this doesn't understand is always safer than a
+/// silently-wrong duration.
+fn parse_simple_duration(s: &str) -> Option<std::time::Duration> {
+    if s.is_empty() {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut idx = 0;
+    let mut total_secs = 0f64;
+    while idx < bytes.len() {
+        let num_start = idx;
+        while idx < bytes.len() && (bytes[idx].is_ascii_digit() || bytes[idx] == b'.') {
+            idx += 1;
+        }
+        if idx == num_start {
+            return None;
+        }
+        let amount: f64 = s[num_start..idx].parse().ok()?;
+        let unit_start = idx;
+        while idx < bytes.len() && bytes[idx].is_ascii_alphabetic() {
+            idx += 1;
+        }
+        let seconds_per_unit = match &s[unit_start..idx] {
+            "h" => 3600.0,
+            "m" => 60.0,
+            "s" => 1.0,
+            _ => return None,
+        };
+        total_secs += amount * seconds_per_unit;
+    }
+    Some(std::time::Duration::from_secs_f64(total_secs))
+}
+
+/// Parse `ociman prune`'s own `--filter` values into a [`PruneFilters`].
+fn parse_prune_filters(filters: &[String]) -> anyhow::Result<PruneFilters> {
+    let mut parsed = PruneFilters::default();
+    let mut until_values = 0usize;
+    for f in filters {
+        if let Some((rest, negate)) = f
+            .strip_prefix("label!=")
+            .map(|rest| (rest, true))
+            .or_else(|| f.strip_prefix("label=").map(|rest| (rest, false)))
+        {
             anyhow::ensure!(
                 !rest.is_empty(),
                 "ociman prune: --filter {f:?} is missing a label key"
@@ -2937,14 +3015,53 @@ fn parse_prune_filters(filters: &[String]) -> anyhow::Result<Vec<LabelFilter>> {
                 Some((k, v)) => (k.to_string(), Some(v.to_string())),
                 None => (rest.to_string(), None),
             };
-            Ok(LabelFilter { key, value, negate })
-        })
-        .collect()
+            parsed.labels.push(LabelFilter { key, value, negate });
+        } else if let Some(rest) = f.strip_prefix("until=") {
+            until_values += 1;
+            anyhow::ensure!(
+                until_values == 1,
+                "ociman prune: more than one until filter specified"
+            );
+            let now = std::time::SystemTime::now();
+            let threshold = if let Some(duration) = parse_simple_duration(rest) {
+                now.checked_sub(duration).unwrap_or(std::time::UNIX_EPOCH)
+            } else if let Some(absolute) = oci_spec_types::time::parse_rfc3339_utc(rest) {
+                absolute
+            } else {
+                anyhow::bail!(
+                    "ociman prune: --filter {f:?}: invalid value for 'until' filter (expected \
+                     a duration like \"24h\" or an RFC3339 timestamp)"
+                );
+            };
+            parsed.until = Some(threshold);
+        } else if let Some(rest) = f.strip_prefix("dangling=") {
+            let value = match rest {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                _ => anyhow::bail!(
+                    "ociman prune: --filter {f:?}: invalid value for 'dangling' filter \
+                     (expected true or false)"
+                ),
+            };
+            anyhow::ensure!(
+                parsed.dangling.is_none_or(|existing| existing == value),
+                "ociman prune: conflicting dangling filter values specified"
+            );
+            parsed.dangling = Some(value);
+        } else {
+            anyhow::bail!(
+                "ociman prune: --filter {f:?} is not yet supported (only \
+                 label=<key>[=<value>], label!=<key>[=<value>], until=<duration-or-timestamp>, \
+                 or dangling=true|false are)"
+            );
+        }
+    }
+    Ok(parsed)
 }
 
 fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
     let store = open_store()?;
-    let label_filters = parse_prune_filters(filter)?;
+    let filters = parse_prune_filters(filter)?;
 
     // A dangling (untagged, `is_untagged_reference`, 0179) image not
     // currently in use by any container is reclaimed even *without*
@@ -2956,11 +3073,19 @@ fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
     // directly against a real dangling image, confirming it gets
     // removed with no `--all` at all). `--all` extends removal to
     // *every* unused image regardless of tag, the pre-existing
-    // behavior, unchanged. Either pass runs *before* the blob/cache GC
-    // below so that an image either one just untags immediately makes
-    // its own now-unreferenced blobs/cache entries eligible for the
-    // same GC run, rather than needing a second `ociman prune`
-    // invocation to actually reclaim them.
+    // behavior, unchanged. An explicit `--filter dangling=<bool>`
+    // always overrides whichever of the two `--all`/no-`--all` would
+    // otherwise decide — checked directly against a real `podman
+    // image prune`: `--all --filter dangling=true` still only removes
+    // dangling images, and `--filter dangling=false` alone (no
+    // `--all` at all) removes every unused image regardless of tag,
+    // in both cases the explicit filter value winning outright.
+    // Either pass runs *before* the blob/cache GC below so that an
+    // image either one just untags immediately makes its own now-
+    // unreferenced blobs/cache entries eligible for the same GC run,
+    // rather than needing a second `ociman prune` invocation to
+    // actually reclaim them.
+    let dangling_only = filters.dangling.unwrap_or(!all);
     let containers = open_container_store()?;
     // Matched by the underlying manifest digest, not the exact
     // reference string a container happened to be started with: two
@@ -2983,16 +3108,39 @@ fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
         if in_use_digests.contains(&record.manifest_digest) {
             continue;
         }
-        if !all && !is_untagged_reference(&record.reference) {
+        if dangling_only && !is_untagged_reference(&record.reference) {
             continue;
         }
-        if !label_filters.is_empty() {
+        if !filters.labels.is_empty() || filters.until.is_some() {
             let config = store
                 .image_config(&record)
                 .with_context(|| format!("reading config for {}", record.reference))?;
-            let labels = &config.config.unwrap_or_default().labels;
-            if !label_filters.iter().any(|f| f.matches(labels)) {
-                continue;
+            if let Some(threshold) = filters.until {
+                // Matches real `docker`/`podman`'s own checked-
+                // directly rule exactly (`~/git/moby/daemon/images/
+                // image_prune.go`'s own `until.IsZero() ||
+                // img.Created == nil || img.Created.After(until)`
+                // skip condition, inverted here since this loop
+                // structure removes rather than collects "keep"
+                // candidates): an image whose own `created` is
+                // missing entirely, or strictly *after* the
+                // threshold, is kept, not removed — only one at or
+                // before the threshold (i.e. at least that old)
+                // qualifies.
+                let created = config
+                    .created
+                    .as_deref()
+                    .and_then(oci_spec_types::time::parse_rfc3339_utc);
+                match created {
+                    Some(created) if created <= threshold => {}
+                    _ => continue,
+                }
+            }
+            if !filters.labels.is_empty() {
+                let labels = &config.config.unwrap_or_default().labels;
+                if !filters.labels.iter().any(|f| f.matches(labels)) {
+                    continue;
+                }
             }
         }
         store

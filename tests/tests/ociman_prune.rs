@@ -871,11 +871,331 @@ fn prune_filter_multiple_label_values_are_ored_together() {
 #[test]
 fn prune_filter_unsupported_key_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();
-    let out = ociman(storage_dir.path(), &["prune", "--filter", "until=24h"]);
+    // `until=`/`dangling=` are both real, supported keys now (0198) —
+    // `reference=` (real docker/podman also support it) still isn't.
+    let out = ociman(storage_dir.path(), &["prune", "--filter", "reference=foo"]);
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("until=24h"),
+        String::from_utf8_lossy(&out.stderr).contains("reference=foo"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// `ociman prune --filter until=<duration>` (0198): matching real
+/// `docker`/`podman`'s own checked-directly semantics exactly — an
+/// image whose own `created` (0197: now real, actually reflecting
+/// build time) is *not yet* older than the given duration is kept,
+/// not removed.
+#[test]
+fn prune_filter_until_keeps_a_freshly_built_dangling_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/prune-until-fresh-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/prune-until-fresh-base:latest\nLABEL marker=fresh\n",
+    )
+    .unwrap();
+    let build = ociman(
+        storage_dir.path(),
+        &["build", context_dir.path().to_str().unwrap()],
+    );
+    assert!(build.status.success());
+    let digest = String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+
+    // A duration comfortably longer than this test itself could ever
+    // take to run -- the freshly built image's own `created` is only
+    // ever a fraction of a second old at this point.
+    let prune = ociman(
+        storage_dir.path(),
+        &["--json", "prune", "--filter", "until=24h"],
+    );
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(
+        view["images_removed"],
+        serde_json::json!([]),
+        "an image younger than the until= duration should be kept: {view:?}"
+    );
+
+    let images = ociman(storage_dir.path(), &["images"]);
+    assert!(
+        String::from_utf8_lossy(&images.stdout).contains(&digest[7..19]),
+        "the image should still be present: {}",
+        String::from_utf8_lossy(&images.stdout)
+    );
+}
+
+/// The other half of `until=`'s own real rule: once an image's own
+/// `created` genuinely is older than the given duration, it's
+/// removed, even without `--all` (the existing dangling-by-default
+/// scope still applies underneath `until=`, this build has no tag).
+#[test]
+fn prune_filter_until_removes_an_image_older_than_the_threshold() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/prune-until-old-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/prune-until-old-base:latest\nLABEL marker=old\n",
+    )
+    .unwrap();
+    let build = ociman(
+        storage_dir.path(),
+        &["build", context_dir.path().to_str().unwrap()],
+    );
+    assert!(build.status.success());
+    let digest = String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let prune = ociman(
+        storage_dir.path(),
+        &["--json", "prune", "--filter", "until=1s"],
+    );
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(
+        view["images_removed"],
+        serde_json::json!([digest]),
+        "an image genuinely older than the until= duration should be removed: {view:?}"
+    );
+}
+
+/// `--filter until=` also accepts a real RFC3339 absolute timestamp,
+/// not just a duration.
+#[test]
+fn prune_filter_until_accepts_an_rfc3339_timestamp() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    // No images at all -- just confirming this doesn't error out as
+    // an unparseable value the way a nonsense string does.
+    let prune = ociman(
+        storage_dir.path(),
+        &["--json", "prune", "--filter", "until=2020-01-01T00:00:00Z"],
+    );
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+}
+
+/// An unparseable `until=` value (neither a duration this project
+/// understands nor an RFC3339 timestamp) is a clear, immediate error.
+#[test]
+fn prune_filter_until_invalid_value_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &["prune", "--filter", "until=not-a-real-value"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("until"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// More than one `until=` filter is a clear error, matching real
+/// docker/podman's own identical refusal.
+#[test]
+fn prune_filter_multiple_until_values_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &["prune", "--filter", "until=1h", "--filter", "until=2h"],
+    );
+    assert!(!out.status.success());
+}
+
+/// `ociman prune --filter dangling=true` (0198): always overrides
+/// `--all`, restricting removal back to dangling images only —
+/// checked directly against a real `podman image prune --all --filter
+/// dangling=true`, which still leaves a real tagged, unused image
+/// alone.
+#[test]
+fn prune_filter_dangling_true_overrides_all_and_keeps_a_tagged_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/prune-dangling-true-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/prune-dangling-true-base:latest\n",
+    )
+    .unwrap();
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/prune-dangling-true-tagged:latest",
+        ],
+    );
+    assert!(build.status.success());
+
+    let prune = ociman(
+        storage_dir.path(),
+        &["--json", "prune", "--all", "--filter", "dangling=true"],
+    );
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(
+        view["images_removed"],
+        serde_json::json!([]),
+        "--filter dangling=true should override --all and keep a real tagged image: {view:?}"
+    );
+}
+
+/// The other direction: `--filter dangling=false` alone, with no
+/// `--all` at all, removes every unused image regardless of tag —
+/// checked directly against a real `podman image prune --filter
+/// dangling=false` with no `-a`.
+#[test]
+fn prune_filter_dangling_false_removes_a_tagged_image_without_all() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/prune-dangling-false-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/prune-dangling-false-base:latest\n",
+    )
+    .unwrap();
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/prune-dangling-false-tagged:latest",
+        ],
+    );
+    assert!(build.status.success());
+
+    let prune = ociman(
+        storage_dir.path(),
+        &["--json", "prune", "--filter", "dangling=false"],
+    );
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    // Both the target tagged image *and* its own now-unused base
+    // image are removed -- `--filter dangling=false` alone (no
+    // `--all`) removes *every* unused image regardless of tag,
+    // matching real `podman image prune --filter dangling=false`
+    // exactly (checked directly).
+    let removed = view["images_removed"]
+        .as_array()
+        .expect("images_removed should be an array");
+    assert!(
+        removed.contains(&serde_json::json!(
+            "docker.io/ociman-test/prune-dangling-false-tagged:latest"
+        )),
+        "--filter dangling=false alone (no --all) should remove a real tagged, unused image \
+         too: {view:?}"
+    );
+}
+
+/// An invalid `dangling=` value is a clear error.
+#[test]
+fn prune_filter_dangling_invalid_value_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["prune", "--filter", "dangling=maybe"]);
+    assert!(!out.status.success());
+}
+
+/// Conflicting `dangling=true`/`dangling=false` values together is a
+/// clear error, matching real docker's own identical refusal.
+#[test]
+fn prune_filter_conflicting_dangling_values_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &[
+            "prune",
+            "--filter",
+            "dangling=true",
+            "--filter",
+            "dangling=false",
+        ],
+    );
+    assert!(!out.status.success());
 }
