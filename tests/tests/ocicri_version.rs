@@ -10,8 +10,8 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::time::Duration;
 
-use oci_cri_types::VersionRequest;
 use oci_cri_types::runtime_service_client::RuntimeServiceClient;
+use oci_cri_types::{StatusRequest, VersionRequest};
 use oci_tools_tests::bin_path;
 
 /// A running `ocicri` server, killed on drop so a failing test (or an
@@ -92,6 +92,75 @@ async fn version_reports_real_honest_values_over_a_real_unix_socket() {
         !response.runtime_version.is_empty(),
         "runtime_version should be a real, non-empty build version string"
     );
+}
+
+/// `Status` reports a real `RuntimeReady=true`/`NetworkReady=false`
+/// pair (never fabricating network readiness this project doesn't
+/// actually have — see `docs/design/0228`), a real default runtime
+/// handler entry, and stays honestly empty in `info` unless
+/// `verbose` is set.
+#[tokio::test]
+async fn status_reports_real_runtime_and_network_conditions_over_a_real_unix_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("ocicri.sock");
+    let _server = spawn_server(&socket_path);
+    wait_for_socket(&socket_path);
+
+    let mut client = connect(socket_path).await;
+    let response = client
+        .status(StatusRequest { verbose: false })
+        .await
+        .expect("Status RPC failed")
+        .into_inner();
+
+    let status = response.status.expect("status should always be present");
+    let runtime_ready = status
+        .conditions
+        .iter()
+        .find(|c| c.r#type == "RuntimeReady")
+        .expect("RuntimeReady condition should be present");
+    assert!(runtime_ready.status);
+
+    let network_ready = status
+        .conditions
+        .iter()
+        .find(|c| c.r#type == "NetworkReady")
+        .expect("NetworkReady condition should be present");
+    assert!(
+        !network_ready.status,
+        "ocicri sets up no container networking of its own yet"
+    );
+    assert!(!network_ready.reason.is_empty());
+    assert!(!network_ready.message.is_empty());
+
+    assert_eq!(response.runtime_handlers.len(), 1);
+    assert_eq!(response.runtime_handlers[0].name, "");
+
+    assert!(
+        response.info.is_empty(),
+        "info should stay empty when verbose is false"
+    );
+}
+
+/// `verbose: true` populates `info` with real, already-known values —
+/// never fabricated debug data this project doesn't actually have.
+#[tokio::test]
+async fn status_verbose_populates_a_real_non_empty_info_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("ocicri.sock");
+    let _server = spawn_server(&socket_path);
+    wait_for_socket(&socket_path);
+
+    let mut client = connect(socket_path).await;
+    let response = client
+        .status(StatusRequest { verbose: true })
+        .await
+        .expect("Status RPC failed")
+        .into_inner();
+
+    assert!(!response.info.is_empty());
+    assert_eq!(response.info.get("runtimeName").unwrap(), "ocicri");
+    assert!(!response.info.get("runtimeVersion").unwrap().is_empty());
 }
 
 /// Every other real RPC returns a real, honest `Unimplemented` gRPC

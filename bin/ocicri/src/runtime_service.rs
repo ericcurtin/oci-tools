@@ -1,8 +1,8 @@
 //! The real `RuntimeService` gRPC implementation — see this crate's
 //! own module doc comment (`main.rs`) for the exact scope of this
-//! first slice: only `Version` is genuinely implemented; every other
-//! one of the real CRI v1 `RuntimeService`'s 33 other RPCs (pod
-//! sandbox/container lifecycle, exec/attach/port-forward, stats,
+//! first slice: `Version`/`Status` are genuinely implemented; every
+//! other one of the real CRI v1 `RuntimeService`'s remaining 32 RPCs
+//! (pod sandbox/container lifecycle, exec/attach/port-forward, stats,
 //! events, ...) returns a real, honest `Status::unimplemented` rather
 //! than silently accepting a request it can't actually act on —
 //! matching this project's own established "narrow first slice,
@@ -39,6 +39,14 @@ const KUBE_API_VERSION: &str = "0.1.0";
 /// `proto/api.proto`), matching real `cri-o`'s own identical constant.
 const RUNTIME_API_VERSION: &str = "v1";
 
+/// `Status`'s own `RuntimeCondition.type` values — checked directly
+/// against real `cri-o`'s own vendored `k8s.io/cri-api` constants
+/// (`server/runtime_status.go`): exactly these two exact strings,
+/// matching the real, fixed contract every CRI implementation
+/// reports, not something either runtime invents on its own.
+const RUNTIME_READY_CONDITION: &str = "RuntimeReady";
+const NETWORK_READY_CONDITION: &str = "NetworkReady";
+
 /// The real `RuntimeService` state — empty for now (`Version` needs
 /// none at all); will grow real `oci_store`/`oci_runtime_core` state
 /// once pod sandbox/container lifecycle RPCs are implemented.
@@ -53,7 +61,7 @@ pub struct RuntimeServiceImpl;
 fn unimplemented<T>(name: &str) -> Result<Response<T>, Status> {
     Err(Status::unimplemented(format!(
         "ocicri: {name} is not implemented yet (milestone 7, a real, narrow first slice: only \
-         Version is answered so far)"
+         Version/Status are answered so far)"
     )))
 }
 
@@ -265,11 +273,90 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         unimplemented("UpdateRuntimeConfig")
     }
 
+    /// A real, mostly-static response — checked directly against real
+    /// `cri-o`'s own `server/runtime_status.go`, which this matches or
+    /// deliberately, honestly diverges from:
+    ///
+    /// * `RuntimeReady` — `true` unconditionally, matching real
+    ///   `cri-o` exactly: it hard-codes this too, since answering the
+    ///   RPC at all is the only "proof" either implementation ever
+    ///   checks.
+    /// * `NetworkReady` — a real, honest `false`, unlike real `cri-o`
+    ///   (which polls a real, configured CNI plugin's own live
+    ///   status): this project sets up no container networking of its
+    ///   own at all yet (no bridge, no pasta, no CNI — see
+    ///   `docs/design/0147`), so reporting readiness here would be a
+    ///   real, false claim, not an honest one.
+    /// * `runtime_handlers` — real `cri-o` reports one real entry per
+    ///   *configured* OCI runtime (`crio.conf`); this project has no
+    ///   configurable runtime-handler concept at all yet, so the
+    ///   smallest honest answer is exactly one entry naming the
+    ///   implicit default handler (`name: ""`, matching the proto's
+    ///   own "empty string denotes the default handler" convention),
+    ///   with both real feature bits `false` (neither recursive
+    ///   read-only mounts nor user namespaces are implemented here).
+    /// * `features` — both `false`: neither `SupplementalGroupsPolicy`
+    ///   nor simultaneous host-network-plus-user-namespace support is
+    ///   implemented anywhere in this project yet, unlike real
+    ///   `cri-o`, which hard-codes both `true` as a genuine, backed
+    ///   capability claim.
+    /// * `info` (only when `verbose`) — the same real, already-known
+    ///   values `Version` itself already reports (name/version),
+    ///   never fabricated cri-o-style CNI/runtime config this project
+    ///   doesn't actually have.
+    ///
+    /// Always succeeds — matching real `cri-o` exactly: there's no
+    /// real failure condition for a response this static.
     async fn status(
         &self,
-        _request: Request<cri::StatusRequest>,
+        request: Request<cri::StatusRequest>,
     ) -> Result<Response<cri::StatusResponse>, Status> {
-        unimplemented("Status")
+        let verbose = request.into_inner().verbose;
+
+        let info = if verbose {
+            std::collections::HashMap::from([
+                ("runtimeName".to_string(), RUNTIME_NAME.to_string()),
+                (
+                    "runtimeVersion".to_string(),
+                    oci_cli_common::version::long(env!("CARGO_PKG_VERSION")),
+                ),
+            ])
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        Ok(Response::new(cri::StatusResponse {
+            status: Some(cri::RuntimeStatus {
+                conditions: vec![
+                    cri::RuntimeCondition {
+                        r#type: RUNTIME_READY_CONDITION.to_string(),
+                        status: true,
+                        reason: String::new(),
+                        message: String::new(),
+                    },
+                    cri::RuntimeCondition {
+                        r#type: NETWORK_READY_CONDITION.to_string(),
+                        status: false,
+                        reason: "NetworkNotImplemented".to_string(),
+                        message: "ocicri sets up no container networking of its own yet \
+                                  (no bridge, no pasta, no CNI) -- see docs/design/0147"
+                            .to_string(),
+                    },
+                ],
+            }),
+            info,
+            runtime_handlers: vec![cri::RuntimeHandler {
+                name: String::new(),
+                features: Some(cri::RuntimeHandlerFeatures {
+                    recursive_read_only_mounts: false,
+                    user_namespaces: false,
+                }),
+            }],
+            features: Some(cri::RuntimeFeatures {
+                supplemental_groups_policy: false,
+                user_namespaces_host_network: false,
+            }),
+        }))
     }
 
     async fn checkpoint_container(
