@@ -6862,3 +6862,263 @@ fn build_unsetenv_down_to_zero_leaves_only_the_real_podman_style_path_fallback()
         "a stray TERM should never leak in, unlike before this fix: {stdout:?}"
     );
 }
+
+/// `ociman build --unsetlabel <KEY>` (0195): removes a label the
+/// *base image itself* declared — matching real `docker build
+/// --unsetlabel`/`podman build --unsetlabel` exactly (checked
+/// directly).
+#[test]
+fn build_unsetlabel_removes_a_label_inherited_from_the_base_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/unsetlabel-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            labels: std::collections::BTreeMap::from([(
+                "inherited".to_string(),
+                "frombase".to_string(),
+            )]),
+            ..Default::default()
+        },
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/unsetlabel-base:latest\nLABEL owndeclared=fromhere\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--unsetlabel",
+            "inherited",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/unsetlabel-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &["inspect", "--json", "ociman-test/unsetlabel-result:latest"],
+    );
+    assert!(inspect.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert!(
+        view["config"]["Labels"].get("inherited").is_none(),
+        "--unsetlabel should remove a label the base image itself declared: {view:?}"
+    );
+    assert_eq!(
+        view["config"]["Labels"]["owndeclared"], "fromhere",
+        "a label only ever declared by this Containerfile's own LABEL should be untouched: \
+         {view:?}"
+    );
+}
+
+/// A real, checked-directly subtlety that makes `--unsetlabel`
+/// deliberately *not* shaped like `--unsetenv`: naming a key that's
+/// only ever set by a `LABEL` instruction in *this* Containerfile
+/// (never present in the base image's own config at all) leaves it
+/// completely untouched.
+#[test]
+fn build_unsetlabel_never_touches_a_label_only_declared_by_this_containerfile() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/unsetlabel-ownonly-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/unsetlabel-ownonly-base:latest\nLABEL owndeclared=fromhere\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--unsetlabel",
+            "owndeclared",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/unsetlabel-ownonly-result:latest",
+        ],
+    );
+    assert!(build.status.success());
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "--json",
+            "ociman-test/unsetlabel-ownonly-result:latest",
+        ],
+    );
+    assert!(inspect.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(
+        view["config"]["Labels"]["owndeclared"], "fromhere",
+        "--unsetlabel naming a key only ever declared by this Containerfile's own LABEL \
+         (never present in the base at all) must leave it completely untouched: {view:?}"
+    );
+}
+
+/// A base-inherited key that a *later* `LABEL` in this same
+/// Containerfile also redeclares is still removed by `--unsetlabel`
+/// naming it — the redeclaration does not save it, matching real
+/// `podman build --unsetlabel`'s own checked-directly behavior
+/// exactly.
+#[test]
+fn build_unsetlabel_still_removes_an_inherited_key_even_when_redeclared() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/unsetlabel-redeclare-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            labels: std::collections::BTreeMap::from([(
+                "inherited".to_string(),
+                "frombase".to_string(),
+            )]),
+            ..Default::default()
+        },
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/unsetlabel-redeclare-base:latest\nLABEL inherited=overridden\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--unsetlabel",
+            "inherited",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/unsetlabel-redeclare-result:latest",
+        ],
+    );
+    assert!(build.status.success());
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "--json",
+            "ociman-test/unsetlabel-redeclare-result:latest",
+        ],
+    );
+    assert!(inspect.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert!(
+        view["config"]["Labels"].get("inherited").is_none(),
+        "--unsetlabel should still remove an inherited key even though a later LABEL in this \
+         same Containerfile redeclares it: {view:?}"
+    );
+}
+
+/// `--unsetlabel` adds no `ociman history` entry of its own, matching
+/// real `podman build --unsetlabel`'s own identical behavior exactly.
+#[test]
+fn build_unsetlabel_adds_no_history_entry_of_its_own() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/unsetlabel-history-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            labels: std::collections::BTreeMap::from([("foo".to_string(), "bar".to_string())]),
+            ..Default::default()
+        },
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/unsetlabel-history-base:latest\n",
+    );
+
+    let without = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/unsetlabel-history-without:latest",
+        ],
+    );
+    assert!(without.status.success());
+    let with = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--unsetlabel",
+            "foo",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/unsetlabel-history-with:latest",
+        ],
+    );
+    assert!(with.status.success());
+
+    let history_without = ociman(
+        storage_dir.path(),
+        &[
+            "history",
+            "--json",
+            "ociman-test/unsetlabel-history-without:latest",
+        ],
+    );
+    let history_with = ociman(
+        storage_dir.path(),
+        &[
+            "history",
+            "--json",
+            "ociman-test/unsetlabel-history-with:latest",
+        ],
+    );
+    assert!(history_without.status.success());
+    assert!(history_with.status.success());
+    assert_eq!(
+        history_without.stdout, history_with.stdout,
+        "--unsetlabel should never add a history entry of its own"
+    );
+}

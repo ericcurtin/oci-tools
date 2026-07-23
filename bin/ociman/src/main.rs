@@ -747,6 +747,25 @@ enum Command {
         /// own identical, checked-directly behavior. Repeatable.
         #[arg(long = "unsetenv", value_name = "NAME")]
         unsetenv: Vec<String>,
+        /// Remove a label the *base image* itself declared (by bare
+        /// key, never `key=value`) — matching real `docker build
+        /// --unsetlabel`/`podman build --unsetlabel` exactly, including
+        /// one real, checked-directly subtlety that makes this
+        /// deliberately *not* the same shape as `--unsetenv`: naming a
+        /// key that's only ever set by a `LABEL` instruction in *this*
+        /// Containerfile (never present in the base image's own
+        /// config at all) leaves it completely untouched, even though
+        /// `--unsetenv` on the analogous case removes it — verified
+        /// directly against a real `podman build --unsetlabel`, three
+        /// separate scenarios: a base-inherited label (removed), a
+        /// purely-Containerfile-declared one (kept), and a base-
+        /// inherited key a later `LABEL` in this same Containerfile
+        /// also re-declares (still removed, the redeclaration doesn't
+        /// save it). Applies only to the target stage's own base, and
+        /// — like `--unsetenv` — produces no history entry of its own.
+        /// Repeatable.
+        #[arg(long = "unsetlabel", value_name = "KEY")]
+        unsetlabel: Vec<String>,
     },
     /// List images in local storage.
     Images,
@@ -1592,6 +1611,7 @@ fn main() -> std::process::ExitCode {
                 squash_all,
                 platform,
                 unsetenv,
+                unsetlabel,
             }) => build::cmd_build(
                 &context,
                 file.as_deref(),
@@ -1610,6 +1630,7 @@ fn main() -> std::process::ExitCode {
                 squash_all,
                 platform.as_deref(),
                 &unsetenv,
+                &unsetlabel,
                 cli.global.json,
             ),
             Some(Command::Images) => cmd_images(cli.global.json),

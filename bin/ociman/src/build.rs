@@ -224,6 +224,7 @@ pub fn cmd_build(
     squash_all: bool,
     platform: Option<&str>,
     unsetenv: &[String],
+    unsetlabel: &[String],
     json: bool,
 ) -> anyhow::Result<()> {
     // Matches real `podman build`'s own identical refusal (checked
@@ -311,6 +312,14 @@ pub fn cmd_build(
         crate::build_cache::load_candidates(&store)
     };
     let mut built: std::collections::HashMap<usize, BuiltStage> = std::collections::HashMap::new();
+    // Captured only for the target stage, right before its own
+    // instructions run (see `--unsetlabel`'s own doc comment for why
+    // this needs to be the *base's* own labels specifically, not the
+    // final built result's): a key filter applied after the whole
+    // build finishes needs to know exactly which keys the base itself
+    // declared, independent of whatever this stage's own `LABEL`
+    // instructions go on to do with the same keys.
+    let mut target_base_labels: BTreeMap<String, String> = BTreeMap::new();
     for &stage_index in &build_order {
         let stage = oci_dockerfile::expand_stage(&global_args, &build_args, &stages[stage_index])
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -446,6 +455,13 @@ pub fn cmd_build(
         // ever been passed at all; only the target's own final result
         // ever gets folded into one layer.
         let is_target = stage_index == target;
+        if is_target {
+            target_base_labels = base_config
+                .config
+                .as_ref()
+                .map(|cc| cc.labels.clone())
+                .unwrap_or_default();
+        }
         let built_stage = build_stage(
             &store,
             context,
@@ -506,6 +522,27 @@ pub fn cmd_build(
             let key = entry.split_once('=').map_or(entry.as_str(), |(k, _)| k);
             !unsetenv.iter().any(|name| name == key)
         });
+    }
+
+    // `--unsetlabel` also applies once, at the very end, with no
+    // history entry of its own — but, unlike `--unsetenv`, only ever
+    // removes a key the *target stage's own base image* itself
+    // already declared (`target_base_labels`, captured above before
+    // this stage's own instructions ran), regardless of whether a
+    // later `LABEL` in this Containerfile also happens to redeclare
+    // that same key (real, checked-directly behavior: the
+    // redeclaration does not save it). A key that's only ever set by
+    // a `LABEL` instruction in this Containerfile, never present in
+    // the base at all, is left completely untouched — the one real
+    // way this is deliberately *not* shaped like `--unsetenv`.
+    if !unsetlabel.is_empty()
+        && let Some(cc) = config.config.as_mut()
+    {
+        for key in unsetlabel {
+            if target_base_labels.contains_key(key) {
+                cc.labels.remove(key);
+            }
+        }
     }
 
     let config_bytes = serde_json::to_vec(&config).context("serializing image config")?;
