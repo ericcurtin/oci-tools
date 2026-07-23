@@ -60,6 +60,13 @@ CAPABILITY_GROUPS: dict[str, list[str]] = {
     "gzip decompression": ["flate2", "libflate", "zune-inflate"],
     "zstd decompression": ["ruzstd", "zstd", "zstd-safe"],
     "D-Bus client": ["zbus", "dbus", "dbus-tokio"],
+    # `ocicri`'s own real gRPC server (kubelet/`crictl` speak this
+    # exact protocol) -- the one deliberate exception to this
+    # workspace's own "no async runtime" default, confined entirely to
+    # `ocicri`/`oci-cri-types` (see their own module doc comments).
+    "gRPC": ["tonic", "grpcio", "grpc"],
+    "protobuf codegen": ["prost-build", "tonic-prost-build", "protobuf-codegen"],
+    "async runtime": ["tokio", "async-std", "smol"],
 }
 
 

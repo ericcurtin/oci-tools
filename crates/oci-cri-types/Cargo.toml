@@ -1,0 +1,21 @@
+[package]
+name = "oci-cri-types"
+description = "Generated Kubernetes CRI v1 protobuf/tonic types, shared by ocicri and its own tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+
+[lints]
+workspace = true

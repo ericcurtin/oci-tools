@@ -1,15 +1,50 @@
 //! `ocicri` — Kubernetes CRI implementation (cri-o equivalent).
 //!
-//! gRPC server implementing the Kubernetes CRI (`RuntimeService` +
-//! `ImageService`) on a unix socket, backed by `oci-store`,
-//! `oci-runtime-core`, and `oci-net` (CNI). Arrives with milestone 7
-//! (critest subset: pod sandbox via infra process, container lifecycle,
-//! image pull, streaming exec/attach/logs).
+//! A real gRPC server implementing the Kubernetes CRI v1 protocol
+//! (`oci_cri_types`'s own `proto/api.proto`, vendored unmodified from
+//! real `cri-o`'s own `k8s.io/cri-api` — see its own `proto/
+//! README.md`) over a Unix domain socket, matching real `cri-o`'s own
+//! `crio.sock` model exactly
+//! (kubelet talks to *either* real runtime over the identical wire
+//! protocol; nothing about this project's own socket path or listener
+//! setup is CRI-specific in a way a real `crictl`/kubelet couldn't
+//! talk to).
+//!
+//! This is a real, narrow first slice, not a placeholder: the server
+//! genuinely listens, accepts real gRPC connections, and answers
+//! `RuntimeService.Version` (kubelet's own first connectivity/
+//! compatibility check against any runtime) with real, honest values
+//! — see `runtime_service.rs`'s own module doc comment for exactly
+//! why `Version` was chosen as the one RPC to implement first, and
+//! why every other one of `RuntimeService`'s 33 other RPCs
+//! deliberately returns a real `Status::unimplemented` naming itself,
+//! rather than accepting a request this project can't actually act on
+//! yet. `ImageService` (CRI's other, smaller service) isn't
+//! registered on the server at all yet — its own separate, still-
+//! ahead increment.
+//!
+//! Unlike every other binary in this workspace, `ocicri` is a real,
+//! long-lived server process, not a short-lived CLI invocation — the
+//! one deliberate exception to this project's own "beat every
+//! benchmark, especially startup time" design pillar, since a
+//! server's own *serving* performance (not its own one-time process
+//! startup) is what actually matters here. This is also the only
+//! binary in the workspace linking `tokio`/`tonic`/`prost`: every
+//! other binary's own hot per-invocation startup path is completely
+//! unaffected.
 
+mod runtime_service;
+
+use std::path::PathBuf;
+
+use anyhow::Context as _;
 use clap::Parser;
+use oci_cri_types as cri;
 
-/// Command-line interface (milestone 1: global flags only; the CRI server
-/// arrives with milestone 7).
+/// Command-line interface. Real `cri-o` itself has no subcommands at
+/// all — invoking it just *is* running the server — so neither does
+/// `ocicri`; global flags plus `--listen` are everything this first
+/// slice needs.
 #[derive(Debug, Parser)]
 #[command(
     name = "ocicri",
@@ -19,6 +54,19 @@ use clap::Parser;
 struct Cli {
     #[command(flatten)]
     global: oci_cli_common::GlobalArgs,
+    /// Unix domain socket path to listen on — matching real `cri-o`'s
+    /// own `--listen` flag exactly (its own default is
+    /// `/var/run/crio/crio.sock`). Defaults to `ocicri.sock` under
+    /// this project's own shared runtime-root convention
+    /// (`oci_cli_common::runtime_root`, the same one `ocirun --root`'s
+    /// own default already uses: `/run/ocicri` for root,
+    /// `$XDG_RUNTIME_DIR/ocicri` rootless).
+    #[arg(long = "listen", value_name = "PATH")]
+    listen: Option<PathBuf>,
+}
+
+fn default_socket_path() -> PathBuf {
+    oci_cli_common::runtime_root::default_root("ocicri").join("ocicri.sock")
 }
 
 fn main() -> std::process::ExitCode {
@@ -29,9 +77,47 @@ fn main() -> std::process::ExitCode {
             git_hash = oci_cli_common::version::GIT_HASH,
             "ocicri starting"
         );
-        anyhow::bail!(
-            "the CRI server is not implemented yet (milestone 1 skeleton); \
-             it arrives with milestone 7"
-        );
+
+        let socket_path = cli.listen.unwrap_or_else(default_socket_path);
+
+        // A real, long-lived server needs a real async runtime to
+        // drive it -- the one place in this whole workspace `tokio`
+        // is used at all (see this module's own doc comment for why
+        // that's fine: `ocicri` is a server, not a hot-path CLI
+        // invocation).
+        let runtime = tokio::runtime::Runtime::new().context("starting the tokio runtime")?;
+        runtime.block_on(serve(&socket_path))
     })
+}
+
+async fn serve(socket_path: &std::path::Path) -> anyhow::Result<()> {
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // A stale socket file from a previous, uncleanly-terminated run
+    // would otherwise make `UnixListener::bind` fail with `EADDRINUSE`
+    // -- matching real `cri-o`'s own identical "remove any existing
+    // socket before binding" startup behavior.
+    match std::fs::remove_file(socket_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("removing stale {}", socket_path.display()));
+        }
+    }
+
+    let listener = tokio::net::UnixListener::bind(socket_path)
+        .with_context(|| format!("binding unix socket {}", socket_path.display()))?;
+    let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
+
+    tracing::info!(socket = %socket_path.display(), "ocicri listening");
+
+    tonic::transport::Server::builder()
+        .add_service(cri::runtime_service_server::RuntimeServiceServer::new(
+            runtime_service::RuntimeServiceImpl,
+        ))
+        .serve_with_incoming(incoming)
+        .await
+        .context("serving CRI gRPC requests")
 }

@@ -47,11 +47,31 @@ thiserror = "2.0"
 ureq = "3.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# gRPC server (`ocicri`'s own CRI `RuntimeService`/`ImageService`,
+# kubelet-compatible) and its protobuf message types -- the one real
+# case in this workspace an async runtime earns its keep: `ocicri` is a
+# long-lived server process, not a short-lived CLI invocation, so
+# `tokio`/`tonic` never touch this project's own hot startup-time path
+# (every other binary links neither at all).
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server", "transport"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "signal", "macros"] }
+tokio-stream = { version = "0.1", default-features = false, features = ["net"] }
+# Dev-dependencies only (`oci-tools-tests`' own real `ocicri` gRPC
+# client, connecting over a Unix socket the same way real `tonic`
+# clients always have to -- both are already pulled in transitively by
+# `tonic`/`tokio` itself, this makes them directly nameable in test
+# code, not a new addition to the dependency graph.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+hyper-util = { version = "0.1", default-features = false }
 
 # Workspace crates. bin/* may depend on crates/* only (enforced by ci/guards.py).
 oci-bls = { path = "crates/oci-bls" }
 oci-build-info = { path = "crates/oci-build-info" }
 oci-cli-common = { path = "crates/oci-cli-common" }
+oci-cri-types = { path = "crates/oci-cri-types" }
 oci-dockerfile = { path = "crates/oci-dockerfile" }
 oci-erofs = { path = "crates/oci-erofs" }
 oci-layer = { path = "crates/oci-layer" }

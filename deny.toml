@@ -46,6 +46,12 @@ skip = [
     # the workspace's proc-macro crates (clap_derive, thiserror-impl, ...)
     # -- the same "ecosystem forces a transient duplicate" case as above.
     { crate = "syn@3.0.0", reason = "pulled in by zbus's own async-trait/serde_repr dependencies; rest of the workspace is on syn 2" },
+    # petgraph (prost-build's own dependency-graph analysis, used by
+    # oci-cri-types' build.rs) still depends on an older hashbrown than
+    # indexmap (pulled in independently by h2/hyper, also part of the
+    # tonic/tokio stack) -- the same "ecosystem forces a transient
+    # duplicate" case as above.
+    { crate = "hashbrown@0.15.5", reason = "pulled in by petgraph (prost-build's dependency-graph analysis); indexmap (h2/hyper) is on 0.17" },
 ]
 skip-tree = []
 deny = [
