@@ -73,18 +73,24 @@ it. Verified directly, twice: a clean install, a correct `--version`
 from every one of the five CLI binaries, a clean removal (confirmed
 via `dpkg -l`/`command -v` afterward — no residue).
 
-Also not yet wired into `.github/workflows/ci.yml`: this project's own
-GitHub runners are `ubuntu-24.04`/`ubuntu-24.04-arm`, genuinely
-dpkg-native, so (unlike the RPM slice) there's no real host/target
-mismatch blocking it there — this is simply sequenced after the RPM
-slice and not yet done, not blocked on anything technical.
+Now wired into `.github/workflows/ci.yml`'s own `native-test` job
+(milestone 8's own third real slice, `docs/design/0218`): since that
+runner is genuinely dpkg-native (`ubuntu-24.04-arm`, the same as this
+project's own development host), the real `sudo dpkg -i`/`dpkg -r`
+round trip described above runs for real, on every push and pull
+request, immediately after `ci/native-ci.sh`'s own build/test — not
+just locally on demand. `dpkg-dev` (the package providing
+`dpkg-shlibdeps`) needed no new `ci/vm-prepare.sh` entry: it's already
+a transitive dependency of `build-essential`, which that script
+already installs.
 
 ## What this doesn't do yet
 
 * **A real RPM-native CI job** actually installing and running the
-  built RPM end to end (see above).
-* **Wiring `ci/build-deb.sh` into `.github/workflows/ci.yml`** — no
-  technical blocker, just not yet sequenced (see above).
+  built RPM end to end (see above) — DEB is now wired in (see above),
+  RPM still isn't; it needs a real RPM-native runner (most likely this
+  project's own existing CentOS Stream 10 VM harness), not the bare
+  dpkg-native `native-test` runner DEB now uses.
 * **systemd units** (most relevantly for `ocicri`, a real, long-lived
   server process — see `docs/design/0212`) and **dracut/
   initramfs-tools integration** for `ociboot-init` (milestone 5's own

@@ -142,9 +142,27 @@ jobs:
       - name: Build, test, and stage release binaries
         run: ci/native-ci.sh
 
+      # DEB only (not RPM): this runner is genuinely dpkg-native
+      # (whatever Ubuntu release `ubuntu-24.04-arm` ships), so a real
+      # `dpkg -i`/`dpkg -r` round trip is meaningful here the same way
+      # it already is on this project's own dpkg-native development
+      # host (see docs/design/0217) -- unlike RPM (docs/design/0216),
+      # which needs a real RPM-native runner (e.g. this project's own
+      # existing CentOS Stream 10 VM harness above) to verify anything
+      # beyond a bare `rpmbuild`, still a separate, later step.
+      - name: Build and verify the DEB package
+        run: ci/build-deb.sh
+
       - name: Upload binaries
         uses: actions/upload-artifact@v7
         with:
           name: binaries-native-aarch64
           path: artifacts/
+          if-no-files-found: error
+
+      - name: Upload DEB package
+        uses: actions/upload-artifact@v7
+        with:
+          name: deb-native-aarch64
+          path: artifacts-deb/
           if-no-files-found: error
