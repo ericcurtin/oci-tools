@@ -1163,6 +1163,7 @@ dependencies = [
  "clap",
  "oci-cli-common",
  "oci-cri-types",
+ "oci-registry",
  "oci-spec-types",
  "oci-store",
  "serde_json",

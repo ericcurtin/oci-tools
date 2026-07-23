@@ -1,21 +1,32 @@
-//! The real `ImageService` gRPC implementation — this increment's own
-//! narrow first slice: `ListImages`/`ImageStatus`, the two read-only
-//! RPCs, reusing this project's own already-tested `oci_store`
-//! resolution/summary primitives directly (the same ones `ociman
-//! images`/`ociman inspect` already use) rather than anything new.
-//! `PullImage`/`RemoveImage`/`ImageFsInfo`/`StreamImages` each return a
-//! real, honest `Status::unimplemented` naming itself — matching this
-//! project's own established "narrow first slice, document the rest"
-//! pattern (see `runtime_service.rs`'s own module doc comment for the
+//! The real `ImageService` gRPC implementation — `ListImages`/
+//! `ImageStatus`/`PullImage` are genuinely implemented, reusing this
+//! project's own already-tested `oci_store`/`oci_registry` primitives
+//! directly (the same ones `ociman images`/`ociman inspect`/`ociman
+//! pull` already use) rather than anything new. `RemoveImage`/
+//! `ImageFsInfo`/`StreamImages` each return a real, honest
+//! `Status::unimplemented` naming itself — matching this project's
+//! own established "narrow first slice, document the rest" pattern
+//! (see `runtime_service.rs`'s own module doc comment for the
 //! identical reasoning applied to `RuntimeService`).
 //!
 //! Behavior checked directly against real `cri-o`'s own
-//! implementation (`~/git/cri-o/server/image_list.go`/`image_status.go`):
-//! a filter naming one specific image resolves just that one (0 or 1
-//! results, never an error for "not found"); `ImageStatus` of an
-//! unresolvable image returns an empty response (`image: None`), not
-//! an error either — only a request naming no image at all is a real
-//! error.
+//! implementation (`~/git/cri-o/server/image_list.go`/`image_status.go`/
+//! `image_pull.go`): a filter naming one specific image resolves just
+//! that one (0 or 1 results, never an error for "not found");
+//! `ImageStatus` of an unresolvable image returns an empty response
+//! (`image: None`), not an error either — only a request naming no
+//! image at all is a real error; `PullImage` is always unconditional
+//! (no pull-policy concept at the CRI layer at all, unlike `ociman run
+//! --pull`).
+//!
+//! `PullImage`'s own real, unconditional pull runs on a
+//! `tokio::task::spawn_blocking` thread, not directly in its own
+//! `async fn` — this project's own registry client (`oci_registry`,
+//! shared unchanged with every other binary) is a plain, synchronous,
+//! blocking `ureq`-based client throughout; running it directly on a
+//! tokio worker thread would block that whole worker for the entire
+//! real network round trip, starving every other RPC this server is
+//! also supposed to be answering concurrently in the meantime.
 
 use std::collections::BTreeSet;
 
@@ -145,6 +156,31 @@ fn group_by_digest(
     grouped
 }
 
+/// The real, blocking half of [`ImageServiceImpl::pull_image`] — a
+/// real, unconditional pull, matching CRI's own `PullImage` semantics
+/// exactly (real `cri-o`'s own doc comment: no pull-policy concept at
+/// this layer at all, unlike `ociman run --pull`) via the exact same
+/// already-shared `oci_registry::pull_unconditionally` `ociman pull`/
+/// `ocibox create` already use. Always `tls_verify: true` (secure by
+/// default) — this first slice doesn't yet expose a way to name an
+/// insecure registry the way `ociman pull --tls-verify=false` does
+/// (the real CRI `PullImageRequest` has no equivalent field at all;
+/// that decision belongs to a real, cluster-level registry
+/// configuration this project doesn't read yet, see this module's own
+/// doc comment). Real kubelet-supplied `PullImageRequest.auth`
+/// (per-pull inline credentials, distinct from the on-disk auth file
+/// `ociman login` populates) is not honored yet either — a pull always
+/// falls back to whatever `oci_registry::Credentials::load` already
+/// finds on disk, exactly like every other pull in this project.
+fn pull_image_blocking(spec: &str) -> Result<String, Status> {
+    let reference = oci_spec_types::Reference::parse(spec)
+        .map_err(|e| Status::invalid_argument(format!("parsing image reference {spec:?}: {e}")))?;
+    let store = open_store()?;
+    let record = oci_registry::pull_unconditionally(&store, &reference, true)
+        .map_err(|e| Status::unavailable(format!("pulling {reference}: {e}")))?;
+    Ok(record.manifest_digest.to_string())
+}
+
 /// A real, honest "not implemented yet" error for every RPC this first
 /// slice doesn't answer — see [`crate::runtime_service::unimplemented`]'s
 /// own identical doc comment.
@@ -272,9 +308,30 @@ impl cri::image_service_server::ImageService for ImageServiceImpl {
 
     async fn pull_image(
         &self,
-        _request: Request<cri::PullImageRequest>,
+        request: Request<cri::PullImageRequest>,
     ) -> Result<Response<cri::PullImageResponse>, Status> {
-        unimplemented("PullImage")
+        let spec = request
+            .into_inner()
+            .image
+            .map(|s| s.image)
+            .filter(|s| !s.is_empty());
+        let Some(spec) = spec else {
+            return Err(Status::invalid_argument("no image specified"));
+        };
+
+        // A real, unconditional pull is always a real network round
+        // trip -- run on a blocking-pool thread so one slow/stuck pull
+        // never starves this server's own tokio worker threads from
+        // answering every other RPC in the meantime (this project's
+        // own registry client, `oci_registry`/`ureq`, is a plain,
+        // synchronous blocking client throughout, shared unchanged
+        // with every other binary — see this module's own doc comment
+        // for why introducing an async HTTP stack just for this one
+        // RPC isn't worth it).
+        tokio::task::spawn_blocking(move || pull_image_blocking(&spec))
+            .await
+            .map_err(|e| Status::internal(format!("pull task panicked: {e}")))?
+            .map(|image_ref| Response::new(cri::PullImageResponse { image_ref }))
     }
 
     async fn remove_image(
@@ -332,6 +389,27 @@ mod tests {
             .image_status(Request::new(cri::ImageStatusRequest {
                 image: None,
                 verbose: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    // `pull_image`'s own real network-attempt/success cases are
+    // covered by the real, socket-connecting integration tests in
+    // `tests/tests/ocicri_pull_image.rs` instead of here, for the same
+    // "avoid touching the real process-global storage-root env var in
+    // an in-process, potentially-parallel unit test" reason given
+    // above -- the "no image specified" argument check alone needs
+    // neither a store nor a real network attempt, so it's safe here.
+    #[tokio::test]
+    async fn pull_image_with_no_image_at_all_is_invalid_argument() {
+        let service = ImageServiceImpl;
+        let status = service
+            .pull_image(Request::new(cri::PullImageRequest {
+                image: None,
+                auth: None,
+                sandbox_config: None,
             }))
             .await
             .unwrap_err();
