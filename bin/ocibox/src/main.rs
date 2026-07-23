@@ -6,20 +6,21 @@
 //! binary. Planned commands (milestone 7): `create`, `enter`, `list`, `rm`,
 //! `stop`, `upgrade`, `export`.
 //!
-//! `create` is the first real subcommand (0205): resolving/pulling an
-//! image and extracting a real, dedicated, writable rootfs for a named
-//! box — deliberately scoped down from the full real `distrobox
+//! `create` was the first real subcommand (0205): resolving/pulling
+//! an image and extracting a real, dedicated, writable rootfs for a
+//! named box — deliberately scoped down from the full real `distrobox
 //! create` (studied directly from `~/git/distrobox`'s own Go rewrite),
 //! which additionally integrates X11/Wayland/audio/nvidia passthrough,
-//! init-hooks, and additional-package installation, none of which this
-//! increment attempts yet. Actually *launching* a box (the real
-//! namespace/mount/home-bind-mount setup, via the exact same shared
-//! `oci_runtime_core::launch::create`/`oci_runtime_core::exec_fifo`
-//! two-phase lifecycle `ociman create`/`ocirun start` already use) is
-//! `ocibox enter`'s own job, still ahead — matches this project's own
-//! established "narrow first slice, document the rest" pattern (e.g.
-//! `ociboot build-image` before `ociboot`'s own eventual `install
-//! to-disk`).
+//! init-hooks, and additional-package installation, none of which
+//! this project attempts yet. `list`/`rm` (0206) round out the family
+//! enough to actually manage what `create` makes. Actually *launching*
+//! a box (the real namespace/mount/home-bind-mount setup, via the
+//! exact same shared `oci_runtime_core::launch::create`/
+//! `oci_runtime_core::exec_fifo` two-phase lifecycle `ociman create`/
+//! `ocirun start` already use) is `ocibox enter`'s own job, still
+//! ahead — matches this project's own established "narrow first
+//! slice, document the rest" pattern (e.g. `ociboot build-image`
+//! before `ociboot`'s own eventual `install to-disk`).
 
 use std::path::{Path, PathBuf};
 
@@ -76,6 +77,33 @@ enum Command {
         #[arg(long, short = 'p')]
         pull: bool,
     },
+    /// List real, created boxes — matching real `distrobox list`
+    /// (alias `ls`), narrowed to what this project's own boxes
+    /// actually track so far (name, image, creation time): real
+    /// `distrobox list` shows real container status too, which
+    /// doesn't apply yet here since `ocibox create` doesn't launch
+    /// anything yet (`ocibox enter`, still ahead, is what will).
+    /// Sorted by name, matching real `distrobox list`'s own stable
+    /// sort order (checked directly against its own source,
+    /// `pkg/commands/list.go`).
+    #[command(alias = "ls")]
+    List,
+    /// Remove a box entirely (its own rootfs and persisted record) —
+    /// matching real `distrobox rm <NAME>`. `--force` is accepted for
+    /// real CLI compatibility but changes nothing: this project has
+    /// no interactive confirmation prompt to skip in the first place
+    /// (the same "nothing to skip" reasoning `create --pull`'s own
+    /// doc comment already gives for `--yes`).
+    Rm {
+        /// The box's own name, exactly as given to `ocibox create
+        /// --name`.
+        name: String,
+        /// Accepted for real CLI compatibility with `distrobox rm
+        /// --force`; has no effect (see this command's own doc
+        /// comment).
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -88,9 +116,11 @@ fn main() -> std::process::ExitCode {
         );
         match cli.command {
             Some(Command::Create { image, name, pull }) => cmd_create(&image, &name, pull),
+            Some(Command::List) => cmd_list(cli.global.json),
+            Some(Command::Rm { name, force: _ }) => cmd_rm(&name),
             None => anyhow::bail!(
                 "no subcommand given (try `ocibox create --image ... --name ...`); \
-                 the rest of milestone 7 (`enter`/`list`/`rm`/`stop`/...) arrives later"
+                 the rest of milestone 7 (`enter`/`stop`/...) arrives later"
             ),
         }
     })
@@ -129,10 +159,10 @@ fn validate_box_name(name: &str) -> anyhow::Result<()> {
 }
 
 /// A box's own persisted metadata (`<boxes_root>/<name>/box.json`) —
-/// deliberately minimal so far (just enough for a future `ocibox list`
-/// to enumerate real boxes): the image it was created from, the real
+/// deliberately minimal so far (just enough for `ocibox list` to
+/// enumerate real boxes): the image it was created from, the real
 /// manifest digest that resolved to at creation time, and when.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BoxRecord {
     name: String,
     image: String,
@@ -224,6 +254,78 @@ fn extract_rootfs(
         oci_layer::apply(blob, compression, rootfs)
             .with_context(|| format!("extracting layer {}", layer.digest))?;
     }
+    Ok(())
+}
+
+/// Every real box's own persisted [`BoxRecord`], read back from
+/// `<boxes_root>/*/box.json`, sorted by name (matching real
+/// `distrobox list`'s own stable sort order). A directory under
+/// `boxes_root` with no readable `box.json` at all (e.g. a leftover
+/// from an interrupted `create` on a version of this tool predating
+/// this file, or any other real I/O error reading one) is skipped
+/// rather than failing the whole listing — matches this project's own
+/// established "one broken entry shouldn't hide every other, otherwise
+/// real one" preference (e.g. `oci_bls::scan_entries`'s own identical
+/// tolerance for one unreadable BLS entry file).
+fn list_boxes() -> anyhow::Result<Vec<BoxRecord>> {
+    let root = boxes_root();
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", root.display())),
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let box_json = entry.path().join("box.json");
+        let Ok(bytes) = std::fs::read(&box_json) else {
+            continue;
+        };
+        if let Ok(record) = serde_json::from_slice::<BoxRecord>(&bytes) {
+            records.push(record);
+        }
+    }
+    records.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(records)
+}
+
+fn cmd_list(json: bool) -> anyhow::Result<()> {
+    let records = list_boxes()?;
+    if json {
+        oci_cli_common::output::print_json(&records)?;
+        return Ok(());
+    }
+    if records.is_empty() {
+        println!("no boxes");
+        return Ok(());
+    }
+    println!("{:<24} {:<50} {:<20}", "NAME", "IMAGE", "CREATED");
+    for record in &records {
+        println!(
+            "{:<24} {:<50} {:<20}",
+            record.name, record.image, record.created
+        );
+    }
+    Ok(())
+}
+
+/// `ocibox rm`: removes `<boxes_root>/<name>` entirely — its own
+/// extracted rootfs and persisted `box.json` alike. A name that
+/// doesn't exist at all is a clear, real error (matching real
+/// `distrobox rm`'s own identical refusal for an unknown name), not a
+/// silent no-op.
+fn cmd_rm(name: &str) -> anyhow::Result<()> {
+    // Validated for exactly the same reason `cmd_create` validates its
+    // own `--name` before ever joining it onto `boxes_root()` — a
+    // `name` containing `/` (or `..`) would otherwise let this
+    // function's own `remove_dir_all` reach an arbitrary path outside
+    // `boxes_root()` entirely, a real path-traversal hazard, not just
+    // a cosmetic naming rule.
+    validate_box_name(name)?;
+    let box_dir = boxes_root().join(name);
+    anyhow::ensure!(box_dir.is_dir(), "{name}: no such box");
+    std::fs::remove_dir_all(&box_dir).with_context(|| format!("removing {}", box_dir.display()))?;
+    println!("{name}");
     Ok(())
 }
 
