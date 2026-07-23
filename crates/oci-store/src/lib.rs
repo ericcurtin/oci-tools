@@ -40,10 +40,15 @@ use oci_spec_types::image::Manifest;
 
 mod describe;
 mod images;
+mod resolve;
 mod rootfs_cache;
 
 pub use describe::ImageSummary;
 pub use images::{ImageRecord, ImagesError};
+pub use resolve::{
+    ResolvedImage, is_untagged_reference, resolve_by_id_only, resolve_by_reference_or_id,
+    untagged_reference,
+};
 pub use rootfs_cache::{
     CachePruneReport, cache_dir_for, cache_root, dir_size, ensure_cached, prune,
 };
@@ -92,6 +97,19 @@ pub enum StoreError {
     UnsupportedLayerMediaType {
         /// The unrecognized media type string.
         media_type: String,
+    },
+    /// [`resolve::resolve_by_id_only`]'s own real or short image ID
+    /// fallback matched more than one genuinely different image (a
+    /// real, if rare in practice, hex-prefix collision) — matching
+    /// real `docker`/`podman`'s own identical "multiple IDs found"
+    /// refusal rather than silently guessing one.
+    #[error("image ID {spec:?} is ambiguous: matches {count} different images")]
+    AmbiguousId {
+        /// The real or short ID string that was given.
+        spec: String,
+        /// How many genuinely different images (distinct manifest
+        /// digests) it matched.
+        count: usize,
     },
 }
 

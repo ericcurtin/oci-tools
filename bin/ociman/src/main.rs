@@ -32,7 +32,11 @@ use oci_spec_types::image::{
     MEDIA_TYPE_IMAGE_LAYER_GZIP, MEDIA_TYPE_IMAGE_MANIFEST, Platform, RootFs,
 };
 use oci_spec_types::time::format_rfc3339_utc;
-use oci_store::{ImageRecord, ImageSummary, Store};
+use oci_store::{
+    ImageRecord, ImageSummary, ResolvedImage, Store, is_untagged_reference,
+    resolve_by_id_only as resolve_image_by_id_only,
+    resolve_by_reference_or_id as resolve_image_by_reference_or_id, untagged_reference,
+};
 use serde::Serialize;
 
 /// See [`ANNOTATION_IMAGE`]: the command actually run, space-joined,
@@ -4103,147 +4107,13 @@ fn validate_container_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The synthetic `reference` this project's own store records an
-/// untagged image under (`ociman build`/`ociman load` with no real,
-/// user-visible tag at all) — the image's own manifest digest,
-/// verbatim (e.g. `sha256:<hex>`). `oci_store::ImageRecord` has no
-/// separate "this image has no tag" concept of its own (see
-/// `docs/design/0179`'s own doc comment for why none was needed): a
-/// bare digest string is used as `ImageRecord::reference` instead,
-/// safe because it can never collide with a real one — every real,
-/// `Reference::parse`-derived reference's own `Display` always writes
-/// `<registry>/<repository>...` (checked directly against
-/// `Reference`'s own `Display` impl), so it always contains at least
-/// one `/`, which a bare digest string never does.
-pub(crate) fn untagged_reference(digest: &oci_spec_types::Digest) -> String {
-    digest.to_string()
-}
-
-/// Whether `reference` (an `ImageRecord`'s own field) is
-/// [`untagged_reference`]'s own sentinel rather than a real tag — see
-/// its own doc comment for why a bare digest string (no `/` at all)
-/// can never be a real one.
-pub(crate) fn is_untagged_reference(reference: &str) -> bool {
-    !reference.contains('/')
-}
-
-/// Resolve `spec` to a stored image record: first as an ordinary tag
-/// reference (the overwhelmingly common case, and the only thing
-/// `ociman` supported resolving an image by before this), then, if
-/// that fails, as a real or short image ID — a hex prefix of its own
-/// manifest digest, no `sha256:` prefix required — matching real
-/// `docker inspect a1b2c3d4`/`podman inspect a1b2c3d4`'s own
-/// convention exactly (the same short ID `ociman images`' own
-/// `DIGEST` column already prints, 12 hex characters by default, but
-/// any real prefix length works here too, same as real docker/
-/// podman). Deduplicated by the *real* underlying digest, not by tag
-/// count: two tags pointing at the exact same image (`ociman tag`'s
-/// own whole point) never make an ID prefix ambiguous — only two
-/// genuinely *different* images that happen to share a digest prefix
-/// do (a real, if rare in practice, `sha256` collision-adjacent case;
-/// checked directly this way rather than just picking the first
-/// match, matching real docker's own "Multiple IDs found" refusal
-/// instead of silently guessing).
-/// Which of the two ways [`resolve_image_by_reference_or_id`] matched
-/// `spec` — callers that need to know (like [`cmd_rmi`]'s own "removing
-/// *by ID* with more than one tag needs `--force`" policy, matching
-/// real `podman rmi`'s own identical rule, checked directly) inspect
-/// this; ones that don't (like `cmd_inspect`, which only ever reads,
-/// never removes) can just call [`ResolvedImage::record`] and ignore
-/// which arm it came from.
-enum ResolvedImage {
-    /// `spec` was itself an existing tag reference.
-    Tag(ImageRecord),
-    /// `spec` didn't match any tag; resolved via a real or short image
-    /// ID fallback instead.
-    Id(ImageRecord),
-}
-
-impl ResolvedImage {
-    fn record(&self) -> &ImageRecord {
-        match self {
-            ResolvedImage::Tag(record) | ResolvedImage::Id(record) => record,
-        }
-    }
-}
-
-fn resolve_image_by_reference_or_id(
-    store: &Store,
-    spec: &str,
-) -> anyhow::Result<Option<ResolvedImage>> {
-    if let Ok(reference) = Reference::parse(spec)
-        && let Some(record) = store
-            .resolve_image(&reference.to_string())
-            .with_context(|| format!("looking up {reference} in local storage"))?
-    {
-        return Ok(Some(ResolvedImage::Tag(record)));
-    }
-    Ok(resolve_image_by_id_only(store, spec)?.map(ResolvedImage::Id))
-}
-
-/// The real-or-short-image-ID half of [`resolve_image_by_reference_or_id`],
-/// split out so a caller that needs the *opposite* ordering (ID first,
-/// tag/pull-policy second — [`prepare_container`]'s own image
-/// resolution, where trying a tag first would mean a real, wasted
-/// network round-trip for the common "run/create by ID" case: an ID
-/// almost always also parses as *some* syntactically valid but
-/// nonsense tag reference, e.g. `docker.io/library/<hex>:latest`, and
-/// this project's own pull policy would otherwise dutifully try to
-/// pull that nonsense reference before ever falling back to ID
-/// resolution) can call this directly, with no tag lookup of its own
-/// at all. Real tag references essentially never accidentally match
-/// the hex-only filter below (matches real docker/podman's own
-/// established "ID resolution basically never collides with a real
-/// name" precedent) — see [`prepare_container`]'s own call site for
-/// why ID-first is safe there.
-fn resolve_image_by_id_only(store: &Store, spec: &str) -> anyhow::Result<Option<ImageRecord>> {
-    let candidate = spec
-        .strip_prefix("sha256:")
-        .unwrap_or(spec)
-        .to_ascii_lowercase();
-    if candidate.is_empty()
-        || candidate.len() > 64
-        || !candidate.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return Ok(None);
-    }
-
-    let mut by_digest: std::collections::HashMap<String, ImageRecord> =
-        std::collections::HashMap::new();
-    for record in store.list_images().context("listing local images")? {
-        if record.manifest_digest.hex().starts_with(&candidate) {
-            // When the exact same image has more than one record
-            // (real tags, or this project's own untagged sentinel,
-            // see `untagged_reference`/0179), a real tag always wins
-            // over the sentinel here, deterministically -- callers
-            // like `cmd_push`'s own "no real reference to push"
-            // refusal read `.reference` off whichever record this
-            // returns, so an image that's *also* been given a real
-            // tag (`ociman tag <id> ...`) alongside its own original
-            // untagged record must never have that guard trip just
-            // because `list_images`'s own iteration order happened to
-            // visit the sentinel first.
-            let hex = record.manifest_digest.hex().to_string();
-            match by_digest.entry(hex) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(record);
-                }
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    if is_untagged_reference(&entry.get().reference)
-                        && !is_untagged_reference(&record.reference)
-                    {
-                        entry.insert(record);
-                    }
-                }
-            }
-        }
-    }
-    match by_digest.len() {
-        0 => Ok(None),
-        1 => Ok(by_digest.into_values().next()),
-        n => anyhow::bail!("image ID {spec:?} is ambiguous: matches {n} different images"),
-    }
-}
+// `untagged_reference`/`is_untagged_reference`/`ResolvedImage`/
+// `resolve_image_by_reference_or_id`/`resolve_image_by_id_only` all now
+// live in `oci_store` itself (see its own `resolve` module) — moved
+// there once `ocicri`'s own `ImageService` needed the identical logic
+// too (CRI's `ImageSpec.image` field is routinely a bare digest/ID,
+// not just a tag). Imported above with their own original local names
+// preserved via `as` aliases, so every call site below is unchanged.
 
 /// Resolve `reference` (whatever a user gave any container-targeting
 /// subcommand: `ps`/`rm`/`stop`/`exec`/`logs`) to a real container id

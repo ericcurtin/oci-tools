@@ -19,9 +19,12 @@
 //! why every other one of `RuntimeService`'s 33 other RPCs
 //! deliberately returns a real `Status::unimplemented` naming itself,
 //! rather than accepting a request this project can't actually act on
-//! yet. `ImageService` (CRI's other, smaller service) isn't
-//! registered on the server at all yet — its own separate, still-
-//! ahead increment.
+//! yet. `ImageService`'s own `ListImages`/`ImageStatus` (0213) are
+//! genuinely implemented too, reusing this project's own already-
+//! tested `oci_store` resolution/summary primitives directly (see
+//! `image_service.rs`'s own module doc comment) — `PullImage`/
+//! `RemoveImage`/`ImageFsInfo`/`StreamImages` remain real, honest
+//! `Status::unimplemented`s, still ahead.
 //!
 //! Unlike every other binary in this workspace, `ocicri` is a real,
 //! long-lived server process, not a short-lived CLI invocation — the
@@ -33,6 +36,7 @@
 //! other binary's own hot per-invocation startup path is completely
 //! unaffected.
 
+mod image_service;
 mod runtime_service;
 
 use std::path::PathBuf;
@@ -116,6 +120,9 @@ async fn serve(socket_path: &std::path::Path) -> anyhow::Result<()> {
     tonic::transport::Server::builder()
         .add_service(cri::runtime_service_server::RuntimeServiceServer::new(
             runtime_service::RuntimeServiceImpl,
+        ))
+        .add_service(cri::image_service_server::ImageServiceServer::new(
+            image_service::ImageServiceImpl,
         ))
         .serve_with_incoming(incoming)
         .await
