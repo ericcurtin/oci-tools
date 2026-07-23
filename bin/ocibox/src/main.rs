@@ -98,13 +98,23 @@ enum Command {
     /// doc comment already gives for `--yes`).
     Rm {
         /// The box's own name, exactly as given to `ocibox create
-        /// --name`.
-        name: String,
+        /// --name`. Required unless `--all` is given instead (matching
+        /// real `distrobox rm`'s own identical either/or requirement).
+        name: Option<String>,
         /// Accepted for real CLI compatibility with `distrobox rm
         /// --force`; has no effect (see this command's own doc
         /// comment).
         #[arg(long, short = 'f')]
         force: bool,
+        /// Remove every existing box, matching real `distrobox rm
+        /// --all`. Mutually exclusive with a positional `name` (this
+        /// project's own narrower "one or the other, not both"
+        /// requirement rather than real `distrobox rm`'s own richer
+        /// "any combination of explicit names and `--all`" handling —
+        /// not worth replicating for a flag whose whole point is
+        /// "remove literally everything" either way).
+        #[arg(long, short = 'a')]
+        all: bool,
     },
     /// Enter a box: runs a real, live, interactive command inside its
     /// own already-extracted rootfs — rootless namespaces (matching
@@ -150,7 +160,11 @@ fn main() -> std::process::ExitCode {
         match cli.command {
             Some(Command::Create { image, name, pull }) => cmd_create(&image, &name, pull),
             Some(Command::List) => cmd_list(cli.global.json),
-            Some(Command::Rm { name, force: _ }) => cmd_rm(&name),
+            Some(Command::Rm {
+                name,
+                force: _,
+                all,
+            }) => cmd_rm(name.as_deref(), all),
             Some(Command::Enter { name, command }) => cmd_enter(&name, &command),
             None => anyhow::bail!(
                 "no subcommand given (try `ocibox create --image ... --name ...`); \
@@ -536,19 +550,64 @@ fn cmd_enter(name: &str, command: &[String]) -> anyhow::Result<()> {
     std::process::exit(exit_code);
 }
 
-fn cmd_rm(name: &str) -> anyhow::Result<()> {
-    // Validated for exactly the same reason `cmd_create` validates its
-    // own `--name` before ever joining it onto `boxes_root()` — a
-    // `name` containing `/` (or `..`) would otherwise let this
-    // function's own `remove_dir_all` reach an arbitrary path outside
-    // `boxes_root()` entirely, a real path-traversal hazard, not just
-    // a cosmetic naming rule.
+/// Removes exactly one box's own directory (its rootfs and persisted
+/// record alike) and prints its name — the one real removal primitive
+/// both a single-name `ocibox rm <NAME>` and `ocibox rm --all` (one
+/// call per already-listed box) share.
+///
+/// Validated for exactly the same reason `cmd_create` validates its
+/// own `--name` before ever joining it onto `boxes_root()` — a `name`
+/// containing `/` (or `..`) would otherwise let this function's own
+/// `remove_dir_all` reach an arbitrary path outside `boxes_root()`
+/// entirely, a real path-traversal hazard, not just a cosmetic naming
+/// rule.
+fn remove_one_box(name: &str) -> anyhow::Result<()> {
     validate_box_name(name)?;
     let box_dir = boxes_root().join(name);
     anyhow::ensure!(box_dir.is_dir(), "{name}: no such box");
     std::fs::remove_dir_all(&box_dir).with_context(|| format!("removing {}", box_dir.display()))?;
     println!("{name}");
     Ok(())
+}
+
+/// `ocibox rm <NAME>` / `ocibox rm --all` (matching real `distrobox rm
+/// --all`): removes either exactly the one named box, or every
+/// existing box — mutually exclusive (see [`Command::Rm`]'s own doc
+/// comment for why this project doesn't replicate real `distrobox
+/// rm`'s own richer "any combination of explicit names and `--all`"
+/// handling).
+///
+/// `--all` on an empty store is a real, silent no-op (nothing to
+/// remove, nothing printed), matching this project's own established
+/// "empty is a valid, unremarkable state" convention (`ocibox list`'s
+/// own `no boxes` message being the one place that *is* worth an
+/// explicit line, since a listing command's whole job is reporting
+/// state — a bulk-removal command has nothing more to say here).
+/// Removal of every box is attempted even if one fails partway through
+/// (matching real `distrobox rm`'s own identical "continue past a
+/// per-container error rather than aborting the whole batch"
+/// behavior) — the first failure's own error is still what this
+/// command ultimately reports and exits nonzero for, once every box
+/// has had its own attempt.
+fn cmd_rm(name: Option<&str>, all: bool) -> anyhow::Result<()> {
+    match (name, all) {
+        (Some(_), true) => anyhow::bail!("cannot give both a box name and --all"),
+        (None, false) => anyhow::bail!("no box name given (try `ocibox rm <NAME>` or `--all`)"),
+        (Some(name), false) => remove_one_box(name),
+        (None, true) => {
+            let mut first_error = None;
+            for record in list_boxes()? {
+                if let Err(e) = remove_one_box(&record.name) {
+                    eprintln!("error removing {}: {e:#}", record.name);
+                    first_error.get_or_insert(e);
+                }
+            }
+            match first_error {
+                Some(e) => Err(e.context("removing every box")),
+                None => Ok(()),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

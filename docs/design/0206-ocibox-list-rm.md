@@ -80,7 +80,8 @@ prior measurements — this change touches only `ocibox`'s own code).
 
 ## What this doesn't do yet
 
-Actually launching a box (`ocibox enter`), `ocibox stop`,
-X11/Wayland/audio/nvidia passthrough, init-hooks, additional-package
-installation, cloning an existing box, and `rm --all`/`--rm-home` are
-all still ahead.
+Actually launching a box (`ocibox enter`, landed in 0207), `ocibox
+stop`, X11/Wayland/audio/nvidia passthrough, init-hooks,
+additional-package installation, cloning an existing box, and
+`rm --all` (landed as its own small follow-up, see the changelog
+entry after 0207 in `README.md`)/`--rm-home` are all still ahead.

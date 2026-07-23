@@ -218,3 +218,94 @@ fn rm_rejects_a_path_traversal_attempt_in_the_name() {
     );
     assert!(canary.is_file(), "the canary file must survive untouched");
 }
+
+/// `ocibox rm --all` (matching real `distrobox rm --all`): removes
+/// every existing box in one call, sorted by name (same order `list`
+/// itself reports them in), leaving the store genuinely empty
+/// afterward.
+#[test]
+fn rm_all_removes_every_box() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/rm-all-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    for name in ["zeta", "alpha", "mid"] {
+        let create = ocibox(
+            storage_dir.path(),
+            &[
+                "create",
+                "--image",
+                "ocibox-test/rm-all-base:latest",
+                "--name",
+                name,
+            ],
+        );
+        assert!(create.status.success());
+    }
+
+    let rm = ocibox(storage_dir.path(), &["rm", "--all"]);
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&rm.stdout).into_owned();
+    let removed: Vec<&str> = stdout.lines().collect();
+    assert_eq!(removed, vec!["alpha", "mid", "zeta"]);
+
+    let list = ocibox(storage_dir.path(), &["list"]);
+    assert_eq!(String::from_utf8_lossy(&list.stdout).trim(), "no boxes");
+    assert!(!storage_dir.path().join("boxes").join("alpha").exists());
+    assert!(!storage_dir.path().join("boxes").join("mid").exists());
+    assert!(!storage_dir.path().join("boxes").join("zeta").exists());
+}
+
+/// `rm --all` on an already-empty store is a real, silent no-op:
+/// nothing to remove, nothing printed, exit success -- there was
+/// never a box to report a failure or a name for.
+#[test]
+fn rm_all_on_an_empty_store_is_a_silent_success() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let rm = ocibox(storage_dir.path(), &["rm", "--all"]);
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert!(rm.stdout.is_empty());
+}
+
+/// `rm` with neither a name nor `--all`, and `rm` with both, are each
+/// a clear, real error rather than an ambiguous silent no-op.
+#[test]
+fn rm_requires_exactly_one_of_name_or_all() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let neither = ocibox(storage_dir.path(), &["rm"]);
+    assert!(!neither.status.success());
+    assert!(
+        String::from_utf8_lossy(&neither.stderr).contains("no box name given"),
+        "{}",
+        String::from_utf8_lossy(&neither.stderr)
+    );
+
+    let both = ocibox(storage_dir.path(), &["rm", "somebox", "--all"]);
+    assert!(!both.status.success());
+    assert!(
+        String::from_utf8_lossy(&both.stderr).contains("cannot give both"),
+        "{}",
+        String::from_utf8_lossy(&both.stderr)
+    );
+}
