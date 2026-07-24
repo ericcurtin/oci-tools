@@ -53,18 +53,28 @@ jobs:
       - name: Project guards (forbidden fs, bin deps, capability dups)
         run: python3 ci/guards.py
 
-  # 2 parallel VM jobs (x86_64 only): each boots the target distro as a VM
-  # on a same-arch runner and builds/tests the workspace natively inside
-  # it. x86_64 runners provide KVM when the underlying host happens to
-  # expose it (falls back to TCG otherwise, see ci/setup-host.sh) --
-  # either way, real per-distro (centos-stream10/ubuntu-26.04) coverage.
+  # 2 parallel VM jobs (x86_64 only): each boots the target distro as a
+  # microVM -- created straight from the distro's own OCI image by this
+  # repo's *own* `ocivmm` binary (dogfooded on every push/PR; its VMM
+  # is libkrun's crates statically linked, nothing to install or load
+  # at run time) -- and builds/tests the workspace natively inside it,
+  # under the distro's *own* kernel and systemd (ocivmm provisions both
+  # into the pet VM with the distro's own package manager at create
+  # time, run as a container on the fresh rootfs).
+  # Dramatically faster than the qemu+cloud-init harness this replaced:
+  # a ~30-60MB OCI image pull (cached) instead of a ~700MB cloud image,
+  # a direct-kernel boot into systemd (~1-2s) instead of
+  # UEFI+cloud-init minutes, and virtiofs instead of ssh+tar for
+  # source/artifact transfer. The pet VM's own rootfs (kernel,
+  # packages, rustup, cargo target) persists across runs via the
+  # vm-state cache below.
+  #
+  # x86_64 runners provide /dev/kvm, which libkrun requires (no TCG
+  # fallback exists anymore -- ci/setup-host.sh fails clearly instead).
   #
   # aarch64 coverage is `native-test` below instead, not a third and
   # fourth cell here: GitHub's own aarch64 runners have no /dev/kvm at
-  # all, so this same harness's guest VMs would only ever boot under
-  # (slow, and — found the hard way, 2026-07-20 — occasionally flaky in
-  # ways that muddy real per-architecture bugs with unrelated timing
-  # noise) TCG there.
+  # all.
   vm-test:
     name: vm (${{ matrix.base }}, ${{ matrix.arch }})
     strategy:
@@ -84,21 +94,41 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The key ends in run_id so a fresh (warmer) cache is saved after every
-      # run; restore falls back to the newest matching prefix.
-      - name: Restore build cache disk
+      # Cargo cache for the *host-side* release build of ocivmm itself
+      # (the guest's own build cache lives inside the VM state below).
+      - name: Cache cargo (host ocivmm build)
         uses: actions/cache@v6
         with:
-          path: ~/.cache/oci-tools-ci/cache-disk.qcow2
-          key: vmcache-v1-${{ matrix.base }}-${{ matrix.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.run_id }}
-          restore-keys: |
-            vmcache-v1-${{ matrix.base }}-${{ matrix.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
-            vmcache-v1-${{ matrix.base }}-${{ matrix.arch }}-
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ocivmm-host-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ocivmm-host-${{ runner.os }}-
 
-      - name: Set up host (qemu, firmware, kvm)
+      # The packed pet-VM state (OCI image blobs + the VM rootfs with
+      # everything ci/vm-ci.sh installed and built on previous runs).
+      # The key ends in run_id so a fresh (warmer) state is saved after
+      # every run; restore falls back to the newest matching prefix.
+      - name: Restore VM state
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/oci-tools-ci/vm-state.tar
+          key: vmstate-v1-${{ matrix.base }}-${{ matrix.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            vmstate-v1-${{ matrix.base }}-${{ matrix.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            vmstate-v1-${{ matrix.base }}-${{ matrix.arch }}-
+
+      - name: Set up host (kvm, passt)
         run: ci/setup-host.sh
 
-      - name: Build and test in VM
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - name: Build ocivmm (host side)
+        run: cargo build --release --locked -p ocivmm
+
+      - name: Build and test in VM (ocivmm)
         env:
           OCI_CI_BASE: ${{ matrix.base }}
           OCI_CI_ARCH: ${{ matrix.arch }}

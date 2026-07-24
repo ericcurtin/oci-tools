@@ -34,34 +34,41 @@ CI denies warnings; locally they are allowed so you can iterate.
 * Every milestone starts with a design note in `docs/design/`; keep it
   updated as the implementation evolves.
 
-## The CI VM harness
+## The CI VM harness (ocivmm, dogfooded)
 
 CI builds and tests natively inside VMs of the two supported bases
-(CentOS Stream 10, Ubuntu 26.04) on both x86_64 and aarch64. The harness in
-`ci/` is plain bash + QEMU and works locally on any Linux with KVM (or
-without — it falls back to TCG, slowly):
+(CentOS Stream 10, Ubuntu 26.04) on x86_64 — booted by this repo's own
+`ocivmm` binary straight from the distros' OCI images (no qemu, no
+cloud images, no cloud-init, no ssh; the VMM is libkrun's crates
+statically linked into `ocivmm`, and the checkout is shared with the
+guest over virtiofs). At create time `ocivmm` provisions the pet VM
+with the distro's *own* kernel, initramfs, and systemd (running the
+distro's own dnf/apt as a container on the fresh rootfs), so the
+tests run under the real distro kernel with the real distro init —
+the same fidelity the cloud images had. Works locally on any Linux
+with KVM (plus the `passt` package for guest networking):
 
 ```sh
-ci/setup-host.sh                       # once: qemu + firmware (+ /dev/kvm perms)
+ci/setup-host.sh                       # once: /dev/kvm perms + passt
 OCI_CI_BASE=ubuntu-26.04 ci/run-in-vm.sh
 OCI_CI_BASE=centos-stream10 ci/run-in-vm.sh
 ```
 
-`run-in-vm.sh` boots the cloud image, pushes the tree, runs `ci/vm-ci.sh`
-inside, and pulls release binaries into `./artifacts/`. Lower-level control:
+`run-in-vm.sh` builds `ocivmm`, boots the pet VM (creating and
+provisioning it from the OCI image on first use), runs `ci/vm-ci.sh`
+inside as a oneshot systemd unit, and the release binaries appear in
+`./artifacts/` directly (written through the virtiofs mount).
+Lower-level control is `ocivmm` itself:
 
 ```sh
-export VM_IMAGE_URL=https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img
-ci/vm.sh up
-ci/vm.sh run -- uname -a
-ci/vm.sh push . oci-tools
-ci/vm.sh pull artifacts ./artifacts
-ci/vm.sh down
+sudo target/release/ocivmm run -v "$PWD:/src" ubuntu:26.04 uname -a
+sudo target/release/ocivmm run ubuntu-26.04    # root console, poweroff to leave
 ```
 
-State lives under `~/.cache/oci-tools-ci/` (base images, VM overlay disk,
-build-cache disk `cache-disk.qcow2` carrying rustup/cargo/target between
-runs — delete it for a cold build).
+State lives under `~/.cache/oci-tools-ci/` (`vm-state.tar`, the packed
+pet-VM storage carrying the provisioned kernel+systemd, installed
+packages, rustup/cargo, and the target dir between runs — delete it
+for a cold build).
 
 ## Benchmarking
 

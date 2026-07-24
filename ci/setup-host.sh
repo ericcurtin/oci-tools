@@ -1,45 +1,36 @@
 #!/usr/bin/env bash
-# Prepare a Debian/Ubuntu host (GitHub Actions runner) to run the VM harness:
-# install QEMU + UEFI firmware + cloud-image tooling and widen /dev/kvm
-# permissions when present. The harness itself degrades to TCG without KVM.
+# Prepare a Debian/Ubuntu host (GitHub Actions runner) to run the ocivmm
+# VM harness: widen /dev/kvm permissions and install passt (the
+# userspace network backend every guest's virtio-net device connects
+# to). Nothing else: ocivmm's VMM is statically linked (libkrun's
+# crates, built like any other Rust dependency by the ordinary cargo
+# build), the guests run their own distro kernels, and provisioning is
+# containerized -- so no qemu, no firmware, no cloud-image tooling, no
+# shared libraries, and no kernel build toolchain.
 set -euo pipefail
 
-arch=$(uname -m)
-
-pkgs=(qemu-utils cloud-image-utils openssh-client curl ca-certificates)
-case "$arch" in
-    x86_64) pkgs+=(qemu-system-x86 ovmf) ;;
-    aarch64) pkgs+=(qemu-system-arm qemu-efi-aarch64) ;;
-    *)
-        echo "setup-host: unsupported host architecture: $arch" >&2
-        exit 1
-        ;;
-esac
-
 sudo apt-get update -qq
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${pkgs[@]}"
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+    build-essential \
+    passt
 
 # GitHub runners ship /dev/kvm restricted to the kvm group; make it usable
-# without re-logging by widening the node (standard approach for CI runners).
-if [ -e /dev/kvm ]; then
-    echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
-        sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
-    sudo udevadm control --reload-rules
-    sudo udevadm trigger --name-match=kvm || true
-    if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-        echo "setup-host: KVM available"
-    else
-        echo "setup-host: /dev/kvm present but not accessible; harness will fall back to TCG"
-    fi
-    # Nested-virt quality varies; unrestricted_guest=N means real-mode
-    # guest code (SeaBIOS) cannot run, which is why the harness boots
-    # x86_64 guests with OVMF by default.
-    for p in /sys/module/kvm_intel/parameters/unrestricted_guest \
-        /sys/module/kvm_amd/parameters/nested; do
-        if [ -f "$p" ]; then
-            echo "setup-host: $p = $(cat "$p" 2>/dev/null || echo '?')"
-        fi
-    done
+# without re-logging by widening the node (standard approach for CI
+# runners). Unlike the old qemu harness there is no TCG fallback: the
+# VMM is KVM-only, so a missing /dev/kvm is a hard, clearly-reported
+# error rather than a silent 20x slowdown.
+if [ ! -e /dev/kvm ]; then
+    echo "setup-host: no /dev/kvm; ocivmm microVMs cannot run on this host" >&2
+    exit 1
+fi
+echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+    sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+sudo udevadm control --reload-rules
+sudo udevadm trigger --name-match=kvm || true
+if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    echo "setup-host: KVM available"
 else
-    echo "setup-host: no /dev/kvm; harness will fall back to TCG"
+    # The harness runs ocivmm under sudo anyway (see ci/run-in-vm.sh),
+    # so root-only /dev/kvm access is still fine; this is informational.
+    echo "setup-host: /dev/kvm present but not user-accessible (harness runs as root)"
 fi

@@ -58,7 +58,7 @@ cargo test --workspace --locked
 cargo build --workspace --release --locked
 
 mkdir -p "$repo/artifacts"
-for bin in ocirun ociman ocicri ocibox ociboot ociboot-init; do
+for bin in ocirun ociman ocicri ocibox ociboot ociboot-init ocivmm; do
     cp "target/release/$bin" "$repo/artifacts/"
 done
 "$repo/artifacts/ociman" --version

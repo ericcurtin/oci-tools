@@ -1,28 +1,39 @@
 #!/usr/bin/env bash
 # Two callers, same script, because neither cares whether it's inside a VM:
-# `ci/run-in-vm.sh`, streamed over ssh stdin *before* the source tree is
-# pushed into a guest VM (so it must not assume anything beyond a stock
-# cloud image there; in particular it installs tar, which `vm.sh push`
-# needs) -- and, directly, `.github/workflows/ci.yml`'s own `native-test`
-# job, on the bare aarch64 runner `ci/native-ci.sh` builds/tests on next
-# (a real `sudo`-capable Ubuntu host already has `tar`; installing it again
-# is simply a no-op there).
+# `ci/vm-ci.sh`, run as *root* inside the ocivmm guest (a stock distro
+# OCI base image, so it must assume very little; the shim below papers
+# over `sudo` not existing there yet, and the lists install it for
+# everything that runs afterward, e.g. tests that spawn `sudo` and
+# `ci/build-rpm.sh`'s own `sudo rpm -i`) -- and, directly,
+# `.github/workflows/ci.yml`'s own `native-test` job, on the bare
+# aarch64 runner `ci/native-ci.sh` builds/tests on next (a real
+# `sudo`-capable Ubuntu host, where the shim never activates and every
+# package below is already present or a cheap no-op).
 #
-# Installs the build toolchain packages for either supported guest-VM base:
-#   - CentOS Stream 10 (dnf)
-#   - Ubuntu 26.04 (apt)
+# Installs the build toolchain packages for either supported guest base:
+#   - CentOS Stream 10 (dnf) -- quay.io/centos/centos:stream10
+#   - Ubuntu 26.04 (apt) -- docker.io/library/ubuntu:26.04
 # Distro differences are data (package lists), not logic. The bare aarch64
 # runner is itself always Ubuntu (whatever `ubuntu-24.04-arm` ships), so it
 # always takes the `apt-get` branch below.
 set -euxo pipefail
+
+# Already root but no sudo binary yet (stock OCI base images ship none):
+# make the `sudo` invocations below plain command invocations.
+if [ "$(id -u)" = 0 ] && ! command -v sudo >/dev/null 2>&1; then
+    sudo() { "$@"; }
+fi
 
 if command -v dnf >/dev/null 2>&1; then
     sudo dnf -y -q install \
         gcc \
         glibc-devel \
         make \
+        sudo \
         tar \
         xz \
+        cpio \
+        findutils \
         e2fsprogs \
         erofs-utils \
         cryptsetup \
@@ -30,10 +41,20 @@ if command -v dnf >/dev/null 2>&1; then
         rpm-build
 elif command -v apt-get >/dev/null 2>&1; then
     sudo apt-get update -qq
+    # `apparmor` (the userspace tools, notably apparmor_parser) is
+    # spelled out because the ocivmm guest starts from the bare ubuntu
+    # OCI image: its own provisioned distro kernel enforces
+    # `apparmor_restrict_unprivileged_userns` exactly like the old
+    # cloud image's kernel did, but the cloud image shipped
+    # apparmor_parser preinstalled and the OCI image doesn't — without
+    # it the profile workaround below would silently skip and every
+    # rootless-userns test would fail.
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        apparmor \
         build-essential \
         ca-certificates \
         curl \
+        sudo \
         tar \
         xz-utils \
         e2fsprogs \

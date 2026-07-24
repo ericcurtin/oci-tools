@@ -15,6 +15,10 @@ Description: Pure-Rust reimplementation of the container and bootable-container 
   * ocicri       - Kubernetes CRI server (cri-o equivalent)
   * ocibox       - pet containers with home/user/host integration
                     (distrobox equivalent)
+  * ocivmm       - pet microVMs from OCI images (krunvm equivalent;
+                    the VMM is libkrun's crates statically linked, so
+                    it needs only /dev/kvm and the `passt` package at
+                    run time -- see packaging/README.md)
   * ociboot      - bootable-container OS manager (bootc-inspired,
                     no ostree/composefs dependency)
   * ociboot-init - tiny initramfs helper that mounts ociboot
@@ -23,7 +27,7 @@ Description: Pure-Rust reimplementation of the container and bootable-container 
                     packaging/README.md)
  .
  This is this project's own first, real packaging slice: it installs
- the six real, already-tested release binaries built from this exact
+ the seven real, already-tested release binaries built from this exact
  source tree, with no systemd units, no initramfs-tools integration,
  and no sub-packages yet -- see packaging/README.md for exactly what's
  still ahead.

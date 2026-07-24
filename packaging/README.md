@@ -8,7 +8,13 @@ binaries from source (`cargo build --release --locked --offline`,
 the exact same build every other CI check in this project already
 uses) and installs them:
 
-* `ocirun`/`ociman`/`ocicri`/`ocibox`/`ociboot` → `/usr/bin/`
+* `ocirun`/`ociman`/`ocicri`/`ocibox`/`ocivmm`/`ociboot` → `/usr/bin/`
+  (`ocivmm`'s VMM is libkrun's own crates *statically linked* — no
+  shared library, no dlopen; at run time it needs only `/dev/kvm` and
+  the `passt` binary for guest networking, deliberately undeclared as
+  a package dependency since every other binary in the package works
+  without it and `ocivmm` reports a clear "install passt" error
+  itself)
 * `ociboot-init` → `/usr/libexec/oci-tools/` (not `/usr/bin/`: real
   `ociboot-init` is meant to be picked up by the *initramfs*, via a
   real dracut module — still ahead, milestone 5 — not invoked
@@ -60,9 +66,10 @@ cell.
 ## Verified for real, once by hand, then wired into CI for good
 
 Manually verified end to end (`docs/design/0224`/`0225`) using this
-project's own existing `ci/vm.sh` harness, booting a real CentOS
-Stream 10 aarch64 guest (the same base `ci/run-in-vm.sh` already uses
-for its own CI cell): a real `bash ci/build-rpm.sh` run, a genuine
+project's own then-current qemu `ci/vm.sh` harness (since retired in
+favor of the `ocivmm` microVM harness, see `ci/run-in-vm.sh`), booting
+a real CentOS Stream 10 aarch64 guest (the same base `ci/run-in-vm.sh`
+still uses for its own CI cell): a real `bash ci/build-rpm.sh` run, a genuine
 `sudo rpm -i` install (not just extract-and-run — this guest has a
 real, non-empty RPM package database), every CLI binary running
 correctly from its real installed `/usr/bin/` path, `rpm -q`/`rpm -ql`
