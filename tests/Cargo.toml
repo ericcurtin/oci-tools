@@ -21,7 +21,7 @@ tar.workspace = true
 hyper-util.workspace = true
 oci-cri-types.workspace = true
 oci-runtime-core.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["fs"] }
 tempfile.workspace = true
 tokio.workspace = true
 tonic.workspace = true

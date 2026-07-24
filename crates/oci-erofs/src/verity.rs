@@ -263,24 +263,113 @@ mod tests {
     /// themselves are exercised exactly as `ociboot` would really call
     /// them -- unprivileged, ordinary file operations, not root-only.
     struct VerityFs {
-        _dir: tempfile::TempDir,
+        /// Held for the fixture's whole lifetime: flocks are released
+        /// by the kernel on process death — even SIGKILL — making
+        /// "lock acquirable" the next run's reliable owner-is-dead
+        /// test (see [`sweep_stale_fixtures`]).
+        _lock: std::fs::File,
+        dir: std::path::PathBuf,
         mountpoint: std::path::PathBuf,
     }
 
     impl Drop for VerityFs {
         fn drop(&mut self) {
-            let _ = Command::new("sudo")
-                .args(["umount", "-q"])
-                .arg(&self.mountpoint)
-                .output();
+            cleanup_fixture_dir(&self.dir, &self.mountpoint);
+        }
+    }
+
+    /// The fixed, per-user base directory for these fixtures —
+    /// deliberately *not* a fresh tempdir per run (`docs/design/
+    /// 0247`): a test run killed mid-flight (SIGKILL skips every
+    /// `Drop`) used to leak its mount + loop device + tempdir
+    /// forever, observed for real on this project's own dev host as
+    /// ten accumulated stale loop devices. With a fixed base, the
+    /// next run finds and sweeps them instead.
+    fn fixture_base() -> std::path::PathBuf {
+        std::path::PathBuf::from(format!(
+            "/tmp/oci-tools-verity-fixture-{}",
+            rustix::process::getuid().as_raw()
+        ))
+    }
+
+    /// Unmounts/detaches/removes one fixture directory, tolerating
+    /// every failure (stale state can be half-torn-down already).
+    fn cleanup_fixture_dir(dir: &Path, mountpoint: &Path) {
+        let _ = Command::new("sudo")
+            .args(["-n", "umount", "-q"])
+            .arg(mountpoint)
+            .output();
+        // `mount -o loop`'s autoclear normally frees the loop device
+        // at unmount, but loops outliving their mounts have been
+        // observed on real half-torn-down fixtures -- detach by
+        // backing file, belt and braces.
+        if let Ok(out) = Command::new("losetup")
+            .arg("-j")
+            .arg(dir.join("verity.img"))
+            .output()
+        {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Some(device) = line.split(':').next().filter(|s| !s.is_empty()) {
+                    let _ = Command::new("sudo")
+                        .args(["-n", "losetup", "-d", device])
+                        .output();
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Sweeps every fixture subdirectory whose owner is dead — the
+    /// nonblocking-flock probe is race-free against a live,
+    /// concurrent fixture in another test process (its own held lock
+    /// makes the probe fail), unlike any timestamp heuristic.
+    fn sweep_stale_fixtures(base: &Path) {
+        let Ok(entries) = std::fs::read_dir(base) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Ok(lock) = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(dir.join(".lock"))
+            else {
+                continue;
+            };
+            if rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                .is_err()
+            {
+                continue; // A live fixture in a concurrent process.
+            }
+            cleanup_fixture_dir(&dir, &dir.join("mnt"));
         }
     }
 
     fn verity_capable_ext4() -> Option<VerityFs> {
-        let dir = tempfile::tempdir().ok()?;
-        let image = dir.path().join("verity.img");
-        let mountpoint = dir.path().join("mnt");
+        let base = fixture_base();
+        std::fs::create_dir_all(&base).ok()?;
+        sweep_stale_fixtures(&base);
+
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = base.join(format!(
+            "{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let image = dir.join("verity.img");
+        let mountpoint = dir.join("mnt");
         std::fs::create_dir_all(&mountpoint).ok()?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(".lock"))
+            .ok()?;
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).ok()?;
 
         let truncate = Command::new("truncate")
             .args(["-s", "16M"])
@@ -298,8 +387,12 @@ mod tests {
         if !mkfs.success() {
             return None;
         }
+        // `-n` on every sudo in this fixture (docs/design/0247): a
+        // host whose passwordless sudo has lapsed must produce a
+        // clean skip, never a test run hanging forever on an
+        // invisible password prompt.
         let mount = Command::new("sudo")
-            .args(["mount", "-o", "loop"])
+            .args(["-n", "mount", "-o", "loop"])
             .arg(&image)
             .arg(&mountpoint)
             .status()
@@ -313,7 +406,7 @@ mod tests {
             rustix::process::getgid().as_raw()
         );
         let chown = Command::new("sudo")
-            .args(["chown", &uid_gid])
+            .args(["-n", "chown", &uid_gid])
             .arg(&mountpoint)
             .status()
             .ok()?;
@@ -321,7 +414,8 @@ mod tests {
             return None;
         }
         Some(VerityFs {
-            _dir: dir,
+            _lock: lock,
+            dir,
             mountpoint,
         })
     }

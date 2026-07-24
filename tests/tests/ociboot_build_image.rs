@@ -302,24 +302,99 @@ fn build_image_origin_records_no_version_when_the_image_declares_none() {
 /// shared across crates) since it's `oci-erofs`'s own private test
 /// helper, not a public API.
 struct VerityFs {
-    _dir: tempfile::TempDir,
+    /// Held for the fixture's whole lifetime: flocks are released by
+    /// the kernel on process death — even SIGKILL — making "lock
+    /// acquirable" the next run's reliable owner-is-dead test (see
+    /// `sweep_stale_fixtures`; the same kill-safe rework as
+    /// `oci_erofs::verity`'s own copy, docs/design/0247).
+    _lock: std::fs::File,
+    dir: std::path::PathBuf,
     mountpoint: std::path::PathBuf,
 }
 
 impl Drop for VerityFs {
     fn drop(&mut self) {
-        let _ = Command::new("sudo")
-            .args(["umount", "-q"])
-            .arg(&self.mountpoint)
-            .output();
+        cleanup_fixture_dir(&self.dir, &self.mountpoint);
+    }
+}
+
+/// The fixed, per-user base directory for these fixtures — shared
+/// with `oci_erofs::verity`'s own identical fixture on purpose (the
+/// flock protocol makes the two crates' fixtures sweep each other's
+/// stale leftovers safely).
+fn fixture_base() -> std::path::PathBuf {
+    std::path::PathBuf::from(format!(
+        "/tmp/oci-tools-verity-fixture-{}",
+        rustix::process::getuid().as_raw()
+    ))
+}
+
+fn cleanup_fixture_dir(dir: &Path, mountpoint: &Path) {
+    let _ = Command::new("sudo")
+        .args(["-n", "umount", "-q"])
+        .arg(mountpoint)
+        .output();
+    if let Ok(out) = Command::new("losetup")
+        .arg("-j")
+        .arg(dir.join("verity.img"))
+        .output()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(device) = line.split(':').next().filter(|s| !s.is_empty()) {
+                let _ = Command::new("sudo")
+                    .args(["-n", "losetup", "-d", device])
+                    .output();
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn sweep_stale_fixtures(base: &Path) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(lock) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(".lock"))
+        else {
+            continue;
+        };
+        if rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
+            continue; // A live fixture in a concurrent process.
+        }
+        cleanup_fixture_dir(&dir, &dir.join("mnt"));
     }
 }
 
 fn verity_capable_ext4() -> Option<VerityFs> {
-    let dir = tempfile::tempdir().ok()?;
-    let image = dir.path().join("verity.img");
-    let mountpoint = dir.path().join("mnt");
+    let base = fixture_base();
+    std::fs::create_dir_all(&base).ok()?;
+    sweep_stale_fixtures(&base);
+
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = base.join(format!(
+        "{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let image = dir.join("verity.img");
+    let mountpoint = dir.join("mnt");
     std::fs::create_dir_all(&mountpoint).ok()?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(".lock"))
+        .ok()?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).ok()?;
 
     if !Command::new("truncate")
         .args(["-s", "32M"])
@@ -339,8 +414,11 @@ fn verity_capable_ext4() -> Option<VerityFs> {
     {
         return None;
     }
+    // `-n` on every sudo (docs/design/0247): a lapsed passwordless
+    // sudo must produce a clean skip, never a hang on an invisible
+    // password prompt.
     if !Command::new("sudo")
-        .args(["mount", "-o", "loop"])
+        .args(["-n", "mount", "-o", "loop"])
         .arg(&image)
         .arg(&mountpoint)
         .status()
@@ -355,7 +433,7 @@ fn verity_capable_ext4() -> Option<VerityFs> {
         rustix::process::getgid().as_raw()
     );
     if !Command::new("sudo")
-        .args(["chown", &uid_gid])
+        .args(["-n", "chown", &uid_gid])
         .arg(&mountpoint)
         .status()
         .ok()?
@@ -364,7 +442,8 @@ fn verity_capable_ext4() -> Option<VerityFs> {
         return None;
     }
     Some(VerityFs {
-        _dir: dir,
+        _lock: lock,
+        dir,
         mountpoint,
     })
 }
