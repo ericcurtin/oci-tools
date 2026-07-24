@@ -1,0 +1,44 @@
+[package]
+name = "ocivmm"
+description = "Pet microVMs from OCI images, libkrun statically linked (krunvm equivalent)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+# Unwrapping the distro bzImage's gzip/zstd-compressed inner vmlinux
+# (see main.rs::extract_vmlinux) -- the same two decompressors the
+# workspace already uses for OCI layers.
+flate2.workspace = true
+libc.workspace = true
+ruzstd.workspace = true
+oci-cli-common.workspace = true
+oci-layer.workspace = true
+oci-registry.workspace = true
+oci-spec-types.workspace = true
+oci-store.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+# The VMM itself (statically linked libkrun crates) and the container
+# machinery the one-off provisioning step runs the guest's package
+# manager with are both KVM/Linux-only; gating them keeps the crate
+# `cargo check`-able on other development hosts (where `ocivmm run`
+# reports a clear "Linux only" error instead).
+[target.'cfg(target_os = "linux")'.dependencies]
+crossbeam-channel.workspace = true
+krun-devices.workspace = true
+krun-polly.workspace = true
+krun-vmm.workspace = true
+oci-runtime-core.workspace = true
+
+[lints]
+workspace = true

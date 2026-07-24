@@ -10,6 +10,7 @@ composefs** (deployments are flattened erofs images sealed with fsverity).
 | `ociman`       | daemonless container engine incl. `build`                   | podman     |
 | `ocicri`       | Kubernetes CRI server                                       | cri-o      |
 | `ocibox`       | pet containers with home/user/host integration              | distrobox  |
+| `ocivmm`       | pet microVMs booted straight from OCI images (libkrun)      | krunvm     |
 | `ociboot`      | bootable-container OS manager (install/upgrade/rollback)    | bootc      |
 | `ociboot-init` | tiny initramfs binary that mounts deployments (dracut)      | —          |
 

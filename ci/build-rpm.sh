@@ -49,11 +49,11 @@ mkdir -p "$topdir"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
 # via `git archive` when a real `.git` is present -- matches this
 # project's own established "no build artifacts, no scratch state
 # committed" convention), not a copy of `target/` or any other build-time
-# state. This project's own CI VM harness (`ci/vm.sh push`) deliberately
-# pushes the tree *without* `.git` at all -- `target`/`artifacts*` are
-# never pushed there either, so a plain recursive copy (excluding those
-# same paths) satisfies the identical real property that matters here
-# just as well when there's no `.git` to archive from.
+# state. This project's own CI VM harness (`ci/vm-ci.sh`'s source sync)
+# deliberately syncs the tree *without* `.git` at all -- `target`/
+# `artifacts*` are never synced there either, so a plain recursive copy
+# (excluding those same paths) satisfies the identical real property
+# that matters here just as well when there's no `.git` to archive from.
 if git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
     git archive --prefix="$name-$version/" -o "$topdir/SOURCES/$name-$version.tar.gz" HEAD
 else
@@ -81,7 +81,7 @@ rpm -qip "$rpm_path"
 # any host regardless of whether `OCI_RPM_VERIFY_INSTALL` below also
 # runs.
 (cd "$extract_dir" && rpm2cpio "$rpm_path" | cpio -idm --quiet)
-for bin in ocirun ociman ocicri ocibox ociboot; do
+for bin in ocirun ociman ocicri ocibox ociboot ocivmm; do
     "$extract_dir/usr/bin/$bin" --version
 done
 
@@ -100,7 +100,7 @@ if [ "${OCI_RPM_VERIFY_INSTALL:-0}" = 1 ]; then
     echo "build-rpm: OCI_RPM_VERIFY_INSTALL=1, doing a real rpm -i/rpm -e round trip"
     sudo rpm -i "$rpm_path"
     rpm -q "$name"
-    for bin in ocirun ociman ocicri ocibox ociboot; do
+    for bin in ocirun ociman ocicri ocibox ociboot ocivmm; do
         "/usr/bin/$bin" --version
     done
     sudo rpm -e "$name"

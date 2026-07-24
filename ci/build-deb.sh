@@ -42,7 +42,7 @@ mkdir -p "$stagedir"/usr/bin
 mkdir -p "$stagedir"/usr/libexec/oci-tools
 mkdir -p "$stagedir"/usr/share/doc/oci-tools
 
-for bin in ocirun ociman ocicri ocibox ociboot; do
+for bin in ocirun ociman ocicri ocibox ociboot ocivmm; do
     install -D -m 0755 "$srcdir/target/release/$bin" "$stagedir/usr/bin/$bin"
 done
 install -D -m 0755 "$srcdir/target/release/ociboot-init" \
@@ -87,7 +87,7 @@ dpkg-deb -I "$deb_path"
 # here. None of ocirun/ociman/ocicri/ocibox/ociboot already exist on
 # $PATH on a clean host, so this is safe and fully reversible.
 sudo dpkg -i "$deb_path"
-for bin in ocirun ociman ocicri ocibox ociboot; do
+for bin in ocirun ociman ocicri ocibox ociboot ocivmm; do
     "/usr/bin/$bin" --version
 done
 sudo dpkg -r "$name"

@@ -16,7 +16,7 @@ Source0:        %{name}-%{version}.tar.gz
 BuildRequires:  gcc
 
 # A real, RPM-native distro (checked directly: CentOS Stream 10, via
-# this project's own ci/vm.sh harness -- not something the Ubuntu
+# this project's own CI VM harness -- not something the Ubuntu
 # development host this spec was originally verified on could ever
 # have surfaced, since a bare Ubuntu `rpmbuild` has none of these
 # distro-specific macros configured at all) tries by default to
@@ -24,7 +24,7 @@ BuildRequires:  gcc
 # every installed ELF binary's own DWARF debug info. Rust's own DWARF
 # output doesn't shape into the clean, C-source-file-list `find-
 # debuginfo` expects (see docs/design/0225): the real, observed
-# failure is "Empty %files file .../debugsourcefiles.list", not a
+# failure is "Empty %%files file .../debugsourcefiles.list", not a
 # missing tool or a real packaging mistake -- rustc/cargo's own DWARF
 # emission is simply a different, if valid, shape. This project's own
 # narrow first packaging slice (0216) has no debug-info subpackage in
@@ -41,6 +41,10 @@ and bootable-container stack:
  * ocicri       - Kubernetes CRI server (cri-o equivalent)
  * ocibox       - pet containers with home/user/host integration
                   (distrobox equivalent)
+ * ocivmm       - pet microVMs from OCI images (krunvm equivalent;
+                  the VMM is libkrun's crates statically linked, so
+                  it needs only /dev/kvm and passt at run time -- see
+                  packaging/README.md)
  * ociboot      - bootable-container OS manager (bootc-inspired,
                   no ostree/composefs dependency)
  * ociboot-init - tiny initramfs helper that mounts ociboot
@@ -48,7 +52,7 @@ and bootable-container stack:
                   to pick up; see packaging/README.md)
 
 This is this project's own first, real packaging slice: it installs
-the six real, already-tested release binaries built from this exact
+the seven real, already-tested release binaries built from this exact
 source tree, with no systemd units, no dracut module integration, and
 no sub-packages yet -- see packaging/README.md for exactly what's
 still ahead.
@@ -64,7 +68,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # cache-disk target dir, still exported in the same shell that later
 # runs `ci/build-rpm.sh`) leaks straight into this section too --
 # silently redirecting cargo's real build output away from this
-# package's own `%install` step's hardcoded, relative `target/release/`
+# package's own `%%install` step's hardcoded, relative `target/release/`
 # path, which then fails with a genuine "No such file or directory"
 # once this section itself has already reported success (confirmed
 # directly: this is exactly what broke the real `vm (centos-stream10,
@@ -73,7 +77,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # place). This package's own build must never depend on the calling
 # environment's own unrelated cargo configuration -- unsetting it here
 # makes cargo fall back to its own real default (`<cwd>/target`),
-# matching exactly what `%install` below already assumes.
+# matching exactly what `%%install` below already assumes.
 unset CARGO_TARGET_DIR
 cargo build --release --locked --offline
 
@@ -82,6 +86,7 @@ install -D -m 0755 target/release/ocirun %{buildroot}%{_bindir}/ocirun
 install -D -m 0755 target/release/ociman %{buildroot}%{_bindir}/ociman
 install -D -m 0755 target/release/ocicri %{buildroot}%{_bindir}/ocicri
 install -D -m 0755 target/release/ocibox %{buildroot}%{_bindir}/ocibox
+install -D -m 0755 target/release/ocivmm %{buildroot}%{_bindir}/ocivmm
 install -D -m 0755 target/release/ociboot %{buildroot}%{_bindir}/ociboot
 install -D -m 0755 target/release/ociboot-init %{buildroot}%{_libexecdir}/oci-tools/ociboot-init
 
@@ -92,6 +97,7 @@ install -D -m 0755 target/release/ociboot-init %{buildroot}%{_libexecdir}/oci-to
 %{_bindir}/ociman
 %{_bindir}/ocicri
 %{_bindir}/ocibox
+%{_bindir}/ocivmm
 %{_bindir}/ociboot
 %{_libexecdir}/oci-tools/ociboot-init
 

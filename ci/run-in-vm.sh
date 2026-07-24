@@ -1,13 +1,40 @@
 #!/usr/bin/env bash
-# Host-side CI orchestration: boot the (base, arch) guest VM, build and test
-# the workspace inside it, and pull the release binaries back out.
+# Host-side CI orchestration, ocivmm edition: boot the (base, arch) guest
+# as a microVM using this repo's own `ocivmm` binary (dogfooding
+# it on every push/PR), build and test the workspace inside it, and find
+# the release binaries already on the host afterward -- the checkout
+# itself is shared with the guest over virtiofs, so there is no image
+# download, no ssh, no push/pull step, and no cloud-init: the guest *is*
+# the distro's own OCI image, extracted once into a persistent pet-VM
+# rootfs, provisioned once by ocivmm with the distro's own kernel,
+# initramfs, and systemd (installed with the distro's own dnf/apt), and
+# booted straight into that systemd on every run after that -- the
+# workspace tests therefore run under the real CentOS Stream 10 /
+# Ubuntu 26.04 kernels, exactly like the cloud images did. The command
+# below runs as a generated oneshot systemd unit whose exit status
+# ocivmm forwards as its own.
+#
+# What replaced what (vs. the retired qemu+cloud-init harness):
+#   cloud image download (~700MB)  -> OCI image pull (~30-60MB, cached)
+#   UEFI boot + cloud-init (min.)  -> direct-kernel boot to systemd (~1-2s)
+#   ssh + tar push/pull            -> virtiofs (-v "$repo:/src")
+#   qcow2 cache disk               -> the pet VM rootfs itself, cached
+#
+# ocivmm runs as root: its in-process virtiofs server (libkrun's own,
+# statically linked) impersonates guest uids/gids via per-thread
+# setresuid (checked in ~/git/libkrun's passthrough.rs at the pinned
+# revision), which needs CAP_SETUID -- without it, dnf/apt inside
+# the guest could not chown the files they install. That's also why the
+# cached VM state travels as a root-created tarball rather than a plain
+# directory: the actions/cache step runs as the runner user, which
+# couldn't read a multi-uid rootfs tree directly.
 #
 # Environment:
-#   OCI_CI_BASE        centos-stream10 | ubuntu-26.04 (required)
-#   OCI_CI_ARCH        x86_64 | aarch64 (default: host arch; must equal it —
-#                      builds are always native, never cross/emulated-arch)
-#   OCI_CI_IMAGE_URL   Override the cloud image URL for the cell.
-#   OCI_CI_CACHE_DISK  Path of the persistent build-cache qcow2.
+#   OCI_CI_BASE     centos-stream10 | ubuntu-26.04 (required)
+#   OCI_CI_ARCH     x86_64 | aarch64 (default: host arch; must equal it)
+#   OCI_CI_IMAGE    Override the guest OCI image reference for the cell.
+#   OCI_CI_MEM_MIB  Guest RAM in MiB (default 8192).
+#   OCI_CI_STATE_TAR  Path of the cached VM-state tarball.
 #
 # Usage: OCI_CI_BASE=ubuntu-26.04 ci/run-in-vm.sh
 set -euo pipefail
@@ -24,77 +51,81 @@ if [ "$arch" != "$host_arch" ]; then
     exit 1
 fi
 
-case "$base/$arch" in
-    centos-stream10/x86_64)
-        # The kiwi-built "GenericCloud-x86_64" variant is UEFI-capable
-        # (hybrid ESP + BIOS-boot partition); the osbuild "GenericCloud"
-        # variant is BIOS-only, and SeaBIOS guests do not run under the
-        # nested virtualization of GitHub's hosted x86_64 runners.
-        default_url="https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-x86_64-10-latest.x86_64.qcow2"
+case "$base" in
+    centos-stream10)
+        # CentOS's own OCI images moved to quay.io years ago; the
+        # docker.io library/centos repository stops at centos:8.
+        default_image="quay.io/centos/centos:stream10"
         ;;
-    centos-stream10/aarch64)
-        default_url="https://cloud.centos.org/centos/10-stream/aarch64/images/CentOS-Stream-GenericCloud-10-latest.aarch64.qcow2"
-        ;;
-    ubuntu-26.04/x86_64)
-        default_url="https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
-        ;;
-    ubuntu-26.04/aarch64)
-        default_url="https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-arm64.img"
+    ubuntu-26.04)
+        default_image="docker.io/library/ubuntu:26.04"
         ;;
     *)
-        echo "run-in-vm: unsupported base/arch combination: $base/$arch" >&2
+        echo "run-in-vm: unsupported base: $base" >&2
         exit 1
         ;;
 esac
+image=${OCI_CI_IMAGE:-$default_image}
 
-export VM_IMAGE_URL=${OCI_CI_IMAGE_URL:-$default_url}
-export VM_DIR=${VM_DIR:-"$HOME/.cache/oci-tools-ci/vm"}
-export VM_NAME="oci-ci-$base"
-export VM_CACHE_DISK=${OCI_CI_CACHE_DISK:-"$HOME/.cache/oci-tools-ci/cache-disk.qcow2"}
+storage="$HOME/.cache/oci-tools-ci/storage"
+state_tar=${OCI_CI_STATE_TAR:-"$HOME/.cache/oci-tools-ci/vm-state.tar"}
+mem_mib=${OCI_CI_MEM_MIB:-8192}
+vm_name="oci-ci-$base"
 
-vm="$here/vm.sh"
+# The harness's own ocivmm (release build; the whole point is dogfooding
+# it). The workflow builds this beforehand with its own cargo cache; the
+# fallback here keeps the script runnable standalone.
+ocivmm="$repo/target/release/ocivmm"
+if [ ! -x "$ocivmm" ]; then
+    echo "run-in-vm: building ocivmm"
+    (cd "$repo" && cargo build --release --locked -p ocivmm)
+fi
 
-# The tree is pushed without .git; hand the hash through so --version output
-# built inside the VM still embeds it.
+# The tree is shared without .git mattering inside; hand the hash through
+# so --version output built inside the VM still embeds it.
 git_hash=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo unknown)
 git_hash=${git_hash:0:12}
 
-cleanup() {
-    local rc=$?
-    if [ "$rc" -ne 0 ]; then
-        echo "::group::VM serial console (tail)"
-        tail -n 300 "$VM_DIR/console.log" 2>/dev/null || true
-        echo "::endgroup::"
-    fi
-    "$vm" down || true
-    exit "$rc"
-}
-trap cleanup EXIT
-
-"$vm" up
-
-echo "run-in-vm: preparing guest (distro packages)"
-"$vm" run -- bash -s <"$here/vm-prepare.sh"
-
-echo "run-in-vm: pushing source tree"
-VM_PUSH_EXCLUDE="./.git ./target ./artifacts ./artifacts-rpm ./artifacts-deb ./.vm-scratch" \
-    "$vm" push "$repo" oci-tools
-
-echo "run-in-vm: building and testing"
-"$vm" run -- "OCI_TOOLS_GIT_HASH=$git_hash bash oci-tools/ci/vm-ci.sh"
-
-echo "run-in-vm: pulling artifacts"
-"$vm" pull artifacts "$repo/artifacts"
-ls -l "$repo/artifacts"
-
-# Only the centos-stream10 cell's own vm-ci.sh ever creates this (real RPM
-# packaging verification, see ci/vm-ci.sh's own comment) -- checked
-# remotely first so the ubuntu-26.04 cell (which never creates it) doesn't
-# turn a missing, expected-to-be-absent directory into a failed `pull`.
-if "$vm" run -- "test -d oci-tools/artifacts-rpm"; then
-    echo "run-in-vm: pulling RPM package"
-    "$vm" pull oci-tools/artifacts-rpm "$repo/artifacts-rpm"
-    ls -l "$repo/artifacts-rpm"
+# Restore the cached pet-VM state (image blobs + extracted rootfs with
+# everything vm-ci.sh installed/built on previous runs) -- root-owned,
+# hence the tarball indirection described in the header comment.
+mkdir -p "$(dirname "$state_tar")"
+if [ -f "$state_tar" ]; then
+    echo "run-in-vm: restoring cached VM state"
+    sudo mkdir -p "$storage"
+    sudo tar -C "$storage" -xf "$state_tar"
+    rm -f "$state_tar"
 fi
 
+echo "run-in-vm: booting $vm_name from $image"
+rc=0
+sudo env \
+    OCI_TOOLS_STORAGE_ROOT="$storage" \
+    "$ocivmm" run \
+    --name "$vm_name" \
+    --mem "$mem_mib" \
+    -v "$repo:/src" \
+    -e "OCI_TOOLS_GIT_HASH=$git_hash" \
+    "$image" \
+    bash /src/ci/vm-ci.sh || rc=$?
+
+# Artifacts were written by guest root straight onto the host checkout
+# via virtiofs; hand them (and any target/ leftovers) back to the runner
+# user so upload-artifact and the next checkout step can touch them.
+sudo chown -R "$(id -u):$(id -g)" "$repo/artifacts" "$repo/artifacts-rpm" 2>/dev/null || true
+
+if [ "$rc" -ne 0 ]; then
+    echo "run-in-vm: guest CI failed (exit $rc)" >&2
+    exit "$rc"
+fi
+
+# Pack the (root-owned) VM state for actions/cache to save: pet-VM reuse
+# is exactly what makes warm runs fast (no pull, no dnf/apt, no rustup,
+# incremental cargo target).
+echo "run-in-vm: packing VM state for the cache"
+sudo tar -C "$storage" -cf "$state_tar.tmp" .
+sudo chown "$(id -u):$(id -g)" "$state_tar.tmp"
+mv "$state_tar.tmp" "$state_tar"
+
+ls -l "$repo/artifacts"
 echo "run-in-vm: success ($base/$arch)"
