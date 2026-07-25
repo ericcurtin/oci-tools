@@ -49,32 +49,23 @@ fi
 if ! getent hosts archive.ubuntu.com >/dev/null 2>&1 &&
     ! getent hosts mirrors.centos.org >/dev/null 2>&1; then
     gateway=""
-    # Up to 2 minutes: confirmed via CI that a default route can
-    # still genuinely not exist yet even a full 30 seconds after our
-    # own oneshot unit's After=network-online.target already fired
-    # (that target, it turns out, doesn't actually guarantee one).
-    for _ in $(seq 1 600); do
-        # `ip route show default` itself (not just an empty/no-match
-        # result) exits non-zero when there's no default route yet --
-        # under `set -o pipefail`, a bare `gateway=$(... | ...)`
-        # assignment then inherits that failure and, being a
-        # standalone command, trips `errexit` and kills the whole
-        # script immediately (confirmed directly: reproduces with a
-        # plain `x=$(false | cat)` under `set -eo pipefail`). `|| true`
-        # so a genuinely-not-ready route table is just another empty
-        # iteration, not a fatal error.
-        gateway=$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}') || true
-        if [ -n "$gateway" ]; then
+    for _ in $(seq 1 300); do
+        # `ip` doesn't even exist on the stock CentOS Stream OCI image
+        # (confirmed via CI: "ip: command not found" -- iproute2 isn't
+        # part of its minimal base, and we can't install it yet
+        # without DNS already working). Parse /proc/net/route
+        # directly instead -- always present, no external tool needed:
+        # its own Destination field is "00000000" for the default
+        # route, and Gateway is the IP address in hex, byte-reversed
+        # (confirmed against a real route: "010011AC" -> AC.11.00.01
+        # -> 172.17.0.1).
+        hex=$(awk '$2 == "00000000" {print $3; exit}' /proc/net/route) || true
+        if [ -n "$hex" ]; then
+            gateway="$((16#${hex:6:2})).$((16#${hex:4:2})).$((16#${hex:2:2})).$((16#${hex:0:2}))"
             break
         fi
         sleep 0.2
     done
-    # TEMPORARY diagnostic: if even two minutes wasn't enough, show
-    # the real routing/address state instead of guessing further.
-    if [ -z "$gateway" ]; then
-        ip addr show 2>&1 || true
-        ip route show 2>&1 || true
-    fi
     if [ -n "$gateway" ]; then
         # /etc/resolv.conf may still be a symlink into resolved's own
         # managed stub file at this point; a plain `>` redirection
@@ -90,7 +81,14 @@ if ! getent hosts archive.ubuntu.com >/dev/null 2>&1 &&
 fi
 
 if command -v dnf >/dev/null 2>&1; then
-    sudo dnf -y -q install \
+    # --setopt=retries=10: package *download* (as opposed to the
+    # single mirror-metadata lookup `getent`/our own resolv.conf fix
+    # already confirmed works) has shown occasional transient
+    # "Could not resolve host"/timeout failures under real CI even
+    # with a known-good DNS config already in place -- automatic
+    # retries paper over that instead of chasing a possible packet-
+    # loss-under-load issue in the underlying virtio-net path.
+    sudo dnf -y -q --setopt=retries=10 install \
         gcc \
         glibc-devel \
         make \
@@ -114,7 +112,18 @@ elif command -v apt-get >/dev/null 2>&1; then
     # apparmor_parser preinstalled and the OCI image doesn't — without
     # it the profile workaround below would silently skip and every
     # rootless-userns test would fail.
-    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+    #
+    # -o Acquire::Retries=10: confirmed via CI that the package
+    # *download* phase specifically (not `apt-get update`'s own single
+    # mirror-metadata fetch, run moments earlier against the exact
+    # same resolv.conf) can hit transient "Temporary failure resolving"
+    # errors on nearly every package at once, even with a known-good
+    # DNS config already in place and already working a moment before
+    # -- automatic retries paper over that instead of chasing a
+    # possible packet-loss-under-load issue in the underlying
+    # virtio-net path.
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=10 \
+        install -y -qq --no-install-recommends \
         apparmor \
         build-essential \
         ca-certificates \
