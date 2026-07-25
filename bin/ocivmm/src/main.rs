@@ -491,15 +491,21 @@ else
         /etc/systemd/system/multi-user.target.wants/NetworkManager.service
     ln -sf /usr/lib/systemd/system/NetworkManager-wait-online.service \
         /etc/systemd/system/network-online.target.wants/NetworkManager-wait-online.service
-    # Force NetworkManager's own default DNS management (writing
-    # /etc/resolv.conf directly) explicitly, rather than trust
-    # whatever this particular build's own compiled-in default
-    # happens to be when no config file exists at all -- leave
+    # Force NetworkManager's own default DNS management explicitly,
+    # rather than trust whatever this particular build's own
+    # compiled-in defaults happen to be when no config file exists at
+    # all -- confirmed via CI: even with dns=default alone,
+    # /etc/resolv.conf stayed completely empty for a full minute after
+    # the interface came up, so rc-manager (which controls whether
+    # NetworkManager actually *commits* its synthesized resolv.conf to
+    # that file at all, separately from dns= choosing how it's
+    # synthesized) apparently wasn't "file" by default here. Leave
     # resolved disabled so the two don't fight over the same file.
     mkdir -p /etc/NetworkManager/conf.d
     cat > /etc/NetworkManager/conf.d/10-ocivmm-dns.conf <<'EOF'
 [main]
 dns=default
+rc-manager=file
 EOF
     # A real, plain, empty file -- not missing, not a symlink --
     # confirmed via CI that NetworkManager will happily *update* an

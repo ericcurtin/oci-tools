@@ -19,7 +19,14 @@
 set -euxo pipefail
 
 # Already root but no sudo binary yet (stock OCI base images ship none):
-# make the `sudo` invocations below plain command invocations.
+# make the `sudo` invocations below plain command invocations. Unlike
+# real sudo, this shim does *not* understand a leading `VAR=value`
+# prefix as an environment assignment (found the hard way: `sudo
+# DEBIAN_FRONTEND=noninteractive apt-get ...` under this shim tried to
+# execute the literal string "DEBIAN_FRONTEND=noninteractive" as a
+# command and failed) -- every invocation below that needs one uses
+# `sudo env VAR=value cmd` instead, which is a single well-formed
+# command either way.
 if [ "$(id -u)" = 0 ] && ! command -v sudo >/dev/null 2>&1; then
     sudo() { "$@"; }
 fi
@@ -70,7 +77,7 @@ elif command -v apt-get >/dev/null 2>&1; then
     # apparmor_parser preinstalled and the OCI image doesn't — without
     # it the profile workaround below would silently skip and every
     # rootless-userns test would fail.
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
         apparmor \
         build-essential \
         ca-certificates \
