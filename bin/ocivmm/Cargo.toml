@@ -29,20 +29,27 @@ serde_json.workspace = true
 tempfile.workspace = true
 tracing.workspace = true
 
-# The VMM itself (oci-vmm, our own KVM/virtio crate), the container
-# machinery the one-off provisioning step runs the guest's package
-# manager with, and loop-mounting the pet VM's own disk image are all
-# Linux-only; gating them keeps the crate `cargo check`-able on other
-# development hosts (where `ocivmm run`/`create`/`cp` report a clear
-# "Linux only" error instead).
+# The container machinery the one-off provisioning step runs the
+# guest's package manager with, and loop-mounting the pet VM's own
+# disk image, are Linux-only (any arch); gating them keeps the crate
+# `cargo check`-able on other development hosts (where `ocivmm
+# run`/`create`/`cp` report a clear "Linux only" error instead).
 [target.'cfg(target_os = "linux")'.dependencies]
 oci-mount.workspace = true
 oci-runtime-core.workspace = true
-oci-vmm.workspace = true
 # `rustix::mount::unmount` (disk.rs) -- the workspace's own base
 # `rustix` dependency doesn't enable the `mount` feature (no other
 # crate needs it), so this one Linux-only user adds it directly.
 rustix = { workspace = true, features = ["mount"] }
+
+# The VMM itself (oci-vmm, our own KVM/virtio-pci crate) is not just
+# Linux-only but x86_64-specific (its PCI/MSI-X/boot code was written
+# and verified against x86_64 only), narrower than the rest of this
+# binary's Linux-only dependencies above -- gating it separately keeps
+# `ocivmm` building cleanly on Linux/aarch64 too (where `__boot`
+# reports a clear "Linux/x86_64 only" error instead).
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+oci-vmm.workspace = true
 
 [lints]
 workspace = true

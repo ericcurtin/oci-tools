@@ -625,7 +625,7 @@ fn boot_in_child(vm_dir: &Path, spec: &BootSpec) -> anyhow::Result<std::process:
 }
 
 /// `ocivmm __boot`: the hidden VMM half — never returns on success.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn cmd_boot(spec_path: &Path) -> anyhow::Result<()> {
     let bytes = std::fs::read(spec_path)
         .with_context(|| format!("reading boot spec {}", spec_path.display()))?;
@@ -650,10 +650,10 @@ fn cmd_boot(spec_path: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// KVM is Linux-only.
-#[cfg(not(target_os = "linux"))]
+/// KVM is Linux-only, and `oci-vmm` is x86_64-specific besides.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn cmd_boot(_spec_path: &Path) -> anyhow::Result<()> {
-    anyhow::bail!("ocivmm can only run VMs on Linux (KVM)");
+    anyhow::bail!("ocivmm can only run VMs on Linux/x86_64 (KVM)");
 }
 
 /// Read one VM's persisted [`VmRecord`] back from `vm.json`.
@@ -1095,7 +1095,6 @@ fn spawn_passt(vm_dir: &Path, ports: &[String]) -> anyhow::Result<PathBuf> {
     let mut command = std::process::Command::new(&passt);
     command
         .arg("--foreground")
-        .arg("--quiet")
         .arg("--one-off")
         .arg("--socket")
         .arg(&socket);
