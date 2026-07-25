@@ -53,21 +53,23 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # long-lived server process, not a short-lived CLI invocation, so
 # `tokio`/`tonic` never touch this project's own hot startup-time path
 # (every other binary links neither at all).
-# libkrun, statically linked into `ocivmm` (Linux-only target deps of
-# that one binary; see bin/ocivmm/src/microvm.rs): the microVM monitor
-# pet VMs boot with. Consumed as ordinary Rust crates pinned to an
-# exact upstream revision -- they compile into the binary like every
-# other dependency, so there is no shared library, no dlopen, and no
-# run-time linkage (the revision matches the ~/git/libkrun checkout
-# the port was reviewed against). The `net` feature (virtio-net for
-# the passt backend) is pure Rust; none of the C-flavored optional
-# features (gpu/input/tee) are enabled.
-krun-vmm = { git = "https://github.com/ericcurtin/libkrun", rev = "7ccb87315d7651cf69bd01bbadeab78f319c45ea", features = ["net"] }
-krun-devices = { git = "https://github.com/ericcurtin/libkrun", rev = "7ccb87315d7651cf69bd01bbadeab78f319c45ea", features = ["net"] }
-krun-polly = { git = "https://github.com/ericcurtin/libkrun", rev = "7ccb87315d7651cf69bd01bbadeab78f319c45ea" }
-# krun-vmm's own `build_microvm` signature takes a crossbeam Sender for
-# its (unused here) device worker channel.
-crossbeam-channel = "0.5"
+# `oci-vmm`'s KVM/virtio foundation: the rust-vmm project's own
+# published building blocks (the same ones Firecracker, from which
+# oci-vmm's core is ported, builds on -- and the same project this
+# workspace already trusts for seccompiler). All from crates.io, all
+# pure Rust.
+event-manager = "0.4"
+kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
+kvm-ioctls = "0.24"
+# `elf`, not `bzimage`: the guest's own compressed bzImage is
+# unwrapped to a plain ELF vmlinux by ocivmm itself before boot (see
+# oci-vmm::boot's own module docs for why `linux-loader`'s own
+# `bzimage` loader can't be used directly for a VMM's direct-64-bit
+# entry boot).
+linux-loader = { version = "0.13", features = ["elf"] }
+vm-memory = { version = "0.17", features = ["backend-mmap"] }
+vm-superio = "0.8"
+vmm-sys-util = "0.15"
 tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server", "transport"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
@@ -104,6 +106,7 @@ oci-registry = { path = "crates/oci-registry" }
 oci-runtime-core = { path = "crates/oci-runtime-core" }
 oci-spec-types = { path = "crates/oci-spec-types" }
 oci-store = { path = "crates/oci-store" }
+oci-vmm = { path = "crates/oci-vmm" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"                  # overridden where genuinely needed (mount/runtime crates)

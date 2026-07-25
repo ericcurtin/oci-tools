@@ -9,7 +9,8 @@ the exact same build every other CI check in this project already
 uses) and installs them:
 
 * `ocirun`/`ociman`/`ocicri`/`ocibox`/`ocivmm`/`ociboot` → `/usr/bin/`
-  (`ocivmm`'s VMM is libkrun's own crates *statically linked* — no
+  (`ocivmm`'s VMM is this workspace's own `oci-vmm` crate — a KVM/
+  virtio-pci monitor ported from Firecracker, *statically linked*, no
   shared library, no dlopen; at run time it needs only `/dev/kvm` and
   the `passt` binary for guest networking, deliberately undeclared as
   a package dependency since every other binary in the package works

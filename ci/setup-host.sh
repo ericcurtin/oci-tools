@@ -2,17 +2,21 @@
 # Prepare a Debian/Ubuntu host (GitHub Actions runner) to run the ocivmm
 # VM harness: widen /dev/kvm permissions and install passt (the
 # userspace network backend every guest's virtio-net device connects
-# to). Nothing else: ocivmm's VMM is statically linked (libkrun's
-# crates, built like any other Rust dependency by the ordinary cargo
-# build), the guests run their own distro kernels, and provisioning is
-# containerized -- so no qemu, no firmware, no cloud-image tooling, no
-# shared libraries, and no kernel build toolchain.
+# to) and e2fsprogs (`mkfs.ext4`, which builds and `ocivmm cp` loop-
+# mounts a pet VM's own disk image). Nothing else: ocivmm's VMM
+# (`oci-vmm`, this workspace's own KVM/virtio-pci monitor) is
+# statically linked, built like any other Rust dependency by the
+# ordinary cargo build; the guests run their own distro kernels, and
+# provisioning is containerized -- so no qemu, no firmware, no
+# cloud-image tooling, no shared libraries, and no kernel build
+# toolchain.
 set -euo pipefail
 
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
     build-essential \
-    passt
+    passt \
+    e2fsprogs
 
 # GitHub runners ship /dev/kvm restricted to the kvm group; make it usable
 # without re-logging by widening the node (standard approach for CI

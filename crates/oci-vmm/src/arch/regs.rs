@@ -1,0 +1,260 @@
+// Copyright © 2020, Oracle and/or its affiliates.
+// Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Portions Copyright 2017 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the THIRD-PARTY file.
+// Ported into oci-vmm from Firecracker (src/vmm/src/arch/x86_64/regs.rs), trimmed of metrics/snapshot/ACPI.
+
+//! Boot-time x86_64 vCPU register setup: FPU, general purpose registers,
+//! segments/special registers and the identity-mapped boot page tables
+//! required by the Linux 64-bit boot protocol.
+
+use kvm_bindings::{kvm_fpu, kvm_regs, kvm_sregs};
+use kvm_ioctls::VcpuFd;
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory};
+
+use super::gdt::{gdt_entry, kvm_segment_from_gdt};
+use super::{BootProtocol, EntryPoint};
+use crate::mem::GuestMemoryMmap;
+
+// Initial pagetables.
+const PML4_START: u64 = 0x9000;
+const PDPTE_START: u64 = 0xa000;
+const PDE_START: u64 = 0xb000;
+
+/// Errors thrown while setting up x86_64 registers.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RegsError {
+    /// Failed to get SREGs for this CPU.
+    #[error("Failed to get SREGs for this CPU: {0}")]
+    GetStatusRegisters(kvm_ioctls::Error),
+    /// Failed to set base registers for this CPU.
+    #[error("Failed to set base registers for this CPU: {0}")]
+    SetBaseRegisters(kvm_ioctls::Error),
+    /// Failed to configure the FPU.
+    #[error("Failed to configure the FPU: {0}")]
+    SetFPURegisters(kvm_ioctls::Error),
+    /// Failed to set SREGs for this CPU.
+    #[error("Failed to set SREGs for this CPU: {0}")]
+    SetStatusRegisters(kvm_ioctls::Error),
+    /// Writing the GDT to RAM failed.
+    #[error("Writing the GDT to RAM failed.")]
+    WriteGDT,
+    /// Writing the IDT to RAM failed.
+    #[error("Writing the IDT to RAM failed")]
+    WriteIDT,
+    /// Writing the PDPTE address to RAM failed.
+    #[error("WritePDPTEAddress")]
+    WritePDPTEAddress,
+    /// Writing the PDE address to RAM failed.
+    #[error("WritePDEAddress")]
+    WritePDEAddress,
+    /// Writing the PML4 address to RAM failed.
+    #[error("WritePML4Address")]
+    WritePML4Address,
+}
+
+/// Error type for [`setup_fpu`].
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("Failed to setup FPU: {0}")]
+pub struct SetupFpuError(vmm_sys_util::errno::Error);
+
+/// Configure Floating-Point Unit (FPU) registers for a given CPU.
+///
+/// # Arguments
+///
+/// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
+///
+/// # Errors
+///
+/// When [`kvm_ioctls::ioctls::vcpu::VcpuFd::set_fpu`] errors.
+pub fn setup_fpu(vcpu: &VcpuFd) -> Result<(), SetupFpuError> {
+    let fpu: kvm_fpu = kvm_fpu {
+        fcw: 0x37f,
+        mxcsr: 0x1f80,
+        ..Default::default()
+    };
+
+    vcpu.set_fpu(&fpu).map_err(SetupFpuError)
+}
+
+/// Error type of [`setup_regs`].
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("Failed to setup registers: {0}")]
+pub struct SetupRegistersError(vmm_sys_util::errno::Error);
+
+/// Configure base registers for a given CPU.
+///
+/// # Arguments
+///
+/// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
+/// * `entry_point` - Address in guest memory the guest starts execution at.
+///
+/// # Errors
+///
+/// When [`kvm_ioctls::ioctls::vcpu::VcpuFd::set_regs`] errors.
+pub fn setup_regs(vcpu: &VcpuFd, entry_point: EntryPoint) -> Result<(), SetupRegistersError> {
+    let regs: kvm_regs = match entry_point.protocol {
+        BootProtocol::LinuxBoot => kvm_regs {
+            // Configure regs as required by Linux 64-bit boot protocol.
+            rflags: 0x0000_0000_0000_0002u64,
+            rip: entry_point.entry_addr.raw_value(),
+            // Frame pointer. It gets a snapshot of the stack pointer (rsp) so that when adjustments
+            // are made to rsp (i.e. reserving space for local variables or pushing
+            // values on to the stack), local variables and function parameters are
+            // still accessible from a constant offset from rbp.
+            rsp: super::layout::BOOT_STACK_POINTER,
+            // Starting stack pointer.
+            rbp: super::layout::BOOT_STACK_POINTER,
+            // Must point to zero page address per Linux ABI. This is x86_64 specific.
+            rsi: super::layout::ZERO_PAGE_START,
+            ..Default::default()
+        },
+    };
+
+    vcpu.set_regs(&regs).map_err(SetupRegistersError)
+}
+
+/// Error type for [`setup_sregs`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SetupSpecialRegistersError {
+    /// Failed to get special registers.
+    #[error("Failed to get special registers: {0}")]
+    GetSpecialRegisters(vmm_sys_util::errno::Error),
+    /// Failed to configure segments and special registers.
+    #[error("Failed to configure segments and special registers: {0}")]
+    ConfigureSegmentsAndSpecialRegisters(RegsError),
+    /// Failed to setup page tables.
+    #[error("Failed to setup page tables: {0}")]
+    SetupPageTables(RegsError),
+    /// Failed to set special registers.
+    #[error("Failed to set special registers: {0}")]
+    SetSpecialRegisters(vmm_sys_util::errno::Error),
+}
+
+/// Configures the special registers and system page tables for a given CPU.
+///
+/// # Arguments
+///
+/// * `mem` - The memory that will be passed to the guest.
+/// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
+///
+/// # Errors
+///
+/// When:
+/// - [`kvm_ioctls::ioctls::vcpu::VcpuFd::get_sregs`] errors.
+/// - [`configure_segments_and_sregs`] errors.
+/// - [`setup_page_tables`] errors
+/// - [`kvm_ioctls::ioctls::vcpu::VcpuFd::set_sregs`] errors.
+pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &VcpuFd) -> Result<(), SetupSpecialRegistersError> {
+    let mut sregs: kvm_sregs = vcpu
+        .get_sregs()
+        .map_err(SetupSpecialRegistersError::GetSpecialRegisters)?;
+
+    configure_segments_and_sregs(mem, &mut sregs)
+        .map_err(SetupSpecialRegistersError::ConfigureSegmentsAndSpecialRegisters)?;
+    setup_page_tables(mem, &mut sregs).map_err(SetupSpecialRegistersError::SetupPageTables)?;
+
+    vcpu.set_sregs(&sregs)
+        .map_err(SetupSpecialRegistersError::SetSpecialRegisters)
+}
+
+const BOOT_GDT_OFFSET: u64 = 0x500;
+const BOOT_IDT_OFFSET: u64 = 0x520;
+
+const BOOT_GDT_MAX: usize = 4;
+
+const EFER_LMA: u64 = 0x400;
+const EFER_LME: u64 = 0x100;
+
+const X86_CR0_PE: u64 = 0x1;
+const X86_CR0_PG: u64 = 0x8000_0000;
+const X86_CR4_PAE: u64 = 0x20;
+
+fn write_gdt_table(table: &[u64], guest_mem: &GuestMemoryMmap) -> Result<(), RegsError> {
+    let boot_gdt_addr = GuestAddress(BOOT_GDT_OFFSET);
+    for (index, entry) in table.iter().enumerate() {
+        let addr = guest_mem
+            .checked_offset(boot_gdt_addr, index * size_of::<u64>())
+            .ok_or(RegsError::WriteGDT)?;
+        guest_mem
+            .write_obj(*entry, addr)
+            .map_err(|_| RegsError::WriteGDT)?;
+    }
+    Ok(())
+}
+
+fn write_idt_value(val: u64, guest_mem: &GuestMemoryMmap) -> Result<(), RegsError> {
+    let boot_idt_addr = GuestAddress(BOOT_IDT_OFFSET);
+    guest_mem
+        .write_obj(val, boot_idt_addr)
+        .map_err(|_| RegsError::WriteIDT)
+}
+
+fn configure_segments_and_sregs(
+    mem: &GuestMemoryMmap,
+    sregs: &mut kvm_sregs,
+) -> Result<(), RegsError> {
+    // Configure GDT entries as specified by Linux 64bit boot protocol
+    let gdt_table: [u64; BOOT_GDT_MAX] = [
+        gdt_entry(0, 0, 0),            // NULL
+        gdt_entry(0xa09b, 0, 0xfffff), // CODE
+        gdt_entry(0xc093, 0, 0xfffff), // DATA
+        gdt_entry(0x808b, 0, 0xfffff), // TSS
+    ];
+
+    let code_seg = kvm_segment_from_gdt(gdt_table[1], 1);
+    let data_seg = kvm_segment_from_gdt(gdt_table[2], 2);
+    let tss_seg = kvm_segment_from_gdt(gdt_table[3], 3);
+
+    // Write segments
+    write_gdt_table(&gdt_table[..], mem)?;
+    sregs.gdt.base = BOOT_GDT_OFFSET;
+    sregs.gdt.limit = u16::try_from(size_of_val(&gdt_table)).unwrap() - 1;
+
+    write_idt_value(0, mem)?;
+    sregs.idt.base = BOOT_IDT_OFFSET;
+    sregs.idt.limit = u16::try_from(size_of::<u64>()).unwrap() - 1;
+
+    sregs.cs = code_seg;
+    sregs.ds = data_seg;
+    sregs.es = data_seg;
+    sregs.fs = data_seg;
+    sregs.gs = data_seg;
+    sregs.ss = data_seg;
+    sregs.tr = tss_seg;
+
+    // 64-bit protected mode
+    sregs.cr0 |= X86_CR0_PE;
+    sregs.efer |= EFER_LME | EFER_LMA;
+
+    Ok(())
+}
+
+fn setup_page_tables(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<(), RegsError> {
+    // Puts PML4 right after zero page but aligned to 4k.
+    let boot_pml4_addr = GuestAddress(PML4_START);
+    let boot_pdpte_addr = GuestAddress(PDPTE_START);
+    let boot_pde_addr = GuestAddress(PDE_START);
+
+    // Entry covering VA [0..512GB)
+    mem.write_obj(boot_pdpte_addr.raw_value() | 0x03, boot_pml4_addr)
+        .map_err(|_| RegsError::WritePML4Address)?;
+
+    // Entry covering VA [0..1GB)
+    mem.write_obj(boot_pde_addr.raw_value() | 0x03, boot_pdpte_addr)
+        .map_err(|_| RegsError::WritePDPTEAddress)?;
+    // 512 2MB entries together covering VA [0..1GB). Note we are assuming
+    // CPU supports 2MB pages (/proc/cpuinfo has 'pse'). All modern CPUs do.
+    for i in 0..512 {
+        mem.write_obj((i << 21) + 0x83u64, boot_pde_addr.unchecked_add(i * 8))
+            .map_err(|_| RegsError::WritePDEAddress)?;
+    }
+
+    sregs.cr3 = boot_pml4_addr.raw_value();
+    sregs.cr4 |= X86_CR4_PAE;
+    sregs.cr0 |= X86_CR0_PG;
+    Ok(())
+}

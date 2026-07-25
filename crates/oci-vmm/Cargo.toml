@@ -1,0 +1,26 @@
+[package]
+name = "oci-vmm"
+description = "oci-tools' own microVM monitor: KVM + virtio-pci, boots stock distro kernels (ported from Firecracker)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+event-manager.workspace = true
+kvm-bindings.workspace = true
+kvm-ioctls.workspace = true
+libc.workspace = true
+linux-loader.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+vm-memory.workspace = true
+vm-superio.workspace = true
+vmm-sys-util.workspace = true
+
+[lints]
+workspace = true

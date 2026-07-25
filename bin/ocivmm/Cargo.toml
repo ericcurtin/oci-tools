@@ -1,6 +1,6 @@
 [package]
 name = "ocivmm"
-description = "Pet microVMs from OCI images, libkrun statically linked (krunvm equivalent)"
+description = "Pet microVMs from OCI images, oci-vmm statically linked (krunvm equivalent)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,7 +13,7 @@ publish = false
 anyhow.workspace = true
 clap.workspace = true
 # Unwrapping the distro bzImage's gzip/zstd-compressed inner vmlinux
-# (see main.rs::extract_vmlinux) -- the same two decompressors the
+# (see disk.rs::extract_vmlinux) -- the same two decompressors the
 # workspace already uses for OCI layers.
 flate2.workspace = true
 libc.workspace = true
@@ -23,22 +23,26 @@ oci-layer.workspace = true
 oci-registry.workspace = true
 oci-spec-types.workspace = true
 oci-store.workspace = true
-rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The pet VM's disk image's own mountpoint (disk.rs::with_loop_mount).
+tempfile.workspace = true
 tracing.workspace = true
 
-# The VMM itself (statically linked libkrun crates) and the container
+# The VMM itself (oci-vmm, our own KVM/virtio crate), the container
 # machinery the one-off provisioning step runs the guest's package
-# manager with are both KVM/Linux-only; gating them keeps the crate
-# `cargo check`-able on other development hosts (where `ocivmm run`
-# reports a clear "Linux only" error instead).
+# manager with, and loop-mounting the pet VM's own disk image are all
+# Linux-only; gating them keeps the crate `cargo check`-able on other
+# development hosts (where `ocivmm run`/`create`/`cp` report a clear
+# "Linux only" error instead).
 [target.'cfg(target_os = "linux")'.dependencies]
-crossbeam-channel.workspace = true
-krun-devices.workspace = true
-krun-polly.workspace = true
-krun-vmm.workspace = true
+oci-mount.workspace = true
 oci-runtime-core.workspace = true
+oci-vmm.workspace = true
+# `rustix::mount::unmount` (disk.rs) -- the workspace's own base
+# `rustix` dependency doesn't enable the `mount` feature (no other
+# crate needs it), so this one Linux-only user adds it directly.
+rustix = { workspace = true, features = ["mount"] }
 
 [lints]
 workspace = true

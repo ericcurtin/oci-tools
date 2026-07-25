@@ -55,26 +55,27 @@ jobs:
 
   # 2 parallel VM jobs (x86_64 only): each boots the target distro as a
   # microVM -- created straight from the distro's own OCI image by this
-  # repo's *own* `ocivmm` binary (dogfooded on every push/PR; its VMM
-  # is libkrun's crates statically linked, nothing to install or load
-  # at run time) -- and builds/tests the workspace natively inside it,
-  # under the distro's *own* kernel and systemd (ocivmm provisions both
-  # into the pet VM with the distro's own package manager at create
-  # time, run as a container on the fresh rootfs).
+  # repo's *own* `ocivmm` binary (dogfooded on every push/PR), whose VMM
+  # (`oci-vmm`, this workspace's own KVM/virtio-pci monitor, ported from
+  # Firecracker) is statically linked, nothing to install or load at run
+  # time -- and builds/tests the workspace natively inside it, under the
+  # distro's *own* kernel and systemd (ocivmm provisions both into the
+  # pet VM with the distro's own package manager at create time, run as
+  # a container on the fresh rootfs).
   # Dramatically faster than the qemu+cloud-init harness this replaced:
   # a ~30-60MB OCI image pull (cached) instead of a ~700MB cloud image,
   # a direct-kernel boot into systemd (~1-2s) instead of
-  # UEFI+cloud-init minutes, and virtiofs instead of ssh+tar for
-  # source/artifact transfer. The pet VM's own rootfs (kernel,
-  # packages, rustup, cargo target) persists across runs via the
-  # vm-state cache below.
+  # UEFI+cloud-init minutes, and `ocivmm cp` (loop-mount, VM stopped)
+  # instead of ssh+tar for source/artifact transfer. The pet VM's own
+  # ext4 disk image (kernel, packages, rustup, cargo target) persists
+  # across runs via the vm-state cache below.
   #
-  # x86_64 runners provide /dev/kvm, which libkrun requires (no TCG
-  # fallback exists anymore -- ci/setup-host.sh fails clearly instead).
+  # x86_64 runners provide /dev/kvm, which the VMM requires (no TCG
+  # fallback exists -- ci/setup-host.sh fails clearly instead).
   #
   # aarch64 coverage is `native-test` below instead, not a third and
   # fourth cell here: GitHub's own aarch64 runners have no /dev/kvm at
-  # all.
+  # all, and `oci-vmm` is x86_64-only besides.
   vm-test:
     name: vm (${{ matrix.base }}, ${{ matrix.arch }})
     strategy:

@@ -2,45 +2,48 @@
 //!
 //! Creates long-lived pet *virtual machines* the same way `ocibox`
 //! creates pet containers: `ocivmm run ubuntu:26.04` resolves/pulls
-//! the image, extracts a real, dedicated, writable rootfs for a named
-//! VM (derived from the image name, `ubuntu-26.04`), and boots it as a
-//! libkrun microVM — the rootfs lives on as a plain host directory, so
-//! everything installed or written inside the guest persists across
-//! runs, exactly the "pet" model. Studied directly from
-//! `~/git/libkrun` (whose own `krunvm` companion pioneered this
-//! OCI-image-as-VM-rootfs design; `ocivmm` replaces its buildah layer
-//! with this project's own `oci-registry`/`oci-store`/`oci-layer`
-//! pull-and-extract stack, the exact same one `ocibox create` uses).
+//! the image, provisions it with the distro's own kernel and systemd,
+//! and boots it — everything installed or written inside the guest
+//! persists across runs, the "pet" model.
 //!
-//! Unlike krunvm, nothing here is dynamically loaded and nothing in
-//! the guest belongs to libkrun: the VMM is libkrun's own Rust crates
-//! **statically linked** into this binary (see `microvm.rs` — no
-//! `libkrun.so`, no libkrunfw, no dlopen), and the pet VM runs the
-//! **distro's own kernel and systemd**. `create` provisions the fresh
-//! rootfs by running *the distro's own package manager in it as a
-//! container* (this project's own `oci_runtime_core::launch`, the
-//! same machinery `ocibox enter` uses): `dnf install kernel systemd
-//! ...` inside centos:stream10, `apt-get install linux-image-virtual
-//! systemd ...` inside ubuntu:26.04 — plus a dracut initramfs able to
-//! mount the virtiofs root (`root=virtiofs:/dev/root`) and a
-//! systemd-networkd DHCP config. Every `run` then loads the guest's
-//! own `/boot/vmlinuz-*` (the external-kernel loader unwraps a distro
-//! bzImage by scanning for its compression magic) and boots straight
-//! into the distro's systemd as PID 1: `ocivmm run centos-stream10`
-//! with no command lands on a real autologin root console
-//! (serial-getty on hvc0), and with a command runs it as a generated
-//! oneshot unit that powers the VM off and hands its exit status back
-//! to the host through a file on the shared rootfs.
+//! The VMM is `oci-vmm`, this workspace's own KVM/virtio-pci monitor
+//! (ported from Firecracker; see `crates/oci-vmm`) — statically
+//! linked, nothing dynamically loaded, nothing dlopen'd. It has no
+//! virtio-fs device at all (a deliberate scope cut: virtio-pci +
+//! virtio-blk + virtio-net covers everything a stock distro kernel
+//! needs to boot and get online), so a pet VM's root filesystem is a
+//! plain **ext4 disk image**, not a shared host directory:
+//!
+//! * `create` extracts the OCI image into a scratch directory, runs
+//!   the distro's own package manager in it *as a container*
+//!   (`oci_runtime_core::launch`, the same machinery `ocibox enter`
+//!   uses) to install its own kernel, dracut, and systemd, then builds
+//!   `rootfs.img` from that directory with `mkfs.ext4 -d` and deletes
+//!   the scratch directory — the image *is* the pet VM from then on.
+//! * `run` loop-mounts the image read-only just long enough to copy
+//!   out the guest's own `/boot/vmlinuz-*` + initramfs (the *host*
+//!   VMM loads these directly; `linux-loader` needs plain files, not
+//!   a mounted filesystem) into a small cache, then boots with the
+//!   image itself as the virtio-blk root disk. No command → an
+//!   autologin root console; a command → a generated oneshot systemd
+//!   unit whose exit status is written back into the image and read
+//!   back by loop-mounting it again once the guest has powered off.
+//! * `cp` copies files into or out of a (stopped) pet VM's image by
+//!   loop-mounting it — the replacement for live directory sharing
+//!   (`--volume`), which virtio-blk-only has no equivalent of; see
+//!   its own doc comment for exactly what this trades away.
 //!
 //! Networking is a passt-backed virtio-net device; systemd-networkd
 //! does DHCP against passt, and `--publish` maps host ports via
 //! passt's own `-t` forwarding.
 //!
 //! Host requirements (run time only — building `ocivmm` needs
-//! nothing): `/dev/kvm` and the `passt` package. Guest uid/gid
-//! fidelity (package managers chown what they install, both in the
-//! provisioning container and over virtiofs) wants real root — run
-//! `ocivmm` as root for full pet-distro behavior, the way CI does.
+//! nothing): `/dev/kvm`, the `passt` package, and `mkfs.ext4`
+//! (e2fsprogs — already a dependency of every distro this project
+//! packages for). Guest uid/gid fidelity (package managers chown what
+//! they install, both in the provisioning container and in the
+//! finished image) wants real root — run `ocivmm` as root for full
+//! pet-distro behavior, the way CI does.
 
 use std::path::{Path, PathBuf};
 
@@ -50,13 +53,13 @@ use oci_spec_types::Reference;
 use oci_store::Store;
 use serde::{Deserialize, Serialize};
 
-mod microvm;
+mod disk;
 
 /// Command-line interface.
 #[derive(Debug, Parser)]
 #[command(
     name = "ocivmm",
-    about = "Pet microVMs from OCI images (libkrun-based)",
+    about = "Pet microVMs from OCI images",
     version = oci_cli_common::version::long(env!("CARGO_PKG_VERSION")),
 )]
 struct Cli {
@@ -67,13 +70,17 @@ struct Cli {
     command: Option<Command>,
 }
 
-/// Default guest RAM in MiB when `--mem` is not given. libkrun
-/// allocates guest memory lazily, so an unused allowance costs nothing.
+/// Default guest RAM in MiB when `--mem` is not given.
 const DEFAULT_MEM_MIB: u32 = 4096;
 
-/// Where the guest command's exit status lands, relative to the rootfs
+/// Default disk image size in MiB when creating a pet VM — generous
+/// headroom for a full `dnf`/`apt` toolchain plus whatever the guest
+/// installs later; the file is sparse, so this costs nothing upfront.
+const DEFAULT_DISK_MIB: u64 = 20_480;
+
+/// Where the guest command's exit status lands inside the image
 /// (written by the generated oneshot unit's `ExecStopPost`, read back
-/// by the host through the shared directory once the VMM exits).
+/// by the host via a loop-mount once the guest has powered off).
 const EXIT_STATUS_FILE: &str = ".ocivmm-exit-status";
 
 /// The generated per-run oneshot unit's own name.
@@ -86,9 +93,10 @@ enum Command {
     /// an image reference: `ocivmm run ubuntu:26.04` creates (pulling
     /// the image and provisioning its own kernel + systemd) a VM named
     /// `ubuntu-26.04` on first use and simply boots the same,
-    /// persistent rootfs on every use after that. With no `COMMAND`,
-    /// boots to a root login on the console; with one, runs it as a
-    /// oneshot systemd unit, powers off, and exits with its status.
+    /// persistent disk image on every use after that. With no
+    /// `COMMAND`, boots to a root login on the console; with one, runs
+    /// it as a oneshot systemd unit, powers off, and exits with its
+    /// status.
     Run {
         /// Existing VM name, or an image reference to create one from.
         target: String,
@@ -108,10 +116,6 @@ enum Command {
         /// Guest RAM in MiB.
         #[arg(long, value_name = "MIB")]
         mem: Option<u32>,
-        /// Extra host directory to share with the guest
-        /// (`HOST_DIR:GUEST_DIR`, repeatable), mounted via virtiofs.
-        #[arg(long = "volume", short = 'v', value_name = "HOST:GUEST")]
-        volumes: Vec<String>,
         /// Map a host port to a guest port (`HOST:GUEST`, repeatable).
         #[arg(long = "publish", short = 'p', value_name = "HOST:GUEST")]
         publish: Vec<String>,
@@ -124,15 +128,14 @@ enum Command {
         workdir: Option<String>,
         /// Pull the image even if a local copy already exists (only
         /// meaningful when the VM doesn't exist yet — an existing pet
-        /// VM's rootfs is never silently replaced).
+        /// VM's disk image is never silently replaced).
         #[arg(long)]
         pull: bool,
     },
     /// Create (and provision) a pet VM without leaving it running:
-    /// resolves `--image`, extracts a dedicated writable rootfs, then
-    /// installs the distro's own kernel, initramfs, and systemd into
-    /// it using its own package manager — the `ocibox create` model
-    /// plus the one bootstrap boot a VM needs on top.
+    /// resolves `--image`, extracts it, runs the distro's own package
+    /// manager in it as a container to install its own kernel and
+    /// systemd, then builds the pet VM's `rootfs.img`.
     Create {
         /// Image reference to base the VM on.
         #[arg(long = "image", short = 'i', value_name = "REFERENCE")]
@@ -144,13 +147,14 @@ enum Command {
         /// Pull `--image` even if a local copy already exists.
         #[arg(long, short = 'p')]
         pull: bool,
+        /// The disk image size in MiB.
+        #[arg(long, value_name = "MIB")]
+        disk_mib: Option<u64>,
     },
-    /// List created VMs (name, image, creation time), sorted by name —
-    /// the same shape (and the same tolerance for one unreadable
-    /// record not hiding every other one) as `ocibox list`.
+    /// List created VMs (name, image, creation time), sorted by name.
     #[command(alias = "ls")]
     List,
-    /// Remove a VM entirely (its rootfs and persisted record).
+    /// Remove a VM entirely (its disk image and persisted record).
     Rm {
         /// The VM's name, exactly as shown by `ocivmm list`. Required
         /// unless `--all` is given instead.
@@ -160,16 +164,29 @@ enum Command {
         #[arg(long, short = 'a')]
         all: bool,
     },
+    /// Copy a file or directory into or out of a pet VM's disk image
+    /// by loop-mounting it — the replacement for live directory
+    /// sharing (a virtio-blk-only VMM has no equivalent of
+    /// krunvm/libkrun's virtiofs `--volume`; this trades a live,
+    /// shared view for an explicit, one-shot copy, docker-`cp`-style).
+    /// Exactly one of `SRC`/`DST` must be `VMNAME:PATH`; the VM must
+    /// not currently be running.
+    Cp {
+        /// Source: a host path, or `VMNAME:PATH` inside the image.
+        src: String,
+        /// Destination: a host path, or `VMNAME:PATH` inside the image.
+        dst: String,
+    },
     /// Hidden: become the VMM for a spec prepared by the parent
-    /// `ocivmm` process. [`microvm::boot`] turns its caller into the
-    /// VMM (it never returns; the process `_exit`s when the guest
-    /// powers off), so `run` — which must keep running to read the
-    /// exit-status file back and clean up per-run guest files — boots
-    /// through this re-exec'd child instead. The same self-re-exec
-    /// technique `ocicri`'s own `__launch` uses.
+    /// `ocivmm` process. [`oci_vmm::run`] turns its caller into the
+    /// VMM (it never returns; the process exits when the guest powers
+    /// off), so `run` — which must keep running to loop-mount the
+    /// image and read the exit-status file back — boots through this
+    /// re-exec'd child instead. The same self-re-exec technique
+    /// `ocicri`'s own `__launch` uses.
     #[command(name = "__boot", hide = true)]
     Boot {
-        /// Path of the serialized [`microvm::VmSpec`] JSON.
+        /// Path of the serialized [`BootSpec`] JSON.
         spec: PathBuf,
     },
 }
@@ -189,7 +206,6 @@ fn main() -> std::process::ExitCode {
                 name,
                 cpus,
                 mem,
-                volumes,
                 publish,
                 env,
                 workdir,
@@ -200,37 +216,38 @@ fn main() -> std::process::ExitCode {
                 name,
                 cpus,
                 mem,
-                volumes,
                 publish,
                 env,
                 workdir,
                 pull,
             }),
-            Some(Command::Create { image, name, pull }) => {
-                cmd_create(&image, name.as_deref(), pull)
-            }
+            Some(Command::Create {
+                image,
+                name,
+                pull,
+                disk_mib,
+            }) => cmd_create(
+                &image,
+                name.as_deref(),
+                pull,
+                disk_mib.unwrap_or(DEFAULT_DISK_MIB),
+            ),
             Some(Command::List) => cmd_list(cli.global.json),
             Some(Command::Rm { name, all }) => cmd_rm(name.as_deref(), all),
+            Some(Command::Cp { src, dst }) => cmd_cp(&src, &dst),
             Some(Command::Boot { spec }) => cmd_boot(&spec),
             None => anyhow::bail!("no subcommand given (try `ocivmm run ubuntu:26.04`)"),
         }
     })
 }
 
-/// Where every VM's own on-disk state lives — a sibling of `oci_store`'s
-/// own `blobs`/`images` directories, this project's established
-/// convention for per-capability state under the one shared storage
-/// root (`containers/` for `ociman`, `boxes/` for `ocibox`, `vms/`
-/// here).
+/// Where every VM's own on-disk state lives.
 fn vms_root() -> PathBuf {
     oci_cli_common::storage::default_root().join("vms")
 }
 
 /// A conservative charset check matching real `docker`/`podman`'s own
-/// `--name` convention — the same small, deliberate duplicate `ocibox`
-/// keeps (see `validate_box_name` there for the cross-binary-dependency
-/// reasoning); also the path-traversal guard before joining onto
-/// [`vms_root`].
+/// `--name` convention.
 fn validate_vm_name(name: &str) -> anyhow::Result<()> {
     let valid = name
         .chars()
@@ -248,11 +265,9 @@ fn validate_vm_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Derive a friendly default VM name from an image reference: the last
-/// path component of the repository plus the tag — `ubuntu:26.04` ->
-/// `ubuntu-26.04`, `quay.io/centos/centos:stream10` ->
-/// `centos-stream10`, tagless/`latest` references just the repository
-/// basename. Any character outside the VM-name charset becomes `-`.
+/// Derive a friendly default VM name from an image reference:
+/// `ubuntu:26.04` -> `ubuntu-26.04`, `quay.io/centos/centos:stream10`
+/// -> `centos-stream10`.
 fn derive_vm_name(reference: &Reference) -> String {
     let base = reference
         .repository()
@@ -284,13 +299,11 @@ fn derive_vm_name(reference: &Reference) -> String {
     sanitized
 }
 
-/// A VM's own persisted metadata (`<vms_root>/<name>/vm.json`) —
-/// deliberately minimal, the same shape (and the same captured-once-at-
-/// create-time reasoning) as `ocibox`'s `BoxRecord`. The kernel and
-/// initramfs are *not* recorded here: they belong to the guest (its own
-/// package manager installs and upgrades them), so every boot
-/// re-detects the newest ones from the rootfs instead of trusting a
-/// stale record ([`find_guest_kernel`]).
+/// A VM's own persisted metadata (`<vms_root>/<name>/vm.json`). The
+/// kernel/initramfs are never recorded here: they belong to the guest
+/// (its own package manager installs and upgrades them), so every
+/// boot re-detects the newest ones from the image instead of trusting
+/// a stale record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VmRecord {
     name: String,
@@ -304,19 +317,16 @@ struct VmRecord {
 }
 
 /// Fallback `PATH` for a VM whose source image declared no default
-/// `env` at all — matching real `podman`'s identical fallback, the
-/// same small duplicate `ocibox`/`ociman` each keep.
+/// `env` at all — matching real `podman`'s identical fallback.
 const DEFAULT_ENV_WHEN_VM_DECLARES_NONE: &str =
     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// The real create logic `cmd_create` and `cmd_run`'s create-on-first-
-/// use path share: resolve/pull the image, extract a dedicated
-/// writable rootfs (mirroring `ocibox`'s `create_box`, including the
-/// deliberate choice *not* to share `oci_store`'s read-only rootfs
-/// cache), persist the record, then provision the distro's own kernel
-/// and systemd into it ([`provision_vm`]). Any failure removes the
-/// half-created VM directory.
-fn create_vm(image: &str, name: &str, pull: bool) -> anyhow::Result<VmRecord> {
+/// use path share: resolve/pull the image, extract it to a scratch
+/// directory, provision the distro's own kernel and systemd into it
+/// (as a container), then image it into `rootfs.img`. Any failure
+/// removes the half-created VM directory.
+fn create_vm(image: &str, name: &str, pull: bool, disk_mib: u64) -> anyhow::Result<VmRecord> {
     validate_vm_name(name)?;
 
     let vm_dir = vms_root().join(name);
@@ -348,8 +358,14 @@ fn create_vm(image: &str, name: &str, pull: bool) -> anyhow::Result<VmRecord> {
         .with_context(|| format!("reading config for {reference}"))?;
     let container_config = config.config.unwrap_or_default();
 
-    let rootfs = vm_dir.join("rootfs");
-    std::fs::create_dir_all(&rootfs).with_context(|| format!("creating {}", rootfs.display()))?;
+    std::fs::create_dir_all(&vm_dir).with_context(|| format!("creating {}", vm_dir.display()))?;
+    // Named "rootfs" (not "scratch"), even though it's deleted right
+    // after imaging: `oci_spec_types::runtime::Spec::example()`'s own
+    // `root.path` is the literal string "rootfs", relative to the
+    // bundle directory (`vm_dir`) `provision_vm` loads as a `Bundle`.
+    let scratch = vm_dir.join("rootfs");
+    std::fs::create_dir_all(&scratch).with_context(|| format!("creating {}", scratch.display()))?;
+
     let vm_record = VmRecord {
         name: name.to_string(),
         image: reference.to_string(),
@@ -357,15 +373,11 @@ fn create_vm(image: &str, name: &str, pull: bool) -> anyhow::Result<VmRecord> {
         created: oci_spec_types::time::format_rfc3339_utc(std::time::SystemTime::now()),
         env: container_config.env,
     };
-    let result = extract_rootfs(&store, &manifest, &rootfs)
-        .and_then(|()| ensure_guest_files(&rootfs, name))
-        // A freshly extracted image has no pet customizations to
-        // preserve, and base images routinely leak a meaningless
-        // resolv.conf from their own build environment (checked:
-        // centos:stream10 ships a NetworkManager-generated file
-        // pointing at a libvirt bridge) -- the provisioning container
-        // needs the host's, unconditionally.
-        .and_then(|()| reset_resolv_conf(&rootfs))
+    let result = extract_rootfs(&store, &manifest, &scratch)
+        .and_then(|()| ensure_guest_files(&scratch, name))
+        .and_then(|()| reset_resolv_conf(&scratch))
+        .and_then(|()| provision_vm(&scratch, name))
+        .and_then(|()| disk::build_ext4_image(&scratch, &vm_dir.join("rootfs.img"), disk_mib))
         .and_then(|()| {
             let vm_json_path = vm_dir.join("vm.json");
             std::fs::write(
@@ -373,8 +385,8 @@ fn create_vm(image: &str, name: &str, pull: bool) -> anyhow::Result<VmRecord> {
                 serde_json::to_vec_pretty(&vm_record).context("serializing VM record")?,
             )
             .with_context(|| format!("writing {}", vm_json_path.display()))
-        })
-        .and_then(|()| provision_vm(&vm_dir, &rootfs, name));
+        });
+    let _ = std::fs::remove_dir_all(&scratch);
     if result.is_err() {
         // Never leave a half-created VM directory lying around for a
         // later create of the same name to trip over — best effort,
@@ -387,12 +399,11 @@ fn create_vm(image: &str, name: &str, pull: bool) -> anyhow::Result<VmRecord> {
 }
 
 /// Extract every one of `manifest`'s layers, bottom-first, into
-/// `rootfs` — identical to `ocibox`'s extraction for identical
-/// reasons (see [`create_vm`]).
+/// `dest`.
 fn extract_rootfs(
     store: &Store,
     manifest: &oci_spec_types::image::ImageManifest,
-    rootfs: &Path,
+    dest: &Path,
 ) -> anyhow::Result<()> {
     for layer in &manifest.layers {
         let compression = oci_layer::compression_for_media_type(&layer.media_type)
@@ -400,7 +411,7 @@ fn extract_rootfs(
         let blob = store
             .open_blob(&layer.digest)
             .with_context(|| format!("opening layer blob {}", layer.digest))?;
-        oci_layer::apply(blob, compression, rootfs)
+        oci_layer::apply(blob, compression, dest)
             .with_context(|| format!("extracting layer {}", layer.digest))?;
     }
     Ok(())
@@ -408,11 +419,10 @@ fn extract_rootfs(
 
 /// The distro-specific half of the provisioning script: install the
 /// distro's own kernel, dracut, kmod, and systemd with the distro's
-/// own package manager. Distro differences are data, not logic — the
-/// `ci/vm-prepare.sh` convention. On the apt side dracut is installed
-/// *before* the kernel so it both satisfies `linux-image-*`'s
-/// `initramfs-tools | linux-initramfs-tool` alternative and owns the
-/// kernel's initramfs hooks.
+/// own package manager. Distro differences are data, not logic. On
+/// the apt side dracut is installed *before* the kernel so it both
+/// satisfies `linux-image-*`'s `initramfs-tools | linux-initramfs-tool`
+/// alternative and owns the kernel's initramfs hooks.
 #[cfg(target_os = "linux")]
 const PROVISION_PACKAGES: &str = r#"
 if command -v dnf >/dev/null 2>&1; then
@@ -431,56 +441,21 @@ else
 fi
 "#;
 
-/// The distro-independent half: a dracut initramfs that can mount the
-/// virtiofs root (`root=virtiofs:/dev/root`, dracut's own documented
-/// syntax — checked in dracut's `modules.d/*virtiofs/parse-virtiofs.sh`),
-/// systemd-networkd DHCP for the passt-backed virtio-net device, and a
-/// root autologin on the hvc0 console systemd's getty-generator spawns
-/// for `console=hvc0`.
+/// The distro-independent half: a dracut initramfs able to mount the
+/// virtio-blk root device directly (`root=/dev/vda`, no virtiofs — the
+/// VMM has no filesystem-sharing device at all), systemd-networkd DHCP
+/// for the passt-backed virtio-net device, and a root autologin on the
+/// serial console systemd's getty-generator spawns for `console=ttyS0`.
 #[cfg(target_os = "linux")]
 const PROVISION_CONFIGURE: &str = r#"
 kver=$(ls /lib/modules | sort -V | tail -n 1)
 [ -n "$kver" ] || { echo 'ocivmm provision: no kernel modules installed' >&2; exit 1; }
-
-# The VMM attaches every device over virtio-MMIO (no PCI). RHEL-family
-# kernels ship *no* virtio-mmio support at all (checked: CentOS Stream
-# 10 and even the hyperscale SIG kernel have CONFIG_VIRTIO_MMIO
-# unset), so build the one upstream driver the distro omits against
-# the distro's own kernel-devel, exactly like any out-of-tree kmod --
-# an 875-line, self-contained platform driver whose compile against
-# the real el10 headers is verified. Ubuntu kernels have it already.
-kcfg=""
-for f in "/boot/config-$kver" "/lib/modules/$kver/config"; do
-    [ -r "$f" ] && kcfg=$f && break
-done
-if [ -n "$kcfg" ] && ! grep -qE '^CONFIG_VIRTIO_MMIO=[ym]' "$kcfg" \
-    && command -v dnf >/dev/null 2>&1; then
-    echo 'ocivmm provision: kernel lacks virtio-mmio; building the upstream module'
-    dnf -y --setopt=install_weak_deps=False install \
-        "kernel-devel-uname-r = $kver" gcc make kmod
-    builddir=$(mktemp -d)
-    mm=$(echo "$kver" | cut -d. -f1-2)
-    curl -sfL -o "$builddir/virtio_mmio.c" \
-        "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/virtio/virtio_mmio.c?h=linux-$mm.y"
-    printf 'obj-m := virtio_mmio.o\n' > "$builddir/Makefile"
-    make -C "/usr/src/kernels/$kver" M="$builddir" modules
-    install -D -m 0644 "$builddir/virtio_mmio.ko" "/lib/modules/$kver/extra/virtio_mmio.ko"
-    depmod "$kver"
-    rm -rf "$builddir"
-fi
-
-# --add-drivers: dracut's default driver policy does not pull the
-# virtio-MMIO transport in even with --no-hostonly -- without it the
-# root filesystem's virtiofs device never appears in the initramfs
-# (found the hard way: "dracut: FATAL: virtiofs: failed to mount
-# root fs").
-dracut --force --no-hostonly --add virtiofs --add-drivers 'virtio_mmio virtiofs' \
-    "/boot/ocivmm-initrd-$kver.img" "$kver"
+dracut --force --no-hostonly "/boot/ocivmm-initrd-$kver.img" "$kver"
 
 mkdir -p /etc/systemd/network \
     /etc/systemd/system/multi-user.target.wants \
     /etc/systemd/system/network-online.target.wants \
-    '/etc/systemd/system/serial-getty@hvc0.service.d'
+    '/etc/systemd/system/serial-getty@ttyS0.service.d'
 
 cat > /etc/systemd/network/20-ocivmm.network <<'EOF'
 [Match]
@@ -496,15 +471,9 @@ ln -sf /usr/lib/systemd/system/systemd-networkd-wait-online.service \
     /etc/systemd/system/network-online.target.wants/systemd-networkd-wait-online.service
 ln -sf /usr/lib/systemd/system/systemd-resolved.service \
     /etc/systemd/system/multi-user.target.wants/systemd-resolved.service
-
-# From here on DNS belongs to systemd-resolved, fed by whatever DNS
-# the DHCP lease carries (passt advertises itself and forwards to the
-# host's resolvers, looping in the host's own loopback stub if that's
-# what the host uses) -- the host-written static resolv.conf above was
-# only ever for this provisioning container itself.
 ln -sfn ../run/systemd/resolve/resolv.conf /etc/resolv.conf
 
-cat > '/etc/systemd/system/serial-getty@hvc0.service.d/autologin.conf' <<'EOF'
+cat > '/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf' <<'EOF'
 [Service]
 ExecStart=
 ExecStart=-/sbin/agetty --autologin root --keep-baud 115200,57600,38400,9600 %I $TERM
@@ -513,17 +482,15 @@ EOF
 echo 'ocivmm provision: done'
 "#;
 
-/// Provision a freshly extracted rootfs with the distro's own kernel
-/// and systemd by running the provisioning script *as a container on
-/// the rootfs* — the same shared `oci_runtime_core::launch`/`Bundle`/
-/// `validate` lifecycle `ocibox enter` uses (host network kept: the
-/// package manager needs the registry mirrors), no VM involved: a
-/// fresh OCI rootfs has no kernel to boot yet, and a container needs
-/// none. Images with no `dnf`/`apt-get` (alpine, distroless) are a
-/// clear, upfront error: without a distro able to install its own
-/// kernel and systemd there is nothing `ocivmm` could boot.
+/// Provision a freshly extracted rootfs (a plain directory, not yet
+/// imaged) with the distro's own kernel and systemd, by running the
+/// provisioning script *as a container on it* — the same shared
+/// `oci_runtime_core::launch`/`Bundle`/`validate` lifecycle `ocibox
+/// enter` uses (host network kept: the package manager needs the
+/// registry mirrors). Images with no `dnf`/`apt-get` (alpine,
+/// distroless) are a clear, upfront error.
 #[cfg(target_os = "linux")]
-fn provision_vm(vm_dir: &Path, rootfs: &Path, name: &str) -> anyhow::Result<()> {
+fn provision_vm(rootfs: &Path, name: &str) -> anyhow::Result<()> {
     let has_pkg_manager = ["usr/bin/dnf", "usr/bin/apt-get", "bin/apt-get"]
         .iter()
         .any(|p| rootfs.join(p).exists());
@@ -550,11 +517,7 @@ fn provision_vm(vm_dir: &Path, rootfs: &Path, name: &str) -> anyhow::Result<()> 
     }
     // The package manager needs host network (into_rootless already
     // drops the network namespace for the rootless case). No seccomp
-    // filter: this is our own trusted provisioning script (found the
-    // hard way: the default profile ENOSYS-blocked `socket(2)` here,
-    // taking DNS down with it), and the same invocation is about to
-    // boot a whole VM anyway — there is no privilege boundary a
-    // filter would enforce.
+    // filter: this is our own trusted provisioning script.
     if let Some(linux) = spec.linux.as_mut() {
         linux
             .namespaces
@@ -583,19 +546,23 @@ fn provision_vm(vm_dir: &Path, rootfs: &Path, name: &str) -> anyhow::Result<()> 
         capabilities.permitted = podman_caps;
     }
 
-    let config_path = vm_dir.join(oci_runtime_core::bundle::CONFIG_FILENAME);
+    let config_path = rootfs
+        .parent()
+        .expect("scratch dir has a parent")
+        .join(oci_runtime_core::bundle::CONFIG_FILENAME);
     std::fs::write(&config_path, serde_json::to_vec_pretty(&spec)?)
         .with_context(|| format!("writing {}", config_path.display()))?;
+    let bundle_dir = rootfs.parent().expect("scratch dir has a parent");
     let result = (|| -> anyhow::Result<()> {
-        let bundle = oci_runtime_core::Bundle::load(vm_dir)
-            .with_context(|| format!("loading bundle from {}", vm_dir.display()))?;
+        let bundle = oci_runtime_core::Bundle::load(bundle_dir)
+            .with_context(|| format!("loading bundle from {}", bundle_dir.display()))?;
         let validated_rootfs = oci_runtime_core::validate::validate(&bundle)
             .context("provisioning config.json failed validation")?;
         // SAFETY: `ocivmm create` has not spawned any additional
-        // threads by this point (pulling and extracting the image
-        // don't), matching `ocibox enter`'s identical safety note for
-        // this same entry point. Stdin is closed (a package install is
-        // never interactive); output passes through for progress.
+        // threads by this point, matching `ocibox enter`'s identical
+        // safety note for this same entry point. Stdin is closed (a
+        // package install is never interactive); output passes
+        // through for progress.
         #[allow(unsafe_code)]
         let exit_code = unsafe {
             oci_runtime_core::launch::run(
@@ -620,16 +587,30 @@ fn provision_vm(vm_dir: &Path, rootfs: &Path, name: &str) -> anyhow::Result<()> 
 /// Containers (and KVM) are Linux-only; everywhere else `create` fails
 /// clearly before leaving half-provisioned state around.
 #[cfg(not(target_os = "linux"))]
-fn provision_vm(_vm_dir: &Path, _rootfs: &Path, _name: &str) -> anyhow::Result<()> {
+fn provision_vm(_rootfs: &Path, _name: &str) -> anyhow::Result<()> {
     anyhow::bail!("ocivmm can only provision and run VMs on Linux (KVM + containers)");
 }
 
+/// A boot spec handed to the re-exec'd `ocivmm __boot` child as JSON —
+/// see [`Command::Boot`] for why a child.
+#[derive(Debug, Serialize, Deserialize)]
+struct BootSpec {
+    cpus: u8,
+    mem_mib: u32,
+    kernel_path: PathBuf,
+    initrd_path: Option<PathBuf>,
+    cmdline: String,
+    disk_path: PathBuf,
+    disk_read_only: bool,
+    net_mac: [u8; 6],
+    /// passt's unix-stream socket path; the `__boot` child connects to
+    /// it itself (already listening by the time this spec is written).
+    passt_socket: PathBuf,
+}
+
 /// Boot `spec` in a re-exec'd `ocivmm __boot` child (stdio inherited)
-/// and wait for it — see [`Command::Boot`] for why a child.
-fn boot_in_child(
-    vm_dir: &Path,
-    spec: &microvm::VmSpec,
-) -> anyhow::Result<std::process::ExitStatus> {
+/// and wait for it.
+fn boot_in_child(vm_dir: &Path, spec: &BootSpec) -> anyhow::Result<std::process::ExitStatus> {
     let spec_path = vm_dir.join("boot-spec.json");
     std::fs::write(&spec_path, serde_json::to_vec_pretty(spec)?)
         .with_context(|| format!("writing {}", spec_path.display()))?;
@@ -644,13 +625,35 @@ fn boot_in_child(
 }
 
 /// `ocivmm __boot`: the hidden VMM half — never returns on success.
+#[cfg(target_os = "linux")]
 fn cmd_boot(spec_path: &Path) -> anyhow::Result<()> {
     let bytes = std::fs::read(spec_path)
         .with_context(|| format!("reading boot spec {}", spec_path.display()))?;
-    let spec: microvm::VmSpec = serde_json::from_slice(&bytes)
+    let spec: BootSpec = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing boot spec {}", spec_path.display()))?;
-    raise_nofile_limit();
-    microvm::boot(&spec).map(|never| match never {})
+    let passt_socket = std::os::unix::net::UnixStream::connect(&spec.passt_socket)
+        .with_context(|| format!("connecting to passt at {}", spec.passt_socket.display()))?;
+    let config = oci_vmm::VmmConfig {
+        vcpu_count: spec.cpus,
+        mem_mib: spec.mem_mib,
+        kernel_path: spec.kernel_path,
+        initrd_path: spec.initrd_path,
+        cmdline: spec.cmdline,
+        disk_path: spec.disk_path,
+        disk_read_only: spec.disk_read_only,
+        net_mac: spec.net_mac,
+        passt_socket,
+    };
+    match oci_vmm::run(config) {
+        Ok(never) => match never {},
+        Err(err) => anyhow::bail!("{err}"),
+    }
+}
+
+/// KVM is Linux-only.
+#[cfg(not(target_os = "linux"))]
+fn cmd_boot(_spec_path: &Path) -> anyhow::Result<()> {
+    anyhow::bail!("ocivmm can only run VMs on Linux (KVM)");
 }
 
 /// Read one VM's persisted [`VmRecord`] back from `vm.json`.
@@ -661,20 +664,19 @@ fn load_vm(name: &str) -> anyhow::Result<VmRecord> {
     serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", vm_json_path.display()))
 }
 
-fn cmd_create(image: &str, name: Option<&str>, pull: bool) -> anyhow::Result<()> {
+fn cmd_create(image: &str, name: Option<&str>, pull: bool, disk_mib: u64) -> anyhow::Result<()> {
     let reference =
         Reference::parse(image).with_context(|| format!("parsing image reference {image:?}"))?;
     let name = match name {
         Some(name) => name.to_string(),
         None => derive_vm_name(&reference),
     };
-    create_vm(image, &name, pull)?;
+    create_vm(image, &name, pull, disk_mib)?;
     println!("{name}");
     Ok(())
 }
 
-/// Every VM's persisted record, sorted by name — same enumeration
-/// shape (and unreadable-entry tolerance) as `ocibox list`.
+/// Every VM's persisted record, sorted by name.
 fn list_vms() -> anyhow::Result<Vec<VmRecord>> {
     let root = vms_root();
     let entries = match std::fs::read_dir(&root) {
@@ -716,8 +718,7 @@ fn cmd_list(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Remove exactly one VM's directory and print its name — validated
-/// first for the same path-traversal reason `ocibox`'s equivalent is.
+/// Remove exactly one VM's directory and print its name.
 fn remove_one_vm(name: &str) -> anyhow::Result<()> {
     validate_vm_name(name)?;
     let vm_dir = vms_root().join(name);
@@ -727,9 +728,7 @@ fn remove_one_vm(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `ocivmm rm <NAME>` / `ocivmm rm --all` — one or the other, not
-/// both; `--all` keeps going past a per-VM failure and reports the
-/// first error at the end, matching `ocibox rm` exactly.
+/// `ocivmm rm <NAME>` / `ocivmm rm --all`.
 fn cmd_rm(name: Option<&str>, all: bool) -> anyhow::Result<()> {
     match (name, all) {
         (Some(_), true) => anyhow::bail!("cannot give both a VM name and --all"),
@@ -751,15 +750,74 @@ fn cmd_rm(name: Option<&str>, all: bool) -> anyhow::Result<()> {
     }
 }
 
-/// Everything `ocivmm run` was asked for, bundled so the handler
-/// signature stays readable.
+/// `ocivmm cp`: `SRC`/`DST` where exactly one side is `VMNAME:PATH`.
+fn cmd_cp(src: &str, dst: &str) -> anyhow::Result<()> {
+    match (parse_vm_path(src)?, parse_vm_path(dst)?) {
+        (Some((name, inner)), None) => {
+            let image = vms_root().join(&name).join("rootfs.img");
+            disk::with_loop_mount(&image, true, |mountpoint| {
+                copy_path(
+                    &mountpoint.join(inner.trim_start_matches('/')),
+                    Path::new(dst),
+                )
+            })
+        }
+        (None, Some((name, inner))) => {
+            let image = vms_root().join(&name).join("rootfs.img");
+            disk::with_loop_mount(&image, false, |mountpoint| {
+                copy_path(
+                    Path::new(src),
+                    &mountpoint.join(inner.trim_start_matches('/')),
+                )
+            })
+        }
+        (Some(_), Some(_)) => anyhow::bail!("ocivmm cp: only one side may be VMNAME:PATH"),
+        (None, None) => anyhow::bail!("ocivmm cp: one side must be VMNAME:PATH"),
+    }
+}
+
+/// Parse a `cp` argument as `VMNAME:PATH`, if it looks like one (a
+/// bare host path never contains `:` in practice on Linux).
+fn parse_vm_path(arg: &str) -> anyhow::Result<Option<(String, String)>> {
+    let Some((name, path)) = arg.split_once(':') else {
+        return Ok(None);
+    };
+    if validate_vm_name(name).is_err() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        vms_root().join(name).join("rootfs.img").is_file(),
+        "{name}: no such VM"
+    );
+    Ok(Some((name.to_string(), path.to_string())))
+}
+
+/// Recursively copy `src` to `dst` (files or directories).
+fn copy_path(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    if src.is_dir() {
+        std::fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
+        for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
+            let entry = entry?;
+            copy_path(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::copy(src, dst)
+            .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
+    }
+    Ok(())
+}
+
+/// Everything `ocivmm run` was asked for.
 struct RunRequest {
     target: String,
     command: Vec<String>,
     name: Option<String>,
     cpus: Option<u8>,
     mem: Option<u32>,
-    volumes: Vec<String>,
     publish: Vec<String>,
     env: Vec<String>,
     workdir: Option<String>,
@@ -767,33 +825,89 @@ struct RunRequest {
 }
 
 /// `ocivmm run`: resolve `TARGET` to a (possibly freshly created and
-/// provisioned) pet VM, then boot it with the guest's own kernel and
-/// systemd ([`run_systemd_vm`]) — exiting the process with the guest
-/// command's own exit status.
+/// provisioned) pet VM, then boot it — exiting the process with the
+/// guest command's own exit status.
 fn cmd_run(request: &RunRequest) -> anyhow::Result<()> {
     let record = resolve_or_create_vm(request)?;
     let vm_dir = vms_root().join(&record.name);
-    let rootfs = vm_dir.join("rootfs");
+    let image = vm_dir.join("rootfs.img");
     anyhow::ensure!(
-        rootfs.is_dir(),
-        "{}: VM record exists but its rootfs is missing (remove it with `ocivmm rm`)",
+        image.is_file(),
+        "{}: VM record exists but its disk image is missing (remove it with `ocivmm rm`)",
         record.name
     );
 
-    ensure_guest_files(&rootfs, &record.name)
-        .with_context(|| format!("preparing guest files for {}", record.name))?;
+    // Checked here rather than left to the VMM: krun-vmm's Kvm setup
+    // panics (not errors) on a missing /dev/kvm.
+    anyhow::ensure!(
+        Path::new("/dev/kvm").exists(),
+        "/dev/kvm not found; ocivmm microVMs need KVM"
+    );
 
-    match find_guest_kernel(&vm_dir, &rootfs)? {
-        Some(kernel) if has_systemd(&rootfs) => {
-            run_systemd_vm(request, &record, &vm_dir, &rootfs, kernel)
-        }
-        _ => anyhow::bail!(
-            "{}: no bootable distro kernel + systemd in this VM's rootfs (created by an \
-             older ocivmm?); `ocivmm rm {}` and recreate it",
-            record.name,
+    let kernel = disk::find_guest_kernel(&vm_dir, &image)?.with_context(|| {
+        format!(
+            "{}: no bootable kernel found in this VM's image",
             record.name
-        ),
+        )
+    })?;
+
+    let ports = parse_ports(&request.publish)?;
+    let passt_socket = spawn_passt(&vm_dir, &ports)?;
+
+    let interactive = request.command.is_empty();
+    let exit_file_rel = EXIT_STATUS_FILE;
+    if !interactive {
+        let env = unit_env(request, &record);
+        let workdir = request.workdir.clone().unwrap_or_else(|| "/root".into());
+        let unit = systemd_unit(&request.command, &env, workdir.as_str())?;
+        disk::with_loop_mount(&image, false, |mountpoint| {
+            let _ = std::fs::remove_file(mountpoint.join(exit_file_rel));
+            write_run_unit(mountpoint, &unit)
+        })?;
+    } else {
+        disk::with_loop_mount(&image, false, remove_run_unit)?;
     }
+
+    let spec = BootSpec {
+        cpus: request.cpus.unwrap_or_else(default_cpus),
+        mem_mib: request.mem.unwrap_or(DEFAULT_MEM_MIB),
+        kernel_path: kernel.vmlinuz,
+        initrd_path: kernel.initramfs,
+        cmdline: kernel_cmdline(),
+        disk_path: image.clone(),
+        disk_read_only: false,
+        net_mac: [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee],
+        passt_socket,
+    };
+
+    eprintln!(
+        "ocivmm: booting {} (image {}, kernel {}, {} vcpu(s), {} MiB)",
+        record.name,
+        record.image,
+        spec.kernel_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        spec.cpus,
+        spec.mem_mib
+    );
+    let status = boot_in_child(&vm_dir, &spec)?;
+    let code = if interactive {
+        status.code().unwrap_or(1)
+    } else {
+        anyhow::ensure!(status.success(), "the VM exited abnormally ({status})");
+        let raw = disk::with_loop_mount(&image, true, |mountpoint| {
+            std::fs::read_to_string(mountpoint.join(exit_file_rel)).with_context(|| {
+                "the guest powered off without reporting a command status".to_string()
+            })
+        })?;
+        disk::with_loop_mount(&image, false, |mountpoint| {
+            let _ = std::fs::remove_file(mountpoint.join(exit_file_rel));
+            Ok(())
+        })?;
+        parse_exit_status(&raw)
+    };
+    std::process::exit(code);
 }
 
 /// Resolve `run`'s `TARGET`: an existing VM name wins; anything else
@@ -820,7 +934,7 @@ fn resolve_or_create_vm(request: &RunRequest) -> anyhow::Result<VmRecord> {
         return load_vm(&name);
     }
     eprintln!("ocivmm: creating VM {name} from {reference}");
-    create_vm(target, &name, request.pull)
+    create_vm(target, &name, request.pull, DEFAULT_DISK_MIB)
 }
 
 /// Default vCPU count: every host CPU (saturating into the `u8` the
@@ -832,318 +946,25 @@ fn default_cpus() -> u8 {
         .min(u8::MAX as usize) as u8
 }
 
-fn path_string(path: &Path) -> anyhow::Result<String> {
-    Ok(path
-        .to_str()
-        .with_context(|| format!("{} is not valid UTF-8", path.display()))?
-        .to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Distro-kernel + systemd boots
-// ---------------------------------------------------------------------------
-
-/// A guest kernel found in the rootfs, ready for `krun_set_kernel`.
-struct GuestKernel {
-    vmlinuz: PathBuf,
-    initramfs: Option<PathBuf>,
-    format: u32,
-}
-
 /// The kernel command line for distro-kernel boots: dracut mounts the
-/// virtiofs root (`root=virtiofs:/dev/root`) and switches into the
+/// virtio-blk root device (`root=/dev/vda`) and switches into the
 /// distro's own systemd (`/sbin/init`, the kernel default — no
-/// `init=`). Two consoles: `ttyS0` (built into distro kernels, so
-/// early boot/dracut/panic output is never lost) then `hvc0` (virtio,
-/// the primary — last `console=` wins `/dev/console`); systemd's
-/// getty-generator spawns the autologin console the provisioning step
-/// configured on both. No `quiet`: boot noise is cheap, and an
-/// unbootable guest with an invisible panic is exactly how the old
-/// qemu harness's serial console log earned its keep. `selinux=0`
-/// because the container image ships no policy to load.
+/// `init=`). `console=ttyS0` (the VMM's only console — see
+/// `oci-vmm`'s own docs) makes systemd's getty-generator spawn the
+/// autologin console the provisioning step configured.
+/// `rd.shell=0`/`rd.emergency=poweroff`: a root-mount failure must end
+/// the VM (which reports it), not park at an interactive dracut
+/// prompt nothing is attached to. `selinux=0` because the container
+/// image ships no policy to load.
 fn kernel_cmdline() -> String {
-    // rd.shell=0 + rd.emergency=poweroff: a root-mount failure must
-    // end the VM (which reports it), not park it at an interactive
-    // dracut emergency prompt nothing is attached to — found the hard
-    // way as a silent 90-minute CI hang.
-    format!(
-        "reboot=k panic=-1 console=ttyS0 console=hvc0 root=virtiofs:{} rw selinux=0 \
-         systemd.firstboot=off rd.shell=0 rd.emergency=poweroff",
-        microvm::ROOT_TAG
-    )
-}
-
-/// Does the rootfs have a real systemd to boot as PID 1?
-fn has_systemd(rootfs: &Path) -> bool {
-    ["usr/lib/systemd/systemd", "lib/systemd/systemd"]
-        .iter()
-        .any(|p| rootfs.join(p).exists())
-}
-
-/// Find the newest kernel the guest's own package manager installed:
-/// the highest-versioned `/lib/modules/<kver>` with a matching
-/// `/boot/vmlinuz-<kver>`, plus its initramfs (preferring the
-/// virtiofs-capable one the provisioning step generated). Re-detected
-/// on every boot so a `dnf upgrade` inside the pet VM takes effect —
-/// nothing is cached in `vm.json`.
-///
-/// On x86_64 the compressed distro bzImage is unwrapped to its inner
-/// ELF vmlinux (cached in the VM directory): the ELF loader is the
-/// path that honors the kernel's PVH entry point, and PVH is the boot
-/// protocol whose initrd pointer is a full 64 bits — the legacy
-/// 64-bit boot-params path truncates `ramdisk_image` to u32 (checked
-/// in the pinned krun-arch's `configure_64bit_boot`), which with the
-/// initrd placed at top-of-RAM breaks any guest bigger than 4 GiB,
-/// found the hard way as a "VFS: Unable to mount root fs" panic on
-/// the 8 GiB CI guests. Both target distros build with CONFIG_PVH=y
-/// (checked in their real x86_64 kernel packages).
-fn find_guest_kernel(vm_dir: &Path, rootfs: &Path) -> anyhow::Result<Option<GuestKernel>> {
-    let modules_dir = rootfs.join("lib/modules");
-    let entries = match std::fs::read_dir(&modules_dir) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(None),
-    };
-    let mut kvers: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
-    kvers.sort_by(|a, b| compare_versions(a, b));
-    while let Some(kver) = kvers.pop() {
-        // Debian/Ubuntu install the image at /boot/vmlinuz-<kver>;
-        // RHEL-family kernels own it at /lib/modules/<kver>/vmlinuz
-        // (kernel-install only copies it to /boot on real systems,
-        // which a container-provisioned rootfs is not — checked
-        // against a real centos:stream10 provisioning run).
-        let Some(vmlinuz) = [
-            format!("boot/vmlinuz-{kver}"),
-            format!("lib/modules/{kver}/vmlinuz"),
-        ]
-        .iter()
-        .map(|p| rootfs.join(p))
-        .find(|p| p.is_file()) else {
-            continue;
-        };
-        let bytes =
-            std::fs::read(&vmlinuz).with_context(|| format!("reading {}", vmlinuz.display()))?;
-        let Some(mut format) = kernel_format(&bytes, std::env::consts::ARCH) else {
-            tracing::debug!(kernel = %vmlinuz.display(), "unrecognized kernel image format");
-            continue;
-        };
-        let mut vmlinuz = vmlinuz;
-        if matches!(format, 4 /* IMAGE_GZ */ | 5 /* IMAGE_ZSTD */) {
-            let elf = extract_vmlinux(&bytes)
-                .with_context(|| format!("extracting vmlinux from {}", vmlinuz.display()))?;
-            let cache = vm_dir.join("vmlinux");
-            std::fs::write(&cache, elf).with_context(|| format!("writing {}", cache.display()))?;
-            vmlinuz = cache;
-            format = 1; // KRUN_KERNEL_FORMAT_ELF -> the PVH-capable loader
-        }
-        let initramfs = [
-            format!("boot/ocivmm-initrd-{kver}.img"),
-            format!("boot/initramfs-{kver}.img"),
-            format!("boot/initrd.img-{kver}"),
-        ]
-        .iter()
-        .map(|p| rootfs.join(p))
-        .find(|p| p.is_file());
-        return Ok(Some(GuestKernel {
-            vmlinuz,
-            initramfs,
-            format,
-        }));
-    }
-    Ok(None)
-}
-
-/// Unwrap a bzImage's inner ELF vmlinux: decompress from the earliest
-/// gzip/zstd magic (both single-stream; trailing bzImage bytes after
-/// the stream are ignored by construction) — the same technique the
-/// kernel's own `extract-vmlinux` script and libkrun's Image* loaders
-/// use, done host-side so the PVH-capable ELF loader can be used
-/// instead (see [`find_guest_kernel`]).
-fn extract_vmlinux(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
-    use std::io::Read as _;
-    let find = |magic: &[u8]| bytes.windows(magic.len()).position(|w| w == magic);
-    let gz = find(&[0x1f, 0x8b, 0x08]);
-    let zst = find(&[0x28, 0xb5, 0x2f, 0xfd]);
-    let mut elf = Vec::new();
-    match (gz, zst) {
-        (Some(g), z) if z.is_none_or(|z| g < z) => {
-            flate2::read::GzDecoder::new(&bytes[g..])
-                .read_to_end(&mut elf)
-                .context("decompressing gzip vmlinux")?;
-        }
-        (_, Some(z)) => {
-            ruzstd::decoding::StreamingDecoder::new(&bytes[z..])
-                .context("initializing zstd decoder")?
-                .read_to_end(&mut elf)
-                .context("decompressing zstd vmlinux")?;
-        }
-        _ => anyhow::bail!("no gzip/zstd stream found in the kernel image"),
-    }
-    anyhow::ensure!(
-        elf.starts_with(&[0x7f, b'E', b'L', b'F']),
-        "decompressed kernel payload is not an ELF vmlinux"
-    );
-    Ok(elf)
-}
-
-/// Order two kernel-version strings by their numeric segments
-/// (`6.12.10-300` > `6.12.9-400`), falling back to lexicographic for
-/// equal numeric prefixes — a tiny `sort -V` equivalent.
-fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    let segments = |s: &str| -> Vec<u64> {
-        s.split(|c: char| !c.is_ascii_digit())
-            .filter(|seg| !seg.is_empty())
-            .filter_map(|seg| seg.parse().ok())
-            .collect()
-    };
-    segments(a).cmp(&segments(b)).then_with(|| a.cmp(b))
-}
-
-/// Sniff a kernel image's `KRUN_KERNEL_FORMAT_*` constant from its own
-/// bytes, mirroring exactly what libkrun's `load_external_kernel` does
-/// with each format (checked in `~/git/libkrun`'s
-/// `src/vmm/src/builder.rs`): on x86_64 a distro `vmlinuz` is a
-/// bzImage whose embedded vmlinux libkrun finds by scanning for the
-/// compression magic — gzip (`IMAGE_GZ`), zstd (`IMAGE_ZSTD`), or
-/// bzip2 (`IMAGE_BZ2`) — while a bare ELF vmlinux is `ELF`; on aarch64
-/// an EFI-stub Image ("MZ") loads as `RAW` and a gzipped Image as
-/// `PE_GZ`.
-fn kernel_format(bytes: &[u8], arch: &str) -> Option<u32> {
-    const ELF: u32 = 1;
-    const PE_GZ: u32 = 2;
-    const IMAGE_BZ2: u32 = 3;
-    const IMAGE_GZ: u32 = 4;
-    const IMAGE_ZSTD: u32 = 5;
-    const RAW: u32 = 0;
-
-    if bytes.starts_with(&[0x7f, b'E', b'L', b'F']) {
-        return Some(ELF);
-    }
-    let find = |magic: &[u8]| bytes.windows(magic.len()).position(|w| w == magic);
-    match arch {
-        "x86_64" => {
-            let candidates = [
-                (find(&[0x1f, 0x8b, 0x08]), IMAGE_GZ),
-                (find(&[0x28, 0xb5, 0x2f, 0xfd]), IMAGE_ZSTD),
-                (find(b"BZh"), IMAGE_BZ2),
-            ];
-            candidates
-                .iter()
-                .filter_map(|(pos, fmt)| pos.map(|p| (p, *fmt)))
-                .min_by_key(|(p, _)| *p)
-                .map(|(_, fmt)| fmt)
-        }
-        "aarch64" => {
-            if bytes.starts_with(b"MZ") {
-                Some(RAW)
-            } else {
-                find(&[0x1f, 0x8b, 0x08]).map(|_| PE_GZ)
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Boot the pet VM with its own kernel and systemd. With a command,
-/// installs a per-run oneshot unit that runs it (console output on
-/// hvc0), powers the VM off, and leaves its exit status in
-/// [`EXIT_STATUS_FILE`] for us to read back and exit with; without
-/// one, boots to the autologin root console and exits 0 on guest
-/// poweroff. Never returns on success.
-fn run_systemd_vm(
-    request: &RunRequest,
-    record: &VmRecord,
-    vm_dir: &Path,
-    rootfs: &Path,
-    kernel: GuestKernel,
-) -> anyhow::Result<()> {
-    let volumes = parse_volumes(&request.volumes)?;
-    let guest_paths: Vec<String> = request
-        .volumes
-        .iter()
-        .map(|v| split_volume(v).map(|(_, guest)| guest))
-        .collect::<Result<_, _>>()?;
-    set_fstab_volumes(rootfs, &guest_paths)?;
-
-    let interactive = request.command.is_empty();
-    let exit_file = rootfs.join(EXIT_STATUS_FILE);
-    let _ = std::fs::remove_file(&exit_file);
-    if interactive {
-        remove_run_unit(rootfs)?;
-    } else {
-        let env = unit_env(request, record);
-        let workdir = request.workdir.clone().unwrap_or_else(|| "/root".into());
-        write_run_unit(rootfs, &systemd_unit(&request.command, &env, &workdir)?)?;
-    }
-
-    // Checked here rather than left to the VMM: krun-vmm's Kvm setup
-    // panics (not errors) on a missing /dev/kvm.
-    anyhow::ensure!(
-        Path::new("/dev/kvm").exists(),
-        "/dev/kvm not found; ocivmm microVMs need KVM"
-    );
-
-    let ports = parse_ports(&request.publish)?;
-    let passt_fd = spawn_passt(vm_dir, &ports)?;
-
-    let spec = microvm::VmSpec {
-        cpus: request.cpus.unwrap_or_else(default_cpus),
-        mem_mib: request.mem.unwrap_or(DEFAULT_MEM_MIB),
-        rootfs: path_string(rootfs)?,
-        volumes,
-        kernel: microvm::KernelSpec {
-            path: path_string(&kernel.vmlinuz)?,
-            format: kernel.format,
-            initramfs: kernel.initramfs.as_deref().map(path_string).transpose()?,
-            cmdline: kernel_cmdline(),
-        },
-        passt_fd,
-    };
-
-    eprintln!(
-        "ocivmm: booting {} (image {}, kernel {}, initramfs {}, {} vcpu(s), {} MiB)",
-        record.name,
-        record.image,
-        kernel
-            .vmlinuz
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        kernel
-            .initramfs
-            .as_deref()
-            .and_then(Path::file_name)
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "none".to_string()),
-        spec.cpus,
-        spec.mem_mib
-    );
-    let status = boot_in_child(vm_dir, &spec)?;
-    let code = if interactive {
-        status.code().unwrap_or(1)
-    } else {
-        remove_run_unit(rootfs)?;
-        if !status.success() {
-            anyhow::bail!("the VM exited abnormally ({status})");
-        }
-        let raw = std::fs::read_to_string(&exit_file).with_context(|| {
-            format!(
-                "the guest powered off without reporting a command status \
-                 (missing {})",
-                exit_file.display()
-            )
-        })?;
-        let _ = std::fs::remove_file(&exit_file);
-        parse_exit_status(&raw)
-    };
-    std::process::exit(code);
+    "reboot=k panic=-1 console=ttyS0 root=/dev/vda rw selinux=0 systemd.firstboot=off \
+     rd.shell=0 rd.emergency=poweroff"
+        .to_string()
 }
 
 /// The guest environment for the generated oneshot unit: the image's
 /// declared env (or the standard `PATH` fallback), `HOME`, the host's
-/// `TERM`, then `-e` overrides — same merge the bundled-init path uses.
+/// `TERM`, then `-e` overrides.
 fn unit_env(request: &RunRequest, record: &VmRecord) -> Vec<String> {
     let mut env = if record.env.is_empty() {
         vec![DEFAULT_ENV_WHEN_VM_DECLARES_NONE.to_string()]
@@ -1159,18 +980,12 @@ fn unit_env(request: &RunRequest, record: &VmRecord) -> Vec<String> {
     merge_env(env, &request.env)
 }
 
-/// Map a unit's `$EXIT_STATUS` content to our own exit code: the
-/// numeric status when the command exited, 1 for anything else (a
-/// signal name like `KILL`, or garbage).
+/// Map a unit's `$EXIT_STATUS` content to our own exit code.
 fn parse_exit_status(raw: &str) -> i32 {
     raw.trim().parse().unwrap_or(1)
 }
 
-/// Render the per-run oneshot unit. `SuccessAction`/`FailureAction`
-/// power the VM off once the command (and the `ExecStopPost` that
-/// records `$EXIT_STATUS` — systemd leaves `$`-in-the-middle-of-a-word
-/// unexpanded, so the quoted `sh -c` sees it) has finished; oneshot
-/// units have no start timeout, so long builds are fine.
+/// Render the per-run oneshot unit.
 fn systemd_unit(command: &[String], env: &[String], workdir: &str) -> anyhow::Result<String> {
     anyhow::ensure!(!command.is_empty(), "empty command");
     let exec_start = command
@@ -1191,7 +1006,7 @@ fn systemd_unit(command: &[String], env: &[String], workdir: &str) -> anyhow::Re
          Type=oneshot\n\
          StandardOutput=tty\n\
          StandardError=tty\n\
-         TTYPath=/dev/hvc0\n",
+         TTYPath=/dev/ttyS0\n",
     );
     unit.push_str(&format!("WorkingDirectory={workdir}\n"));
     for entry in env {
@@ -1208,9 +1023,7 @@ fn systemd_unit(command: &[String], env: &[String], workdir: &str) -> anyhow::Re
     Ok(unit)
 }
 
-/// Quote one `ExecStart` argument per systemd.service syntax: double
-/// quotes with `\`-escapes, `%` doubled (specifier syntax), `$`
-/// doubled (variable expansion).
+/// Quote one `ExecStart` argument per systemd.service syntax.
 fn unit_escape_word(arg: &str) -> anyhow::Result<String> {
     anyhow::ensure!(
         !arg.contains('\n'),
@@ -1231,29 +1044,30 @@ fn unit_escape_word(arg: &str) -> anyhow::Result<String> {
     Ok(out)
 }
 
-/// Install the per-run unit: the unit file, a `multi-user.target.wants`
-/// symlink, and a mask for `serial-getty@hvc0` (the autologin console
-/// would fight the unit for the same tty).
-fn write_run_unit(rootfs: &Path, unit: &str) -> anyhow::Result<()> {
-    let system = rootfs.join("etc/systemd/system");
+/// Install the per-run unit (mounted image root at `mountpoint`): the
+/// unit file, a `multi-user.target.wants` symlink, and a mask for
+/// `serial-getty@ttyS0` (the autologin console would fight the unit
+/// for the same tty).
+fn write_run_unit(mountpoint: &Path, unit: &str) -> anyhow::Result<()> {
+    let system = mountpoint.join("etc/systemd/system");
     let wants = system.join("multi-user.target.wants");
     std::fs::create_dir_all(&wants).with_context(|| format!("creating {}", wants.display()))?;
     std::fs::write(system.join(RUN_UNIT), unit).with_context(|| format!("writing {RUN_UNIT}"))?;
     let link = wants.join(RUN_UNIT);
     let _ = std::fs::remove_file(&link);
     symlink(&format!("/etc/systemd/system/{RUN_UNIT}"), &link)?;
-    let mask = system.join("serial-getty@hvc0.service");
+    let mask = system.join("serial-getty@ttyS0.service");
     let _ = std::fs::remove_file(&mask);
     symlink("/dev/null", &mask)?;
     Ok(())
 }
 
 /// Remove everything [`write_run_unit`] installed (idempotent).
-fn remove_run_unit(rootfs: &Path) -> anyhow::Result<()> {
-    let system = rootfs.join("etc/systemd/system");
+fn remove_run_unit(mountpoint: &Path) -> anyhow::Result<()> {
+    let system = mountpoint.join("etc/systemd/system");
     let _ = std::fs::remove_file(system.join("multi-user.target.wants").join(RUN_UNIT));
     let _ = std::fs::remove_file(system.join(RUN_UNIT));
-    let _ = std::fs::remove_file(system.join("serial-getty@hvc0.service"));
+    let _ = std::fs::remove_file(system.join("serial-getty@ttyS0.service"));
     Ok(())
 }
 
@@ -1267,72 +1081,14 @@ fn symlink(target: &str, link: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Point systemd at this run's `--volume`s: an ocivmm-managed block in
-/// the guest's `/etc/fstab` (`ocivmm0 /guest/path virtiofs ...`),
-/// rewritten wholesale on every boot so removed volumes disappear too;
-/// systemd's fstab generator mounts them. Mount points are created
-/// host-side.
-fn set_fstab_volumes(rootfs: &Path, guest_paths: &[String]) -> anyhow::Result<()> {
-    for guest in guest_paths {
-        let mount_point = rootfs.join(guest.trim_start_matches('/'));
-        std::fs::create_dir_all(&mount_point)
-            .with_context(|| format!("creating mount point {}", mount_point.display()))?;
-    }
-    let fstab_path = rootfs.join("etc/fstab");
-    let existing = std::fs::read_to_string(&fstab_path).unwrap_or_default();
-    let lines: Vec<String> = guest_paths
-        .iter()
-        .enumerate()
-        .map(|(index, guest)| format!("ocivmm{index} {guest} virtiofs defaults 0 0"))
-        .collect();
-    std::fs::create_dir_all(rootfs.join("etc")).context("creating /etc")?;
-    std::fs::write(&fstab_path, splice_fstab(&existing, &lines))
-        .with_context(|| format!("writing {}", fstab_path.display()))?;
-    Ok(())
-}
-
-/// Pure fstab surgery for [`set_fstab_volumes`]: drop any previous
-/// ocivmm-managed block, append the new one (if any lines).
-fn splice_fstab(existing: &str, lines: &[String]) -> String {
-    const BEGIN: &str = "# ocivmm-volumes-begin";
-    const END: &str = "# ocivmm-volumes-end";
-    let mut out = String::new();
-    let mut in_block = false;
-    for line in existing.lines() {
-        match line.trim() {
-            BEGIN => in_block = true,
-            END => in_block = false,
-            _ if !in_block => {
-                out.push_str(line);
-                out.push('\n');
-            }
-            _ => {}
-        }
-    }
-    if !lines.is_empty() {
-        out.push_str(BEGIN);
-        out.push('\n');
-        for line in lines {
-            out.push_str(line);
-            out.push('\n');
-        }
-        out.push_str(END);
-        out.push('\n');
-    }
-    out
-}
-
-/// Start passt for one VM boot and return an already-connected
-/// unix-stream fd to it, inheritable by the `__boot` child (CLOEXEC
-/// cleared). passt runs `--foreground` as our own child (its
-/// self-daemonization on the runner's older passt unlinked the socket
-/// file, found the hard way as `Binding(ENOENT)` device activation
-/// failures) and the socket is polled into existence before
-/// connecting; connecting here rather than in the VMM makes a passt
-/// problem a clear pre-boot error, and `--one-off` ends passt when
-/// this one connection's last holder (the VMM) goes away. `--publish`
-/// mappings become passt's own `-t host:guest` TCP forwards.
-fn spawn_passt(vm_dir: &Path, ports: &[String]) -> anyhow::Result<i32> {
+/// Start passt for one VM boot and return its unix-stream socket path
+/// (the `__boot` child connects to it itself). passt runs
+/// `--foreground` as our own child (self-daemonization has been known
+/// to unlink the socket file on some passt builds) and the socket is
+/// polled into existence before returning; `--one-off` ends passt once
+/// the VMM's one connection closes. `--publish` mappings become
+/// passt's own `-t host:guest` TCP forwards.
+fn spawn_passt(vm_dir: &Path, ports: &[String]) -> anyhow::Result<PathBuf> {
     let socket = vm_dir.join("passt.sock");
     let _ = std::fs::remove_file(&socket);
     let passt = std::env::var("OCIVMM_PASST").unwrap_or_else(|_| "passt".to_string());
@@ -1362,52 +1118,7 @@ fn spawn_passt(vm_dir: &Path, ports: &[String]) -> anyhow::Result<i32> {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-
-    let stream = std::os::unix::net::UnixStream::connect(&socket)
-        .with_context(|| format!("connecting to passt at {}", socket.display()))?;
-    rustix::io::fcntl_setfd(&stream, rustix::io::FdFlags::empty())
-        .context("clearing CLOEXEC on the passt connection")?;
-    Ok(std::os::fd::IntoRawFd::into_raw_fd(stream))
-}
-
-/// Parse every `--volume HOST:GUEST` into `(virtiofs_tag, host_path)`
-/// device pairs; the guest destinations are consumed separately, in
-/// the same order, by [`set_fstab_volumes`].
-fn parse_volumes(volumes: &[String]) -> anyhow::Result<Vec<(String, String)>> {
-    volumes
-        .iter()
-        .enumerate()
-        .map(|(index, volume)| {
-            let (host, _guest) = split_volume(volume)?;
-            let host_dir = PathBuf::from(&host);
-            anyhow::ensure!(
-                host_dir.is_dir(),
-                "--volume {volume}: host path {host} is not a directory"
-            );
-            let host = path_string(
-                &host_dir
-                    .canonicalize()
-                    .with_context(|| format!("--volume {volume}: resolving {host}"))?,
-            )?;
-            Ok((format!("ocivmm{index}"), host))
-        })
-        .collect()
-}
-
-/// Split one `HOST:GUEST` volume argument and validate the guest side.
-fn split_volume(volume: &str) -> anyhow::Result<(String, String)> {
-    let (host, guest) = volume
-        .split_once(':')
-        .with_context(|| format!("--volume {volume}: expected HOST_DIR:GUEST_DIR"))?;
-    anyhow::ensure!(
-        guest.starts_with('/'),
-        "--volume {volume}: guest path must be absolute"
-    );
-    anyhow::ensure!(
-        !guest.contains('\'') && !host.contains('\'') && !guest.contains(char::is_whitespace),
-        "--volume {volume}: paths with quotes or whitespace are not supported"
-    );
-    Ok((host.to_string(), guest.to_string()))
+    Ok(socket)
 }
 
 /// Validate every `--publish HOST:GUEST` port mapping; passt's `-t`
@@ -1432,8 +1143,7 @@ fn parse_ports(publish: &[String]) -> anyhow::Result<Vec<String>> {
 }
 
 /// Merge `extra` `NAME=value` entries into `base`, replacing any entry
-/// with the same `NAME` in place and appending the rest — so a later
-/// `-e PATH=...` overrides the image's `PATH` instead of duplicating it.
+/// with the same `NAME` in place and appending the rest.
 fn merge_env(mut base: Vec<String>, extra: &[String]) -> Vec<String> {
     for entry in extra {
         let key = entry.split('=').next().unwrap_or(entry);
@@ -1449,50 +1159,12 @@ fn merge_env(mut base: Vec<String>, extra: &[String]) -> Vec<String> {
 }
 
 /// Make the guest's `/etc/resolv.conf`, `/etc/hosts`, and
-/// `/etc/hostname` usable. OCI base images ship these absent, empty,
-/// or as dangling symlinks (container engines bind-mount over them at
-/// run time; there is no engine here, the rootfs *is* the machine).
-///
-/// resolv.conf handling is two-phased by design: before provisioning
-/// the only consumer is the provisioning *container* (host network
-/// namespace), so the right content is the **host's own resolv.conf
-/// verbatim** — loopback stub included, since host loopback works
-/// there and public resolvers may well be blocked (Azure-hosted CI
-/// runners are). Provisioning then hands the file over to
-/// systemd-resolved (a symlink into `/run/systemd/resolve/`), which
-/// gets the *VM's* DNS dynamically from the DHCP lease — passt
-/// advertises itself as the resolver and forwards to whatever the
-/// host uses. That symlink (dangling from the host's point of view)
-/// is therefore deliberately left alone here, as is any regular file
-/// with nameservers in it — a pet VM's own customizations belong to
-/// it.
+/// `/etc/hostname` usable, applied to the scratch directory before
+/// imaging. OCI base images ship these absent, empty, or as dangling
+/// symlinks.
 fn ensure_guest_files(rootfs: &Path, name: &str) -> anyhow::Result<()> {
     let etc = rootfs.join("etc");
     std::fs::create_dir_all(&etc).with_context(|| format!("creating {}", etc.display()))?;
-
-    let resolv = etc.join("resolv.conf");
-    let usable = match std::fs::symlink_metadata(&resolv) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            let target = std::fs::read_link(&resolv).unwrap_or_default();
-            if target.to_string_lossy().contains("systemd/resolve") {
-                // Provisioned: systemd-resolved owns DNS in the guest.
-                true
-            } else {
-                // A dangling stub link from the image itself.
-                std::fs::remove_file(&resolv)
-                    .with_context(|| format!("removing symlink {}", resolv.display()))?;
-                false
-            }
-        }
-        Ok(_) => std::fs::read_to_string(&resolv)
-            .map(|content| !nameservers_from(&content).is_empty())
-            .unwrap_or(false),
-        Err(_) => false,
-    };
-    if !usable {
-        std::fs::write(&resolv, host_resolv_conf())
-            .with_context(|| format!("writing {}", resolv.display()))?;
-    }
 
     let hosts = etc.join("hosts");
     if !hosts.exists() {
@@ -1511,9 +1183,11 @@ fn ensure_guest_files(rootfs: &Path, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Unconditionally point the rootfs's resolv.conf at the host's (used
-/// at create time, before the provisioning container runs — see
-/// [`ensure_guest_files`] for the two-phase design).
+/// Unconditionally point the scratch rootfs's resolv.conf at the
+/// host's (the provisioning container needs it; provisioning later
+/// hands DNS over to systemd-resolved for the booted VM itself). Base
+/// images routinely leak a meaningless resolv.conf from their own
+/// build environment.
 fn reset_resolv_conf(rootfs: &Path) -> anyhow::Result<()> {
     let resolv = rootfs.join("etc/resolv.conf");
     let _ = std::fs::remove_file(&resolv);
@@ -1521,10 +1195,8 @@ fn reset_resolv_conf(rootfs: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("writing {}", resolv.display()))
 }
 
-/// The host's own resolv.conf, verbatim (for the host-network
-/// provisioning container — see [`ensure_guest_files`]), with a
-/// public-resolver fallback only when the host has nothing usable to
-/// offer at all.
+/// The host's own resolv.conf, verbatim, with a public-resolver
+/// fallback only when the host has nothing usable to offer at all.
 fn host_resolv_conf() -> String {
     match std::fs::read_to_string("/etc/resolv.conf") {
         Ok(content) if !nameservers_from(&content).is_empty() => content,
@@ -1544,21 +1216,6 @@ fn nameservers_from(content: &str) -> Vec<String> {
         })
         .map(ToString::to_string)
         .collect()
-}
-
-/// Raise `RLIMIT_NOFILE` to its hard limit, best effort: libkrun's
-/// in-process virtiofs server holds an fd per open guest file, and the
-/// default soft limit (often 1024) is nowhere near enough for a
-/// package-manager transaction or a cargo build over virtiofs.
-fn raise_nofile_limit() {
-    use rustix::process::{Resource, getrlimit, setrlimit};
-    let mut limit = getrlimit(Resource::Nofile);
-    if limit.current < limit.maximum {
-        limit.current = limit.maximum;
-        if let Err(e) = setrlimit(Resource::Nofile, limit) {
-            tracing::debug!(error = %e, "could not raise RLIMIT_NOFILE");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1589,124 +1246,6 @@ mod tests {
     }
 
     #[test]
-    fn compare_versions_orders_numerically() {
-        use std::cmp::Ordering;
-        assert_eq!(
-            compare_versions("6.12.10-300.el10.x86_64", "6.12.9-400.el10.x86_64"),
-            Ordering::Greater
-        );
-        assert_eq!(
-            compare_versions("6.8.0-31-generic", "6.8.0-31-generic"),
-            Ordering::Equal
-        );
-        assert_eq!(compare_versions("5.14.0", "6.1.0"), Ordering::Less);
-    }
-
-    #[test]
-    fn extract_vmlinux_unwraps_gzip_and_zstd_bzimages() {
-        use std::io::Write as _;
-        let fake_elf = {
-            let mut v = vec![0x7f, b'E', b'L', b'F'];
-            v.extend_from_slice(&[0u8; 64]);
-            v
-        };
-        // bzImage-shaped: setup stub bytes, then the compressed payload.
-        let mut gz_image = vec![0u8; 512];
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&fake_elf).unwrap();
-        gz_image.extend_from_slice(&encoder.finish().unwrap());
-        assert_eq!(extract_vmlinux(&gz_image).unwrap(), fake_elf);
-
-        let mut zst_image = vec![0u8; 512];
-        zst_image.extend_from_slice(&ruzstd::encoding::compress_to_vec(
-            fake_elf.as_slice(),
-            ruzstd::encoding::CompressionLevel::Fastest,
-        ));
-        assert_eq!(extract_vmlinux(&zst_image).unwrap(), fake_elf);
-
-        assert!(extract_vmlinux(&[0u8; 128]).is_err());
-    }
-
-    #[test]
-    fn kernel_format_detects_elf_and_compressed_bzimages() {
-        // Bare ELF vmlinux.
-        assert_eq!(
-            kernel_format(&[0x7f, b'E', b'L', b'F', 0, 0], "x86_64"),
-            Some(1)
-        );
-        // bzImage wrapping a zstd-compressed vmlinux.
-        let mut bz = vec![0u8; 512];
-        bz.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd]);
-        assert_eq!(kernel_format(&bz, "x86_64"), Some(5));
-        // bzImage wrapping a gzip-compressed vmlinux.
-        let mut gz = vec![0u8; 512];
-        gz.extend_from_slice(&[0x1f, 0x8b, 0x08]);
-        assert_eq!(kernel_format(&gz, "x86_64"), Some(4));
-        // Unrecognized.
-        assert_eq!(kernel_format(&[0u8; 64], "x86_64"), None);
-        // aarch64 EFI-stub Image loads raw.
-        assert_eq!(kernel_format(b"MZ\x00\x00", "aarch64"), Some(0));
-    }
-
-    #[test]
-    fn splice_fstab_replaces_only_the_managed_block() {
-        let existing = "/dev/vda1 / ext4 defaults 0 1\n\
-                        # ocivmm-volumes-begin\n\
-                        ocivmm0 /old virtiofs defaults 0 0\n\
-                        # ocivmm-volumes-end\n";
-        let out = splice_fstab(
-            existing,
-            &["ocivmm0 /src virtiofs defaults 0 0".to_string()],
-        );
-        assert!(out.contains("/dev/vda1 / ext4"));
-        assert!(out.contains("ocivmm0 /src virtiofs"));
-        assert!(!out.contains("/old"));
-        let cleared = splice_fstab(&out, &[]);
-        assert!(!cleared.contains("ocivmm"));
-        assert!(cleared.contains("/dev/vda1 / ext4"));
-    }
-
-    #[test]
-    fn systemd_unit_escapes_and_powers_off() {
-        let unit = systemd_unit(
-            &["bash".into(), "/src/ci/vm-ci.sh".into(), "100%".into()],
-            &["PATH=/usr/bin".into()],
-            "/root",
-        )
-        .unwrap();
-        assert!(unit.contains("ExecStart=\"bash\" \"/src/ci/vm-ci.sh\" \"100%%\"\n"));
-        assert!(unit.contains("SuccessAction=poweroff"));
-        assert!(unit.contains("FailureAction=poweroff"));
-        assert!(unit.contains("Environment=\"PATH=/usr/bin\"\n"));
-        assert!(unit.contains("$EXIT_STATUS"));
-        assert!(systemd_unit(&[], &[], "/").is_err());
-    }
-
-    #[test]
-    fn unit_escape_word_handles_specifiers_and_expansion() {
-        assert_eq!(unit_escape_word("a b").unwrap(), "\"a b\"");
-        assert_eq!(unit_escape_word("50%").unwrap(), "\"50%%\"");
-        assert_eq!(unit_escape_word("$HOME").unwrap(), "\"$$HOME\"");
-        assert_eq!(unit_escape_word("q\"q").unwrap(), "\"q\\\"q\"");
-        assert!(unit_escape_word("a\nb").is_err());
-    }
-
-    #[test]
-    fn parse_exit_status_maps_signals_to_failure() {
-        assert_eq!(parse_exit_status("0\n"), 0);
-        assert_eq!(parse_exit_status("42"), 42);
-        assert_eq!(parse_exit_status("KILL"), 1);
-        assert_eq!(parse_exit_status(""), 1);
-    }
-
-    #[test]
-    fn split_volume_requires_absolute_guest_path() {
-        assert!(split_volume("/host:relative").is_err());
-        assert!(split_volume("/host").is_err());
-        assert!(split_volume("/host:/guest").is_ok());
-    }
-
-    #[test]
     fn parse_ports_validates_both_sides() {
         assert!(parse_ports(&["8080:80".into()]).is_ok());
         assert!(parse_ports(&["notaport:80".into()]).is_err());
@@ -1732,14 +1271,43 @@ mod tests {
 
     #[test]
     fn nameservers_parse_including_loopback() {
-        // Loopback stubs are deliberately kept: the file's first
-        // consumer is the host-network provisioning container, where
-        // the host's own 127.0.0.53 works (and public resolvers may
-        // be blocked); VM boots get DNS from systemd-resolved instead.
         let content = "nameserver 127.0.0.53\nnameserver 10.0.0.2\noptions edns0\n";
         assert_eq!(
             nameservers_from(content),
             vec!["127.0.0.53".to_string(), "10.0.0.2".to_string()]
         );
+    }
+
+    #[test]
+    fn parse_exit_status_maps_signals_to_failure() {
+        assert_eq!(parse_exit_status("0\n"), 0);
+        assert_eq!(parse_exit_status("42"), 42);
+        assert_eq!(parse_exit_status("KILL"), 1);
+        assert_eq!(parse_exit_status(""), 1);
+    }
+
+    #[test]
+    fn systemd_unit_escapes_and_powers_off() {
+        let unit = systemd_unit(
+            &["bash".into(), "/src/ci/vm-ci.sh".into(), "100%".into()],
+            &["PATH=/usr/bin".into()],
+            "/root",
+        )
+        .unwrap();
+        assert!(unit.contains("ExecStart=\"bash\" \"/src/ci/vm-ci.sh\" \"100%%\"\n"));
+        assert!(unit.contains("SuccessAction=poweroff"));
+        assert!(unit.contains("FailureAction=poweroff"));
+        assert!(unit.contains("Environment=\"PATH=/usr/bin\"\n"));
+        assert!(unit.contains("$EXIT_STATUS"));
+        assert!(systemd_unit(&[], &[], "/").is_err());
+    }
+
+    #[test]
+    fn unit_escape_word_handles_specifiers_and_expansion() {
+        assert_eq!(unit_escape_word("a b").unwrap(), "\"a b\"");
+        assert_eq!(unit_escape_word("50%").unwrap(), "\"50%%\"");
+        assert_eq!(unit_escape_word("$HOME").unwrap(), "\"$$HOME\"");
+        assert_eq!(unit_escape_word("q\"q").unwrap(), "\"q\\\"q\"");
+        assert!(unit_escape_word("a\nb").is_err());
     }
 }

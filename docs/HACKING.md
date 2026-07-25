@@ -39,30 +39,36 @@ CI denies warnings; locally they are allowed so you can iterate.
 CI builds and tests natively inside VMs of the two supported bases
 (CentOS Stream 10, Ubuntu 26.04) on x86_64 — booted by this repo's own
 `ocivmm` binary straight from the distros' OCI images (no qemu, no
-cloud images, no cloud-init, no ssh; the VMM is libkrun's crates
-statically linked into `ocivmm`, and the checkout is shared with the
-guest over virtiofs). At create time `ocivmm` provisions the pet VM
+cloud images, no cloud-init, no ssh; the VMM is `oci-vmm`, this
+workspace's own KVM/virtio-pci monitor ported from Firecracker,
+statically linked into `ocivmm` — nothing external to install or
+dlopen at run time). At create time `ocivmm` provisions the pet VM
 with the distro's *own* kernel, initramfs, and systemd (running the
 distro's own dnf/apt as a container on the fresh rootfs), so the
 tests run under the real distro kernel with the real distro init —
-the same fidelity the cloud images had. Works locally on any Linux
-with KVM (plus the `passt` package for guest networking):
+the same fidelity the cloud images had. The pet VM's root filesystem
+is a plain ext4 disk image (`oci-vmm` has no virtiofs-equivalent
+device); source and artifacts move in and out via `ocivmm cp`
+(loop-mount based, VM stopped), not a shared mount. Works locally on
+any Linux with KVM (plus the `passt` and `e2fsprogs` packages):
 
 ```sh
-ci/setup-host.sh                       # once: /dev/kvm perms + passt
+ci/setup-host.sh                       # once: /dev/kvm perms + passt + e2fsprogs
 OCI_CI_BASE=ubuntu-26.04 ci/run-in-vm.sh
 OCI_CI_BASE=centos-stream10 ci/run-in-vm.sh
 ```
 
 `run-in-vm.sh` builds `ocivmm`, boots the pet VM (creating and
-provisioning it from the OCI image on first use), runs `ci/vm-ci.sh`
-inside as a oneshot systemd unit, and the release binaries appear in
-`./artifacts/` directly (written through the virtiofs mount).
-Lower-level control is `ocivmm` itself:
+provisioning it from the OCI image on first use), pushes the checkout
+in and runs `ci/vm-ci.sh` inside as a oneshot systemd unit, and pulls
+`./artifacts/` back out — both transfers via `ocivmm cp`. Lower-level
+control is `ocivmm` itself:
 
 ```sh
-sudo target/release/ocivmm run -v "$PWD:/src" ubuntu:26.04 uname -a
-sudo target/release/ocivmm run ubuntu-26.04    # root console, poweroff to leave
+sudo target/release/ocivmm create -i ubuntu:26.04 my-vm
+sudo target/release/ocivmm cp "$PWD" my-vm:/root/oci-tools
+sudo target/release/ocivmm run my-vm bash /root/oci-tools/ci/vm-ci.sh
+sudo target/release/ocivmm run my-vm    # root console, poweroff to leave
 ```
 
 State lives under `~/.cache/oci-tools-ci/` (`vm-state.tar`, the packed

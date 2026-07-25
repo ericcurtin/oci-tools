@@ -1,33 +1,36 @@
 #!/usr/bin/env bash
 # Host-side CI orchestration, ocivmm edition: boot the (base, arch) guest
-# as a microVM using this repo's own `ocivmm` binary (dogfooding
-# it on every push/PR), build and test the workspace inside it, and find
-# the release binaries already on the host afterward -- the checkout
-# itself is shared with the guest over virtiofs, so there is no image
-# download, no ssh, no push/pull step, and no cloud-init: the guest *is*
-# the distro's own OCI image, extracted once into a persistent pet-VM
-# rootfs, provisioned once by ocivmm with the distro's own kernel,
-# initramfs, and systemd (installed with the distro's own dnf/apt), and
-# booted straight into that systemd on every run after that -- the
-# workspace tests therefore run under the real CentOS Stream 10 /
-# Ubuntu 26.04 kernels, exactly like the cloud images did. The command
-# below runs as a generated oneshot systemd unit whose exit status
-# ocivmm forwards as its own.
+# as a microVM using this repo's own `ocivmm` binary (dogfooding it on
+# every push/PR), build and test the workspace inside it, and pull the
+# release binaries back out -- the guest *is* the distro's own OCI
+# image, extracted once into a persistent pet-VM disk image, provisioned
+# once by ocivmm with the distro's own kernel, initramfs, and systemd
+# (installed with the distro's own dnf/apt), and booted straight into
+# that systemd on every run after that -- the workspace tests therefore
+# run under the real CentOS Stream 10 / Ubuntu 26.04 kernels, exactly
+# like the cloud images did. The command below runs as a generated
+# oneshot systemd unit whose exit status ocivmm forwards as its own.
+#
+# ocivmm's VMM (`oci-vmm`, this workspace's own KVM/virtio-pci monitor)
+# has no filesystem-sharing device at all -- unlike the earlier
+# virtiofs-based design this replaced, the pet VM's root filesystem is
+# a plain ext4 disk image, and `ocivmm cp` (loop-mount based) is how
+# source goes in and artifacts come out, both while the VM is stopped.
 #
 # What replaced what (vs. the retired qemu+cloud-init harness):
 #   cloud image download (~700MB)  -> OCI image pull (~30-60MB, cached)
 #   UEFI boot + cloud-init (min.)  -> direct-kernel boot to systemd (~1-2s)
-#   ssh + tar push/pull            -> virtiofs (-v "$repo:/src")
-#   qcow2 cache disk               -> the pet VM rootfs itself, cached
+#   ssh + tar push/pull            -> `ocivmm cp` (loop-mount, VM stopped)
+#   qcow2 cache disk               -> the pet VM's own disk image, cached
 #
-# ocivmm runs as root: its in-process virtiofs server (libkrun's own,
-# statically linked) impersonates guest uids/gids via per-thread
-# setresuid (checked in ~/git/libkrun's passthrough.rs at the pinned
-# revision), which needs CAP_SETUID -- without it, dnf/apt inside
-# the guest could not chown the files they install. That's also why the
-# cached VM state travels as a root-created tarball rather than a plain
-# directory: the actions/cache step runs as the runner user, which
-# couldn't read a multi-uid rootfs tree directly.
+# ocivmm runs as root: real distro package managers (both in the
+# provisioning container and, via `ocivmm cp`'s loop-mount, whenever the
+# host writes into the image) need real chown, which loop-mounted ext4
+# only honors for a real root process. That's also why the cached VM
+# state travels as a root-created tarball rather than a plain directory:
+# the actions/cache step runs as the runner user, which couldn't read a
+# root-owned ext4 image file's contents directly anyway (nor would it
+# need to -- the whole image is one opaque file to actions/cache).
 #
 # Environment:
 #   OCI_CI_BASE     centos-stream10 | ubuntu-26.04 (required)
@@ -81,12 +84,12 @@ if [ ! -x "$ocivmm" ]; then
     (cd "$repo" && cargo build --release --locked -p ocivmm)
 fi
 
-# The tree is shared without .git mattering inside; hand the hash through
-# so --version output built inside the VM still embeds it.
+# The tree is pushed without .git; hand the hash through so --version
+# output built inside the VM still embeds it.
 git_hash=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo unknown)
 git_hash=${git_hash:0:12}
 
-# Restore the cached pet-VM state (image blobs + extracted rootfs with
+# Restore the cached pet-VM state (image blobs + the disk image with
 # everything vm-ci.sh installed/built on previous runs) -- root-owned,
 # hence the tarball indirection described in the header comment.
 mkdir -p "$(dirname "$state_tar")"
@@ -97,22 +100,41 @@ if [ -f "$state_tar" ]; then
     rm -f "$state_tar"
 fi
 
-echo "run-in-vm: booting $vm_name from $image"
-rc=0
-sudo env \
-    OCI_TOOLS_STORAGE_ROOT="$storage" \
-    "$ocivmm" run \
-    --name "$vm_name" \
-    --mem "$mem_mib" \
-    -v "$repo:/src" \
-    -e "OCI_TOOLS_GIT_HASH=$git_hash" \
-    "$image" \
-    bash /src/ci/vm-ci.sh || rc=$?
+if ! sudo env OCI_TOOLS_STORAGE_ROOT="$storage" "$ocivmm" create \
+    --name "$vm_name" -i "$image" 2>/dev/null; then
+    echo "run-in-vm: $vm_name already exists (reusing the pet VM)"
+fi
 
-# Artifacts were written by guest root straight onto the host checkout
-# via virtiofs; hand them (and any target/ leftovers) back to the runner
-# user so upload-artifact and the next checkout step can touch them.
-sudo chown -R "$(id -u):$(id -g)" "$repo/artifacts" "$repo/artifacts-rpm" 2>/dev/null || true
+echo "run-in-vm: pushing source (excluding .git/target/artifacts)"
+push_dir=$(mktemp -d)
+trap 'rm -rf "$push_dir"' EXIT
+tar -C "$repo" \
+    --exclude=./.git --exclude=./target \
+    --exclude=./artifacts --exclude=./artifacts-rpm --exclude=./artifacts-deb \
+    -cf - . | tar -C "$push_dir" -xf -
+sudo env OCI_TOOLS_STORAGE_ROOT="$storage" "$ocivmm" cp "$push_dir" "$vm_name:/root/oci-tools"
+
+echo "run-in-vm: booting $vm_name"
+rc=0
+sudo env OCI_TOOLS_STORAGE_ROOT="$storage" "$ocivmm" run \
+    --mem "$mem_mib" \
+    -e "OCI_TOOLS_GIT_HASH=$git_hash" \
+    "$vm_name" \
+    bash /root/oci-tools/ci/vm-ci.sh || rc=$?
+
+echo "run-in-vm: pulling artifacts"
+mkdir -p "$repo/artifacts"
+sudo env OCI_TOOLS_STORAGE_ROOT="$storage" "$ocivmm" cp \
+    "$vm_name:/root/oci-tools/artifacts" "$repo/artifacts" || true
+sudo chown -R "$(id -u):$(id -g)" "$repo/artifacts"
+
+# Only the centos-stream10 cell's own vm-ci.sh ever creates this.
+if [ "$base" = centos-stream10 ]; then
+    mkdir -p "$repo/artifacts-rpm"
+    sudo env OCI_TOOLS_STORAGE_ROOT="$storage" "$ocivmm" cp \
+        "$vm_name:/root/oci-tools/artifacts-rpm" "$repo/artifacts-rpm" || true
+    sudo chown -R "$(id -u):$(id -g)" "$repo/artifacts-rpm"
+fi
 
 if [ "$rc" -ne 0 ]; then
     echo "run-in-vm: guest CI failed (exit $rc)" >&2
@@ -121,7 +143,7 @@ fi
 
 # Pack the (root-owned) VM state for actions/cache to save: pet-VM reuse
 # is exactly what makes warm runs fast (no pull, no dnf/apt, no rustup,
-# incremental cargo target).
+# incremental cargo target -- all of it lives inside the disk image).
 echo "run-in-vm: packing VM state for the cache"
 sudo tar -C "$storage" -cf "$state_tar.tmp" .
 sudo chown "$(id -u):$(id -g)" "$state_tar.tmp"
