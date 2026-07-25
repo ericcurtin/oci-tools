@@ -33,8 +33,10 @@
 //!   (`--volume`), which virtio-blk-only has no equivalent of; see
 //!   its own doc comment for exactly what this trades away.
 //!
-//! Networking is a passt-backed virtio-net device; systemd-networkd
-//! does DHCP against passt, and `--publish` maps host ports via
+//! Networking is a passt-backed virtio-net device; the guest's own
+//! DHCP client does the negotiating against passt (`systemd-networkd`
+//! where the distro ships it, `NetworkManager` where it doesn't — see
+//! `PROVISION_CONFIGURE`), and `--publish` maps host ports via
 //! passt's own `-t` forwarding.
 //!
 //! Host requirements (run time only — building `ocivmm` needs
@@ -423,11 +425,19 @@ fn extract_rootfs(
 /// the apt side dracut is installed *before* the kernel so it both
 /// satisfies `linux-image-*`'s `initramfs-tools | linux-initramfs-tool`
 /// alternative and owns the kernel's initramfs hooks.
+///
+/// `NetworkManager` on the dnf side, `systemd-networkd` on the apt
+/// side, not the same tool on both: CentOS Stream doesn't ship a
+/// `systemd-networkd` package at all (confirmed directly — `dnf list
+/// systemd-networkd` reports no matching package; RHEL-family systems
+/// use NetworkManager as their native DHCP client instead), so
+/// `PROVISION_CONFIGURE` below branches on which one is actually
+/// available rather than assuming either universally.
 #[cfg(target_os = "linux")]
 const PROVISION_PACKAGES: &str = r#"
 if command -v dnf >/dev/null 2>&1; then
     dnf -y --setopt=install_weak_deps=False install \
-        kernel dracut kmod systemd systemd-resolved dbus-broker util-linux
+        kernel dracut kmod systemd systemd-resolved dbus-broker util-linux NetworkManager
 elif command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
@@ -443,9 +453,11 @@ fi
 
 /// The distro-independent half: a dracut initramfs able to mount the
 /// virtio-blk root device directly (`root=/dev/vda`, no virtiofs — the
-/// VMM has no filesystem-sharing device at all), systemd-networkd DHCP
-/// for the passt-backed virtio-net device, and a root autologin on the
-/// serial console systemd's getty-generator spawns for `console=ttyS0`.
+/// VMM has no filesystem-sharing device at all), DHCP for the
+/// passt-backed virtio-net device (`systemd-networkd` where it
+/// exists, `NetworkManager` where it doesn't — see `PROVISION_PACKAGES`),
+/// and a root autologin on the serial console systemd's getty-generator
+/// spawns for `console=ttyS0`.
 #[cfg(target_os = "linux")]
 const PROVISION_CONFIGURE: &str = r#"
 kver=$(ls /lib/modules | sort -V | tail -n 1)
@@ -457,21 +469,32 @@ mkdir -p /etc/systemd/network \
     /etc/systemd/system/network-online.target.wants \
     '/etc/systemd/system/serial-getty@ttyS0.service.d'
 
-cat > /etc/systemd/network/20-ocivmm.network <<'EOF'
+if [ -e /usr/lib/systemd/system/systemd-networkd.service ]; then
+    cat > /etc/systemd/network/20-ocivmm.network <<'EOF'
 [Match]
 Name=e*
 
 [Network]
 DHCP=yes
 EOF
-
-ln -sf /usr/lib/systemd/system/systemd-networkd.service \
-    /etc/systemd/system/multi-user.target.wants/systemd-networkd.service
-ln -sf /usr/lib/systemd/system/systemd-networkd-wait-online.service \
-    /etc/systemd/system/network-online.target.wants/systemd-networkd-wait-online.service
-ln -sf /usr/lib/systemd/system/systemd-resolved.service \
-    /etc/systemd/system/multi-user.target.wants/systemd-resolved.service
-ln -sfn ../run/systemd/resolve/resolv.conf /etc/resolv.conf
+    ln -sf /usr/lib/systemd/system/systemd-networkd.service \
+        /etc/systemd/system/multi-user.target.wants/systemd-networkd.service
+    ln -sf /usr/lib/systemd/system/systemd-networkd-wait-online.service \
+        /etc/systemd/system/network-online.target.wants/systemd-networkd-wait-online.service
+    # networkd itself doesn't manage DNS; hand that to resolved, whose
+    # own stub /etc/resolv.conf picks up the DHCP-provided nameserver.
+    ln -sf /usr/lib/systemd/system/systemd-resolved.service \
+        /etc/systemd/system/multi-user.target.wants/systemd-resolved.service
+    ln -sfn ../run/systemd/resolve/resolv.conf /etc/resolv.conf
+else
+    ln -sf /usr/lib/systemd/system/NetworkManager.service \
+        /etc/systemd/system/multi-user.target.wants/NetworkManager.service
+    ln -sf /usr/lib/systemd/system/NetworkManager-wait-online.service \
+        /etc/systemd/system/network-online.target.wants/NetworkManager-wait-online.service
+    # NetworkManager writes /etc/resolv.conf directly by default (no
+    # dns=systemd-resolved configured) -- leave resolved disabled and
+    # the file alone so the two don't fight over it.
+fi
 
 cat > '/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf' <<'EOF'
 [Service]
