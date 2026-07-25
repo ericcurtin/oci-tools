@@ -952,13 +952,21 @@ fn default_cpus() -> u8 {
 /// `init=`). `console=ttyS0` (the VMM's only console — see
 /// `oci-vmm`'s own docs) makes systemd's getty-generator spawn the
 /// autologin console the provisioning step configured.
-/// `rd.shell=0`/`rd.emergency=poweroff`: a root-mount failure must end
+/// `rd.shell=0`/`rd.emergency=reboot`: a root-mount failure must end
 /// the VM (which reports it), not park at an interactive dracut
-/// prompt nothing is attached to. `selinux=0` because the container
-/// image ships no policy to load.
+/// prompt nothing is attached to — `reboot`, not `poweroff`: `oci-vmm`
+/// has no ACPI at all, so the only way the guest can ever signal "end
+/// the VM" is `reboot=k`'s i8042 keyboard-controller reset write,
+/// which its own reset-only i8042 device is built to detect; a real
+/// ACPI poweroff has nothing to negotiate with and the kernel just
+/// halts forever instead (found via a full real CI boot: the guest
+/// completed its actual workload and systemd shutdown target cleanly,
+/// then printed `reboot: Power off not available: System halted
+/// instead` and hung there until the job's own timeout killed it).
+/// `selinux=0` because the container image ships no policy to load.
 fn kernel_cmdline() -> String {
     "reboot=k panic=-1 console=ttyS0 root=/dev/vda rw selinux=0 systemd.firstboot=off \
-     rd.shell=0 rd.emergency=poweroff"
+     rd.shell=0 rd.emergency=reboot"
         .to_string()
 }
 
@@ -986,6 +994,11 @@ fn parse_exit_status(raw: &str) -> i32 {
 }
 
 /// Render the per-run oneshot unit.
+///
+/// `SuccessAction`/`FailureAction` are `reboot`, not `poweroff`: see
+/// `kernel_cmdline`'s own doc comment for why `oci-vmm` (no ACPI at
+/// all) can only ever be told to end the VM via the i8042 reset path
+/// that `reboot` triggers.
 fn systemd_unit(command: &[String], env: &[String], workdir: &str) -> anyhow::Result<String> {
     anyhow::ensure!(!command.is_empty(), "empty command");
     let exec_start = command
@@ -999,8 +1012,8 @@ fn systemd_unit(command: &[String], env: &[String], workdir: &str) -> anyhow::Re
          Description=ocivmm one-shot command\n\
          Wants=network-online.target\n\
          After=network-online.target\n\
-         SuccessAction=poweroff\n\
-         FailureAction=poweroff\n\
+         SuccessAction=reboot\n\
+         FailureAction=reboot\n\
          \n\
          [Service]\n\
          Type=oneshot\n\
@@ -1303,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn systemd_unit_escapes_and_powers_off() {
+    fn systemd_unit_escapes_and_reboots_to_end_the_vm() {
         let unit = systemd_unit(
             &["bash".into(), "/src/ci/vm-ci.sh".into(), "100%".into()],
             &["PATH=/usr/bin".into()],
@@ -1311,8 +1324,8 @@ mod tests {
         )
         .unwrap();
         assert!(unit.contains("ExecStart=\"bash\" \"/src/ci/vm-ci.sh\" \"100%%\"\n"));
-        assert!(unit.contains("SuccessAction=poweroff"));
-        assert!(unit.contains("FailureAction=poweroff"));
+        assert!(unit.contains("SuccessAction=reboot"));
+        assert!(unit.contains("FailureAction=reboot"));
         assert!(unit.contains("Environment=\"PATH=/usr/bin\"\n"));
         assert!(unit.contains("$EXIT_STATUS"));
         assert!(systemd_unit(&[], &[], "/").is_err());
