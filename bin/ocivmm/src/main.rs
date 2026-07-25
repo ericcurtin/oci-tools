@@ -1166,12 +1166,13 @@ fn spawn_passt(vm_dir: &Path, ports: &[String]) -> anyhow::Result<PathBuf> {
     command
         .arg("--foreground")
         .arg("--one-off")
-        // Every guest packet is NAT'd through passt anyway (there is
-        // no real routing), so IPv6 buys nothing here and its own
-        // SLAAC/DAD negotiation only gives NetworkManager/networkd's
-        // own "wait-online" checks another, slower thing to converge
-        // on before considering the link ready.
-        .arg("--ipv4-only")
+        // NOT --ipv4-only: tried it (every guest packet is NAT'd
+        // through passt anyway, so IPv6 seemed to buy nothing here),
+        // but CI showed the guest's DHCPv4 client then never
+        // completing at all (only ever gaining its own IPv6
+        // link-local address) -- reverted rather than dig into why a
+        // flag that per passt's own docs should only affect IPv6
+        // somehow broke IPv4 DHCP too.
         .arg("--socket")
         .arg(&socket);
     for port in ports {
