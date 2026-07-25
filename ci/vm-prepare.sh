@@ -50,8 +50,19 @@ if ! getent hosts archive.ubuntu.com >/dev/null 2>&1 &&
     ! getent hosts mirrors.centos.org >/dev/null 2>&1; then
     gateway=""
     for _ in $(seq 1 150); do
-        gateway=$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}')
-        [ -n "$gateway" ] && break
+        # `ip route show default` itself (not just an empty/no-match
+        # result) exits non-zero when there's no default route yet --
+        # under `set -o pipefail`, a bare `gateway=$(... | ...)`
+        # assignment then inherits that failure and, being a
+        # standalone command, trips `errexit` and kills the whole
+        # script immediately (confirmed directly: reproduces with a
+        # plain `x=$(false | cat)` under `set -eo pipefail`). `|| true`
+        # so a genuinely-not-ready route table is just another empty
+        # iteration, not a fatal error.
+        gateway=$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}') || true
+        if [ -n "$gateway" ]; then
+            break
+        fi
         sleep 0.2
     done
     if [ -n "$gateway" ]; then
