@@ -1088,17 +1088,44 @@ fn symlink(target: &str, link: &Path) -> anyhow::Result<()> {
 /// polled into existence before returning; `--one-off` ends passt once
 /// the VMM's one connection closes. `--publish` mappings become
 /// passt's own `-t host:guest` TCP forwards.
+///
+/// Observed in CI (recent git-snapshot passt builds): passt
+/// occasionally dies ~0.5s after binding the socket with "Error on
+/// listening Unix socket, exiting" and no client ever having
+/// connected yet — an apparent spurious epoll event on its own
+/// listening socket, before our `__boot` child even gets a chance to
+/// connect (this function hasn't returned yet at that point). Rather
+/// than depend on a fix landing in a pre-release passt, retry a
+/// handful of times: each attempt is cheap (a fresh bind), and the
+/// failure has not been reproduced twice in a row.
 fn spawn_passt(vm_dir: &Path, ports: &[String]) -> anyhow::Result<PathBuf> {
     let socket = vm_dir.join("passt.sock");
-    let _ = std::fs::remove_file(&socket);
+    const ATTEMPTS: u32 = 5;
+    let mut last_err = None;
+    for attempt in 1..=ATTEMPTS {
+        match try_spawn_passt(&socket, ports) {
+            Ok(()) => return Ok(socket),
+            Err(err) if attempt < ATTEMPTS => {
+                eprintln!("ocivmm: passt attempt {attempt}/{ATTEMPTS} failed ({err}), retrying");
+                last_err = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.expect("loop always sets last_err before falling through"))
+}
+
+/// One attempt at starting passt and waiting for its socket to appear;
+/// see [`spawn_passt`] for why the caller retries on failure.
+fn try_spawn_passt(socket: &Path, ports: &[String]) -> anyhow::Result<()> {
+    let _ = std::fs::remove_file(socket);
     let passt = std::env::var("OCIVMM_PASST").unwrap_or_else(|_| "passt".to_string());
     let mut command = std::process::Command::new(&passt);
     command
         .arg("--foreground")
-        .arg("--debug")
         .arg("--one-off")
         .arg("--socket")
-        .arg(&socket);
+        .arg(socket);
     for port in ports {
         command.arg("-t").arg(port);
     }
@@ -1118,7 +1145,7 @@ fn spawn_passt(vm_dir: &Path, ports: &[String]) -> anyhow::Result<PathBuf> {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    Ok(socket)
+    Ok(())
 }
 
 /// Validate every `--publish HOST:GUEST` port mapping; passt's `-t`
