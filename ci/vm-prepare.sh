@@ -24,6 +24,22 @@ if [ "$(id -u)" = 0 ] && ! command -v sudo >/dev/null 2>&1; then
     sudo() { "$@"; }
 fi
 
+# In the ocivmm guest specifically, this is the very first thing that
+# needs DNS: reaching network-online.target (interface has an address)
+# and even nss-lookup.target (a passive target nothing here actually
+# gates on) both turned out insufficient in practice -- the package
+# manager's very first mirror lookup failed with "Could not resolve
+# host" a couple of seconds after boot on real CI hardware, before
+# systemd-resolved had actually finished processing the DHCP-provided
+# DNS server. Poll for real resolution instead of trusting either
+# target; a no-op after the first `getent` success everywhere else
+# (native aarch64, already-up hosts).
+for _ in $(seq 1 50); do
+    getent hosts mirrors.centos.org >/dev/null 2>&1 && break
+    getent hosts archive.ubuntu.com >/dev/null 2>&1 && break
+    sleep 0.2
+done
+
 if command -v dnf >/dev/null 2>&1; then
     sudo dnf -y -q install \
         gcc \
