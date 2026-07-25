@@ -1095,6 +1095,7 @@ fn spawn_passt(vm_dir: &Path, ports: &[String]) -> anyhow::Result<PathBuf> {
     let mut command = std::process::Command::new(&passt);
     command
         .arg("--foreground")
+        .arg("--debug")
         .arg("--one-off")
         .arg("--socket")
         .arg(&socket);
