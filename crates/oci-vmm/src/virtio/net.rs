@@ -234,9 +234,19 @@ impl VirtioNet {
         })
     }
 
-    fn signal(&self, active: &ActiveState) {
-        if let Err(err) = active.interrupt.trigger(VirtioInterruptType::Queue(0)) {
-            error!("virtio-net: failed to signal used queue: {err:?}");
+    /// Signal the vector the guest driver assigned to queue `index`
+    /// (RX and TX each get their own — a real bug here (a
+    /// hardcoded `Queue(0)` regardless of which queue actually had
+    /// completions) meant every TX completion signaled RX's vector
+    /// instead of TX's own, silently stalling TX buffer reclaim until
+    /// some unrelated RX interrupt happened to trigger a NAPI poll
+    /// that opportunistically cleaned up TX too — consistent with
+    /// DHCP eventually working, just far too slowly to beat
+    /// `systemd-networkd-wait-online`'s own timeout).
+    fn signal(&self, active: &ActiveState, index: usize) {
+        let index = u16::try_from(index).expect("queue index fits in u16");
+        if let Err(err) = active.interrupt.trigger(VirtioInterruptType::Queue(index)) {
+            error!("virtio-net: failed to signal used queue {index}: {err:?}");
         }
     }
 
@@ -352,7 +362,7 @@ impl VirtioNet {
         }
         self.queues[TX_INDEX].advance_used_ring_idx();
         if used_any && self.queues[TX_INDEX].prepare_kick() {
-            self.signal(&active);
+            self.signal(&active, TX_INDEX);
         }
     }
 
@@ -362,7 +372,7 @@ impl VirtioNet {
         };
         self.queues[RX_INDEX].advance_used_ring_idx();
         if self.queues[RX_INDEX].prepare_kick() {
-            self.signal(&active);
+            self.signal(&active, RX_INDEX);
         }
     }
 }
