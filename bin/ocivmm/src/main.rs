@@ -491,27 +491,21 @@ else
         /etc/systemd/system/multi-user.target.wants/NetworkManager.service
     ln -sf /usr/lib/systemd/system/NetworkManager-wait-online.service \
         /etc/systemd/system/network-online.target.wants/NetworkManager-wait-online.service
-    # Force NetworkManager's own default DNS management explicitly,
-    # rather than trust whatever this particular build's own
-    # compiled-in defaults happen to be when no config file exists at
-    # all -- confirmed via CI: even with dns=default alone,
-    # /etc/resolv.conf stayed completely empty for a full minute after
-    # the interface came up, so rc-manager (which controls whether
-    # NetworkManager actually *commits* its synthesized resolv.conf to
-    # that file at all, separately from dns= choosing how it's
-    # synthesized) apparently wasn't "file" by default here. Leave
-    # resolved disabled so the two don't fight over the same file.
+    # Neither NetworkManager's own DNS management (dns=default,
+    # rc-manager=file: tried, confirmed over several real CI runs to
+    # leave /etc/resolv.conf empty anyway) nor systemd-resolved proved
+    # reliable at actually getting a DHCP-provided nameserver into
+    # /etc/resolv.conf at all -- `ci/vm-prepare.sh` writes it directly
+    # instead, from the DHCP-assigned default gateway (passt always
+    # serves its own DNS proxy there), the one thing that reliably is
+    # correct by the time our own unit's `After=network-online.target`
+    # is satisfied. dns=none here so NetworkManager never touches the
+    # file at all and can't reclaim it later.
     mkdir -p /etc/NetworkManager/conf.d
     cat > /etc/NetworkManager/conf.d/10-ocivmm-dns.conf <<'EOF'
 [main]
-dns=default
-rc-manager=file
+dns=none
 EOF
-    # A real, plain, empty file -- not missing, not a symlink --
-    # confirmed via CI that NetworkManager will happily *update* an
-    # existing /etc/resolv.conf but does not necessarily *create* one
-    # from nothing.
-    : > /etc/resolv.conf
 fi
 
 cat > '/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf' <<'EOF'

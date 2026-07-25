@@ -32,25 +32,41 @@ if [ "$(id -u)" = 0 ] && ! command -v sudo >/dev/null 2>&1; then
 fi
 
 # In the ocivmm guest specifically, this is the very first thing that
-# needs DNS: reaching network-online.target (interface has an address)
-# and even nss-lookup.target (a passive target nothing here actually
-# gates on) both turned out insufficient in practice -- the package
-# manager's very first mirror lookup failed with "Could not resolve
-# host" before DHCP/DNS had actually converged (confirmed via CI:
-# NetworkManager's own device state was still "connecting (getting IP
-# configuration)" a full 10 seconds in). Poll for real resolution
-# instead of trusting either target, for up to a minute; a no-op after
-# the first `getent` success everywhere else (native aarch64,
-# already-up hosts).
-for _ in $(seq 1 300); do
-    getent hosts mirrors.centos.org >/dev/null 2>&1 && break
-    getent hosts archive.ubuntu.com >/dev/null 2>&1 && break
-    sleep 0.2
-done
-# TEMPORARY diagnostic: if the loop above still gave up, show exactly
-# what DNS configuration was actually in place, instead of guessing
-# further from the package manager's own opaque curl error alone.
-cat /etc/resolv.conf 2>&1 || true
+# needs DNS -- and both systemd-resolved (networkd path) and
+# NetworkManager itself (its own dns=default/rc-manager=file, tried
+# and confirmed insufficient over several real CI runs) turned out
+# unreliable at actually getting a DHCP-provided nameserver into
+# /etc/resolv.conf at all: sometimes it stays empty for a full minute,
+# sometimes (confirmed on ubuntu-26.04) it works just long enough for
+# `apt-get update` to succeed and then goes empty again before
+# `apt-get install`'s own package download phase. Stop depending on
+# either service's own DNS-writing behavior and write it ourselves,
+# directly, from the one thing we already know is reliably true by
+# this point (our own oneshot unit's `After=network-online.target`):
+# a real default route exists, and passt always serves its own DNS
+# proxy at that same gateway address. A no-op everywhere a working
+# /etc/resolv.conf already exists (native aarch64, already-up hosts).
+if ! getent hosts archive.ubuntu.com >/dev/null 2>&1 &&
+    ! getent hosts mirrors.centos.org >/dev/null 2>&1; then
+    gateway=""
+    for _ in $(seq 1 150); do
+        gateway=$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}')
+        [ -n "$gateway" ] && break
+        sleep 0.2
+    done
+    if [ -n "$gateway" ]; then
+        # /etc/resolv.conf may still be a symlink into resolved's own
+        # managed stub file at this point; a plain `>` redirection
+        # would write *through* that symlink instead of replacing it,
+        # only for resolved's own next update cycle to silently
+        # overwrite it again later. Remove it first so our own write
+        # lands in a real, independent file nothing else can reclaim.
+        rm -f /etc/resolv.conf
+        echo "nameserver $gateway" >/etc/resolv.conf
+    else
+        echo "vm-prepare: no default route found; can't set up DNS" >&2
+    fi
+fi
 
 if command -v dnf >/dev/null 2>&1; then
     sudo dnf -y -q install \
