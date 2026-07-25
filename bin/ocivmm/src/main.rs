@@ -1089,12 +1089,24 @@ fn symlink(target: &str, link: &Path) -> anyhow::Result<()> {
 /// the VMM's one connection closes. `--publish` mappings become
 /// passt's own `-t host:guest` TCP forwards.
 ///
-/// passt always creates its own user namespace
-/// (`unshare(CLONE_NEWUSER)`) before binding the socket — see
-/// `ci/setup-host.sh`'s AppArmor exception for why that alone is
-/// fatal on Ubuntu 24.04+ without it.
+/// The socket itself lives directly under `/tmp` (sticky-bit 1777,
+/// universally writable), not inside `vm_dir` (root-owned since the
+/// whole harness runs under sudo): passt always creates its own,
+/// unmapped user namespace (`unshare(CLONE_NEWUSER)`) before binding,
+/// and — confirmed via strace — a process inside an unmapped user
+/// namespace has its filesystem permission checks against anything
+/// outside that namespace (i.e. every pre-existing file, from any
+/// original UID) degrade to the overflow UID, regardless of AppArmor
+/// settings or `--runas`. `/tmp`'s own permissions already handle
+/// this for every UID, sidestepping the whole question. `vm_dir`
+/// itself is used only to name the temp socket uniquely and to
+/// remove any stale one from a previous boot.
 fn spawn_passt(vm_dir: &Path, ports: &[String]) -> anyhow::Result<PathBuf> {
-    let socket = vm_dir.join("passt.sock");
+    let vm_name = vm_dir
+        .file_name()
+        .expect("vm_dir always has a final component")
+        .to_string_lossy();
+    let socket = std::env::temp_dir().join(format!("ocivmm-{vm_name}-passt.sock"));
     let _ = std::fs::remove_file(&socket);
     let passt = std::env::var("OCIVMM_PASST").unwrap_or_else(|_| "passt".to_string());
     let mut command = std::process::Command::new(&passt);
