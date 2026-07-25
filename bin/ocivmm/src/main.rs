@@ -501,7 +501,11 @@ else
 [main]
 dns=default
 EOF
-    rm -f /etc/resolv.conf
+    # A real, plain, empty file -- not missing, not a symlink --
+    # confirmed via CI that NetworkManager will happily *update* an
+    # existing /etc/resolv.conf but does not necessarily *create* one
+    # from nothing.
+    : > /etc/resolv.conf
 fi
 
 cat > '/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf' <<'EOF'
@@ -996,8 +1000,13 @@ fn default_cpus() -> u8 {
 /// instead` and hung there until the job's own timeout killed it).
 /// `selinux=0` because the container image ships no policy to load.
 fn kernel_cmdline() -> String {
+    // TEMPORARY diagnostic: ignore_loglevel, to rule out virtio_net's
+    // own probe messages being filtered by a distro-specific default
+    // console loglevel -- the ubuntu-26.04 cell's own guest kernel
+    // shows no virtio_net driver messages at all (no probe success,
+    // no failure, nothing), unlike centos-stream10's, which does.
     "reboot=k panic=-1 console=ttyS0 root=/dev/vda rw selinux=0 systemd.firstboot=off \
-     rd.shell=0 rd.emergency=reboot"
+     rd.shell=0 rd.emergency=reboot ignore_loglevel"
         .to_string()
 }
 
@@ -1157,6 +1166,12 @@ fn spawn_passt(vm_dir: &Path, ports: &[String]) -> anyhow::Result<PathBuf> {
     command
         .arg("--foreground")
         .arg("--one-off")
+        // Every guest packet is NAT'd through passt anyway (there is
+        // no real routing), so IPv6 buys nothing here and its own
+        // SLAAC/DAD negotiation only gives NetworkManager/networkd's
+        // own "wait-online" checks another, slower thing to converge
+        // on before considering the link ready.
+        .arg("--ipv4-only")
         .arg("--socket")
         .arg(&socket);
     for port in ports {

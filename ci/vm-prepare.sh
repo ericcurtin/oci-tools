@@ -29,12 +29,13 @@ fi
 # and even nss-lookup.target (a passive target nothing here actually
 # gates on) both turned out insufficient in practice -- the package
 # manager's very first mirror lookup failed with "Could not resolve
-# host" a couple of seconds after boot on real CI hardware, before
-# systemd-resolved had actually finished processing the DHCP-provided
-# DNS server. Poll for real resolution instead of trusting either
-# target; a no-op after the first `getent` success everywhere else
-# (native aarch64, already-up hosts).
-for _ in $(seq 1 50); do
+# host" before DHCP/DNS had actually converged (confirmed via CI:
+# NetworkManager's own device state was still "connecting (getting IP
+# configuration)" a full 10 seconds in). Poll for real resolution
+# instead of trusting either target, for up to a minute; a no-op after
+# the first `getent` success everywhere else (native aarch64,
+# already-up hosts).
+for _ in $(seq 1 300); do
     getent hosts mirrors.centos.org >/dev/null 2>&1 && break
     getent hosts archive.ubuntu.com >/dev/null 2>&1 && break
     sleep 0.2
@@ -43,8 +44,6 @@ done
 # what DNS configuration was actually in place, instead of guessing
 # further from the package manager's own opaque curl error alone.
 cat /etc/resolv.conf 2>&1 || true
-resolvectl status 2>&1 || true
-nmcli device show 2>&1 || true
 
 if command -v dnf >/dev/null 2>&1; then
     sudo dnf -y -q install \
