@@ -345,7 +345,14 @@ fn run_vcpu(
                 std::process::exit(1);
             }
             Ok(other) => warn!("vcpu {index}: unhandled exit: {other:?}"),
-            Err(e) if e.errno() == libc::EINTR => {}
+            // Both are ordinary, expected conditions, not failures: EINTR
+            // means a signal interrupted KVM_RUN (harmless, just retry);
+            // EAGAIN is returned e.g. while a secondary vCPU is still
+            // waiting on the boot CPU's INIT-SIPI-SIPI sequence, before
+            // it has anything to actually run yet. Firecracker's own
+            // vcpu loop treats both the same way (see its
+            // `handle_kvm_exit`), just re-entering KVM_RUN.
+            Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {}
             Err(e) => {
                 error!("vcpu {index}: KVM_RUN failed: {e}");
                 std::process::exit(1);
