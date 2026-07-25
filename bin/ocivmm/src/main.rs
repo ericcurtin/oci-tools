@@ -1089,15 +1089,17 @@ fn symlink(target: &str, link: &Path) -> anyhow::Result<()> {
 /// the VMM's one connection closes. `--publish` mappings become
 /// passt's own `-t host:guest` TCP forwards.
 ///
-/// passt drops root privilege (to "nobody") and then sandboxes itself
-/// with its own namespace/seccomp isolation before it will accept a
-/// connection; on a host where unprivileged user namespace creation
-/// is restricted by AppArmor (Ubuntu 24.04+'s
-/// `kernel.apparmor_restrict_unprivileged_userns` default) that
-/// isolation step itself fails and passt dies immediately, every
-/// time — see `ci/setup-host.sh`'s AppArmor exception for passt,
-/// which is the real fix; this function has no workaround of its own
-/// for that case.
+/// `--runas 0:0` keeps passt as root instead of its own default
+/// privilege drop to "nobody": found via strace that passt's own
+/// `bind()` on the socket path fails with EACCES once it has dropped
+/// privilege, because `ocivmm run`'s own vm_dir (created while we're
+/// still root, since the whole harness runs under sudo) isn't
+/// world-writable — and passt doesn't check that `bind()` return
+/// value at all, prints "socket bound" regardless, then dies moments
+/// later when `listen()` on the never-actually-bound fd predictably
+/// fails too. Since `ocivmm run` itself already requires root (KVM,
+/// loop-mounting), there's no isolation benefit to passt dropping
+/// privilege further in this harness specifically.
 fn spawn_passt(vm_dir: &Path, ports: &[String]) -> anyhow::Result<PathBuf> {
     let socket = vm_dir.join("passt.sock");
     let _ = std::fs::remove_file(&socket);
@@ -1106,6 +1108,8 @@ fn spawn_passt(vm_dir: &Path, ports: &[String]) -> anyhow::Result<PathBuf> {
     command
         .arg("--foreground")
         .arg("--one-off")
+        .arg("--runas")
+        .arg("0:0")
         .arg("--socket")
         .arg(&socket);
     for port in ports {
