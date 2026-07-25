@@ -14,57 +14,31 @@ set -euo pipefail
 
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-    apparmor \
     build-essential \
     passt \
-    strace \
     e2fsprogs
 
 # Ubuntu 24.04+ GitHub runners auto-confine any unconfined process
 # that creates an unprivileged user namespace into a restrictive
 # built-in AppArmor profile
-# (`kernel.apparmor_restrict_unprivileged_userns`) -- the same
-# hardening default `ci/vm-prepare.sh` already works around for this
-# workspace's own rootless-userns binaries inside the guest, but this
-# one is on the *host* side: passt's own `unshare(CLONE_NEWUSER)`
-# hits this exact wall, reproducibly, before it can even bind its
-# socket (confirmed via strace: bind() fails EACCES, passt doesn't
-# check that return value at all and prints "socket bound" anyway,
-# then dies moments later when listen() on the never-actually-bound
-# fd predictably fails too).
-#
-# The profile must match the *actual* running binary, not just
-# /usr/bin/passt: passt re-execs itself into a CPU-feature-specific
-# build (confirmed via strace: passt -> passt.avx2) before it ever
-# calls unshare(), and AppArmor profile attachment is by the
-# executable path in effect at that point, not the one the user
-# originally invoked.
+# (`kernel.apparmor_restrict_unprivileged_userns`). passt's own
+# unshare(CLONE_NEWUSER) hits this wall reproducibly (confirmed via
+# strace: its socket bind() then fails EACCES -- passt doesn't check
+# that return value at all and prints "socket bound" regardless --
+# and a second, later unshare() for its own further sandboxing fails
+# outright with EPERM). A per-binary AppArmor profile exception
+# (`ci/vm-prepare.sh`'s approach for this workspace's own rootless
+# binaries *inside* the guest) turned out fragile to get right here:
+# passt re-execs itself into a CPU-feature-specific build
+# (passt -> passt.avx2) before it ever calls unshare(), and even a
+# profile correctly scoped to both names and loaded successfully
+# (confirmed via aa-status) did not actually stop the kernel's
+# auto-confinement from kicking in. Disable the restriction directly
+# instead: this is a fresh, single-tenant, ephemeral CI VM with no
+# other untrusted userns-creating workload to protect against.
 if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-    profile=/etc/apparmor.d/oci-tools-ci-passt-userns
-    sudo tee "$profile" >/dev/null <<'EOF'
-abi <abi/4.0>,
-include <tunables/global>
-
-profile oci-tools-ci-passt-userns /usr/bin/passt{,.avx2} flags=(unconfined) {
-  userns,
-}
-EOF
-    sudo apparmor_parser -r "$profile"
-    echo "setup-host: loaded passt userns AppArmor exception"
-else
-    echo "setup-host: no apparmor_restrict_unprivileged_userns on this host, skipping passt's AppArmor exception"
+    sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 fi
-
-# TEMPORARY diagnostic: passt is still dying at startup even with the
-# AppArmor exception loaded; wrap it in strace so the next failed
-# run's log shows exactly which syscall/event is responsible now.
-# ci/run-in-vm.sh points OCIVMM_PASST at this wrapper and cats the
-# trace on failure.
-sudo tee /usr/local/bin/ocivmm-passt-strace >/dev/null <<'EOF'
-#!/bin/sh
-exec strace -f -tt -s 200 -o /tmp/passt-strace.log /usr/bin/passt "$@"
-EOF
-sudo chmod +x /usr/local/bin/ocivmm-passt-strace
 
 # GitHub runners ship /dev/kvm restricted to the kvm group; make it usable
 # without re-logging by widening the node (standard approach for CI
