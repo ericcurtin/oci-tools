@@ -81,6 +81,24 @@ loader, using its `kernel_load` entry point directly (ELF loading sets
 this from the plain ELF header regardless of whether a PVH note is
 also present, which `oci-vmm` doesn't use).
 
+### Multi-vCPU boot: `KVM_RUN` returning `EAGAIN` is normal, not an error
+
+Each vCPU runs its own `KVM_RUN` loop on its own thread; the *boot*
+vCPU starts runnable immediately, but the others don't run anything
+until the boot CPU sends them an INIT-SIPI-SIPI sequence over the
+(emulated) LAPIC during the guest kernel's own SMP bring-up. Verified
+directly on real KVM hardware: calling `KVM_RUN` on one of those
+not-yet-started vCPUs returns `EAGAIN`, and if that's treated as a
+fatal error (as a naive `match` on `kvm_ioctls`'s result might), the
+whole VMM process exits the instant the guest kernel prints `smp:
+Bringing up secondary CPUs ...` — after everything *else* about early
+boot (memory detection, MP table parsing, IRQ setup, RCU init) had
+already worked correctly, which is what made this one easy to miss
+until real hardware exercised it. Firecracker's own vcpu loop
+(`vstate/vcpu.rs::handle_kvm_exit`) treats `EAGAIN` exactly like
+`EINTR` — a normal, retryable condition, not a failure — and so does
+`oci-vmm`'s.
+
 ## The pet VM is a disk image, not a shared directory — `ocivmm cp`
 
 `oci-vmm` has no filesystem-sharing device at all (no virtio-fs): a
@@ -107,6 +125,24 @@ against it, and `--publish` becomes passt's own `-t host:guest`
 forwards. `ocivmm` spawns passt `--foreground` as its own child
 (self-daemonization was observed to unlink the socket file on some
 builds) and polls for the socket file before connecting.
+
+passt's own socket path lives directly under `/tmp` (sticky-bit
+1777), not inside the pet VM's own `vm_dir` (root-owned, since the
+whole harness runs under sudo) — found the hard way, via strace, on
+real CI hardware: passt always creates its own, unmapped user
+namespace (`unshare(CLONE_NEWUSER)`) before it will `bind()` its
+socket, and per `user_namespaces(7)`, a process inside a *new,
+unmapped* user namespace has its filesystem permission checks against
+anything outside that namespace degrade to the overflow UID —
+regardless of the process's real UID beforehand, which is exactly why
+`--runas 0:0` and an AppArmor `userns,` exception both turned out to
+be dead ends (see git history for the full trail). passt itself
+doesn't check its own `bind()` return value at all, so the actual
+symptom was never an obvious error: it prints "socket bound"
+unconditionally and dies moments later when `listen()` on the
+never-actually-bound fd predictably fails too. `/tmp`'s own
+permissions already satisfy every UID, sidestepping the question
+entirely.
 
 ## Provisioning: the distro's own kernel + systemd, installed by the distro
 
