@@ -17,7 +17,19 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommen
     apparmor \
     build-essential \
     passt \
+    strace \
     e2fsprogs
+
+# TEMPORARY diagnostic: passt has been dying deterministically and
+# immediately in this exact CI environment; wrap it in strace so the
+# next failed run's log shows exactly which syscall/event is
+# responsible, instead of guessing further. ci/run-in-vm.sh points
+# OCIVMM_PASST at this wrapper and cats the trace on failure.
+sudo tee /usr/local/bin/ocivmm-passt-strace >/dev/null <<'EOF'
+#!/bin/sh
+exec strace -f -tt -s 200 -o /tmp/passt-strace.log /usr/bin/passt "$@"
+EOF
+sudo chmod +x /usr/local/bin/ocivmm-passt-strace
 
 # Ubuntu 24.04+ GitHub runners auto-confine any unconfined process that
 # creates an unprivileged user namespace into a restrictive built-in
