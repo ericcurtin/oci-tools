@@ -39,6 +39,12 @@ for _ in $(seq 1 50); do
     getent hosts archive.ubuntu.com >/dev/null 2>&1 && break
     sleep 0.2
 done
+# TEMPORARY diagnostic: if the loop above still gave up, show exactly
+# what DNS configuration was actually in place, instead of guessing
+# further from the package manager's own opaque curl error alone.
+cat /etc/resolv.conf 2>&1 || true
+resolvectl status 2>&1 || true
+nmcli device show 2>&1 || true
 
 if command -v dnf >/dev/null 2>&1; then
     sudo dnf -y -q install \

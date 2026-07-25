@@ -491,9 +491,17 @@ else
         /etc/systemd/system/multi-user.target.wants/NetworkManager.service
     ln -sf /usr/lib/systemd/system/NetworkManager-wait-online.service \
         /etc/systemd/system/network-online.target.wants/NetworkManager-wait-online.service
-    # NetworkManager writes /etc/resolv.conf directly by default (no
-    # dns=systemd-resolved configured) -- leave resolved disabled and
-    # the file alone so the two don't fight over it.
+    # Force NetworkManager's own default DNS management (writing
+    # /etc/resolv.conf directly) explicitly, rather than trust
+    # whatever this particular build's own compiled-in default
+    # happens to be when no config file exists at all -- leave
+    # resolved disabled so the two don't fight over the same file.
+    mkdir -p /etc/NetworkManager/conf.d
+    cat > /etc/NetworkManager/conf.d/10-ocivmm-dns.conf <<'EOF'
+[main]
+dns=default
+EOF
+    rm -f /etc/resolv.conf
 fi
 
 cat > '/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf' <<'EOF'
