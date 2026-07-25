@@ -66,6 +66,17 @@ if ! getent hosts archive.ubuntu.com >/dev/null 2>&1 &&
         fi
         sleep 0.2
     done
+    # TEMPORARY diagnostic: if even a minute of retries never found a
+    # default route at all, show the real, raw state instead of
+    # guessing further -- /proc/net/route directly (in case the
+    # awk pattern itself is somehow not matching what's really there)
+    # and whatever device/connection info is available without
+    # depending on iproute2.
+    if [ -z "$gateway" ]; then
+        cat /proc/net/route 2>&1 || true
+        command -v nmcli >/dev/null 2>&1 && nmcli device show 2>&1 || true
+        command -v networkctl >/dev/null 2>&1 && networkctl status 2>&1 || true
+    fi
     if [ -n "$gateway" ]; then
         # /etc/resolv.conf may still be a symlink into resolved's own
         # managed stub file at this point; a plain `>` redirection
