@@ -1089,22 +1089,11 @@ fn symlink(target: &str, link: &Path) -> anyhow::Result<()> {
 /// the VMM's one connection closes. `--publish` mappings become
 /// passt's own `-t host:guest` TCP forwards.
 ///
-/// passt always creates its own, unmapped user namespace
-/// (`unshare(CLONE_NEWUSER)`, even with `--runas 0:0` to stay root —
-/// confirmed via strace) before binding the socket; an unmapped
-/// user namespace has no privilege at all against the *original*
-/// namespace's files, so its own `bind()` on the socket path fails
-/// with EACCES whenever `vm_dir` (created while we're still root,
-/// since the whole harness runs under sudo) isn't world-writable —
-/// and passt doesn't check that `bind()` return value at all, prints
-/// "socket bound" regardless, then dies moments later when
-/// `listen()` on the never-actually-bound fd predictably fails too.
-/// `vm_dir` is a private per-VM directory this process alone manages,
-/// so widening it is safe.
+/// passt always creates its own user namespace
+/// (`unshare(CLONE_NEWUSER)`) before binding the socket — see
+/// `ci/setup-host.sh`'s AppArmor exception for why that alone is
+/// fatal on Ubuntu 24.04+ without it.
 fn spawn_passt(vm_dir: &Path, ports: &[String]) -> anyhow::Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(vm_dir, std::fs::Permissions::from_mode(0o777))
-        .with_context(|| format!("widening permissions on {}", vm_dir.display()))?;
     let socket = vm_dir.join("passt.sock");
     let _ = std::fs::remove_file(&socket);
     let passt = std::env::var("OCIVMM_PASST").unwrap_or_else(|_| "passt".to_string());

@@ -115,21 +115,12 @@ tar -C "$repo" \
 sudo env OCI_TOOLS_STORAGE_ROOT="$storage" "$ocivmm" cp "$push_dir" "$vm_name:/root/oci-tools"
 
 echo "run-in-vm: booting $vm_name"
-sudo ls -la "$storage/vms/$vm_name" || true
 rc=0
-rm -f /tmp/passt-strace.log
-sudo env OCI_TOOLS_STORAGE_ROOT="$storage" OCIVMM_PASST=ocivmm-passt-strace "$ocivmm" run \
+sudo env OCI_TOOLS_STORAGE_ROOT="$storage" "$ocivmm" run \
     --mem "$mem_mib" \
     -e "OCI_TOOLS_GIT_HASH=$git_hash" \
     "$vm_name" \
     bash /root/oci-tools/ci/vm-ci.sh || rc=$?
-
-# TEMPORARY diagnostic: see ci/setup-host.sh's ocivmm-passt-strace
-# wrapper. Remove both once passt's real failure mode here is found.
-if [ "$rc" -ne 0 ] && [ -f /tmp/passt-strace.log ]; then
-    echo "run-in-vm: passt strace log follows"
-    sudo cat /tmp/passt-strace.log
-fi
 
 echo "run-in-vm: pulling artifacts"
 mkdir -p "$repo/artifacts"
