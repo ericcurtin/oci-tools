@@ -49,7 +49,11 @@ fi
 if ! getent hosts archive.ubuntu.com >/dev/null 2>&1 &&
     ! getent hosts mirrors.centos.org >/dev/null 2>&1; then
     gateway=""
-    for _ in $(seq 1 150); do
+    # Up to 2 minutes: confirmed via CI that a default route can
+    # still genuinely not exist yet even a full 30 seconds after our
+    # own oneshot unit's After=network-online.target already fired
+    # (that target, it turns out, doesn't actually guarantee one).
+    for _ in $(seq 1 600); do
         # `ip route show default` itself (not just an empty/no-match
         # result) exits non-zero when there's no default route yet --
         # under `set -o pipefail`, a bare `gateway=$(... | ...)`
@@ -65,6 +69,12 @@ if ! getent hosts archive.ubuntu.com >/dev/null 2>&1 &&
         fi
         sleep 0.2
     done
+    # TEMPORARY diagnostic: if even two minutes wasn't enough, show
+    # the real routing/address state instead of guessing further.
+    if [ -z "$gateway" ]; then
+        ip addr show 2>&1 || true
+        ip route show 2>&1 || true
+    fi
     if [ -n "$gateway" ]; then
         # /etc/resolv.conf may still be a symlink into resolved's own
         # managed stub file at this point; a plain `>` redirection
