@@ -1089,43 +1089,25 @@ fn symlink(target: &str, link: &Path) -> anyhow::Result<()> {
 /// the VMM's one connection closes. `--publish` mappings become
 /// passt's own `-t host:guest` TCP forwards.
 ///
-/// Observed in CI (recent git-snapshot passt builds): passt
-/// occasionally dies ~0.5s after binding the socket with "Error on
-/// listening Unix socket, exiting" and no client ever having
-/// connected yet — an apparent spurious epoll event on its own
-/// listening socket, before our `__boot` child even gets a chance to
-/// connect (this function hasn't returned yet at that point). Rather
-/// than depend on a fix landing in a pre-release passt, retry a
-/// handful of times: each attempt is cheap (a fresh bind), and the
-/// failure has not been reproduced twice in a row.
+/// passt drops root privilege (to "nobody") and then sandboxes itself
+/// with its own namespace/seccomp isolation before it will accept a
+/// connection; on a host where unprivileged user namespace creation
+/// is restricted by AppArmor (Ubuntu 24.04+'s
+/// `kernel.apparmor_restrict_unprivileged_userns` default) that
+/// isolation step itself fails and passt dies immediately, every
+/// time — see `ci/setup-host.sh`'s AppArmor exception for passt,
+/// which is the real fix; this function has no workaround of its own
+/// for that case.
 fn spawn_passt(vm_dir: &Path, ports: &[String]) -> anyhow::Result<PathBuf> {
     let socket = vm_dir.join("passt.sock");
-    const ATTEMPTS: u32 = 5;
-    let mut last_err = None;
-    for attempt in 1..=ATTEMPTS {
-        match try_spawn_passt(&socket, ports) {
-            Ok(()) => return Ok(socket),
-            Err(err) if attempt < ATTEMPTS => {
-                eprintln!("ocivmm: passt attempt {attempt}/{ATTEMPTS} failed ({err}), retrying");
-                last_err = Some(err);
-            }
-            Err(err) => return Err(err),
-        }
-    }
-    Err(last_err.expect("loop always sets last_err before falling through"))
-}
-
-/// One attempt at starting passt and waiting for its socket to appear;
-/// see [`spawn_passt`] for why the caller retries on failure.
-fn try_spawn_passt(socket: &Path, ports: &[String]) -> anyhow::Result<()> {
-    let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(&socket);
     let passt = std::env::var("OCIVMM_PASST").unwrap_or_else(|_| "passt".to_string());
     let mut command = std::process::Command::new(&passt);
     command
         .arg("--foreground")
         .arg("--one-off")
         .arg("--socket")
-        .arg(socket);
+        .arg(&socket);
     for port in ports {
         command.arg("-t").arg(port);
     }
@@ -1145,7 +1127,7 @@ fn try_spawn_passt(socket: &Path, ports: &[String]) -> anyhow::Result<()> {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    Ok(())
+    Ok(socket)
 }
 
 /// Validate every `--publish HOST:GUEST` port mapping; passt's `-t`

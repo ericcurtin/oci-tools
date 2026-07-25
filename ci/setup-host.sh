@@ -14,9 +14,32 @@ set -euo pipefail
 
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+    apparmor \
     build-essential \
     passt \
     e2fsprogs
+
+# Ubuntu 24.04+ GitHub runners auto-confine any unconfined process that
+# creates an unprivileged user namespace into a restrictive built-in
+# AppArmor profile (`kernel.apparmor_restrict_unprivileged_userns`) --
+# the same hardening default `ci/vm-prepare.sh` already works around
+# for this workspace's own rootless-userns binaries *inside* the guest,
+# but this one is on the *host* side: passt's own privilege-drop (to
+# "nobody") plus internal namespace isolation hits this exact wall,
+# reproducibly, before it can even accept its first connection. Grant
+# passt the same `userns,` exception.
+if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+    profile=/etc/apparmor.d/oci-tools-ci-passt-userns
+    sudo tee "$profile" >/dev/null <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile oci-tools-ci-passt-userns /usr/bin/passt flags=(unconfined) {
+  userns,
+}
+EOF
+    sudo apparmor_parser -r "$profile"
+fi
 
 # GitHub runners ship /dev/kvm restricted to the kvm group; make it usable
 # without re-logging by widening the node (standard approach for CI
