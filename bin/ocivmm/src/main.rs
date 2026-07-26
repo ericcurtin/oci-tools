@@ -1173,6 +1173,20 @@ fn spawn_passt(vm_dir: &Path, ports: &[String]) -> anyhow::Result<PathBuf> {
         // link-local address) -- reverted rather than dig into why a
         // flag that per passt's own docs should only affect IPv6
         // somehow broke IPv4 DHCP too.
+        //
+        // --mtu 1500: passt defaults to assigning an MTU of 65520 to
+        // the guest via DHCP/NDP. Our virtio-net device doesn't
+        // negotiate VIRTIO_NET_F_MTU or any GSO/TSO offload feature,
+        // and its RX buffers are sized for a fixed, standard 1500-byte
+        // Ethernet MTU (see MAX_FRAME_LEN/VNET_HDR_LEN in
+        // crates/oci-vmm/src/virtio/net.rs). Left at its default,
+        // passt's oversized MTU announcement led it to forward frames
+        // far larger than our device can receive, which our own
+        // bounds checks then had to drop -- silently stalling
+        // reassembly-dependent traffic (e.g. package-manager
+        // downloads) instead of ever failing loudly. Pin it to match.
+        .arg("--mtu")
+        .arg("1500")
         .arg("--socket")
         .arg(&socket);
     for port in ports {

@@ -77,6 +77,52 @@ pub enum PasstError {
     OversizedFrame(u32, usize),
 }
 
+/// How much of the next frame passt is sending has been read so far.
+/// A non-blocking stream socket has no frame boundaries of its own —
+/// a `read()` can return after any number of bytes, at any point in
+/// either the 4-byte length prefix or the frame body — so this must
+/// be tracked and resumed explicitly across calls, rather than
+/// assuming a single `read()`/`read_exact()` either completes a
+/// whole stage or reads nothing at all.
+///
+/// Getting this wrong doesn't just drop or duplicate a frame: it
+/// desyncs *every* frame after it, since the "length prefix" of the
+/// next read is now built from whatever bytes happen to be at the
+/// wrong stream offset. Found the hard way, on real KVM hardware
+/// under real sustained traffic: this exact desync produced a
+/// "frame length" of 3.4 billion (read as if it were a real prefix)
+/// that then panicked on an out-of-bounds slice, and — even once that
+/// panic was fixed into a clean bounds check instead — kept silently
+/// manufacturing plausible-but-wrong frame lengths (consistently a
+/// few KiB, i.e. bigger than a single real Ethernet frame ever is)
+/// forever afterward, dropping real traffic indefinitely and
+/// presenting as intermittent "Connection reset by peer" partway
+/// through unrelated downloads.
+#[derive(Debug)]
+enum RxProgress {
+    /// Reading the 4-byte length prefix; `buf[..have]` holds what's
+    /// been read of it so far.
+    Header {
+        buf: [u8; FRAME_HEADER_LEN],
+        have: usize,
+    },
+    /// Length prefix decoded; reading the frame body into this
+    /// backend's own buffer (sized to the decoded length) rather than
+    /// the caller's — `try_read_frame`'s own `buf` argument is a fresh
+    /// stack buffer on most calls, not something safe to keep partial
+    /// progress in across calls — until `have == body.len()`.
+    Body { body: Vec<u8>, have: usize },
+}
+
+impl Default for RxProgress {
+    fn default() -> Self {
+        Self::Header {
+            buf: [0; FRAME_HEADER_LEN],
+            have: 0,
+        }
+    }
+}
+
 /// The passt-facing half of the device: an already-connected
 /// unix-stream socket, with the small amount of state needed to
 /// resume a frame read/write that hit `EWOULDBLOCK` partway through
@@ -84,10 +130,9 @@ pub enum PasstError {
 #[derive(Debug)]
 pub struct PasstBackend {
     stream: UnixStream,
-    /// Bytes of a length-prefix already read for the frame currently
-    /// being received, if any (`None` once a full 4-byte prefix has
-    /// been consumed and its value decoded).
-    rx_expected_len: Option<u32>,
+    /// How much of the frame currently being received has arrived so
+    /// far — see [`RxProgress`].
+    rx_progress: RxProgress,
     /// A TX frame (with the passt header prefixed at
     /// `buf[..FRAME_HEADER_LEN]`) that was partially written and still
     /// needs `bytes_written..` sent before the next TX frame can start.
@@ -100,7 +145,7 @@ impl PasstBackend {
         stream.set_nonblocking(true)?;
         Ok(Self {
             stream,
-            rx_expected_len: None,
+            rx_progress: RxProgress::default(),
             tx_pending: None,
         })
     }
@@ -111,47 +156,46 @@ impl PasstBackend {
 
     /// Try to read one full Ethernet frame from passt into
     /// `buf[VNET_HDR_LEN..]` (the caller has already zeroed the vnet
-    /// header). Returns `Ok(None)` on `EWOULDBLOCK` (nothing to read
-    /// right now — the normal, expected case when polled by epoll
-    /// readiness); a real I/O error otherwise ends the device (passt
-    /// exited).
+    /// header). Returns `Ok(None)` on `EWOULDBLOCK` (nothing more to
+    /// read right now — the normal, expected case when polled by
+    /// epoll readiness, including partway through a frame); a real
+    /// I/O error otherwise ends the device (passt exited).
     fn try_read_frame(&mut self, buf: &mut [u8]) -> Result<Option<usize>, PasstError> {
-        if self.rx_expected_len.is_none() {
-            let mut len_buf = [0u8; FRAME_HEADER_LEN];
-            match self.stream.read_exact(&mut len_buf) {
-                Ok(()) => {
-                    let len = u32::from_be_bytes(len_buf);
-                    let max = (MAX_FRAME_LEN - VNET_HDR_LEN) as u32;
+        loop {
+            match &mut self.rx_progress {
+                RxProgress::Header {
+                    buf: header,
+                    have: have @ 0..FRAME_HEADER_LEN,
+                } => match self.stream.read(&mut header[*have..]) {
+                    Ok(0) => return Err(PasstError::Io(ErrorKind::UnexpectedEof.into())),
+                    Ok(n) => *have += n,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
+                    Err(e) => return Err(e.into()),
+                },
+                RxProgress::Header { buf: header, .. } => {
+                    let len = u32::from_be_bytes(*header) as usize;
+                    let max = MAX_FRAME_LEN - VNET_HDR_LEN;
                     if len > max {
-                        return Err(PasstError::OversizedFrame(len, max as usize));
+                        return Err(PasstError::OversizedFrame(len as u32, max));
                     }
-                    self.rx_expected_len = Some(len);
+                    self.rx_progress = RxProgress::Body {
+                        body: vec![0u8; len],
+                        have: 0,
+                    };
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
-                Err(e) => return Err(e.into()),
+                RxProgress::Body { body, have } if *have == body.len() => {
+                    let len = body.len();
+                    buf[VNET_HDR_LEN..VNET_HDR_LEN + len].copy_from_slice(body);
+                    self.rx_progress = RxProgress::default();
+                    return Ok(Some(VNET_HDR_LEN + len));
+                }
+                RxProgress::Body { body, have } => match self.stream.read(&mut body[*have..]) {
+                    Ok(0) => return Err(PasstError::Io(ErrorKind::UnexpectedEof.into())),
+                    Ok(n) => *have += n,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
+                    Err(e) => return Err(e.into()),
+                },
             }
-        }
-        let frame_len = self.rx_expected_len.expect("checked above") as usize;
-        let dst = &mut buf[VNET_HDR_LEN..VNET_HDR_LEN + frame_len];
-        match self.stream.read_exact(dst) {
-            Ok(()) => {
-                self.rx_expected_len = None;
-                Ok(Some(VNET_HDR_LEN + frame_len))
-            }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                // The length prefix arrived but the frame body hasn't
-                // yet; passt frames are small and this is rare, but
-                // correctness requires blocking briefly rather than
-                // dropping — a stream socket has no frame boundaries
-                // to resume from otherwise.
-                self.stream.set_nonblocking(false)?;
-                let result = self.stream.read_exact(dst);
-                self.stream.set_nonblocking(true)?;
-                result?;
-                self.rx_expected_len = None;
-                Ok(Some(VNET_HDR_LEN + frame_len))
-            }
-            Err(e) => Err(e.into()),
         }
     }
 
@@ -279,6 +323,32 @@ impl VirtioNet {
         let Some(head) = self.queues[RX_INDEX].pop_or_enable_notification()? else {
             return Ok(false);
         };
+        // `mem.write()` only checks against the *guest memory
+        // region's* own bounds, not this descriptor's own advertised
+        // length — nothing stops it from writing straight past the
+        // buffer the guest actually allocated and into whatever
+        // memory (guest kernel data structures, quite possibly)
+        // happens to follow it. Found the hard way: a real guest
+        // kernel panic ("general protection fault, probably for
+        // non-canonical address ...", inside down_write()) under
+        // real, sustained network traffic on real KVM hardware.
+        // Drop an over-length frame instead of ever writing past
+        // head.len — the frame is unusable to the guest either way,
+        // and retrying won't make it smaller.
+        let head_len = head.len as usize;
+        if buf.len() > head_len {
+            error!(
+                "virtio-net: RX frame ({} bytes) larger than the guest's own descriptor \
+                 ({head_len} bytes); dropping it rather than overrunning guest memory",
+                buf.len()
+            );
+            self.queues[RX_INDEX]
+                .add_used(head.index, 0)
+                .unwrap_or_else(|err| {
+                    error!("virtio-net: failed to add used RX descriptor: {err}")
+                });
+            return Ok(true);
+        }
         let written = mem.write(buf, head.addr).unwrap_or_else(|err| {
             error!("virtio-net: failed writing RX frame to guest memory: {err}");
             0
