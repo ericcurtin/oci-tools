@@ -65,6 +65,16 @@ pub enum PasstError {
     /// The stream returned `EOF` or another unrecoverable I/O error.
     #[error("passt connection error: {0}")]
     Io(#[from] std::io::Error),
+    /// passt's own 4-byte length prefix claimed a frame larger than
+    /// this device will ever send or receive — either a genuinely
+    /// corrupt/malicious peer, or (more likely in practice) this
+    /// backend's own read state having desynced from passt's framing
+    /// somehow. Ends the device cleanly instead of the alternative:
+    /// using the bogus length as a slice bound directly, which panics
+    /// (found the hard way, under real sustained traffic — NDP/DHCPv6
+    /// negotiation specifically — on real KVM hardware).
+    #[error("passt sent an oversized frame length {0} (max {1})")]
+    OversizedFrame(u32, usize),
 }
 
 /// The passt-facing half of the device: an already-connected
@@ -109,7 +119,14 @@ impl PasstBackend {
         if self.rx_expected_len.is_none() {
             let mut len_buf = [0u8; FRAME_HEADER_LEN];
             match self.stream.read_exact(&mut len_buf) {
-                Ok(()) => self.rx_expected_len = Some(u32::from_be_bytes(len_buf)),
+                Ok(()) => {
+                    let len = u32::from_be_bytes(len_buf);
+                    let max = (MAX_FRAME_LEN - VNET_HDR_LEN) as u32;
+                    if len > max {
+                        return Err(PasstError::OversizedFrame(len, max as usize));
+                    }
+                    self.rx_expected_len = Some(len);
+                }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
                 Err(e) => return Err(e.into()),
             }
