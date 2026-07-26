@@ -11,10 +11,10 @@
 use tracing::error;
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryError};
 
+use super::disk::DiskProperties;
 use super::io::SyncIoError;
 use super::{SECTOR_SHIFT, SECTOR_SIZE, VirtioBlockError};
 use crate::mem::GuestMemoryMmap;
-use crate::virtio::block::device::DiskProperties;
 pub use crate::virtio::generated::virtio_blk::{
     VIRTIO_BLK_ID_BYTES, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP,
     VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_GET_ID, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT,

@@ -45,11 +45,23 @@ pub mod builder;
 pub mod hvf;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod legacy;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+// The `GuestMemoryMmap` alias itself is portable (see mem.rs's own
+// doc comment); only its x86_64 memory *layout* helpers are gated
+// internally.
 pub mod mem;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod pci;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+// Not gated to Linux/x86_64 like the rest of this list: the virtqueue
+// (`queue`), generated virtio protocol constants (`generated`), and
+// the virtio-blk request-parsing/sync-file-I/O logic (`block::request`/
+// `block::io`) are transport- and hypervisor-agnostic (only
+// `vm-memory` + `std`), and `hvf`'s own virtio-mmio transport (phase 4
+// of docs/design/0249) reuses them directly instead of duplicating
+// them -- everything that *does* need Linux/x86_64 (the
+// `event_manager`/`EventFd`-driven `VirtioDevice` trait in `device`,
+// `net`, `transport::pci`, and `block::device`'s own EventFd-based
+// `VirtioBlock`) is gated at the individual `mod` level inside this
+// module and `block`'s own `mod.rs` instead.
 pub mod virtio;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod vstate;

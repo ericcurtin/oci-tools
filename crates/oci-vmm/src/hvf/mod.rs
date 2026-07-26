@@ -35,6 +35,8 @@ pub mod pl011;
 pub mod sys;
 pub mod sysreg_trap;
 pub mod vcpu;
+pub mod virtio_blk;
+pub mod virtio_mmio;
 pub mod vm;
 
 pub use boot::ImageHeader;
@@ -45,6 +47,8 @@ pub use mmio::{DataAbort, MmioDevice, MmioError};
 pub use pl011::Pl011;
 pub use sysreg_trap::Sys64Trap;
 pub use vcpu::{Exception, ExitReason, Vcpu};
+pub use virtio_blk::VirtioBlkMmio;
+pub use virtio_mmio::VirtioMmioTransport;
 pub use vm::Vm;
 
 #[cfg(test)]

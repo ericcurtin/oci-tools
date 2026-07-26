@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#![allow(unsafe_code)] // mmap + Vm::map: safety documented at each call site below.
-
 //! Phase 3's capstone test: boot a real, unmodified, stock arm64
 //! Linux `Image` under this backend end to end (`hvf::vm`/`vcpu`/
 //! `gic`/`pl011`/`boot`/`machine` together) and confirm it reaches its
@@ -22,6 +19,17 @@
 //! default; not yet wired into any CI job at all (`docs/design/0249`
 //! phase 7 is what would do that, once a real provisioning story
 //! exists to produce this file automatically).
+//!
+//! The `//!` doc comment above must stay *before* the `#![cfg(...)]`
+//! below -- confirmed directly: `missing_docs` still fires for this
+//! whole (empty, on any other target) crate otherwise, since a
+//! crate-level `cfg` strips everything textually after it, doc
+//! comments included (the working precedent is this crate's own
+//! `lib.rs`, before phase 2 replaced its own whole-crate `cfg` with
+//! per-module ones).
+
+#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#![allow(unsafe_code)] // mmap + Vm::map: safety documented at each call site below.
 
 use std::time::{Duration, Instant};
 
@@ -147,6 +155,7 @@ fn boots_a_real_kernel_image_to_its_own_console_and_panics_without_a_rootfs() {
         RAM_SIZE,
         "console=ttyAMA0 panic=-1 earlycon=pl011,0x9000000",
         None,
+        0, // No virtio-mmio devices in this test -- see hvf_virtio_blk.rs for phase 4's own.
     );
     assert!(
         DTB_OFFSET + dtb.len() as u64 <= RAM_SIZE,

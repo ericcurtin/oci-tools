@@ -247,6 +247,12 @@ unsafe extern "C" {
     /// `hv_vcpu_create`.
     pub fn hv_gic_create(config: *mut c_void) -> hv_return_t;
 
+    /// Triggers a Shared Peripheral Interrupt (SPI). `level = true`
+    /// asserts it (and, for an edge-triggered interrupt, causes the
+    /// edge itself); `false` on an edge-triggered interrupt is
+    /// ignored.
+    pub fn hv_gic_set_spi(intid: u32, level: bool) -> hv_return_t;
+
     /// The GIC distributor region's fixed size, in bytes.
     pub fn hv_gic_get_distributor_size(distributor_size: *mut usize) -> hv_return_t;
 

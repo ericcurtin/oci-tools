@@ -14,10 +14,19 @@ use std::any::Any;
 use self::queue::QueueError;
 
 pub mod block;
+// EventFd/event_manager-driven: the interface the KVM/x86_64 PCI
+// transport (`transport::pci`) drives a device through. `hvf`'s own
+// virtio-mmio transport (docs/design/0249 phase 4) is a synchronous,
+// dispatched-from-the-vCPU-exit-loop design instead (matching every
+// other `hvf` device, e.g. `hvf::pl011`) and has no equivalent trait
+// of its own to share -- see `hvf::virtio_mmio`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod device;
 pub mod generated;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod net;
 pub mod queue;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod transport;
 
 /// Errors triggered when activating a VirtioDevice.

@@ -26,12 +26,20 @@ use crate::hvf::layout;
 /// and kernel command line `bootargs`. `initrd`, if present, is a
 /// `(start, end)` guest physical address pair (`/chosen`'s own
 /// `linux,initrd-start`/`-end` convention -- `end` is exclusive, one
-/// byte past the last initrd byte, per the binding).
+/// byte past the last initrd byte, per the binding). `virtio_mmio_slots`
+/// describes one `virtio,mmio` node per slot index in
+/// `0..virtio_mmio_slots`, based at [`layout::VIRTIO_MMIO_BASE`] plus
+/// `index * `[`layout::VIRTIO_MMIO_SIZE`], SPI
+/// [`layout::VIRTIO_MMIO_SPI_BASE`] plus `index` -- the guest kernel
+/// probes each slot's own `MagicValue`/`DeviceId` registers at boot to
+/// discover what (if anything) is actually there, so an unused slot is
+/// harmless to describe.
 pub fn build_device_tree(
     gic: &GicLayout,
     ram_size: u64,
     bootargs: &str,
     initrd: Option<(u64, u64)>,
+    virtio_mmio_slots: u32,
 ) -> Vec<u8> {
     let mut fdt = FdtWriter::new();
 
@@ -166,6 +174,24 @@ pub fn build_device_tree(
     fdt.property_cells("clocks", &[APB_PCLK_PHANDLE, APB_PCLK_PHANDLE]);
     fdt.end_node();
 
+    for slot in 0..virtio_mmio_slots {
+        let base = layout::VIRTIO_MMIO_BASE + u64::from(slot) * layout::VIRTIO_MMIO_SIZE;
+        let spi = layout::VIRTIO_MMIO_SPI_BASE + slot;
+        fdt.begin_node(&format!("virtio_mmio@{base:x}"));
+        // Matches Firecracker's own aarch64 virtio_mmio node
+        // (src/vmm/src/arch/aarch64/fdt.rs::create_virtio_node): this
+        // backend's virtio-mmio device has no non-coherent DMA
+        // engine of its own (`hvf::virtio_blk`'s "DMA" is just plain
+        // host-process reads/writes into the same guest memory
+        // mapping), so declaring it coherent is accurate, not just
+        // cargo-culted from Firecracker.
+        fdt.property_empty("dma-coherent");
+        fdt.property_strings("compatible", &["virtio,mmio"]);
+        fdt.property_cells("reg", &be64_pair_cells(base, layout::VIRTIO_MMIO_SIZE));
+        fdt.property_cells("interrupts", &[0, spi, 4]); // <GIC_SPI spi IRQ_TYPE_LEVEL_HIGH>
+        fdt.end_node();
+    }
+
     fdt.end_node(); // root
 
     fdt.finish(0)
@@ -216,7 +242,7 @@ mod tests {
             redistributor_base: layout::GIC_REDISTRIBUTOR_BASE,
             redistributor_size: 0x20000, // one vCPU's worth (2x64 KiB frames).
         };
-        let dtb = build_device_tree(&gic, 256 * 1024 * 1024, "console=ttyAMA0 panic=-1", None);
+        let dtb = build_device_tree(&gic, 256 * 1024 * 1024, "console=ttyAMA0 panic=-1", None, 0);
         let dts = decompile(&dtb);
 
         assert!(dts.contains("compatible = \"linux,dummy-virt\";"), "{dts}");
@@ -244,9 +270,34 @@ mod tests {
             256 * 1024 * 1024,
             "console=ttyAMA0",
             Some((0x4800_0000, 0x4900_0000)),
+            0,
         );
         let dts = decompile(&dtb);
         assert!(dts.contains("linux,initrd-start"), "{dts}");
         assert!(dts.contains("linux,initrd-end"), "{dts}");
+    }
+
+    #[test]
+    fn includes_one_virtio_mmio_node_per_slot() {
+        let gic = GicLayout {
+            distributor_base: layout::GIC_DISTRIBUTOR_BASE,
+            distributor_size: 0x10000,
+            redistributor_base: layout::GIC_REDISTRIBUTOR_BASE,
+            redistributor_size: 0x20000,
+        };
+        let dtb = build_device_tree(&gic, 256 * 1024 * 1024, "console=ttyAMA0", None, 2);
+        let dts = decompile(&dtb);
+        assert!(
+            dts.contains(&format!("virtio_mmio@{:x}", layout::VIRTIO_MMIO_BASE)),
+            "{dts}"
+        );
+        assert!(
+            dts.contains(&format!(
+                "virtio_mmio@{:x}",
+                layout::VIRTIO_MMIO_BASE + layout::VIRTIO_MMIO_SIZE
+            )),
+            "{dts}"
+        );
+        assert!(dts.contains("compatible = \"virtio,mmio\";"), "{dts}");
     }
 }

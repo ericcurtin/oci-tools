@@ -8,11 +8,8 @@
 
 //! The virtio block device: a host file exposed to the guest as a disk.
 
-use std::cmp;
-use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom};
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use event_manager::{EventOps, Events, MutEventSubscriber};
@@ -21,101 +18,17 @@ use vm_memory::ByteValued;
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 
-use super::io::SyncFileEngine;
+use super::disk::{ConfigSpace, DiskProperties};
 use super::request::{FinishedRequest, Request};
-use super::{BLOCK_QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE, VirtioBlockError};
+use super::{BLOCK_QUEUE_SIZES, VirtioBlockError};
 use crate::mem::GuestMemoryMmap;
 use crate::virtio::ActivateError;
 use crate::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
-use crate::virtio::generated::virtio_blk::{
-    VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_ID_BYTES,
-};
+use crate::virtio::generated::virtio_blk::{VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO};
 use crate::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use crate::virtio::queue::{InvalidAvailIdx, Queue};
 use crate::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
-
-/// Helper object for setting up all `Block` fields derived from its backing file.
-#[derive(Debug)]
-pub struct DiskProperties {
-    /// The engine performing I/O against the backing file.
-    pub file_engine: SyncFileEngine,
-    /// Number of `SECTOR_SIZE` sectors the disk exposes to the guest.
-    pub nsectors: u64,
-    /// The serial returned for `VIRTIO_BLK_T_GET_ID` requests.
-    pub image_id: [u8; VIRTIO_BLK_ID_BYTES as usize],
-}
-
-impl DiskProperties {
-    // Helper function that opens the file with the proper access permissions
-    fn open_file(
-        disk_image_path: &Path,
-        is_disk_read_only: bool,
-    ) -> Result<File, VirtioBlockError> {
-        OpenOptions::new()
-            .read(true)
-            .write(!is_disk_read_only)
-            .open(disk_image_path)
-            .map_err(|x| VirtioBlockError::BackingFile(x, disk_image_path.display().to_string()))
-    }
-
-    // Helper function that gets the size of the file
-    fn file_size(disk_image_path: &Path, disk_image: &mut File) -> Result<u64, VirtioBlockError> {
-        let disk_size = disk_image
-            .seek(SeekFrom::End(0))
-            .map_err(|x| VirtioBlockError::BackingFile(x, disk_image_path.display().to_string()))?;
-
-        // We only support disk size, which uses the first two words of the configuration space.
-        // If the image is not a multiple of the sector size, the tail bits are not exposed.
-        if disk_size % u64::from(SECTOR_SIZE) != 0 {
-            warn!(
-                "Disk size {disk_size} is not a multiple of sector size {SECTOR_SIZE}; the \
-                 remainder will not be visible to the guest."
-            );
-        }
-
-        Ok(disk_size)
-    }
-
-    /// Create the disk properties from the backing file and the disk ID.
-    pub fn new(
-        disk_image_path: PathBuf,
-        is_disk_read_only: bool,
-        disk_id: &str,
-    ) -> Result<Self, VirtioBlockError> {
-        let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only)?;
-        let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
-
-        Ok(Self {
-            file_engine: SyncFileEngine::from_file(disk_image),
-            nsectors: disk_size >> SECTOR_SHIFT,
-            image_id: Self::build_disk_image_id(disk_id),
-        })
-    }
-
-    fn build_disk_image_id(disk_id: &str) -> [u8; VIRTIO_BLK_ID_BYTES as usize] {
-        let mut default_id = [0; VIRTIO_BLK_ID_BYTES as usize];
-        // The kernel only knows to read a maximum of VIRTIO_BLK_ID_BYTES.
-        // This will also zero out any leftover bytes.
-        let disk_id = disk_id.as_bytes();
-        let bytes_to_copy = cmp::min(disk_id.len(), VIRTIO_BLK_ID_BYTES as usize);
-        default_id[..bytes_to_copy].copy_from_slice(&disk_id[..bytes_to_copy]);
-        default_id
-    }
-}
-
-/// The virtio block device configuration space (`struct virtio_blk_config`,
-/// of which Firecracker exposes only the mandatory `capacity` field).
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
-#[repr(C)]
-pub struct ConfigSpace {
-    /// Disk capacity in `SECTOR_SIZE` sectors, little-endian.
-    pub capacity: u64,
-}
-
-// SAFETY: `ConfigSpace` contains only PODs in `repr(C)` or `repr(transparent)`, without padding.
-#[allow(unsafe_code)]
-unsafe impl ByteValued for ConfigSpace {}
 
 /// Virtio device for exposing block level read/write operations on a host file.
 #[derive(Debug)]

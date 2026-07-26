@@ -9,13 +9,21 @@
 //! requests with `fsync` (Firecracker's `Writeback` behavior), because a
 //! pet VM's one disk deserves its data.
 
+// EventFd-based VirtioDevice impl -- see virtio::device's own doc
+// comment on why this is Linux/x86_64-only; `disk`/`io`/`request` (the
+// backing file, sync file I/O, and virtio-blk request parsing) have
+// no such dependency and are shared with `hvf::virtio_mmio` directly.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod device;
+pub mod disk;
 pub mod io;
 pub mod request;
 
 use vm_memory::GuestMemoryError;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use self::device::VirtioBlock;
+pub use self::disk::{ConfigSpace, DiskProperties};
 pub use self::request::*;
 
 /// Sector shift for block device.

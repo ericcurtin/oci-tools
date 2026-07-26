@@ -49,3 +49,16 @@ pub const PL011_SPI: u32 = 1;
 /// SGIs/PPIs, private to each vCPU, never used for a platform device
 /// like PL011).
 pub const GIC_SPI_BASE: u32 = 32;
+
+/// Base address of the first virtio-mmio device slot (QEMU `virt`'s
+/// own convention: `VIRT_MMIO_BASE`, one 0x200-byte slot per device,
+/// 32 slots).
+pub const VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
+/// Size of a single virtio-mmio device's register window (spec-fixed:
+/// the register file fits in far less, but this matches QEMU's own
+/// per-slot spacing).
+pub const VIRTIO_MMIO_SIZE: u64 = 0x200;
+/// SPI (relative to [`PL011_SPI`], which uses SPI 1) of the first
+/// virtio-mmio slot (QEMU `virt`'s own convention: SPI 16..48 for the
+/// 32 virtio-mmio slots).
+pub const VIRTIO_MMIO_SPI_BASE: u32 = 16;

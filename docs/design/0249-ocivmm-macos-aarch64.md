@@ -3,7 +3,11 @@
 Status: proposed (phases 2-3 landed: raw HVF bindings, VM/vCPU/GIC/
 PL011/FDT foundation, and a real, unmodified stock arm64 kernel boots
 end to end to its own console banner and panics cleanly for lack of a
-root filesystem; phases 4-7 are future work, tracked below)
+root filesystem; phase 4 partially landed -- virtio-mmio transport and
+a virtio-blk device exist and are wired up correctly as far as the
+device tree and MMIO trap-and-emulate go, but the guest's own driver
+can't yet actually bind to the device, a real open issue, not yet
+root-caused; phases 5-7 are future work; all tracked below)
 Scope: `crates/oci-vmm/` (new `hvf`/`aarch64` backend, alongside the
 existing KVM/x86_64 one), `bin/ocivmm/` (macOS provisioning path,
 codesigning), `.github/workflows/ci.yml` (two new matrix cells, added
@@ -279,13 +283,59 @@ a dependency of this phase too, not yet designed in detail here).
      printed everything this test was looking for. The fix was a real
      watchdog thread calling `hv_vcpus_exit` after a deadline, exactly
      the mechanism the framework documents that call for.
-4. **virtio-mmio transport + device-tree nodes (not started).** Port
-   `virtio::block`/`virtio::net` onto a new `virtio/transport/mmio/`
-   sitting alongside `virtio/transport/pci/`; this is also the natural
-   point to extract a small `VmBackend`/`VcpuBackend`-shaped trait the
-   KVM and HVF modules both implement, now that there are two real
-   implementations to abstract over. Milestone: boots to the guest's
-   own systemd against a real virtio-blk root disk.
+4. **virtio-mmio transport + device-tree nodes (partially landed;
+   blocked on an open issue).** `hvf::virtio_mmio` implements the
+   virtio-mmio register file (a completely different layout from
+   virtio-pci's common configuration structure, though the same
+   underlying protocol: feature negotiation, the device status state
+   machine, `QueueNotify`/interrupt handling) directly against
+   `crate::virtio::queue::Queue` and `crate::virtio::block::{disk,
+   request}` -- the transport- and hypervisor-agnostic parts of the
+   *existing* virtio-blk implementation the KVM/x86_64 backend's own
+   `virtio::block::device::VirtioBlock` already builds on, now made to
+   compile on macOS too (only `vm-memory` needed moving to a common
+   dependency; `crate::mem::GuestMemoryMmap`'s own type alias needed
+   the same treatment). Deliberately *not* shared: `virtio::device::
+   VirtioDevice`/`virtio::transport::VirtioInterrupt`, which are
+   shaped around `event_manager`'s epoll-driven `MutEventSubscriber`
+   and `vmm_sys_util::eventfd::EventFd` -- this backend has no
+   equivalent event loop at all (every `hvf` device, PL011 included,
+   is dispatched synchronously out of the vCPU exit loop); `hvf::
+   virtio_mmio::MmioVirtioDevice` is this module's own, much smaller
+   device trait for that model instead. `hvf::virtio_blk::
+   VirtioBlkMmio` is the block device itself, and `hv_gic_set_spi`
+   (newly bound) delivers its interrupts.
+
+   Real, confirmed progress, not just compiling: booted against a
+   real, unmodified Ubuntu 24.04 `linux-generic` aarch64 kernel (the
+   actual real signed `.deb` package, gunzipped down to a plain
+   `Image` -- simpler than Alpine's own EFI-zboot-wrapped `vmlinuz`,
+   see `hvf::boot`'s own module docs), the guest's `virtio_mmio`
+   platform driver *does* find and match the generated device tree
+   node by name (`a000000.virtio_mmio`) -- confirming the node's
+   `compatible`/`reg`/`interrupts` properties, and `hvf::mmio`'s Data
+   Abort trap-and-emulate mechanism underneath it, are all correct.
+
+   What isn't working yet, and is a genuinely open, unresolved
+   question rather than a placeholder: the guest's own
+   `devm_request_mem_region()` call -- a pure Linux resource-tree
+   operation, before any actual MMIO access to the device at all --
+   fails with `-EBUSY`, so `hvf::virtio_mmio`'s own register file is
+   never actually reached by a guest read/write yet. The *identical*
+   symptom (`OF: amba_device_add() failed (-16)`, the AMBA-bus
+   equivalent of the same underlying `request_resource` call) has
+   silently been present since phase 3's own PL011 node -- it just
+   never blocked that phase's milestone, since `earlycon=` bypasses
+   the AMBA bus entirely. Investigated at length (ruled out: the
+   device tree's own content -- an independent parser, `dtc`, accepts
+   it; a missing `dma-coherent` property, matching Firecracker's own
+   aarch64 FDT convention, added but confirmed by retest not to be the
+   cause; `earlycon=`'s presence on the kernel command line itself) but
+   not yet root-caused -- see `crates/oci-vmm/tests/
+   hvf_virtio_blk.rs`'s own test (currently `#[ignore]`d, with the full
+   investigation write-up in its doc comment) for the complete, honest
+   accounting. Milestone once resolved: boots to the guest's own
+   systemd against a real virtio-blk root disk.
 5. **`vmnet.framework` networking (not started).** New virtio-net
    backend parallel to the existing passt one. Milestone: DHCP and
    `--publish` parity with the Linux/passt path.
@@ -304,12 +354,19 @@ a dependency of this phase too, not yet designed in detail here).
 
 ## Honest deltas and risks accepted
 
-* Phases 4-7 are unimplemented as of this note. Phases 2-3 are real,
+* Phases 5-7 are unimplemented, and phase 4 is blocked on a real, open
+  bug (see phase 4's own entry above for the full accounting): the
+  virtio-mmio transport and virtio-blk device are implemented and the
+  guest driver does find and match the device tree node, but can't yet
+  actually bind to it (`devm_request_mem_region` fails with `-EBUSY`
+  for a not-yet-root-caused reason -- notably, the *identical* symptom
+  has quietly affected the PL011 AMBA node since phase 3, without
+  blocking that phase's own milestone). Phases 2-3 remain real,
   working, and hardware-verified: a real stock arm64 kernel boots to
   console and panics cleanly with no root filesystem, exactly as
-  designed — but there is still no disk (virtio-blk), no network
-  (virtio-net/vmnet), no SMP, and no way to actually provision a pet
-  VM's own rootfs on macOS at all yet.
+  designed — but there is still no working disk or network
+  (virtio-blk/virtio-net/vmnet), no SMP, and no way to actually
+  provision a pet VM's own rootfs on macOS at all yet.
 * `hvf::pl011` never raises a guest interrupt (`UARTRIS`/`UARTMIS`
   always read `0`) — sufficient for the kernel's own polling-based
   console writer (`pl011_console_write`, used by every serial console

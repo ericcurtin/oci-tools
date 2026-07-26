@@ -127,6 +127,14 @@ pub fn create(
     })
 }
 
+/// Asserts (or, for a level-triggered interrupt, deasserts) SPI
+/// `intid` (a full GIC INTID, i.e. already offset by
+/// [`crate::hvf::layout::GIC_SPI_BASE`], not a bare SPI index).
+#[allow(unsafe_code)] // hv_gic_set_spi takes no guest-memory/vCPU argument at all.
+pub fn set_spi(intid: u32, level: bool) -> Result<(), HvError> {
+    check(unsafe { sys::hv_gic_set_spi(intid, level) })
+}
+
 #[cfg(test)]
 mod tests {
     //! Run for real on Apple Silicon hardware (requires the

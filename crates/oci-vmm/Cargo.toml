@@ -14,20 +14,27 @@ anyhow.workspace = true
 libc.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# `GuestMemoryMmap`, the virtqueue (virtio::queue), the generated
+# virtio protocol constants, and the virtio-blk request-parsing/sync-
+# file-I/O logic all only need vm-memory's `backend-mmap` feature
+# (plain mmap), which builds cleanly on macOS too -- confirmed
+# directly, not assumed -- so this one rust-vmm crate is common to
+# both backends, unlike the rest listed below.
+vm-memory.workspace = true
 
-# The KVM/virtio-pci backend (arch, boot, builder, legacy, mem, pci,
-# virtio, vstate) is Linux/x86_64-only -- see lib.rs and
-# docs/design/0248/0249. These rust-vmm crates have no macOS
-# equivalent (kvm-ioctls wraps Linux-only ioctls directly), so they're
-# gated the same way `bin/ocivmm`'s own dependency on this crate
-# already is, rather than left as plain `[dependencies]` that would
-# fail to build at all on macOS.
+# The KVM/virtio-pci backend (arch, boot, builder, legacy, pci,
+# vstate, and the EventFd/event_manager-driven parts of virtio) is
+# Linux/x86_64-only -- see lib.rs and docs/design/0248/0249. These
+# rust-vmm crates have no macOS equivalent (kvm-ioctls wraps
+# Linux-only ioctls directly), so they're gated the same way
+# `bin/ocivmm`'s own dependency on this crate already is, rather than
+# left as plain `[dependencies]` that would fail to build at all on
+# macOS.
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 event-manager.workspace = true
 kvm-bindings.workspace = true
 kvm-ioctls.workspace = true
 linux-loader.workspace = true
-vm-memory.workspace = true
 vm-superio.workspace = true
 vmm-sys-util.workspace = true
 
