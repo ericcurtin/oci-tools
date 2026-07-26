@@ -122,13 +122,30 @@ const MAX_WALL_CLOCK: Duration = Duration::from_secs(30);
 ///   (`MPIDR_EL1`, `PC`, `X0`, `CPSR`) and nothing more. A repo-wide
 ///   search of libkrun for `iomem`/`request_region`/`EBUSY`/`-16`/
 ///   resource-conflict handling turns up nothing at all -- this bug
-///   class doesn't appear in their code. Net effect: this comparison
-///   rules out several plausible hypotheses (missing debug-trap
-///   config, missing sysreg initialization, GIC/vCPU creation
-///   ordering, wrong CPSR, a special MMIO memory-mapping attribute)
-///   rather than pointing at a fix -- the bug is very likely specific
-///   to this backend's own code, not a general HVF/macOS gotcha, and
-///   still not found.
+///   class doesn't appear in their code.
+/// * **The bug is confirmed 100% generic, not address- or
+///   device-specific**: a throwaway third device-tree node (a PL031
+///   RTC, `arm,pl031`/`arm,primecell`, at `0x09010000` -- a brand-new
+///   address never previously used by this backend at all) hits the
+///   *exact* same `OF: amba_device_add() failed (-16)` the very first
+///   time it's ever tried. Every non-RAM `iomem` resource request this
+///   backend's guest has ever attempted -- PL011, virtio-mmio, and
+///   this throwaway PL031 -- fails identically, regardless of
+///   address, AMBA-vs-plain-platform-device, or driver. Also checked
+///   and ruled out: `ID_AA64MMFR0_EL1`'s `PARange` field (`0x2`,
+///   40-bit/1 TiB) and `SCTLR_EL1`/`TCR_EL1`/`MAIR_EL1` (all `0` at
+///   reset, MMU off as expected) are all ordinary, sane values, not
+///   some corrupt/unusual vCPU reset state.
+/// * Given the bug's proven genericity, the leading remaining
+///   hypothesis (not yet confirmed) is that something makes the
+///   *entire* non-RAM address space look already-claimed to Linux's
+///   `iomem_resource` tree -- e.g. an oversized/miscomputed "System
+///   RAM", "reserved", or similar resource -- rather than anything
+///   about any *individual* device's own registration. Confirming
+///   that would need actual kernel-side introspection (a debug
+///   kernel build with `iomem_resource` tree dumping, `kgdb`, or
+///   `ftrace`) that isn't available without a working root filesystem
+///   -- itself blocked by this very bug.
 #[test]
 #[ignore = "known issue: virtio-mmio/amba devm_request_mem_region fails with -EBUSY before any \
             MMIO access reaches this backend at all -- see this test's own doc comment and \

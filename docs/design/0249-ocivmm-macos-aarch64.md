@@ -336,7 +336,19 @@ a dependency of this phase too, not yet designed in detail here).
    value, `hv_vcpu_set_trap_debug_*` usage, which system registers get
    initialized, and the "leave MMIO regions unmapped" memory-mapping
    strategy are all identical between the two backends, so none of
-   those are the cause either) but not yet root-caused -- see
+   those are the cause either) but not yet root-caused. One further,
+   decisive data point since: **the bug is confirmed 100% generic**,
+   not address- or device-specific at all -- a throwaway third node (a
+   PL031 RTC at a brand-new address, `0x09010000`, never previously
+   used) hits the identical `-16` the very first time it's tried, and
+   `ID_AA64MMFR0_EL1`/`SCTLR_EL1`/`TCR_EL1`/`MAIR_EL1` were all checked
+   and are ordinary values, not a corrupt vCPU reset state. The leading
+   remaining hypothesis: something makes the *entire* non-RAM address
+   space look already-claimed to Linux's `iomem_resource` tree, rather
+   than anything about any individual device's own registration --
+   confirming that needs real kernel-side introspection (a debug
+   kernel build, `kgdb`, `ftrace`) not available without a working
+   root filesystem, itself blocked by this very bug. See
    `crates/oci-vmm/tests/hvf_virtio_blk.rs`'s own test (currently
    `#[ignore]`d, with the full investigation write-up in its doc
    comment) for the complete, honest accounting. Milestone once
