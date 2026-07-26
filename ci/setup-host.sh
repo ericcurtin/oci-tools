@@ -39,6 +39,29 @@ sudo curl -fsSL -o /usr/local/bin/passt https://passt.top/builds/latest/x86_64/p
 sudo chmod +x /usr/local/bin/passt
 passt --version
 
+# passt refuses, by design, to run as real root outside a user
+# namespace: even started as root, it always drops to an unprivileged
+# user (`nobody` by default, or whatever `--runas` says -- confirmed:
+# even `--runas 0:0` still goes through the same drop-then-unshare
+# path) and then unshares its own user namespace to safely regain
+# "root" only inside that namespace. Confirmed the hard way: on
+# ubuntu-24.04 (this runner's own OS), that unshare(CLONE_NEWUSER)
+# call fails outright ("Couldn't create user namespace: Operation not
+# permitted" / "Failed to sandbox process, exiting"), because
+# ubuntu-24.04 restricts *unprivileged* user namespace creation by
+# default (AppArmor's own userns restriction, generally enforced via
+# this sysctl -- and, on older kernels, via the analogous, more
+# widely known unprivileged_userns_clone knob instead). This is a
+# real, deliberate hardening feature (relevant to shared, multi-user
+# desktops), not a bug -- but this CI runner is a single-purpose,
+# ephemeral VM we already fully own via sudo, so there's no multi-
+# tenant boundary here worth keeping: relax it outright rather than
+# maintaining a whole AppArmor profile just for passt. Tolerate either
+# knob being absent (kernel/AppArmor version dependent).
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null ||
+    true
+sudo sysctl -w kernel.unprivileged_userns_clone=1 2>/dev/null || true
+
 # GitHub runners ship /dev/kvm restricted to the kvm group; make it usable
 # without re-logging by widening the node (standard approach for CI
 # runners). Unlike the old qemu harness there is no TCG fallback: the
