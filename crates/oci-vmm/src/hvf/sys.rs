@@ -70,6 +70,19 @@ pub const HV_REG_PC: hv_reg_t = 31;
 /// (after `FPCR`/`FPSR`).
 pub const HV_REG_CPSR: hv_reg_t = 34;
 
+/// The general-purpose register `HV_REG_X0 + n` (`n` in `0..=30`).
+/// `hv_reg_t`'s `X0`..`X30` enumerators are contiguous, so this is
+/// exactly what the framework's own headers do too (`HV_REG_FP =
+/// HV_REG_X29`, `HV_REG_LR = HV_REG_X30`); there is no `HV_REG_X31`
+/// enumerator at all -- register index 31 in an instruction encoding
+/// means the zero register (`XZR`)/stack pointer depending on
+/// context, never a real, readable `hv_reg_t`, and callers (e.g.
+/// `hvf::mmio`'s data-abort decode) must special-case it themselves.
+pub fn hv_reg_x(n: u32) -> hv_reg_t {
+    debug_assert!(n <= 30, "x{n} is not a valid general-purpose register");
+    HV_REG_X0 + n
+}
+
 /// Memory permission flags for `hv_vm_map`/`hv_vm_protect`
 /// (`hv_memory_flags_t`, a `uint64_t` bitmask on arm64).
 pub const HV_MEMORY_READ: u64 = 1 << 0;

@@ -6,15 +6,16 @@
 //! backend alongside the KVM/x86_64 one (`crate::vstate`), sharing no
 //! code with it (different API, different architecture entirely).
 //!
-//! This module is phase 2 of `docs/design/0249-ocivmm-macos-
-//! aarch64.md`: a proven foundation (VM/vCPU creation, register
-//! access, running a guest instruction and observing its exit -- see
-//! the smoke test at the bottom of this file, which really executes
-//! this on real Apple Silicon hardware, not just compiles it), not
-//! yet a bootable guest. Later phases (arm64 boot + GIC + console,
-//! virtio-mmio, `vmnet.framework` networking, bootstrap-VM
-//! provisioning, CI wiring) are unimplemented; see that design note
-//! for the full plan and current status.
+//! This module started as phase 2 of `docs/design/0249-ocivmm-macos-
+//! aarch64.md` (VM/vCPU creation, register access, running a guest
+//! instruction and observing its exit -- see the smoke test at the
+//! bottom of this file, which really executes this on real Apple
+//! Silicon hardware, not just compiles it) and is growing into phase
+//! 3 (arm64 boot + GIC + console): [`mmio`]'s Data-Abort trap-and-
+//! emulate is the mechanism the PL011 console (and, phase 4,
+//! virtio-mmio) both need, since AArch64 has no port I/O for the
+//! architecture to trap directly the way x86_64 does. See that design
+//! note for the full plan and current status.
 //!
 //! ## Entitlement required
 //! Every test/binary that actually calls into this module must be
@@ -24,11 +25,13 @@
 //! fails with `HvError::Denied`, even running as root.
 
 pub mod error;
+pub mod mmio;
 pub mod sys;
 pub mod vcpu;
 pub mod vm;
 
 pub use error::HvError;
+pub use mmio::{DataAbort, MmioDevice, MmioError};
 pub use vcpu::{Exception, ExitReason, Vcpu};
 pub use vm::Vm;
 
