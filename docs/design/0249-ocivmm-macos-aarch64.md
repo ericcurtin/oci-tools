@@ -330,12 +330,18 @@ a dependency of this phase too, not yet designed in detail here).
    device tree's own content -- an independent parser, `dtc`, accepts
    it; a missing `dma-coherent` property, matching Firecracker's own
    aarch64 FDT convention, added but confirmed by retest not to be the
-   cause; `earlycon=`'s presence on the kernel command line itself) but
-   not yet root-caused -- see `crates/oci-vmm/tests/
-   hvf_virtio_blk.rs`'s own test (currently `#[ignore]`d, with the full
-   investigation write-up in its doc comment) for the complete, honest
-   accounting. Milestone once resolved: boots to the guest's own
-   systemd against a real virtio-blk root disk.
+   cause; `earlycon=`'s presence on the kernel command line itself;
+   and, cross-checked directly against libkrun's own HVF backend --
+   `hv_gic_create`-before-`hv_vcpu_create` ordering, the boot CPSR
+   value, `hv_vcpu_set_trap_debug_*` usage, which system registers get
+   initialized, and the "leave MMIO regions unmapped" memory-mapping
+   strategy are all identical between the two backends, so none of
+   those are the cause either) but not yet root-caused -- see
+   `crates/oci-vmm/tests/hvf_virtio_blk.rs`'s own test (currently
+   `#[ignore]`d, with the full investigation write-up in its doc
+   comment) for the complete, honest accounting. Milestone once
+   resolved: boots to the guest's own systemd against a real
+   virtio-blk root disk.
 5. **`vmnet.framework` networking (not started).** New virtio-net
    backend parallel to the existing passt one. Milestone: DHCP and
    `--publish` parity with the Linux/passt path.
