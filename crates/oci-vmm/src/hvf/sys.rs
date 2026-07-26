@@ -70,6 +70,15 @@ pub const HV_REG_PC: hv_reg_t = 31;
 /// (after `FPCR`/`FPSR`).
 pub const HV_REG_CPSR: hv_reg_t = 34;
 
+/// `HV_SYS_REG_MPIDR_EL1`: the register `hv_gic_create`'s own docs
+/// say a vCPU must have its affinity set in before running, once a
+/// GIC device exists (GICv3 uses affinity-based interrupt routing).
+/// Framework-managed: writing it through `hv_vcpu_set_sys_reg` is the
+/// documented mechanism, even though real hardware's `MPIDR_EL1` is
+/// architecturally read-only from EL1 (the actual backing register is
+/// EL2's `VMPIDR_EL2`, invisible to this API).
+pub const HV_SYS_REG_MPIDR_EL1: hv_sys_reg_t = 0xc005;
+
 /// The general-purpose register `HV_REG_X0 + n` (`n` in `0..=30`).
 /// `hv_reg_t`'s `X0`..`X30` enumerators are contiguous, so this is
 /// exactly what the framework's own headers do too (`HV_REG_FP =
@@ -169,4 +178,61 @@ unsafe extern "C" {
     /// Runs the vCPU until the next exit. Blocks the calling thread.
     /// Must be called by the owning thread.
     pub fn hv_vcpu_run(vcpu: hv_vcpu_t) -> hv_return_t;
+
+    // -- GIC (`Hypervisor/hv_gic.h`, `hv_gic_config.h`,
+    // `hv_gic_parameters.h`) --------------------------------------
+    //
+    // `hv_gic_config_t` is an opaque, retain-counted `os_object_t` in
+    // the real headers (`OS_OBJECT_DECL`); modeled here as `*mut
+    // c_void` since this module only ever creates one, passes it
+    // straight to `hv_gic_create`, and deliberately leaks it rather
+    // than resolve the ObjC-runtime-vs-plain-C-symbol question for a
+    // release call that would run at most once per process anyway --
+    // see `hvf::gic`.
+
+    /// Creates a GIC configuration object. Must be `os_release`d when
+    /// no longer needed -- `hvf::gic` deliberately doesn't (see
+    /// above).
+    pub fn hv_gic_config_create() -> *mut c_void;
+
+    /// Sets the GIC distributor region's guest physical base address
+    /// on a not-yet-`hv_gic_create`d configuration.
+    pub fn hv_gic_config_set_distributor_base(
+        config: *mut c_void,
+        distributor_base_address: hv_ipa_t,
+    ) -> hv_return_t;
+
+    /// Sets the GIC redistributor region's guest physical base
+    /// address (covering every vCPU's own redistributor frame,
+    /// contiguously) on a not-yet-`hv_gic_create`d configuration.
+    pub fn hv_gic_config_set_redistributor_base(
+        config: *mut c_void,
+        redistributor_base_address: hv_ipa_t,
+    ) -> hv_return_t;
+
+    /// Creates the (single, process-wide) GICv3 device from `config`.
+    /// Must be called after `hv_vm_create` but before any
+    /// `hv_vcpu_create`.
+    pub fn hv_gic_create(config: *mut c_void) -> hv_return_t;
+
+    /// The GIC distributor region's fixed size, in bytes.
+    pub fn hv_gic_get_distributor_size(distributor_size: *mut usize) -> hv_return_t;
+
+    /// The required alignment, in bytes, of the distributor region's
+    /// base address.
+    pub fn hv_gic_get_distributor_base_alignment(
+        distributor_base_alignment: *mut usize,
+    ) -> hv_return_t;
+
+    /// The total size, in bytes, of the redistributor region (every
+    /// vCPU's own frame, contiguously).
+    pub fn hv_gic_get_redistributor_region_size(
+        redistributor_region_size: *mut usize,
+    ) -> hv_return_t;
+
+    /// The required alignment, in bytes, of the redistributor
+    /// region's base address.
+    pub fn hv_gic_get_redistributor_base_alignment(
+        redistributor_base_alignment: *mut usize,
+    ) -> hv_return_t;
 }

@@ -25,6 +25,7 @@
 //! fails with `HvError::Denied`, even running as root.
 
 pub mod error;
+pub mod gic;
 pub mod mmio;
 pub mod pl011;
 pub mod sys;
@@ -32,6 +33,7 @@ pub mod vcpu;
 pub mod vm;
 
 pub use error::HvError;
+pub use gic::GicLayout;
 pub use mmio::{DataAbort, MmioDevice, MmioError};
 pub use pl011::Pl011;
 pub use vcpu::{Exception, ExitReason, Vcpu};
