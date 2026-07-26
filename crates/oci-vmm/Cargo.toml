@@ -11,13 +11,22 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# The KVM/virtio-pci backend (arch, boot, builder, legacy, mem, pci,
+# virtio, vstate) is Linux/x86_64-only -- see lib.rs and
+# docs/design/0248/0249. These rust-vmm crates have no macOS
+# equivalent (kvm-ioctls wraps Linux-only ioctls directly), so they're
+# gated the same way `bin/ocivmm`'s own dependency on this crate
+# already is, rather than left as plain `[dependencies]` that would
+# fail to build at all on macOS.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 event-manager.workspace = true
 kvm-bindings.workspace = true
 kvm-ioctls.workspace = true
-libc.workspace = true
 linux-loader.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
 vm-memory.workspace = true
 vm-superio.workspace = true
 vmm-sys-util.workspace = true

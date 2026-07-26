@@ -27,16 +27,32 @@
 //! ACPI, no rate limiters, no jailer, no MMIO transport. Built on the
 //! rust-vmm ecosystem crates from crates.io — every byte statically
 //! linked, nothing resolved at run time.
+//!
+//! A second, independent backend (`hvf`) targets macOS/aarch64 via
+//! Hypervisor.framework -- see `docs/design/0249-ocivmm-macos-
+//! aarch64.md` for the phased plan. It shares no code with the
+//! modules above (different hypervisor API, different architecture
+//! entirely) and is gated to its own target instead of this crate's
+//! historical whole-crate `cfg`.
 
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
-
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod arch;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod boot;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod builder;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod hvf;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod legacy;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod mem;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod pci;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod virtio;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod vstate;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use builder::{VmmConfig, run};
