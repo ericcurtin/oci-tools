@@ -189,8 +189,10 @@ fn guest_virtio_blk_driver_detects_the_disk_and_reports_its_size() {
         .len();
     let expected_sectors = disk_len / 512;
 
-    let kernel =
+    let raw_kernel =
         std::fs::read(&kernel_path).unwrap_or_else(|e| panic!("reading {kernel_path}: {e}"));
+    let kernel = oci_vmm::hvf::load_image(&raw_kernel)
+        .expect("unwrap the kernel package's own vmlinuz/Image");
     let header = ImageHeader::parse(&kernel).expect("parse arm64 Image header");
     let entry_addr = header.entry_address(layout::RAM_BASE);
     let kernel_offset = entry_addr - layout::RAM_BASE;

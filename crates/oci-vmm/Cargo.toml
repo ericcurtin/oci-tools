@@ -11,6 +11,11 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+# `hvf::boot::unwrap_efi_zboot`'s own gzip decompression -- the same
+# pure-Rust decompressor `bin/ocivmm`'s own x86_64 bzImage-unwrapping
+# already uses, for the same reason (real distro kernel packages, not
+# a bare `Image` file).
+flate2.workspace = true
 libc.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

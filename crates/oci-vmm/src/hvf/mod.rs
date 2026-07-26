@@ -39,7 +39,7 @@ pub mod virtio_blk;
 pub mod virtio_mmio;
 pub mod vm;
 
-pub use boot::ImageHeader;
+pub use boot::{ImageError, ImageHeader, load_image, unwrap_efi_zboot};
 pub use error::HvError;
 pub use fdt::FdtWriter;
 pub use gic::GicLayout;

@@ -15,17 +15,27 @@
 //! `SCTLR_EL1`, so it stays at its post-reset off state; `CPSR` is set
 //! explicitly by every caller, matching the phase-2/3 smoke tests).
 //!
-//! No decompression step of this module's own: unlike x86_64's
-//! bzImage (a *compressed* payload the guest's own embedded stub
-//! would normally decompress, which a direct-64-bit-entry boot never
-//! runs -- see `crate::boot`'s own module docs), "the AArch64 kernel
-//! does not currently provide a decompressor" at all (ibid.) --
-//! meaning a compressed `Image.gz` target requires the *bootloader*
-//! to gunzip it first, but the plain `Image` target (what every stock
-//! distro kernel package actually ships as `/boot/vmlinuz-*` on
-//! aarch64, unlike some other packaging's `Image.gz`/EFI zboot
-//! wrapper) is already the same plain, uncompressed, directly-
-//! executable form this module loads as-is.
+//! No decompression step for the plain `Image` itself: unlike
+//! x86_64's bzImage (a *compressed* payload the guest's own embedded
+//! stub would normally decompress, which a direct-64-bit-entry boot
+//! never runs -- see `crate::boot`'s own module docs), "the AArch64
+//! kernel does not currently provide a decompressor" at all (ibid.)
+//! -- a compressed `Image.gz` target requires the *bootloader* to
+//! gunzip it first, but the plain `Image` form this module loads is
+//! already directly executable as-is.
+//!
+//! One real wrinkle found booting actual distro kernel packages
+//! rather than a bare `Image` file, though: `/boot/vmlinuz-*` as
+//! shipped by real Ubuntu and CentOS Stream aarch64 kernel packages
+//! turned out to be **EFI zboot**-wrapped (`CONFIG_EFI_ZBOOT`) -- a
+//! small, valid PE/COFF "EFI application" (magic `"MZ"`, then `"zimg"`
+//! at offset 4) whose own header names a compressed payload offset/
+//! size/algorithm, meant to be decompressed by a real UEFI
+//! bootloader's own EFI stub, not by a direct-kernel-boot VMM like
+//! this one at all. [`unwrap_efi_zboot`] undoes exactly that
+//! wrapping, so this backend can boot real, unmodified distro kernel
+//! packages directly instead of requiring a pre-extracted plain
+//! `Image` file prepared by hand.
 
 /// Required alignment of the 2 MiB-aligned base the `Image` is placed
 /// `text_offset` bytes past.
@@ -52,8 +62,8 @@ pub struct ImageHeader {
     pub flags: u64,
 }
 
-/// Errors parsing an `Image`'s header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+/// Errors parsing an `Image`'s header, or loading/unwrapping one.
+#[derive(Debug, thiserror::Error)]
 pub enum ImageError {
     /// Fewer than 64 bytes -- not even large enough to hold the
     /// header.
@@ -67,6 +77,29 @@ pub enum ImageError {
         "bad Image magic {0:#010x}, expected {IMAGE_MAGIC:#010x} (\"ARM\\x64\") -- not a plain, uncompressed arm64 Image"
     )]
     BadMagic(u32),
+    /// An EFI zboot header was found, but its own `payload_offset`/
+    /// `payload_size` fields don't fit within the actual file.
+    #[error(
+        "EFI zboot header names a payload [{offset:#x}, {offset:#x}+{size:#x}) past the end of a {file_len}-byte file"
+    )]
+    ZbootPayloadOutOfBounds {
+        /// The header's own `payload_offset` field.
+        offset: u32,
+        /// The header's own `payload_size` field.
+        size: u32,
+        /// The actual length of the file.
+        file_len: usize,
+    },
+    /// An EFI zboot header was found, naming a compression algorithm
+    /// this module doesn't implement (only `gzip` is; every real
+    /// aarch64 distro kernel package examined so far -- Ubuntu,
+    /// CentOS Stream -- uses it).
+    #[error("EFI zboot payload uses unsupported compression {0:?} (only \"gzip\" is implemented)")]
+    UnsupportedZbootCompression(String),
+    /// The EFI zboot payload claimed to be `gzip` but failed to
+    /// decompress as one.
+    #[error("EFI zboot gzip payload failed to decompress: {0}")]
+    ZbootGzip(#[from] std::io::Error),
 }
 
 impl ImageHeader {
@@ -101,6 +134,80 @@ impl ImageHeader {
     }
 }
 
+/// EFI zboot header magic: `"MZ"` (the shared PE/COFF-and-arm64-Image
+/// magic both formats start with) followed by `"zimg"` at offset 4.
+const ZBOOT_MAGIC: &[u8; 8] = b"MZ\0\0zimg";
+
+/// The plain gzip magic (`RFC 1952`): real distro packaging isn't
+/// consistent about *which* wrapping a `vmlinuz` file uses -- Ubuntu's
+/// own aarch64 kernel package ships a plain gzip stream directly (no
+/// EFI zboot header at all), while CentOS Stream's uses EFI zboot
+/// (see [`unwrap_efi_zboot`]'s own docs) -- confirmed directly against
+/// both projects' real packages, not assumed.
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
+/// Loads a real arm64 kernel package's `vmlinuz`/`Image` file,
+/// transparently undoing whichever wrapping (if any) it turns out to
+/// use -- EFI zboot ([`unwrap_efi_zboot`]) or a bare gzip stream (both
+/// confirmed necessary against real distro packages; see this
+/// module's own docs). Returns the plain bytes [`ImageHeader::parse`]
+/// expects, unmodified if `data` was already a plain `Image`.
+pub fn load_image(data: &[u8]) -> Result<Vec<u8>, ImageError> {
+    if let Some(unwrapped) = unwrap_efi_zboot(data)? {
+        return Ok(unwrapped);
+    }
+
+    if data.len() >= 2 && data[0..2] == GZIP_MAGIC {
+        let mut decoder = flate2::read::GzDecoder::new(data);
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut out)?;
+        return Ok(out);
+    }
+
+    Ok(data.to_vec())
+}
+
+/// Undoes EFI zboot wrapping (see this module's own docs) if `data` is
+/// zboot-wrapped at all. Returns `Ok(None)` (not an error) if `data`
+/// doesn't start with the zboot magic -- the caller's own `data` is
+/// presumably already a plain `Image` in that case, for
+/// [`ImageHeader::parse`] to judge.
+pub fn unwrap_efi_zboot(data: &[u8]) -> Result<Option<Vec<u8>>, ImageError> {
+    if data.len() < 32 || &data[0..8] != ZBOOT_MAGIC {
+        return Ok(None);
+    }
+
+    let payload_offset = u32::from_le_bytes(data[8..12].try_into().unwrap());
+    let payload_size = u32::from_le_bytes(data[12..16].try_into().unwrap());
+    let compression = &data[24..32];
+    let compression_str = compression[..compression
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(compression.len())]
+        .to_vec();
+
+    let start = payload_offset as usize;
+    let end = start.saturating_add(payload_size as usize);
+    let payload = data
+        .get(start..end)
+        .ok_or(ImageError::ZbootPayloadOutOfBounds {
+            offset: payload_offset,
+            size: payload_size,
+            file_len: data.len(),
+        })?;
+
+    if compression_str != b"gzip" {
+        return Err(ImageError::UnsupportedZbootCompression(
+            String::from_utf8_lossy(&compression_str).into_owned(),
+        ));
+    }
+
+    let mut decoder = flate2::read::GzDecoder::new(payload);
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut out)?;
+    Ok(Some(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,14 +235,14 @@ mod tests {
     #[test]
     fn rejects_a_short_buffer() {
         let err = ImageHeader::parse(&[0u8; 63]).unwrap_err();
-        assert_eq!(err, ImageError::TooShort(63));
+        assert!(matches!(err, ImageError::TooShort(63)));
     }
 
     #[test]
     fn rejects_a_bad_magic() {
         let bytes = header_bytes(0, 0, 0, 0xdead_beef);
         let err = ImageHeader::parse(&bytes).unwrap_err();
-        assert_eq!(err, ImageError::BadMagic(0xdead_beef));
+        assert!(matches!(err, ImageError::BadMagic(0xdead_beef)));
     }
 
     #[test]
@@ -145,5 +252,89 @@ mod tests {
 
         let header = ImageHeader::parse(&header_bytes(0x8_0000, 0, 0, IMAGE_MAGIC)).unwrap();
         assert_eq!(header.entry_address(0x4000_0000), 0x4008_0000);
+    }
+
+    /// Builds a synthetic EFI-zboot-wrapped file around `inner`
+    /// (gzip-compressed), matching the real header layout found in
+    /// actual Ubuntu/CentOS Stream aarch64 kernel packages: `"MZ\0\0zimg"`
+    /// magic, then `payload_offset`/`payload_size` (u32 LE), then 8
+    /// reserved bytes, then an 8-byte NUL-padded compression-algorithm
+    /// name, then arbitrary padding before the payload itself.
+    fn zboot_wrap(inner: &[u8], compression: &[u8; 8]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(inner).unwrap();
+        let payload = gz.finish().unwrap();
+
+        let payload_offset: u32 = 64; // arbitrary padding before the payload, like the real format has.
+        let mut wrapped = vec![0u8; payload_offset as usize];
+        wrapped[0..8].copy_from_slice(ZBOOT_MAGIC);
+        wrapped[8..12].copy_from_slice(&payload_offset.to_le_bytes());
+        wrapped[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        wrapped[24..32].copy_from_slice(compression);
+        wrapped.extend_from_slice(&payload);
+        wrapped
+    }
+
+    #[test]
+    fn unwrap_efi_zboot_recovers_the_original_gzip_payload() {
+        let inner = header_bytes(0x8_0000, 0x0100_0000, 0, IMAGE_MAGIC);
+        let wrapped = zboot_wrap(&inner, b"gzip\0\0\0\0");
+
+        let unwrapped = unwrap_efi_zboot(&wrapped)
+            .unwrap()
+            .expect("should detect zboot wrapping");
+        assert_eq!(unwrapped, inner);
+
+        // load_image should transparently do the same thing.
+        let loaded = load_image(&wrapped).unwrap();
+        assert_eq!(loaded, inner);
+
+        // ...and the result should parse as a normal Image header.
+        let header = ImageHeader::parse(&unwrapped).unwrap();
+        assert_eq!(header.text_offset, 0x8_0000);
+    }
+
+    #[test]
+    fn load_image_also_unwraps_a_bare_gzip_stream() {
+        // Matches Ubuntu's own real aarch64 kernel packaging: a plain
+        // gzip stream, no EFI zboot header at all.
+        use std::io::Write;
+        let inner = header_bytes(0, 0, 0, IMAGE_MAGIC);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&inner).unwrap();
+        let wrapped = gz.finish().unwrap();
+
+        assert_eq!(load_image(&wrapped).unwrap(), inner);
+    }
+
+    #[test]
+    fn unwrap_efi_zboot_returns_none_for_a_plain_image() {
+        let plain = header_bytes(0, 0, 0, IMAGE_MAGIC);
+        assert_eq!(unwrap_efi_zboot(&plain).unwrap(), None);
+
+        // load_image should pass plain (non-zboot) data through unchanged.
+        assert_eq!(load_image(&plain).unwrap(), plain);
+    }
+
+    #[test]
+    fn unwrap_efi_zboot_rejects_unsupported_compression() {
+        let inner = header_bytes(0, 0, 0, IMAGE_MAGIC);
+        let wrapped = zboot_wrap(&inner, b"zstd\0\0\0\0");
+        let err = unwrap_efi_zboot(&wrapped).unwrap_err();
+        assert!(matches!(err, ImageError::UnsupportedZbootCompression(ref s) if s == "zstd"));
+    }
+
+    #[test]
+    fn unwrap_efi_zboot_rejects_an_out_of_bounds_payload() {
+        let mut wrapped = vec![0u8; 64];
+        wrapped[0..8].copy_from_slice(ZBOOT_MAGIC);
+        wrapped[8..12].copy_from_slice(&64u32.to_le_bytes());
+        wrapped[12..16].copy_from_slice(&0xffff_ffffu32.to_le_bytes()); // Absurdly large payload_size.
+        wrapped[24..32].copy_from_slice(b"gzip\0\0\0\0");
+
+        let err = unwrap_efi_zboot(&wrapped).unwrap_err();
+        assert!(matches!(err, ImageError::ZbootPayloadOutOfBounds { .. }));
     }
 }

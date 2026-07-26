@@ -80,14 +80,18 @@ const MAX_WALL_CLOCK: Duration = Duration::from_secs(30);
 fn boots_a_real_kernel_image_to_its_own_console_and_panics_without_a_rootfs() {
     let Ok(kernel_path) = std::env::var("OCIVMM_TEST_KERNEL_IMAGE") else {
         eprintln!(
-            "skipping: set OCIVMM_TEST_KERNEL_IMAGE to a plain, uncompressed arm64 Image file \
-             to run this test (see hvf::boot's own module docs on what \"plain\" means -- not \
-             every distro's own vmlinuz-* qualifies directly)"
+            "skipping: set OCIVMM_TEST_KERNEL_IMAGE to point at a real distro aarch64 kernel \
+             package's own vmlinuz/Image file to run this test -- `hvf::load_image` transparently \
+             unwraps whichever wrapping (if any) it uses (EFI zboot, a bare gzip stream, or \
+             neither), so any of Ubuntu's, CentOS Stream's, or Alpine's own real kernel packages \
+             work directly, no manual pre-extraction needed"
         );
         return;
     };
-    let kernel =
+    let raw_kernel =
         std::fs::read(&kernel_path).unwrap_or_else(|e| panic!("reading {kernel_path}: {e}"));
+    let kernel = oci_vmm::hvf::load_image(&raw_kernel)
+        .expect("unwrap the kernel package's own vmlinuz/Image");
     let header = ImageHeader::parse(&kernel).expect("parse arm64 Image header");
     let entry_addr = header.entry_address(layout::RAM_BASE);
     let kernel_offset = entry_addr - layout::RAM_BASE;

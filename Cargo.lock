@@ -1170,6 +1170,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "event-manager",
+ "flate2",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
