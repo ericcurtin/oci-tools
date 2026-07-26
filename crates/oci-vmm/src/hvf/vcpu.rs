@@ -84,6 +84,16 @@ impl<'vm> Vcpu<'vm> {
         })
     }
 
+    /// The raw `hv_vcpu_t` ID -- exposed only so another thread can
+    /// call `hv_vcpus_exit`/`hv_vcpu_interrupt`-shaped cancellation
+    /// APIs against this vCPU while it's blocked in `run()` (the one
+    /// documented exception to every other `hv_vcpu_*` call's
+    /// owning-thread restriction); this module itself doesn't wrap
+    /// such a call yet.
+    pub fn id(&self) -> sys::hv_vcpu_t {
+        self.id
+    }
+
     /// Reads a general-purpose/PC/FPCR/FPSR/CPSR register.
     pub fn get_reg(&self, reg: hv_reg_t) -> Result<u64, HvError> {
         let mut value = 0u64;
@@ -116,6 +126,46 @@ impl<'vm> Vcpu<'vm> {
     pub fn set_sys_reg(&self, reg: hv_sys_reg_t, value: u64) -> Result<(), HvError> {
         // SAFETY: see `get_reg`.
         let rc = unsafe { sys::hv_vcpu_set_sys_reg(self.id, reg, value) };
+        check(rc)
+    }
+
+    /// Disables (or re-enables) trapping guest debug exceptions and
+    /// debug-register accesses to the host -- see `hvf::sys`'s own
+    /// docs on `hv_vcpu_set_trap_debug_exceptions`/
+    /// `hv_vcpu_set_trap_debug_reg_accesses` on why every real distro
+    /// kernel this backend targets needs this called with `false`
+    /// before running at all (its own early debug-monitor bring-up
+    /// writes `OSDLR_EL1` unconditionally, which traps by default).
+    pub fn set_trap_debug(&self, trap: bool) -> Result<(), HvError> {
+        let rc = unsafe { sys::hv_vcpu_set_trap_debug_exceptions(self.id, trap) };
+        check(rc)?;
+        let rc = unsafe { sys::hv_vcpu_set_trap_debug_reg_accesses(self.id, trap) };
+        check(rc)
+    }
+
+    /// Reads whether the ARM generic virtual timer interrupt is
+    /// currently masked (see [`Vcpu::set_vtimer_mask`]).
+    pub fn get_vtimer_mask(&self) -> Result<bool, HvError> {
+        let mut masked = false;
+        let rc = unsafe { sys::hv_vcpu_get_vtimer_mask(self.id, &mut masked) };
+        check(rc)?;
+        Ok(masked)
+    }
+
+    /// Masks or unmasks the ARM generic virtual timer interrupt. The
+    /// framework masks it automatically whenever `run()` returns
+    /// [`ExitReason::VtimerActivated`]; per its own docs, the caller
+    /// is expected to make the corresponding interrupt pending in the
+    /// guest's interrupt controller and unmask it again once that
+    /// interrupt has been serviced. With `hvf::gic` (this backend's
+    /// only interrupt-controller integration) actively managing the
+    /// redistributor, it isn't yet established whether this backend
+    /// needs to call this at all or whether the framework's own GIC
+    /// integration handles the whole vtimer-to-PPI path automatically
+    /// -- exercised directly, not just assumed, by this backend's own
+    /// real-kernel boot testing.
+    pub fn set_vtimer_mask(&self, masked: bool) -> Result<(), HvError> {
+        let rc = unsafe { sys::hv_vcpu_set_vtimer_mask(self.id, masked) };
         check(rc)
     }
 

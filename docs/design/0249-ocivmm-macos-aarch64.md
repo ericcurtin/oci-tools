@@ -1,7 +1,9 @@
 # Design note 0249: `ocivmm` on macOS/aarch64 — a Hypervisor.framework backend
 
-Status: proposed (phase 2 landed: raw HVF bindings + a standalone
-VM/vCPU smoke test; phases 3-7 are future work, tracked below)
+Status: proposed (phases 2-3 landed: raw HVF bindings, VM/vCPU/GIC/
+PL011/FDT foundation, and a real, unmodified stock arm64 kernel boots
+end to end to its own console banner and panics cleanly for lack of a
+root filesystem; phases 4-7 are future work, tracked below)
 Scope: `crates/oci-vmm/` (new `hvf`/`aarch64` backend, alongside the
 existing KVM/x86_64 one), `bin/ocivmm/` (macOS provisioning path,
 codesigning), `.github/workflows/ci.yml` (two new matrix cells, added
@@ -88,14 +90,31 @@ devices today.
 
 arm64 Linux's own boot protocol is entirely different from x86_64's:
 a plain, already-uncompressed `Image` file (no bzImage self-extracting
-stub to unwrap, unlike `boot.rs`'s `extract_vmlinux`), entered with the
-device tree blob's physical address in `x0` and every other register
-zeroed, no GDT/page-table/MP-table setup at all. The device tree itself
-(built at boot time with a small hand-rolled FDT writer, matching this
-project's "own the code that matters" precedent rather than pulling in
-a generic `fdt`-crate dependency) carries `/memory`, `/cpus`, `/chosen`
-(bootargs + initrd location), a `/pl011` UART node, a `/psci` node, and
-one `/virtio_mmio` node per device.
+stub to unwrap, unlike `boot.rs`'s `extract_vmlinux` — see phase 3
+below on one real packaging wrinkle this still ran into), entered with
+the device tree blob's physical address in `x0` and every other
+register zeroed, no GDT/page-table/MP-table setup at all. The device
+tree itself (built with a small hand-rolled FDT writer, `hvf::fdt` —
+matching this project's "own the code that matters" precedent rather
+than pulling in a generic `fdt`-crate dependency, and cross-checked
+against a real external parser, `dtc`, not just self-consistency)
+carries `/memory`, `/cpus` (a single, always-on boot CPU only — see
+below on why there's no `/psci` node yet), `/chosen` (bootargs + initrd
+location), `/timer` (the architected timer — required for Linux's
+clockevent source to exist at all, see phase 3), a `/pl011` UART node
+plus its own `apb-pclk` fixed-clock dependency, the GICv3
+`interrupt-controller` node, and (phase 4) one `/virtio_mmio` node per
+device.
+
+No `/psci` node, and no `enable-method` on the one CPU node, for the
+same single-boot-CPU reason: a `psci`-enable-method secondary CPU
+requires this backend to answer real PSCI HVC calls (`CPU_ON`,
+`PSCI_VERSION`, ...), which nothing here implements yet; omitting
+`/psci` entirely means `psci_dt_init` finds no such node and skips
+PSCI setup outright, so the (single) boot CPU never attempts one. A
+future phase adding real SMP would need both a `/psci` node and an
+HVC-call responder in `hvf::vcpu`'s own exit loop — deferred
+deliberately, not an oversight.
 
 ### Interrupts: `hv_gic`, not a hand-rolled GIC
 
@@ -107,13 +126,21 @@ to make the way there was for KVM's PIC/IOAPIC; the aarch64 backend
 always uses the framework's own GIC, configured for the vCPU count at
 VM-creation time.
 
-### Console: PL011, not the 16550
+### Console: a hand-written PL011, not the 16550 and not `vm-superio`
 
 `legacy/serial.rs`'s 16550 UART emulation (`vm-superio`) is
-x86_64/PC-legacy-shaped; arm64 "virt"-style boots use an ARM PL011,
-which `vm-superio` also implements (`vm_superio::Pl011`) — the same
-crate, a different one of its device models, wired to a second MMIO
-window and device-tree node instead of port 0x3f8.
+x86_64/PC-legacy-shaped; arm64 "virt"-style boots use an ARM PL011
+instead. `vm-superio` (already a dependency, on the KVM/x86_64 side)
+turned out to have **no PL011 model at all** — only a 16550, an i8042,
+and a PL031 RTC — an assumption this note originally got wrong before
+phase 3 actually went looking; `hvf::pl011` is hand-written directly
+against the real PL011 register layout instead, cross-checked against
+QEMU's own `hw/char/pl011.c` (in particular the AMBA PrimeCell ID
+bytes Linux's `amba` bus driver reads back during probe). It has no
+MMIO-mapped host memory of its own at all: every access is a real
+stage-2 Data Abort this crate decodes and dispatches (`hvf::mmio`),
+since AArch64 has no port I/O for the architecture to trap directly
+the way x86_64/KVM's device model does.
 
 ### Networking: `vmnet.framework`, not passt
 
@@ -188,11 +215,70 @@ a dependency of this phase too, not yet designed in detail here).
      worth recording so a future "why did the smoke test just
      disappear with no output" doesn't get mis-attributed to this
      module's own code.
-3. **arm64 boot + GIC + console (not started).** `Image`+dtb loader,
-   `hv_gic` setup, PL011. Milestone: a stock CentOS/Ubuntu aarch64
-   kernel reaches its own early console output and panics cleanly for
-   lack of a root filesystem (the same "no rootfs yet" milestone the
-   x86_64 port used along the way, per 0248's own history).
+3. **arm64 boot + GIC + console (landed).** `hvf::boot` (`Image`
+   header parsing), `hvf::mmio` (Data Abort trap-and-emulate — the
+   mechanism PL011, and phase 4's virtio-mmio, both need), `hvf::pl011`
+   (the console device), `hvf::gic` (`hv_gic` bindings + GICv3
+   creation), `hvf::fdt` (the device tree writer), `hvf::layout` (this
+   backend's memory map, deliberately matching QEMU's own `virt`
+   machine addresses so `qemu-system-aarch64 -M virt -accel hvf` —
+   itself Hypervisor.framework-accelerated, available on this same
+   Apple Silicon hardware — could be used as an independent reference
+   implementation while developing this phase), and `hvf::sysreg_trap`
+   (trapped `MSR`/`MRS` handling, see below). Milestone genuinely
+   reached, not just approximated: `crates/oci-vmm/tests/hvf_boot.rs`
+   boots a real, unmodified Alpine `linux-virt` 6.6.142 aarch64 kernel
+   (a real stock distro kernel package, not a custom build) through
+   this backend end to end, to its own `Linux version ...` banner and
+   a clean `Kernel panic - not syncing: VFS: Unable to mount root fs`
+   (no initrd/root= given) — the same "no rootfs yet" milestone the
+   x86_64 port used along the way, per 0248's own history.
+
+   Facts confirmed directly while getting a real kernel to boot, none
+   obvious ahead of time:
+   * **A `/timer` device tree node (`compatible = "arm,armv8-timer"`)
+     is required for Linux's `arch_timer` driver to register a
+     clockevent device *at all*.** Without one, the kernel boots
+     (memory, GIC, SMP bring-up all succeed) but hangs indefinitely at
+     a fixed instruction address once something depends on jiffies
+     actually advancing — confirmed by forcibly cancelling the vCPU
+     mid-hang (`hv_vcpus_exit`, explicitly documented as safe to call
+     from another thread, unlike every other `hv_vcpu_*` call) and
+     re-checking its `PC` across several rounds: identical every time,
+     not slow progress. The standard PPI numbers (secure/non-secure
+     physical, virtual, hypervisor) match both QEMU's own generated
+     tree and `hv_gic_intid_t`'s own values.
+   * **The device tree needs a root `interrupt-parent` pointing at the
+     GIC.** `dtc` itself warns about this (`Missing interrupt-parent`)
+     if omitted; without it device interrupt properties can't resolve
+     at all.
+   * **The PL011 device tree node needs a real `clocks`/`apb-pclk`
+     fixed-clock dependency.** `amba-pl011`'s driver probe calls
+     `devm_clk_get` and fails outright without one (found by
+     cross-checking QEMU's own generated tree, which provides exactly
+     this node for the same reason).
+   * **Hypervisor.framework traps some debug-adjacent system registers
+     Linux writes unconditionally during early boot, that
+     `hv_vcpu_set_trap_debug_reg_accesses(false)` does not cover.**
+     Specifically `OSLAR_EL1`/`OSDLR_EL1` (the "OS Lock"/"OS Double
+     Lock" registers, written by every stock kernel's own debug-monitor
+     bring-up) still exit with `EC == 0x18` ("Trapped MSR, MRS, or
+     System instruction execution") regardless. `hvf::sysreg_trap`
+     handles this generically (decode `op0`/`op1`/`CRn`/`CRm`/`op2`,
+     accept writes, answer reads with `0`) rather than special-casing
+     just the two registers hit so far, since this project emulates
+     none of the ARM debug architecture and has no reason to expect
+     it's seen the last such register.
+   * **A guest-run watchdog needs a real cancellation mechanism, not
+     just a deadline checked between `vcpu.run()` calls.** Once the
+     kernel panics (`panic=-1`, no reboot configured), it settles into
+     a final idle/halt loop that does not reliably produce any further
+     exit at all — a naive "check `Instant::now()` before each
+     `run()`" loop hung indefinitely at exactly that point during this
+     phase's own development, even though the guest had already
+     printed everything this test was looking for. The fix was a real
+     watchdog thread calling `hv_vcpus_exit` after a deadline, exactly
+     the mechanism the framework documents that call for.
 4. **virtio-mmio transport + device-tree nodes (not started).** Port
    `virtio::block`/`virtio::net` onto a new `virtio/transport/mmio/`
    sitting alongside `virtio/transport/pci/`; this is also the natural
@@ -218,9 +304,25 @@ a dependency of this phase too, not yet designed in detail here).
 
 ## Honest deltas and risks accepted
 
-* Phases 3-7 are unimplemented as of this note. Phase 2 is a real,
-  working foundation (VM/vCPU creation, one instruction executed, exit
-  observed, entitlement plumbing proven) but not yet a bootable guest.
+* Phases 4-7 are unimplemented as of this note. Phases 2-3 are real,
+  working, and hardware-verified: a real stock arm64 kernel boots to
+  console and panics cleanly with no root filesystem, exactly as
+  designed — but there is still no disk (virtio-blk), no network
+  (virtio-net/vmnet), no SMP, and no way to actually provision a pet
+  VM's own rootfs on macOS at all yet.
+* `hvf::pl011` never raises a guest interrupt (`UARTRIS`/`UARTMIS`
+  always read `0`) — sufficient for the kernel's own polling-based
+  console writer (`pl011_console_write`, used by every serial console
+  driver Linux ships, precisely because `printk` must also work with
+  interrupts disabled), but real interactive input beyond this
+  project's existing `ocivmm cp` disk-image channel would need actual
+  `hv_gic_set_spi`-driven interrupt delivery, not implemented.
+* `hvf::sysreg_trap`'s "answer every unrecognized `MRS` with `0`"
+  policy is a real risk for any future kernel/config that reads a
+  trapped register expecting a *specific*, non-zero value as part of a
+  poll loop (a wrong answer there could hang exactly the way the
+  missing `/timer` node did) — no such case has been hit yet, but nothing
+  currently detects one before it manifests as a hang.
 * The provisioning redesign (phase 6) has no existing precedent in
   this codebase to port from (unlike phases 2-5, which have KVM/x86_64
   and/or libkrun analogues to study) — it is new design, and may turn

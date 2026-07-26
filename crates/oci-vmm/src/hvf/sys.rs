@@ -179,6 +179,38 @@ unsafe extern "C" {
     /// Must be called by the owning thread.
     pub fn hv_vcpu_run(vcpu: hv_vcpu_t) -> hv_return_t;
 
+    /// Reads whether the ARM generic virtual timer interrupt is
+    /// currently masked for this vCPU (auto-set by the framework on
+    /// `HV_EXIT_REASON_VTIMER_ACTIVATED`).
+    pub fn hv_vcpu_get_vtimer_mask(vcpu: hv_vcpu_t, vtimer_is_masked: *mut bool) -> hv_return_t;
+
+    /// Sets whether the ARM generic virtual timer interrupt is masked
+    /// for this vCPU.
+    pub fn hv_vcpu_set_vtimer_mask(vcpu: hv_vcpu_t, vtimer_is_masked: bool) -> hv_return_t;
+
+    /// Forces an immediate exit of the given vCPUs -- unlike every
+    /// other `hv_vcpu_*` call in this module, explicitly *not*
+    /// restricted to the owning thread (it exists specifically so
+    /// another thread can cancel a blocked `hv_vcpu_run`).
+    pub fn hv_vcpus_exit(vcpus: *mut hv_vcpu_t, vcpu_count: u32) -> hv_return_t;
+
+    /// Sets whether debug exceptions in the guest are trapped to the
+    /// host. `false` (this backend's own setting -- it emulates no
+    /// part of the ARM debug architecture) lets the guest handle its
+    /// own debug exceptions entirely natively.
+    pub fn hv_vcpu_set_trap_debug_exceptions(vcpu: hv_vcpu_t, value: bool) -> hv_return_t;
+
+    /// Sets whether guest accesses to debug registers (`DBGBCRn_EL1`,
+    /// `DBGBVRn_EL1`, `DBGWCRn_EL1`, `DBGWVRn_EL1`, `MDSCR_EL1`, and
+    /// -- found the hard way, booting a real kernel -- `OSDLR_EL1`)
+    /// are trapped to the host. `false` (this backend's own setting)
+    /// lets the guest access them directly; every stock distro
+    /// kernel's own debug-monitor bring-up (`reset_ctrl_regs` writing
+    /// `OSDLR_EL1 = 0`) does this unconditionally during early boot,
+    /// trap-and-emulating it would mean handling the entire debug
+    /// register file for no benefit this backend needs.
+    pub fn hv_vcpu_set_trap_debug_reg_accesses(vcpu: hv_vcpu_t, value: bool) -> hv_return_t;
+
     // -- GIC (`Hypervisor/hv_gic.h`, `hv_gic_config.h`,
     // `hv_gic_parameters.h`) --------------------------------------
     //

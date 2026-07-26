@@ -132,6 +132,21 @@ impl<W: Write> Pl011<W> {
         self.rx.extend(bytes);
     }
 
+    /// Consumes this device and returns its writer -- e.g. to inspect
+    /// everything a guest transmitted after the device is done being
+    /// used, the way this backend's own boot-integration test reads
+    /// back captured console output.
+    pub fn into_inner(self) -> W {
+        self.writer
+    }
+
+    /// Borrows the writer without consuming the device -- e.g. to
+    /// peek at transmitted output while the guest may still be
+    /// running.
+    pub fn writer(&self) -> &W {
+        &self.writer
+    }
+
     fn flags(&self) -> u32 {
         let mut flags = FR_TXFE;
         if self.rx.is_empty() {

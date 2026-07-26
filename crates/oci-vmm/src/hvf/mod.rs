@@ -29,9 +29,11 @@ pub mod error;
 pub mod fdt;
 pub mod gic;
 pub mod layout;
+pub mod machine;
 pub mod mmio;
 pub mod pl011;
 pub mod sys;
+pub mod sysreg_trap;
 pub mod vcpu;
 pub mod vm;
 
@@ -41,6 +43,7 @@ pub use fdt::FdtWriter;
 pub use gic::GicLayout;
 pub use mmio::{DataAbort, MmioDevice, MmioError};
 pub use pl011::Pl011;
+pub use sysreg_trap::Sys64Trap;
 pub use vcpu::{Exception, ExitReason, Vcpu};
 pub use vm::Vm;
 
