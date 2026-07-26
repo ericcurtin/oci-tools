@@ -24,6 +24,7 @@
 //! `packaging/macos/ocivmm.entitlements`) -- otherwise `Vm::create`
 //! fails with `HvError::Denied`, even running as root.
 
+pub mod boot;
 pub mod error;
 pub mod fdt;
 pub mod gic;
@@ -34,6 +35,7 @@ pub mod sys;
 pub mod vcpu;
 pub mod vm;
 
+pub use boot::ImageHeader;
 pub use error::HvError;
 pub use fdt::FdtWriter;
 pub use gic::GicLayout;
