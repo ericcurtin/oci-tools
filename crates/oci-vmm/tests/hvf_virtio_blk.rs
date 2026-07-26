@@ -146,6 +146,28 @@ const MAX_WALL_CLOCK: Duration = Duration::from_secs(30);
 ///   kernel build with `iomem_resource` tree dumping, `kgdb`, or
 ///   `ftrace`) that isn't available without a working root filesystem
 ///   -- itself blocked by this very bug.
+/// * **Confirmed version/vendor-independent**: the identical
+///   `OF: amba_device_add() failed (-16)` for `/pl011@9000000`
+///   reproduces, unchanged, under a real, unmodified CentOS Stream 10
+///   kernel (`6.12.0-250.el10`, extracted from the real signed
+///   `kernel-core` RPM the same way the Ubuntu/Alpine `Image`s were)
+///   -- a completely different vendor and kernel version from both
+///   Alpine (`6.6.142`) and Ubuntu (`6.8.0`), all three of which now
+///   show the exact same failure under this backend. This makes a
+///   kernel-version-specific bug or fluke very unlikely; combined
+///   with the libkrun comparison (no equivalent issue in a real,
+///   shipping HVF-based VMM doing almost exactly the same thing), the
+///   most likely remaining explanation continues to be something
+///   specific to this backend's own code or environment, not a
+///   generic Linux/arm64/HVF quirk -- still not found. (CentOS
+///   Stream 10's own `kernel-core` build, incidentally, does not
+///   appear to support virtio-mmio at all -- confirmed independently
+///   under real `qemu-system-aarch64 -M virt -accel hvf
+///   -device virtio-blk-device`, which shows no `virtio_blk`/
+///   `virtio-mmio` driver activity whatsoever -- so it can't be used
+///   for this test's own virtio-mmio milestone regardless; it was
+///   useful here only for cross-checking the PL011/AMBA side of the
+///   bug against a third kernel.)
 #[test]
 #[ignore = "known issue: virtio-mmio/amba devm_request_mem_region fails with -EBUSY before any \
             MMIO access reaches this backend at all -- see this test's own doc comment and \

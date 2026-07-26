@@ -236,7 +236,13 @@ a dependency of this phase too, not yet designed in detail here).
    this backend end to end, to its own `Linux version ...` banner and
    a clean `Kernel panic - not syncing: VFS: Unable to mount root fs`
    (no initrd/root= given) — the same "no rootfs yet" milestone the
-   x86_64 port used along the way, per 0248's own history.
+   x86_64 port used along the way, per 0248's own history. The same
+   test also passes unmodified against Ubuntu 24.04's real
+   `linux-generic` `6.8.0-31` kernel and CentOS Stream 10's real
+   `kernel-core` `6.12.0-250.el10` (both extracted the same way as
+   Alpine's, from their own real signed `.deb`/RPM packages) — CentOS
+   Stream 10 and Ubuntu being this project's actual two target
+   distros (0248).
 
    Facts confirmed directly while getting a real kernel to boot, none
    obvious ahead of time:
