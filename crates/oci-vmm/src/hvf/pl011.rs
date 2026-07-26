@@ -319,6 +319,12 @@ mod tests {
     /// `ci/codesign-ocivmm.sh`).
     #[test]
     #[allow(unsafe_code)] // mmap + Vm::map: safety documented at each call site below.
+    #[ignore = "needs real Hypervisor.framework hardware support (hv_vm_create) plus this test \
+                binary codesigned with the com.apple.security.hypervisor entitlement -- run \
+                locally on real Apple Silicon (ci/codesign-ocivmm.sh, then `cargo test ... -- \
+                --ignored --test-threads=1`); GitHub-hosted macOS runners have no hv_support at \
+                all on any macOS version, so this can never pass there regardless of signing -- \
+                see docs/design/0249 phase 7"]
     fn a_running_guest_prints_through_a_real_data_abort() {
         use crate::hvf::mmio::emulate;
         use crate::hvf::sys::{HV_REG_CPSR, HV_REG_PC, hv_reg_x};

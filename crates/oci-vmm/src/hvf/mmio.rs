@@ -233,6 +233,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs real Hypervisor.framework hardware support (hv_vm_create) plus this test \
+                binary codesigned with the com.apple.security.hypervisor entitlement -- run \
+                locally on real Apple Silicon (ci/codesign-ocivmm.sh, then `cargo test ... -- \
+                --ignored --test-threads=1`); GitHub-hosted macOS runners have no hv_support at \
+                all on any macOS version, so this can never pass there regardless of signing -- \
+                see docs/design/0249 phase 7"]
     fn write_then_read_round_trips_through_a_data_abort() {
         const PAGE_SIZE: usize = 16384; // see hvf::tests's own note on Apple Silicon's page size.
         const CODE_ADDR: u64 = PAGE_SIZE as u64;

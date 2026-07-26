@@ -155,6 +155,69 @@ jobs:
           path: artifacts-rpm/
           if-no-files-found: error
 
+  # Compile + non-hardware-test coverage for ocivmm's own
+  # Hypervisor.framework backend (see docs/design/0249). Deliberately
+  # *not* a real VM-boot job, unlike vm-test above: GitHub's own
+  # hosted macOS runners (every version, confirmed directly against
+  # actions/runner-images#13505, closed "not planned") report
+  # `kern.hv_support` as unsupported -- Hypervisor.framework itself
+  # isn't available there at all, for any macOS version, so
+  # `hv_vm_create()` could never succeed in this job regardless of
+  # anything in this project's own code. (Reference implementations
+  # hit the same wall: sailor only boots real HVF VMs on a
+  # self-hosted `mac/arm64` runner, never GitHub-hosted; libkrun's own
+  # macOS CI is compile-only too, for the same reason, though it
+  # doesn't say so explicitly.)
+  #
+  # This job exists so the hvf backend at least gets real compiler/
+  # lint coverage on its native target on every push/PR (previously
+  # none at all) -- catching e.g. a macOS-only build break -- while
+  # being explicit that the actual real, hardware-verified milestone
+  # (a real distro kernel booting to console + panic; see 0249's own
+  # phase 3) is only ever exercised locally, on real Apple Silicon
+  # hardware, not in this CI.
+  hvf-build:
+    name: hvf build + unit tests (aarch64)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      # hvf::fdt's own unit tests round-trip every tree they build
+      # through a real `dtc` invocation (cross-checking this backend's
+      # writer against the real reference device-tree compiler, not
+      # just this project's own assumptions about what's well-formed)
+      # -- not preinstalled on this runner image, unlike Linux's own
+      # apt-installable package.
+      - name: Install dtc (device tree compiler)
+        run: brew install dtc
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: hvf-build-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: hvf-build-${{ runner.os }}-
+
+      - name: Build oci-vmm and its hvf hardware tests (compile only)
+        run: cargo build -p oci-vmm --tests --locked
+
+      # Real hardware tests (hv_vm_create, needing both actual
+      # Hypervisor.framework support and this binary codesigned with
+      # its entitlement) are `#[ignore]`d -- skipped by default here,
+      # not because of the codesigning (a separate, solvable problem;
+      # see ci/codesign-ocivmm.sh) but because GitHub-hosted macOS
+      # runners have no hv_support at all, on any macOS version (see
+      # this job's own comment above) -- no signing fixes that.
+      - name: Run oci-vmm's own non-hardware unit tests
+        run: cargo test -p oci-vmm --lib --locked
+
   # Real aarch64 architecture coverage, without the nested-VM harness
   # `vm-test` uses for x86_64: builds and tests directly on GitHub's own
   # aarch64 runner (a real CPU, no TCG emulation, no /dev/kvm dependency

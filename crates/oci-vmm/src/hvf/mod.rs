@@ -23,6 +23,21 @@
 //! first (`ci/codesign-ocivmm.sh` /
 //! `packaging/macos/ocivmm.entitlements`) -- otherwise `Vm::create`
 //! fails with `HvError::Denied`, even running as root.
+//!
+//! ## Real-hardware tests are `#[ignore]`d
+//! Every unit test that actually calls `Vm::create` is `#[ignore]`d
+//! (run them with `cargo test ... -- --ignored --test-threads=1` on
+//! real Apple Silicon hardware, after codesigning per above) -- not
+//! only for the entitlement reason above, but because GitHub-hosted
+//! macOS CI runners have no `hv_support` at all, on any macOS version
+//! (confirmed directly, see `.github/workflows/ci.yml`'s own
+//! `hvf-build` job and `docs/design/0249`'s phase 7), so no amount of
+//! codesigning would ever make them pass there. `--test-threads=1`
+//! specifically (not just leaving it to the default parallel runner)
+//! matters here too: `Vm::create` enforces one real VM per process at
+//! a time (see `vm::Vm`'s own docs) with a hard, loud error if a
+//! second call races the first, rather than a hang or silent reuse --
+//! exactly what running these tests in parallel would trigger.
 
 pub mod boot;
 pub mod error;
@@ -102,6 +117,12 @@ mod tests {
     const ESR_EC_HVC64: u64 = 0x16;
 
     #[test]
+    #[ignore = "needs real Hypervisor.framework hardware support (hv_vm_create) plus this test \
+                binary codesigned with the com.apple.security.hypervisor entitlement -- run \
+                locally on real Apple Silicon (ci/codesign-ocivmm.sh, then `cargo test ... -- \
+                --ignored --test-threads=1`); GitHub-hosted macOS runners have no hv_support at \
+                all on any macOS version, so this can never pass there regardless of signing -- \
+                see docs/design/0249 phase 7"]
     fn vcpu_runs_one_instruction_and_exits_via_hvc() {
         // Apple Silicon's own host page size is 16 KiB, not the
         // 4 KiB one might assume -- confirmed directly on this

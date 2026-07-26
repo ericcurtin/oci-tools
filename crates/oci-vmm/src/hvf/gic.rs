@@ -152,6 +152,12 @@ mod tests {
     const ONE_MIB: u64 = 1 << 20;
 
     #[test]
+    #[ignore = "needs real Hypervisor.framework hardware support (hv_vm_create) plus this test \
+                binary codesigned with the com.apple.security.hypervisor entitlement -- run \
+                locally on real Apple Silicon (ci/codesign-ocivmm.sh, then `cargo test ... -- \
+                --ignored --test-threads=1`); GitHub-hosted macOS runners have no hv_support at \
+                all on any macOS version, so this can never pass there regardless of signing -- \
+                see docs/design/0249 phase 7"]
     fn create_gic_then_a_vcpu_with_affinity_set() {
         let vm = Vm::create().expect("hv_vm_create");
 

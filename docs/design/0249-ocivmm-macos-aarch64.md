@@ -7,11 +7,16 @@ root filesystem; phase 4 partially landed -- virtio-mmio transport and
 a virtio-blk device exist and are wired up correctly as far as the
 device tree and MMIO trap-and-emulate go, but the guest's own driver
 can't yet actually bind to the device, a real open issue, not yet
-root-caused; phases 5-7 are future work; all tracked below)
+root-caused; phase 7 landed in reduced, compile-only form -- GitHub-
+hosted macOS runners don't support Hypervisor.framework at all, on any
+macOS version, a real infrastructure limitation, not something this
+project can fix (see phase 7's own entry); phases 5-6 are future work;
+all tracked below)
 Scope: `crates/oci-vmm/` (new `hvf`/`aarch64` backend, alongside the
 existing KVM/x86_64 one), `bin/ocivmm/` (macOS provisioning path,
-codesigning), `.github/workflows/ci.yml` (two new matrix cells, added
-only once the backend actually boots a pet VM end to end).
+codesigning), `.github/workflows/ci.yml` (a compile-only `hvf-build`
+job landed; real VM-boot CI coverage remains future work, blocked on
+both phase 4 and the lack of any self-hosted macOS runner).
 
 ## Why this exists
 
@@ -394,25 +399,43 @@ a dependency of this phase too, not yet designed in detail here).
    under this same backend and run the distro package manager inside
    it instead of a container; work out the macOS side of loop-mount-
    equivalent image access for `ocivmm cp`.
-7. **CI wiring (in progress; scoped down from the original plan).**
-   The original plan here was two new `vm-test` matrix cells
-   (`centos-stream10`/`ubuntu-26.04` × `aarch64`), added only once
-   phases 2-6 boot a real pet VM end to end locally, on the theory
-   that landing CI cells against a backend that can't yet finish a
-   boot would just be permanently-red or permanently-skipped jobs.
-   Phase 4 being blocked (see above) makes that a wait with no clear
-   end date, though, so instead: a *smaller* CI job verifying
-   exactly the phase 3 milestone that already is real and
-   hardware-verified (real kernel boots to console + panics cleanly,
-   no rootfs) against both real target distros' *actual, current*
-   kernel packages (`ci/fetch-aarch64-kernel.sh`, not a fixed/vendored
-   copy) — explicitly a lesser milestone than x86_64's own `vm-test`
-   (no disk, no network, no pet VM), called out as such in the
-   workflow itself, not silently implied to be equivalent.
-   `hv_gic_create` requires macOS 15.0+
-   (`API_AVAILABLE(macos(15.0))`), so this runs on `macos-15`, not
-   `macos-14`. The original two full-pet-VM `vm-test` cells remain
-   future work, blocked on phase 4.
+7. **CI wiring (landed, much smaller in scope than originally
+   planned — a hard platform wall, not a choice).** The original plan
+   here was two new `vm-test` matrix cells (`centos-stream10`/
+   `ubuntu-26.04` × `aarch64`), added only once phases 2-6 boot a real
+   pet VM end to end locally. That's blocked on phase 4 with no clear
+   end date, but a real boot-to-console-and-panic CI job (the phase 3
+   milestone, already real and hardware-verified) was tried anyway
+   and hit a harder wall than phase 4 itself: **GitHub-hosted macOS
+   runners don't support Hypervisor.framework at all, on any macOS
+   version** — confirmed directly against
+   [`actions/runner-images#13505`](https://github.com/actions/runner-images/issues/13505)
+   (closed "not planned"), whose own repro script (`sysctl -n
+   kern.hv_support`) fails identically on `macos-14`, `macos-15`, and
+   even `macos-26` hosted runners. `hv_vm_create()` can never succeed
+   there, regardless of anything in this project's own code — not a
+   bug to fix, a real infrastructure limitation. (This is also,
+   retroactively, *why* the reference implementations researched
+   earlier both avoid this: sailor only boots real HVF VMs on a
+   self-hosted `mac/arm64` runner, never GitHub-hosted; libkrun's own
+   macOS CI is compile-only, for the same unstated reason.)
+
+   Landed instead: `hvf-build`, a `macos-15` job that builds
+   `oci-vmm` (including its hvf hardware tests, compile-only) and runs
+   its non-hardware unit tests on every push/PR — real compiler/lint
+   coverage for this backend that didn't exist in CI at all before,
+   without pretending it exercises the real, hardware-verified boot
+   path. `ci/fetch-aarch64-kernel.sh` and `ci/hvf-boot-test.sh` (real,
+   working, tested against actual current CentOS Stream 10/Ubuntu
+   26.04 kernel packages) exist for **local** verification on real
+   Apple Silicon hardware — the only place this backend's real
+   capability can currently be exercised at all. `hv_gic_create`
+   itself requires macOS 15.0+ (`API_AVAILABLE(macos(15.0))`), hence
+   `macos-15` rather than `macos-14` even for the compile-only job.
+   The original two full-pet-VM `vm-test` cells, and any real VM-boot
+   CI coverage at all, remain future work — blocked on both phase 4
+   and on provisioning a self-hosted macOS runner, should this
+   project ever want one.
 
 ## Honest deltas and risks accepted
 
