@@ -17,6 +17,13 @@ anyhow.workspace = true
 # a bare `Image` file).
 flate2.workspace = true
 libc.workspace = true
+# `hvf::boot::unwrap_efi_zboot`'s own zstd decompression -- Ubuntu's
+# own real aarch64 kernel package switched to it (CONFIG_KERNEL_ZSTD)
+# at some point after 24.04/noble's plain-gzip vmlinuz (confirmed
+# directly against the real, current 26.04/resolute package); the
+# same pure-Rust decompressor oci-layer already uses for zstd-
+# compressed OCI layers, for the same "no libzstd dependency" reason.
+ruzstd.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 # `GuestMemoryMmap`, the virtqueue (virtio::queue), the generated

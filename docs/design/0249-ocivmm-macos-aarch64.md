@@ -237,12 +237,38 @@ a dependency of this phase too, not yet designed in detail here).
    a clean `Kernel panic - not syncing: VFS: Unable to mount root fs`
    (no initrd/root= given) — the same "no rootfs yet" milestone the
    x86_64 port used along the way, per 0248's own history. The same
-   test also passes unmodified against Ubuntu 24.04's real
-   `linux-generic` `6.8.0-31` kernel and CentOS Stream 10's real
-   `kernel-core` `6.12.0-250.el10` (both extracted the same way as
-   Alpine's, from their own real signed `.deb`/RPM packages) — CentOS
-   Stream 10 and Ubuntu being this project's actual two target
-   distros (0248).
+   test also passes unmodified against Ubuntu's real `linux-image`
+   kernel and CentOS Stream 10's real `kernel-core` — CentOS Stream 10
+   and Ubuntu being this project's actual two target distros (0248).
+   `hvf::boot::load_image` now does the unwrapping itself directly
+   from a real, unmodified package's own `vmlinuz` (no manual
+   pre-extraction step needed, for this test or for
+   `ci/fetch-aarch64-kernel.sh`): real distro packaging turned out
+   inconsistent in more than one way, confirmed directly against the
+   actual current packages rather than assumed —
+   * CentOS Stream 10's `kernel-core` RPM ships an **EFI
+     zboot**-wrapped (`CONFIG_EFI_ZBOOT`) image, `gzip`-compressed.
+   * Ubuntu 24.04/noble's `linux-generic` shipped a **bare `gzip`
+     stream**, no zboot wrapping at all.
+   * Ubuntu 26.04/resolute's own current kernel switched again: its
+     `linux-image-unsigned-*` package (not `linux-image-<ver>-generic`,
+     what `linux-image-generic` actually depends on — that one's own
+     `vmlinuz` on `ports.ubuntu.com` is a non-zboot, seemingly
+     non-functional artifact, arm64 having no real Secure Boot signing
+     infrastructure the way amd64 does) ships an EFI zboot image
+     again, but **`zstd`-compressed**, not `gzip`. `hvf::boot` decodes
+     both compressions (`ruzstd`, the same pure-Rust decoder
+     `oci-layer` already uses for zstd-compressed OCI layers).
+
+   `ci/fetch-aarch64-kernel.sh` always resolves whichever kernel
+   version/package is *currently* the real, latest one for each distro
+   (CentOS Stream 10's rolling `kernel-core`; Ubuntu's own
+   `linux-image-generic` meta-package's current dependency, substituted
+   to its `-unsigned` sibling) rather than a hardcoded version, so it
+   keeps working release after release with no manual bumps — and, not
+   incidentally, is exactly what already caught the `zstd` switch above
+   during this project's own development, rather than that drifting
+   silently unnoticed.
 
    Facts confirmed directly while getting a real kernel to boot, none
    obvious ahead of time:
@@ -368,13 +394,25 @@ a dependency of this phase too, not yet designed in detail here).
    under this same backend and run the distro package manager inside
    it instead of a container; work out the macOS side of loop-mount-
    equivalent image access for `ocivmm cp`.
-7. **CI wiring (not started, and deliberately last).** Two new
-   `vm-test` matrix cells (`centos-stream10`/`ubuntu-26.04` ×
-   `aarch64`, `runs-on: macos-14`), added only once phases 2-6 boot a
-   real pet VM end to end locally — landing CI cells against a backend
-   that can't yet finish a boot would just be permanently-red or
-   permanently-skipped jobs, which this project's existing CI has no
-   precedent for.
+7. **CI wiring (in progress; scoped down from the original plan).**
+   The original plan here was two new `vm-test` matrix cells
+   (`centos-stream10`/`ubuntu-26.04` × `aarch64`), added only once
+   phases 2-6 boot a real pet VM end to end locally, on the theory
+   that landing CI cells against a backend that can't yet finish a
+   boot would just be permanently-red or permanently-skipped jobs.
+   Phase 4 being blocked (see above) makes that a wait with no clear
+   end date, though, so instead: a *smaller* CI job verifying
+   exactly the phase 3 milestone that already is real and
+   hardware-verified (real kernel boots to console + panics cleanly,
+   no rootfs) against both real target distros' *actual, current*
+   kernel packages (`ci/fetch-aarch64-kernel.sh`, not a fixed/vendored
+   copy) — explicitly a lesser milestone than x86_64's own `vm-test`
+   (no disk, no network, no pet VM), called out as such in the
+   workflow itself, not silently implied to be equivalent.
+   `hv_gic_create` requires macOS 15.0+
+   (`API_AVAILABLE(macos(15.0))`), so this runs on `macos-15`, not
+   `macos-14`. The original two full-pet-VM `vm-test` cells remain
+   future work, blocked on phase 4.
 
 ## Honest deltas and risks accepted
 

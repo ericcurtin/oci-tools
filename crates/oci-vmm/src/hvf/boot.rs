@@ -35,7 +35,26 @@
 //! this one at all. [`unwrap_efi_zboot`] undoes exactly that
 //! wrapping, so this backend can boot real, unmodified distro kernel
 //! packages directly instead of requiring a pre-extracted plain
-//! `Image` file prepared by hand.
+//! `Image` file prepared by hand. The named compression algorithm
+//! itself isn't consistent either: CentOS Stream 10's own
+//! `kernel-core` RPM uses `gzip`, Ubuntu's own current (26.04/
+//! resolute) `linux-image-unsigned-*` `.deb` uses `zstd` instead
+//! (its own *older*, 24.04/noble packaging used a bare `gzip` stream
+//! with no zboot wrapping at all -- real distro packaging choices
+//! keep changing release to release; both `unwrap_efi_zboot` and
+//! [`load_image`]'s own bare-stream fallback handle whichever a given
+//! package turns out to use). Also found, and worth calling out
+//! explicitly: Ubuntu's *signed* kernel-image variant
+//! (`linux-image-<ver>-generic`, what `linux-image-generic` actually
+//! depends on, i.e. what a real `apt-get install linux-image-generic`
+//! installs) ships a non-zboot, seemingly-broken `vmlinuz` on
+//! `ports.ubuntu.com` specifically -- arm64 has no real Secure Boot
+//! signing infrastructure the way amd64 does, so this looks like a
+//! non-functional template artifact of that architecture, not
+//! something this module should try to unwrap. The *unsigned*
+//! variant (`linux-image-unsigned-<ver>-generic`) is the one that's
+//! actually a real, bootable zboot image, and what
+//! `ci/fetch-aarch64-kernel.sh` fetches for Ubuntu accordingly.
 
 /// Required alignment of the 2 MiB-aligned base the `Image` is placed
 /// `text_offset` bytes past.
@@ -91,15 +110,22 @@ pub enum ImageError {
         file_len: usize,
     },
     /// An EFI zboot header was found, naming a compression algorithm
-    /// this module doesn't implement (only `gzip` is; every real
-    /// aarch64 distro kernel package examined so far -- Ubuntu,
-    /// CentOS Stream -- uses it).
-    #[error("EFI zboot payload uses unsupported compression {0:?} (only \"gzip\" is implemented)")]
+    /// this module doesn't implement (only `gzip` and `zstd` are;
+    /// every real aarch64 distro kernel package examined so far --
+    /// CentOS Stream's own `gzip`, Ubuntu's own `zstd` -- uses one of
+    /// the two).
+    #[error(
+        "EFI zboot payload uses unsupported compression {0:?} (only \"gzip\"/\"zstd\" are implemented)"
+    )]
     UnsupportedZbootCompression(String),
     /// The EFI zboot payload claimed to be `gzip` but failed to
     /// decompress as one.
     #[error("EFI zboot gzip payload failed to decompress: {0}")]
     ZbootGzip(#[from] std::io::Error),
+    /// The EFI zboot payload claimed to be `zstd` but failed to
+    /// decompress as one.
+    #[error("EFI zboot zstd payload failed to decompress: {0}")]
+    ZbootZstd(String),
 }
 
 impl ImageHeader {
@@ -196,16 +222,33 @@ pub fn unwrap_efi_zboot(data: &[u8]) -> Result<Option<Vec<u8>>, ImageError> {
             file_len: data.len(),
         })?;
 
-    if compression_str != b"gzip" {
-        return Err(ImageError::UnsupportedZbootCompression(
+    match compression_str.as_slice() {
+        b"gzip" => {
+            let mut decoder = flate2::read::GzDecoder::new(payload);
+            let mut out = Vec::new();
+            std::io::Read::read_to_end(&mut decoder, &mut out)?;
+            Ok(Some(out))
+        }
+        // Ubuntu's own real aarch64 kernel package (confirmed against
+        // the actual, current 26.04/resolute `linux-image-unsigned-*`
+        // package -- see this module's own docs) uses this, not
+        // `gzip`, despite `gzip` being what its own *older* (24.04/
+        // noble) packaging used instead (as a bare stream, no zboot
+        // wrapping at all then) -- real distro packaging choices
+        // change across releases, so both are supported rather than
+        // assuming either is the one true answer.
+        b"zstd" => {
+            let mut decoder = ruzstd::decoding::StreamingDecoder::new(payload)
+                .map_err(|e| ImageError::ZbootZstd(e.to_string()))?;
+            let mut out = Vec::new();
+            std::io::Read::read_to_end(&mut decoder, &mut out)
+                .map_err(|e| ImageError::ZbootZstd(e.to_string()))?;
+            Ok(Some(out))
+        }
+        _ => Err(ImageError::UnsupportedZbootCompression(
             String::from_utf8_lossy(&compression_str).into_owned(),
-        ));
+        )),
     }
-
-    let mut decoder = flate2::read::GzDecoder::new(payload);
-    let mut out = Vec::new();
-    std::io::Read::read_to_end(&mut decoder, &mut out)?;
-    Ok(Some(out))
 }
 
 #[cfg(test)]
@@ -319,11 +362,44 @@ mod tests {
     }
 
     #[test]
+    fn unwrap_efi_zboot_recovers_a_zstd_compressed_payload() {
+        // Matches Ubuntu's own current real aarch64 kernel packaging
+        // (26.04/resolute's `linux-image-unsigned-*`): zboot-wrapped,
+        // but with `zstd` rather than `gzip` compression.
+        let inner = header_bytes(0x8_0000, 0x0100_0000, 0, IMAGE_MAGIC);
+        let payload = ruzstd::encoding::compress_to_vec(
+            inner.as_slice(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+
+        let payload_offset: u32 = 64;
+        let mut wrapped = vec![0u8; payload_offset as usize];
+        wrapped[0..8].copy_from_slice(ZBOOT_MAGIC);
+        wrapped[8..12].copy_from_slice(&payload_offset.to_le_bytes());
+        wrapped[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        wrapped[24..32].copy_from_slice(b"zstd\0\0\0\0");
+        wrapped.extend_from_slice(&payload);
+
+        let unwrapped = unwrap_efi_zboot(&wrapped)
+            .unwrap()
+            .expect("should detect zboot wrapping");
+        assert_eq!(unwrapped, inner);
+
+        let loaded = load_image(&wrapped).unwrap();
+        assert_eq!(loaded, inner);
+    }
+
+    #[test]
     fn unwrap_efi_zboot_rejects_unsupported_compression() {
         let inner = header_bytes(0, 0, 0, IMAGE_MAGIC);
-        let wrapped = zboot_wrap(&inner, b"zstd\0\0\0\0");
+        // Neither real compression this module implements (`gzip`,
+        // `zstd`) -- `lz4` is a real zboot-supported option upstream
+        // too (`CONFIG_KERNEL_LZ4`), just not one any real distro
+        // package examined so far actually uses, so not implemented
+        // here.
+        let wrapped = zboot_wrap(&inner, b"lz4\0\0\0\0\0");
         let err = unwrap_efi_zboot(&wrapped).unwrap_err();
-        assert!(matches!(err, ImageError::UnsupportedZbootCompression(ref s) if s == "zstd"));
+        assert!(matches!(err, ImageError::UnsupportedZbootCompression(ref s) if s == "lz4"));
     }
 
     #[test]

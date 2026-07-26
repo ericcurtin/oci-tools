@@ -1175,6 +1175,7 @@ dependencies = [
  "kvm-ioctls",
  "libc",
  "linux-loader",
+ "ruzstd",
  "thiserror",
  "tracing",
  "vm-memory",
