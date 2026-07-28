@@ -26,8 +26,15 @@
 //! disposable box, created under a real, random name, entered once,
 //! then always removed again — a pure composition of `create`/
 //! `enter`/`rm`, matching real `distrobox ephemeral` exactly, no new
-//! namespace/mount/launch code at all. `stop`/`upgrade`/`export` are
-//! still ahead.
+//! namespace/mount/launch code at all. `export --bin` (0252) writes a
+//! real, executable wrapper script routing an exported binary's own
+//! invocations through `ocibox enter` — matching real `distrobox
+//! export --bin`'s own actual shell implementation field for field,
+//! with one honest divergence (an explicit `--box` flag, since this
+//! project has no per-session `$CONTAINER_ID` a real `distrobox
+//! export` run from *inside* a box could detect instead — see
+//! `docs/design/0252`); `--app` desktop-entry export, `stop`, and
+//! `upgrade` are still ahead.
 
 use std::path::{Path, PathBuf};
 
@@ -183,6 +190,48 @@ enum Command {
         /// if empty.
         command: Vec<String>,
     },
+    /// Export a binary from inside a box onto the host as a small
+    /// wrapper script, matching real `distrobox export --bin`'s own
+    /// binary-export mode (checked directly against `~/git/distrobox`'s
+    /// own real shell implementation, `internal/inside-distrobox/
+    /// assets/distrobox-export`) — deliberately not yet `--app`
+    /// desktop-entry export, a materially bigger feature needing
+    /// desktop-file/icon handling this project has none of yet.
+    ///
+    /// Real `distrobox export` is meant to be run *from inside* the
+    /// container, detecting which box it's running in via its own
+    /// `$CONTAINER_ID` convention; this project has no such
+    /// infrastructure (no persistent keeper process a box's own shell
+    /// session could report itself to — `ocibox enter`'s own doc
+    /// comment already notes this same gap), so this instead runs
+    /// from the host and takes an explicit `--box` naming which one
+    /// to route the wrapper's own invocations through: a real,
+    /// honestly-documented divergence, not a silent behavior change.
+    Export {
+        /// The box whose rootfs `--bin` lives in, and that the
+        /// generated wrapper routes through (`--box`).
+        #[arg(long = "box", value_name = "NAME")]
+        box_name: String,
+        /// Absolute path (inside the box's own rootfs) of the binary
+        /// to export (`--bin`/`-b`, matching real `distrobox export`'s
+        /// own identical flag).
+        #[arg(long = "bin", short = 'b', value_name = "PATH")]
+        bin: String,
+        /// Directory to write the generated wrapper script into
+        /// (`--export-path`), matching real `distrobox export`'s own
+        /// identical option; defaults to `$HOME/.local/bin`, the real
+        /// tool's own documented default for binary exports.
+        #[arg(long = "export-path", value_name = "DIR")]
+        export_path: Option<PathBuf>,
+        /// Remove a previously exported wrapper instead of creating
+        /// one (`--delete`/`-d`, matching real `distrobox export`'s
+        /// own identical flag) — refuses a destination that isn't
+        /// actually an `ocibox`-generated wrapper, the same real
+        /// safety check (a `distrobox_binary` marker comment) real
+        /// `distrobox export --delete` itself does.
+        #[arg(long, short = 'd')]
+        delete: bool,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -207,6 +256,12 @@ fn main() -> std::process::ExitCode {
                 pull,
                 command,
             }) => cmd_ephemeral(&image, pull, &command),
+            Some(Command::Export {
+                box_name,
+                bin,
+                export_path,
+                delete,
+            }) => cmd_export(&box_name, &bin, export_path.as_deref(), delete),
             None => anyhow::bail!(
                 "no subcommand given (try `ocibox create --image ... --name ...`); \
                  the rest of milestone 7 (`stop`/...) arrives later"
@@ -737,6 +792,116 @@ fn cmd_ephemeral(image: &str, pull: bool, command: &[String]) -> anyhow::Result<
         Ok(exit_code) => std::process::exit(exit_code),
         Err(e) => Err(e),
     }
+}
+
+/// The comment line every wrapper [`cmd_export`] writes carries, and
+/// the one [`cmd_export`]'s own `--delete` checks for before ever
+/// removing a file — matching real `distrobox export`'s own identical
+/// `distrobox_binary` marker/safety-check pair (`internal/inside-
+/// distrobox/assets/distrobox-export`'s own `generate_script`/
+/// `export_binary`), just namespaced to this project's own binary
+/// name so a `--delete` here can never remove a real `distrobox`
+/// export (or vice versa) by mistake.
+const EXPORT_MARKER: &str = "ocibox_binary";
+
+/// `$HOME/.local/bin`, real `distrobox export --bin`'s own documented
+/// default destination when `--export-path` isn't given.
+fn default_export_path() -> anyhow::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| anyhow::anyhow!("--export-path was not given and $HOME is not set"))?;
+    Ok(PathBuf::from(home).join(".local/bin"))
+}
+
+/// `ocibox export --box <NAME> --bin <PATH>`: writes a small wrapper
+/// script at `--export-path` (or [`default_export_path`]) that runs
+/// `--bin` inside `--box` via `ocibox enter` — see [`Command::Export`]'s
+/// own doc comment for exactly how this scopes down real `distrobox
+/// export --bin` and why. `--delete` reverses it, refusing to touch a
+/// destination file that isn't actually one of this project's own
+/// exported wrappers (real `distrobox export --delete`'s own identical
+/// safety check, checked directly).
+fn cmd_export(
+    box_name: &str,
+    bin: &str,
+    export_path: Option<&Path>,
+    delete: bool,
+) -> anyhow::Result<()> {
+    validate_box_name(box_name)?;
+    let box_dir = boxes_root().join(box_name);
+    anyhow::ensure!(box_dir.is_dir(), "{box_name}: no such box");
+
+    let bin_path = Path::new(bin);
+    anyhow::ensure!(
+        bin_path.is_absolute(),
+        "--bin must be an absolute path inside the box (got {bin:?})"
+    );
+    let bin_name = bin_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("--bin {bin:?} has no file name"))?;
+
+    let export_dir = match export_path {
+        Some(dir) => dir.to_path_buf(),
+        None => default_export_path()?,
+    };
+    let dest_file = export_dir.join(bin_name);
+
+    if delete {
+        let existing = std::fs::read_to_string(&dest_file)
+            .with_context(|| format!("reading {}", dest_file.display()))?;
+        anyhow::ensure!(
+            existing.contains(EXPORT_MARKER),
+            "{}: not an ocibox-exported binary",
+            dest_file.display()
+        );
+        std::fs::remove_file(&dest_file)
+            .with_context(|| format!("removing {}", dest_file.display()))?;
+        println!(
+            "{bin} from {box_name} removed successfully from {}",
+            export_dir.display()
+        );
+        return Ok(());
+    }
+
+    // The binary must actually exist inside the box's own rootfs --
+    // real `distrobox-export`'s own identical check: a wrapper
+    // pointing at nothing would otherwise just fail confusingly later
+    // (at actual `ocibox enter` time) instead of clearly now.
+    let rootfs_bin = box_dir
+        .join("rootfs")
+        .join(bin_path.strip_prefix("/").unwrap_or(bin_path));
+    anyhow::ensure!(
+        rootfs_bin.is_file(),
+        "cannot find {bin} inside box {box_name:?}"
+    );
+
+    std::fs::create_dir_all(&export_dir)
+        .with_context(|| format!("creating {}", export_dir.display()))?;
+
+    // Single-quoted, matching real `distrobox-export`'s own template
+    // (`generate_script`'s `'${exported_bin}'`) -- `bin`/`box_name`
+    // are administrator-supplied CLI input, not untrusted data this
+    // project defends against embedding a stray `'` in, the same
+    // level of care the real script itself applies.
+    let script = format!(
+        "#!/bin/sh\n# {EXPORT_MARKER}\n# box: {box_name}\nexec ocibox enter {box_name} -- '{bin}' \"$@\"\n"
+    );
+    std::fs::write(&dest_file, script)
+        .with_context(|| format!("writing {}", dest_file.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = std::fs::metadata(&dest_file)
+            .with_context(|| format!("reading metadata for {}", dest_file.display()))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dest_file, perms)
+            .with_context(|| format!("chmod +x {}", dest_file.display()))?;
+    }
+
+    println!(
+        "{bin} from {box_name} exported successfully in {}",
+        export_dir.display()
+    );
+    Ok(())
 }
 
 #[cfg(test)]
