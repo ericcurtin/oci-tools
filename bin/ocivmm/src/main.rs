@@ -1,4 +1,4 @@
-//! `ocivmm` — pet microVMs from OCI images (krunvm equivalent).
+//! `ocivmm` — pet microVMs from OCI images.
 //!
 //! Creates long-lived pet *virtual machines* the same way `ocibox`
 //! creates pet containers: `ocivmm run ubuntu:26.04` resolves/pulls
@@ -168,9 +168,9 @@ enum Command {
     },
     /// Copy a file or directory into or out of a pet VM's disk image
     /// by loop-mounting it — the replacement for live directory
-    /// sharing (a virtio-blk-only VMM has no equivalent of
-    /// krunvm/libkrun's virtiofs `--volume`; this trades a live,
-    /// shared view for an explicit, one-shot copy, docker-`cp`-style).
+    /// sharing (a virtio-blk-only VMM has no virtiofs `--volume`
+    /// equivalent; this trades a live, shared view for an explicit,
+    /// one-shot copy, docker-`cp`-style).
     /// Exactly one of `SRC`/`DST` must be `VMNAME:PATH`; the VM must
     /// not currently be running.
     Cp {

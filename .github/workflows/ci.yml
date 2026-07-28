@@ -165,9 +165,7 @@ jobs:
   # `hv_vm_create()` could never succeed in this job regardless of
   # anything in this project's own code. (Reference implementations
   # hit the same wall: sailor only boots real HVF VMs on a
-  # self-hosted `mac/arm64` runner, never GitHub-hosted; libkrun's own
-  # macOS CI is compile-only too, for the same reason, though it
-  # doesn't say so explicitly.)
+  # self-hosted `mac/arm64` runner, never GitHub-hosted.)
   #
   # This job exists so the hvf backend at least gets real compiler/
   # lint coverage on its native target on every push/PR (previously

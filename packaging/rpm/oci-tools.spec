@@ -41,10 +41,9 @@ and bootable-container stack:
  * ocicri       - Kubernetes CRI server (cri-o equivalent)
  * ocibox       - pet containers with home/user/host integration
                   (distrobox equivalent)
- * ocivmm       - pet microVMs from OCI images (krunvm equivalent;
-                  the VMM is libkrun's crates statically linked, so
-                  it needs only /dev/kvm and passt at run time -- see
-                  packaging/README.md)
+ * ocivmm       - pet microVMs from OCI images (own VMM, statically
+                  linked, so it needs only /dev/kvm and passt at run
+                  time -- see packaging/README.md)
  * ociboot      - bootable-container OS manager (bootc-inspired,
                   no ostree/composefs dependency)
  * ociboot-init - tiny initramfs helper that mounts ociboot

@@ -7,16 +7,14 @@
 // network *backend* — a passt-connected unix stream, framed with a
 // 4-byte big-endian length prefix per Ethernet frame — has no
 // Firecracker equivalent (Firecracker only ever speaks to a host TAP
-// device). That framing is libkrun's own passt wire protocol, studied
-// directly from `~/git/libkrun`'s `src/devices/src/virtio/net/
-// unixstream.rs` (itself passt's own documented `--socket` protocol,
-// not libkrun-specific) — ocivmm speaks the same wire format so it can
-// reuse passt unmodified as its network backend.
+// device). That framing is passt's own documented `--socket` protocol
+// — ocivmm speaks the same wire format so it can reuse passt
+// unmodified as its network backend.
 
 //! The virtio-net device: a single virtio-net-pci device backed by an
 //! already-connected passt unix-stream socket (see
 //! [`PasstBackend`]) — this is the *only* networking oci-vmm has:
-//! stock distro kernels have no libkrun-style TSI, so every guest
+//! stock distro kernels have no built-in TSI, so every guest
 //! packet crosses this device.
 
 use std::io::{ErrorKind, Read, Write};

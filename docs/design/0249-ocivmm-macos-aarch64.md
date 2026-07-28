@@ -79,8 +79,8 @@ x86_64 kernels ship no virtio-mmio support at all (0248). That
 constraint doesn't hold on arm64: real CentOS Stream 10 and Ubuntu
 26.04 aarch64 kernel packages both build `CONFIG_VIRTIO_MMIO`, since
 virtio-mmio is the standard transport for arm64 "virt"-machine-style
-boots generally (it's what QEMU's `virt` machine and, notably,
-libkrun's own HVF/aarch64 backend both use). Building an ECAM-based
+boots generally (it's what QEMU's `virt` machine and other real,
+shipping HVF/aarch64 backends both use). Building an ECAM-based
 PCIe config-space window plus arm64 MSI/GICv3-ITS routing purely to
 reuse `pci/{bus,configuration,msix}.rs` would be substantially more new
 emulation code for no boot-compatibility benefit, so the aarch64
@@ -368,7 +368,8 @@ a dependency of this phase too, not yet designed in detail here).
    it; a missing `dma-coherent` property, matching Firecracker's own
    aarch64 FDT convention, added but confirmed by retest not to be the
    cause; `earlycon=`'s presence on the kernel command line itself;
-   and, cross-checked directly against libkrun's own HVF backend --
+   and, cross-checked directly against another real, shipping
+   HVF-based VMM's aarch64 backend --
    `hv_gic_create`-before-`hv_vcpu_create` ordering, the boot CPSR
    value, `hv_vcpu_set_trap_debug_*` usage, which system registers get
    initialized, and the "leave MMIO regions unmapped" memory-mapping
@@ -417,8 +418,7 @@ a dependency of this phase too, not yet designed in detail here).
    bug to fix, a real infrastructure limitation. (This is also,
    retroactively, *why* the reference implementations researched
    earlier both avoid this: sailor only boots real HVF VMs on a
-   self-hosted `mac/arm64` runner, never GitHub-hosted; libkrun's own
-   macOS CI is compile-only, for the same unstated reason.)
+   self-hosted `mac/arm64` runner, never GitHub-hosted.)
 
    Landed instead: `hvf-build`, a `macos-15` job that builds
    `oci-vmm` (including its hvf hardware tests, compile-only) and runs
@@ -467,7 +467,7 @@ a dependency of this phase too, not yet designed in detail here).
   currently detects one before it manifests as a hang.
 * The provisioning redesign (phase 6) has no existing precedent in
   this codebase to port from (unlike phases 2-5, which have KVM/x86_64
-  and/or libkrun analogues to study) — it is new design, and may turn
+  analogues to study) — it is new design, and may turn
   out to need more machinery than sketched here (e.g. a
   userspace-ext4-image writer if loop-mount-equivalent access on macOS
   proves impractical).

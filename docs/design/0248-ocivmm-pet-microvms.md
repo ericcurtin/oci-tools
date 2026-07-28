@@ -28,7 +28,7 @@ command runs as a generated oneshot systemd unit whose exit status is
 written back into the image and read back once the guest has powered
 off.
 
-## No libkrun, no dlopen, nothing dynamically loaded: `oci-vmm`, this workspace's own VMM
+## No dlopen, nothing dynamically loaded: `oci-vmm`, this workspace's own VMM
 
 The VMM is `crates/oci-vmm` — this project's *own* KVM + virtio-pci
 monitor, statically linked into `ocivmm` like any other Rust
@@ -41,9 +41,9 @@ workspace already trusts via `seccompiler`) and trimmed of everything
 a pet VM never needs — no snapshots, no metrics, no ACPI, no rate
 limiters, no jailer, no MMIO transport.
 
-Why not just reuse an existing microVM monitor (libkrun, crosvm,
+Why not just reuse an existing microVM monitor (crosvm,
 cloud-hypervisor)? Every one of them either dynamically loads a
-kernel/companion library at run time (libkrun + libkrunfw) or is
+kernel/companion library at run time or is
 itself a large, separately-versioned dependency this workspace would
 have no control over — this project's own stated goal is outperforming
 `llama.cpp`-style tooling by *minimizing* what's linked and *owning*
@@ -60,8 +60,9 @@ distro kernel actually has built in. RHEL-family kernels ship *no*
 virtio-MMIO support at all (checked directly against the real CentOS
 Stream 10 kernel-core package's own `.config`), which is exactly why a
 generic MMIO-only microVM monitor cannot boot a real CentOS/RHEL
-kernel without a custom kernel build — the same wall libkrun-based
-prototyping of this milestone hit before this design was chosen.
+kernel without a custom kernel build — the same wall an earlier
+virtio-MMIO prototype of this milestone hit before this design was
+chosen.
 Enumeration is legacy conf1 port I/O (`0xcf8`/`0xcfc`) plus an MP
 table; no ACPI, no firmware.
 
@@ -104,7 +105,7 @@ until real hardware exercised it. Firecracker's own vcpu loop
 `oci-vmm` has no filesystem-sharing device at all (no virtio-fs): a
 pet VM's root filesystem is a plain **ext4 disk image**
 (`rootfs.img`), and volumes/live directory sharing (`--volume` in
-earlier designs studied from krunvm/libkrun) has no equivalent here.
+earlier virtiofs-based designs) has no equivalent here.
 In its place: **`ocivmm cp`** copies a file or directory into or out
 of a *stopped* pet VM by loop-mounting its image
 (`oci_mount::loop_device`, already used by `oci-erofs`), docker-`cp`-
@@ -118,9 +119,8 @@ the exit-status file back once the guest has powered off.
 
 `oci-vmm`'s virtio-net device is backed by an already-connected
 **passt** unix-stream socket (framed with passt's own documented
-4-byte-big-endian-length-prefix wire protocol — studied directly from
-libkrun's own `unixstream.rs` backend, itself just passt's own
-`--socket` protocol, not libkrun-specific); systemd-networkd does DHCP
+4-byte-big-endian-length-prefix wire protocol, per its documented
+`--socket` protocol); systemd-networkd does DHCP
 against it, and `--publish` becomes passt's own `-t host:guest`
 forwards. `ocivmm` spawns passt `--foreground` as its own child
 (self-daemonization was observed to unlink the socket file on some
@@ -225,8 +225,8 @@ userns-profile workaround for
 ## Honest deltas and risks accepted
 
 * **No live directory sharing.** `--volume`/virtiofs-style live
-  sharing (studied from krunvm/libkrun during earlier design
-  iterations of this milestone) has no equivalent: `oci-vmm` has no
+  sharing (studied during earlier design iterations of this
+  milestone) has no equivalent: `oci-vmm` has no
   filesystem-sharing virtio device. `ocivmm cp` (explicit,
   VM-stopped, docker-`cp`-shaped) is the replacement — a real
   capability cut, not hidden, and CI's own source-push/artifact-pull

@@ -104,23 +104,23 @@ const MAX_WALL_CLOCK: Duration = Duration::from_secs(30);
 ///   introspection, a serial-attached debugger, or ftrace -- none
 ///   available without a working root filesystem, itself blocked by
 ///   this very bug.
-/// * Cross-checked directly against libkrun's own HVF backend
-///   (`/Users/ecurtin/git/libkrun` locally) for anything this backend
-///   might be missing: nothing found. libkrun's `hv_vm_map` usage is
-///   identical (guest RAM only, `READ|WRITE|EXEC`; every MMIO device
-///   region -- including its own virtio-mmio devices -- is left
-///   unmapped and handled via the same trap-and-emulate HVF itself
-///   provides, not mapped with any special "device" memory attribute
-///   at all); `hv_gic_create` always precedes every `hv_vcpu_create`,
-///   same as here; the boot CPSR is bit-for-bit the same
-///   (`EL1h`, all four DAIF bits masked, `0x3c5`); and libkrun never
-///   calls `hv_vcpu_set_trap_debug_exceptions`/
+/// * Cross-checked directly against another real, shipping
+///   HVF-based VMM's aarch64 backend for anything this backend might
+///   be missing: nothing found. Its `hv_vm_map` usage is identical
+///   (guest RAM only, `READ|WRITE|EXEC`; every MMIO device region --
+///   including its own virtio-mmio devices -- is left unmapped and
+///   handled via the same trap-and-emulate HVF itself provides, not
+///   mapped with any special "device" memory attribute at all);
+///   `hv_gic_create` always precedes every `hv_vcpu_create`, same as
+///   here; the boot CPSR is bit-for-bit the same (`EL1h`, all four
+///   DAIF bits masked, `0x3c5`); and it never calls
+///   `hv_vcpu_set_trap_debug_exceptions`/
 ///   `hv_vcpu_set_trap_debug_reg_accesses` at all (relies on
 ///   whatever HVF's own default is) nor touches `SCTLR_EL1`/
 ///   `TCR_EL1`/`MAIR_EL1`/`VBAR_EL1`/`CNTKCTL_EL1`/`ID_AA64MMFR0_EL1`/
 ///   IPA size -- the same minimal register set this backend sets
 ///   (`MPIDR_EL1`, `PC`, `X0`, `CPSR`) and nothing more. A repo-wide
-///   search of libkrun for `iomem`/`request_region`/`EBUSY`/`-16`/
+///   search of its source for `iomem`/`request_region`/`EBUSY`/`-16`/
 ///   resource-conflict handling turns up nothing at all -- this bug
 ///   class doesn't appear in their code.
 /// * **The bug is confirmed 100% generic, not address- or
@@ -155,8 +155,8 @@ const MAX_WALL_CLOCK: Duration = Duration::from_secs(30);
 ///   Alpine (`6.6.142`) and Ubuntu (`6.8.0`), all three of which now
 ///   show the exact same failure under this backend. This makes a
 ///   kernel-version-specific bug or fluke very unlikely; combined
-///   with the libkrun comparison (no equivalent issue in a real,
-///   shipping HVF-based VMM doing almost exactly the same thing), the
+///   with the other-VMM comparison above (no equivalent issue in a
+///   real, shipping HVF-based VMM doing almost exactly the same thing), the
 ///   most likely remaining explanation continues to be something
 ///   specific to this backend's own code or environment, not a
 ///   generic Linux/arm64/HVF quirk -- still not found. (CentOS
