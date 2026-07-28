@@ -25,7 +25,8 @@ const HELP: &str = concat!(
     "ociboot-init - initramfs helper for ociboot deployments\n",
     "\n",
     "Usage: ociboot-init [--version | --help]\n",
-    "       ociboot-init mount --image-dir <DIR> --target <DIR> [--cmdline <FILE>]\n",
+    "       ociboot-init mount --image-dir <DIR> --target <DIR>\n",
+    "                          [--cmdline <FILE>] [--state-dir <DIR>]\n",
     "\n",
     "Runs inside the initramfs (installed by the 90ociboot dracut module);\n",
     "it is not intended to be invoked manually.\n",
@@ -37,6 +38,13 @@ const HELP: &str = concat!(
     "mismatching image is a hard error; no verity karg mounts unverified,\n",
     "with a warning), loop-attaches the image read-only, and mounts it\n",
     "erofs-read-only at --target.\n",
+    "\n",
+    "With --state-dir (docs/design/0250), also assembles the writable view\n",
+    "on top of the read-only image: a real overlay on <target>/etc (upper/\n",
+    "work under <state>/etc), <state>/var bind-mounted at <target>/var, and\n",
+    "fresh tmpfs at <target>/run and <target>/tmp. On any writable-view\n",
+    "failure the whole target is unmounted again (lazy-detached) and the\n",
+    "loop device released, so a failed boot attempt leaks nothing.\n",
 );
 
 fn main() -> ExitCode {
@@ -142,6 +150,7 @@ fn cmd_mount(args: &[String]) -> Result<(), MountError> {
     let mut cmdline_path = PathBuf::from("/proc/cmdline");
     let mut image_dir: Option<PathBuf> = None;
     let mut target: Option<PathBuf> = None;
+    let mut state_dir: Option<PathBuf> = None;
 
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
@@ -154,6 +163,7 @@ fn cmd_mount(args: &[String]) -> Result<(), MountError> {
             "--cmdline" => cmdline_path = PathBuf::from(value_for("--cmdline")?),
             "--image-dir" => image_dir = Some(PathBuf::from(value_for("--image-dir")?)),
             "--target" => target = Some(PathBuf::from(value_for("--target")?)),
+            "--state-dir" => state_dir = Some(PathBuf::from(value_for("--state-dir")?)),
             other => {
                 return Err(MountError::Usage(format!("unknown mount flag {other:?}")));
             }
@@ -208,15 +218,152 @@ fn cmd_mount(args: &[String]) -> Result<(), MountError> {
         }
     }
 
-    mount_erofs_via_loop(&image_path, &target)?;
+    let loop_device = mount_erofs_via_loop(&image_path, &target)?;
+
+    // The writable view (docs/design/0250), only when a state
+    // directory was given -- a plain `mount` without one stays the
+    // 0246 verify-and-mount. On any failure here the whole target is
+    // torn down again (lazy detach + loop release): a half-assembled
+    // root must never linger, whether the caller is a real initramfs
+    // about to drop to emergency or a test.
+    if let Some(state_dir) = &state_dir
+        && let Err(e) = assemble_writable_view(&target, state_dir)
+    {
+        teardown_target(&target, &loop_device);
+        return Err(e);
+    }
+
     println!("mounted {} at {}", image_path.display(), target.display());
+    Ok(())
+}
+
+/// Best-effort teardown for the writable-view failure path
+/// (`docs/design/0250`): plain (non-lazy) unmounts of whatever
+/// sub-mounts were assembled, deepest first, then the base target —
+/// deliberately not one lazy `MNT_DETACH` sweep, whose deferred
+/// completion leaves the loop device busy at the moment of the
+/// explicit detach below (observed for real: the detach silently
+/// raced the deferred unmount and the device leaked). The detach
+/// itself is retried briefly for the same reason; nothing here can
+/// make an already-failing boot fail *worse*, so every step
+/// tolerates errors.
+fn teardown_target(target: &Path, loop_device: &Path) {
+    for sub in ["tmp", "run", "var", "etc"] {
+        let _ = oci_mount::unmount(&target.join(sub));
+    }
+    let _ = oci_mount::unmount(target);
+
+    // `detach` (`LOOP_CLR_FD`) can report success immediately while
+    // only *scheduling* the clear if anything else still has the
+    // device node open at that moment (systemd-udevd transiently
+    // probing a just-changed device, observed directly on this
+    // development host) -- so a bare `.is_ok()` check here isn't
+    // enough proof the device is actually gone, only that the kernel
+    // accepted the request. `wait_until_detached` polls for the real
+    // completion; retry the whole thing (not just the wait) up to an
+    // overall 2-second deadline, tolerating a `detach` call that
+    // itself still errors too (e.g. if the preceding unmount above
+    // hasn't fully released the mount yet).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if oci_mount::loop_device::detach(loop_device).is_ok()
+            && oci_mount::loop_device::wait_until_detached(loop_device, remaining)
+        {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "ociboot-init: warning: could not release {} during cleanup",
+                loop_device.display()
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Assembles the writable view on top of the already-mounted
+/// read-only image (`docs/design/0250`): `/etc` becomes a real
+/// overlay (the image's own `/etc` as lowerdir, upper/work on the
+/// state directory — so `/etc` edits persist across boots on the
+/// state partition while the image stays sealed), `/var` binds the
+/// state directory's own `var` (all real machine state lives there),
+/// and `/run`/`/tmp` get fresh tmpfs. The image must provide all
+/// four directories — a real OS image always does; a clear error
+/// names whichever is missing rather than a bare `ENOENT` from
+/// `mount(2)`.
+fn assemble_writable_view(target: &Path, state_dir: &Path) -> Result<(), MountError> {
+    for required in ["etc", "var", "run", "tmp"] {
+        if !target.join(required).is_dir() {
+            return Err(MountError::Real(format!(
+                "deployment image has no /{required} directory (required for the writable view)"
+            )));
+        }
+    }
+
+    let etc_upper = state_dir.join("etc/upper");
+    let etc_work = state_dir.join("etc/work");
+    let state_var = state_dir.join("var");
+    for dir in [&etc_upper, &etc_work, &state_var] {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| MountError::Real(format!("creating {}: {e}", dir.display())))?;
+    }
+
+    // /etc overlay. Overlay option values are comma/colon-delimited
+    // by the kernel itself; the fixed initramfs paths this runs with
+    // at boot never contain either, and a hostile --state-dir is not
+    // in this tool's threat model (it *is* root), but a clear early
+    // error beats silently corrupted options.
+    let lower = target.join("etc");
+    for (name, path) in [
+        ("lowerdir", &lower),
+        ("upperdir", &etc_upper),
+        ("workdir", &etc_work),
+    ] {
+        let text = path.display().to_string();
+        if text.contains(',') || text.contains(':') {
+            return Err(MountError::Real(format!(
+                "{name} path {text:?} contains characters the kernel's overlay option \
+                 syntax cannot represent"
+            )));
+        }
+    }
+    let overlay_options = [
+        format!("lowerdir={}", lower.display()),
+        format!("upperdir={}", etc_upper.display()),
+        format!("workdir={}", etc_work.display()),
+    ];
+    let overlay_refs: Vec<&str> = overlay_options.iter().map(String::as_str).collect();
+    let parsed = oci_mount::parse_mount_options(&overlay_refs);
+    oci_mount::mount(Some("overlay"), &lower, Some("overlay"), &parsed)
+        .map_err(|e| MountError::Real(format!("mounting /etc overlay: {e}")))?;
+
+    // /var: the state partition's own var, bind-mounted.
+    let parsed = oci_mount::parse_mount_options(&["rbind"]);
+    oci_mount::mount(
+        Some(&state_var.display().to_string()),
+        &target.join("var"),
+        None,
+        &parsed,
+    )
+    .map_err(|e| MountError::Real(format!("bind-mounting /var: {e}")))?;
+
+    // /run and /tmp: fresh tmpfs, like every real init does.
+    for name in ["run", "tmp"] {
+        let parsed = oci_mount::parse_mount_options(&["nosuid", "nodev"]);
+        oci_mount::mount(Some("tmpfs"), &target.join(name), Some("tmpfs"), &parsed)
+            .map_err(|e| MountError::Real(format!("mounting tmpfs /{name}: {e}")))?;
+    }
     Ok(())
 }
 
 /// Loop-attach `image` read-only and mount it erofs-read-only at
 /// `target` — detaching the loop device again if the mount itself
-/// fails, so a failed boot attempt never leaks one.
-fn mount_erofs_via_loop(image: &Path, target: &Path) -> Result<(), MountError> {
+/// fails, so a failed boot attempt never leaks one. Returns the
+/// attached loop device (the caller needs it for its own later
+/// cleanup paths).
+fn mount_erofs_via_loop(image: &Path, target: &Path) -> Result<PathBuf, MountError> {
     std::fs::create_dir_all(target)
         .map_err(|e| MountError::Real(format!("creating {}: {e}", target.display())))?;
     let loop_device = oci_mount::loop_device::attach(
@@ -247,7 +394,7 @@ fn mount_erofs_via_loop(image: &Path, target: &Path) -> Result<(), MountError> {
             target.display()
         )));
     }
-    Ok(())
+    Ok(loop_device)
 }
 
 #[cfg(test)]

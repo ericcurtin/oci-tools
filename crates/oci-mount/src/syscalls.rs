@@ -72,6 +72,27 @@ pub fn plan_mount(parsed: &ParsedMountOptions) -> MountPlan {
     }
 }
 
+/// Plain (non-lazy) `umount2(target, 0)` — completes synchronously or
+/// fails (`EBUSY`, ...), unlike [`unmount_detach`]'s deferred variant;
+/// the right choice when a caller needs the unmount genuinely done
+/// before its next step (e.g. releasing the loop device backing it —
+/// `docs/design/0250`'s teardown path, where the lazy variant's
+/// deferred completion was observed racing the detach).
+pub fn unmount(target: &Path) -> io::Result<()> {
+    rustix::mount::unmount(target, rustix::mount::UnmountFlags::empty()).map_err(io::Error::from)
+}
+
+/// Lazy-unmount `target` and everything mounted beneath it
+/// (`umount2(MNT_DETACH)`) — the cleanup primitive a caller tearing
+/// down a partially-assembled mount tree needs (`ociboot-init`'s own
+/// writable-view failure path, `docs/design/0250`): the detach is
+/// deferred by the kernel until the last user goes away, so it never
+/// fails with `EBUSY` the way a plain unmount of a still-referenced
+/// tree would.
+pub fn unmount_detach(target: &Path) -> io::Result<()> {
+    rustix::mount::unmount(target, rustix::mount::UnmountFlags::DETACH).map_err(io::Error::from)
+}
+
 /// Perform one `mount(2)` call for an OCI mount entry, given its
 /// already-parsed options ([`plan_mount`] decides which of the three
 /// shapes below applies).

@@ -50,6 +50,7 @@ use rustix::fs::{Mode, OFlags, open};
 const LOOP_CTL_GET_FREE: libc::c_ulong = 0x4C82;
 const LOOP_CONFIGURE: libc::c_ulong = 0x4C0A;
 const LOOP_CLR_FD: libc::c_ulong = 0x4C01;
+const LOOP_GET_STATUS64: libc::c_ulong = 0x4C05;
 
 /// `enum` values from `linux/loop.h`'s own loop flags.
 const LO_FLAGS_READ_ONLY: u32 = 1;
@@ -168,6 +169,16 @@ pub fn attach(backing_file: &Path, options: &AttachOptions) -> io::Result<PathBu
 /// raw errno `ENXIO` -- `std` has no dedicated `ErrorKind` for it) if
 /// `loop_device` isn't currently attached to anything, confirmed
 /// directly rather than assumed.
+///
+/// `Ok` here means the kernel *accepted* the clear, not necessarily
+/// that it already happened: `LOOP_CLR_FD` genuinely can report
+/// success while only *scheduling* the clear, completing it only once
+/// every other opener of the device node closes it (confirmed
+/// directly and repeatedly on this development host: `systemd-udevd`
+/// transiently opens a just-changed block device to probe it). A
+/// caller that needs the real, completed release -- not just the
+/// kernel's acknowledgment -- should follow this with
+/// [`wait_until_detached`].
 pub fn detach(loop_device: &Path) -> io::Result<()> {
     let device = open(loop_device, OFlags::RDWR, Mode::empty())?;
     // SAFETY: `device` is a valid, open file descriptor to a real loop
@@ -178,6 +189,60 @@ pub fn detach(loop_device: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Whether `loop_device` is still configured (bound to a backing
+/// file), via a direct `LOOP_GET_STATUS64` -- the real, current
+/// kernel state, not this crate's own idea of it. An already-gone
+/// device node (`ENOENT`) counts as "not configured" too, since that's
+/// just as thoroughly detached as `ENXIO` from the ioctl itself would
+/// be.
+fn is_configured(loop_device: &Path) -> io::Result<bool> {
+    let device = match open(loop_device, OFlags::RDWR, Mode::empty()) {
+        Ok(device) => device,
+        Err(e) if io::Error::from(e).kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    // SAFETY: `device` is a valid, open file descriptor to a real loop
+    // device node; `status` is a properly sized, zero-initialized
+    // `LoopInfo64` the kernel only ever writes into on success
+    // (`LOOP_GET_STATUS64`).
+    #[allow(unsafe_code)]
+    let mut status: LoopInfo64 = unsafe { std::mem::zeroed() };
+    #[allow(unsafe_code)]
+    let ret = unsafe { libc::ioctl(device.as_raw_fd(), LOOP_GET_STATUS64, &mut status) };
+    if ret == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ENXIO) {
+        Ok(false)
+    } else {
+        Err(err)
+    }
+}
+
+/// Poll until `loop_device` is genuinely no longer configured, or
+/// `timeout` elapses -- the tolerant wait a caller needs after
+/// [`detach`] to be sure of its real completion rather than just the
+/// kernel's acknowledgment (see [`detach`]'s own doc comment).
+/// Returns whether it became genuinely detached within `timeout`; any
+/// error querying the device's state (beyond the "already gone" cases
+/// [`is_configured`] itself already treats as detached) is treated the
+/// same as "still configured" -- a caller polling this in a cleanup
+/// path should keep retrying rather than stop on a transient query
+/// failure.
+pub fn wait_until_detached(loop_device: &Path, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if is_configured(loop_device).is_ok_and(|configured| !configured) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 #[cfg(test)]
@@ -397,5 +462,62 @@ mod tests {
 
         let err = detach(&device).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENXIO));
+    }
+
+    #[test]
+    fn wait_until_detached_confirms_a_real_detach() {
+        let Some(_guard) =
+            run_as_root_or_reexec("loop_device::tests::wait_until_detached_confirms_a_real_detach")
+        else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let backing = dir.path().join("backing.img");
+        std::fs::write(&backing, vec![0u8; 16 * 1024 * 1024]).unwrap();
+
+        let device = attach(&backing, &AttachOptions::default()).unwrap();
+        assert!(
+            is_configured(&device).unwrap(),
+            "a freshly attached device should read back as configured"
+        );
+
+        detach(&device).unwrap();
+        assert!(
+            wait_until_detached(&device, std::time::Duration::from_secs(2)),
+            "a real detach should complete within a generous timeout"
+        );
+        assert!(
+            !is_configured(&device).unwrap(),
+            "once wait_until_detached returns true, is_configured must agree"
+        );
+
+        // Cross-checked against the independent, shellout-based
+        // helper the rest of this module's own tests already use --
+        // both should agree it's genuinely gone by now.
+        assert!(wait_until_truly_detached(&device));
+    }
+
+    #[test]
+    fn wait_until_detached_times_out_on_a_device_still_configured() {
+        let Some(_guard) = run_as_root_or_reexec(
+            "loop_device::tests::wait_until_detached_times_out_on_a_device_still_configured",
+        ) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let backing = dir.path().join("backing.img");
+        std::fs::write(&backing, vec![0u8; 16 * 1024 * 1024]).unwrap();
+
+        // Never detached at all: a real, still-configured device must
+        // never be spuriously reported as detached, no matter how
+        // short the given timeout.
+        let device = attach(&backing, &AttachOptions::default()).unwrap();
+        assert!(!wait_until_detached(
+            &device,
+            std::time::Duration::from_millis(100)
+        ));
+
+        detach(&device).unwrap();
+        assert!(wait_until_truly_detached(&device));
     }
 }

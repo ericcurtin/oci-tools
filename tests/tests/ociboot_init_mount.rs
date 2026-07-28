@@ -13,6 +13,7 @@ use std::process::Command;
 use oci_spec_types::image::ContainerConfig;
 use oci_store::Store;
 use oci_tools_tests::{bin_path, busybox_path, seed_image};
+// (seed_image_with_files referenced via the crate path where used.)
 
 fn ociboot(storage_root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin_path("ociboot"))
@@ -271,4 +272,210 @@ fn mount_loop_mounts_a_real_deployment_read_only() {
             .unwrap();
         assert!(detach.status.success(), "{detach:?}");
     }
+}
+
+/// The writable view (`docs/design/0250`): with `--state-dir`, `/etc`
+/// becomes a real overlay whose upper half lives on the state
+/// directory (edits persist there, host-visible), `/var` binds the
+/// state directory's own `var`, `/run`+`/tmp` are fresh tmpfs — all
+/// on top of the still-sealed read-only image. An image missing the
+/// required directories is a clear error, and the failure path tears
+/// the whole target down again (no mount, no loop device left).
+#[test]
+fn mount_with_state_dir_assembles_the_writable_view() {
+    if !mkfs_erofs_available() {
+        eprintln!("skipping: mkfs.erofs not installed");
+        return;
+    }
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !sudo_available() {
+        eprintln!("skipping: no passwordless sudo");
+        return;
+    }
+
+    // An OS-shaped image: /etc with real content, /var, /run, /tmp.
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    oci_tools_tests::seed_image_with_files(
+        &store,
+        "ociboot-test/os-shaped:latest",
+        &busybox,
+        &["sh"],
+        &[
+            ("etc/os-release", b"NAME=oci-tools-test\n"),
+            ("var/.keep", b""),
+            ("run/.keep", b""),
+            ("tmp/.keep", b""),
+        ],
+        ContainerConfig::default(),
+    );
+    let image = dir.path().join("deployment.erofs");
+    let build = ociboot(
+        storage_dir.path(),
+        &[
+            "build-image",
+            "ociboot-test/os-shaped:latest",
+            "--output",
+            image.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let target = dir.path().join("sysroot");
+    let state = dir.path().join("state");
+    let cmdline_path = dir.path().join("cmdline");
+    std::fs::write(&cmdline_path, "ociboot.image=deployment.erofs").unwrap();
+
+    let out = Command::new("sudo")
+        .args([
+            "-n",
+            bin_path("ociboot-init").to_str().unwrap(),
+            "mount",
+            "--cmdline",
+            cmdline_path.to_str().unwrap(),
+            "--image-dir",
+            dir.path().to_str().unwrap(),
+            "--target",
+            target.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to spawn sudo ociboot-init");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() && (stderr.contains("mounting") || stderr.contains("overlay")) {
+        eprintln!("skipping: erofs/overlay mount unsupported here: {stderr}");
+        return;
+    }
+    assert!(out.status.success(), "{stderr}");
+
+    // The overlay's lower half: the image's own /etc content reads
+    // back through the mounted view.
+    assert_eq!(
+        std::fs::read_to_string(target.join("etc/os-release")).unwrap(),
+        "NAME=oci-tools-test\n"
+    );
+    // An /etc write lands in the state directory's upper half --
+    // host-visible, which is exactly how it persists across boots.
+    let write = Command::new("sudo")
+        .args(["-n", "sh", "-c"])
+        .arg(format!(
+            "echo persisted > {}/etc/new.conf && echo vardata > {}/var/data.txt && \
+             echo scratch > {}/tmp/scratch",
+            target.display(),
+            target.display(),
+            target.display()
+        ))
+        .output()
+        .unwrap();
+    assert!(write.status.success(), "{write:?}");
+    assert_eq!(
+        std::fs::read_to_string(state.join("etc/upper/new.conf")).unwrap(),
+        "persisted\n",
+        "/etc writes must land on the state directory"
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.join("var/data.txt")).unwrap(),
+        "vardata\n",
+        "/var writes must land on the state directory"
+    );
+    assert!(
+        !state.join("tmp").exists() && !dir.path().join("tmp/scratch").exists(),
+        "/tmp is a fresh tmpfs, never persisted anywhere"
+    );
+    // The base image itself is still genuinely read-only.
+    let scribble = Command::new("sudo")
+        .args(["-n", "sh", "-c"])
+        .arg(format!("echo x > {}/scribble", target.display()))
+        .output()
+        .unwrap();
+    assert!(
+        !scribble.status.success(),
+        "the erofs base must reject writes even as root"
+    );
+
+    // Cleanup: recursive unmount takes the overlay/bind/tmpfs and the
+    // base in one sweep, then release the loop device.
+    let umount = Command::new("sudo")
+        .args(["-n", "umount", "-R", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(umount.status.success(), "{umount:?}");
+    let list = Command::new("losetup")
+        .args(["-j", image.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&list.stdout);
+    if let Some(device) = listing.split(':').next().filter(|s| !s.is_empty()) {
+        let detach = Command::new("sudo")
+            .args(["-n", "losetup", "-d", device])
+            .output()
+            .unwrap();
+        assert!(detach.status.success(), "{detach:?}");
+    }
+
+    // The failure path: a minimal image (no /etc at all) with
+    // --state-dir errors clearly and leaves nothing behind.
+    let (minimal, _) = build_deployment(dir.path(), false);
+    std::fs::rename(&minimal, dir.path().join("minimal.erofs")).unwrap();
+    std::fs::write(&cmdline_path, "ociboot.image=minimal.erofs").unwrap();
+    let out = Command::new("sudo")
+        .args([
+            "-n",
+            bin_path("ociboot-init").to_str().unwrap(),
+            "mount",
+            "--cmdline",
+            cmdline_path.to_str().unwrap(),
+            "--image-dir",
+            dir.path().to_str().unwrap(),
+            "--target",
+            target.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("has no /etc directory"),
+        "{out:?}"
+    );
+    // Nothing left mounted, no loop device leaked.
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap();
+    assert!(
+        !mounts.contains(target.to_str().unwrap()),
+        "the failure path must unmount the target again"
+    );
+    // `ociboot-init`'s own teardown already waits out the real,
+    // environment-dependent delay `LOOP_CLR_FD` can have before the
+    // device is genuinely gone (see `oci_mount::loop_device::detach`'s
+    // own doc comment: another opener -- `systemd-udevd` transiently
+    // probing a just-changed device, observed directly -- can defer
+    // the actual clear past the ioctl call that scheduled it), so by
+    // the time the subprocess above has exited this should already be
+    // true; poll briefly anyway rather than assuming a zero-delay
+    // `losetup -j` observes the exact same instant the kernel does.
+    let minimal_path = dir.path().join("minimal.erofs");
+    let released = (0..40).any(|i| {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let list = Command::new("losetup")
+            .args(["-j", minimal_path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        list.stdout.is_empty()
+    });
+    assert!(
+        released,
+        "the failure path must release the loop device (still listed after waiting)"
+    );
 }
