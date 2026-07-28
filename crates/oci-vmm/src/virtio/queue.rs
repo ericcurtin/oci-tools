@@ -673,6 +673,14 @@ impl Queue {
     }
 
     /// Resets the Virtio Queue
+    // Unused specifically on aarch64 Linux: its only real caller today
+    // is `hvf::virtio_mmio` (macOS/aarch64-gated); `Queue` itself stays
+    // ungated because it's hypervisor-agnostic (this crate's own
+    // `lib.rs` doc comment) and a future aarch64 Linux (KVM) backend
+    // would need this same reset. Every target with a real backend
+    // compiled (Linux/x86_64, macOS/aarch64) still gets normal
+    // dead-code detection for genuinely unused code.
+    #[cfg_attr(all(target_os = "linux", target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn reset(&mut self) {
         self.ready = false;
         self.size = self.max_size;

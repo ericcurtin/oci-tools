@@ -330,10 +330,20 @@ impl Request {
         Ok(req)
     }
 
+    // `offset`/`to_pending_request`/`process` below are unused
+    // specifically on aarch64 Linux: their only real callers today are
+    // `virtio::block::device` (Linux/x86_64-gated) and
+    // `hvf::virtio_blk` (macOS/aarch64-gated); this module itself
+    // stays ungated because it's transport/hypervisor-agnostic (this
+    // crate's own `lib.rs` doc comment) and a future aarch64 Linux
+    // (KVM) backend would reuse it unchanged. Every target with a real
+    // backend compiled still gets normal dead-code detection.
+    #[cfg_attr(all(target_os = "linux", target_arch = "aarch64"), allow(dead_code))]
     fn offset(&self) -> u64 {
         self.sector << SECTOR_SHIFT
     }
 
+    #[cfg_attr(all(target_os = "linux", target_arch = "aarch64"), allow(dead_code))]
     fn to_pending_request(&self, desc_idx: u16) -> PendingRequest {
         PendingRequest {
             r#type: self.r#type,
@@ -347,6 +357,7 @@ impl Request {
     ///
     /// The engine is synchronous, so the request always executes to
     /// completion here (there is no submission/throttling state).
+    #[cfg_attr(all(target_os = "linux", target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn process(
         self,
         disk: &mut DiskProperties,
