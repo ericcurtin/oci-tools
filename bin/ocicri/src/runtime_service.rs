@@ -483,6 +483,39 @@ fn container_state_to_proto(state: container::ContainerState) -> i32 {
     }
 }
 
+/// Converts a CRI `LinuxContainerResources` request into the same
+/// [`oci_spec_types::runtime::LinuxResources`] shape `ociman update`/
+/// `ocirun update` already apply — see `update_container_resources`'s
+/// own doc comment for exactly which fields map where (and which
+/// three genuinely have no home yet). `0`/`""` throughout is the
+/// proto's own documented "not specified" sentinel, so every field
+/// maps to `None`/omitted rather than a real, if degenerate, `0`
+/// value -- a caller that actually wants e.g. `cpu_shares: 0` has no
+/// way to ask for that over this RPC either way (the proto gives it
+/// no other meaning), so this loses nothing real.
+fn linux_container_resources_to_oci(
+    linux: &cri::LinuxContainerResources,
+) -> oci_spec_types::runtime::LinuxResources {
+    let memory = oci_spec_types::runtime::LinuxMemory {
+        limit: (linux.memory_limit_in_bytes != 0).then_some(linux.memory_limit_in_bytes),
+        swap: (linux.memory_swap_limit_in_bytes != 0).then_some(linux.memory_swap_limit_in_bytes),
+        ..Default::default()
+    };
+    let cpu = oci_spec_types::runtime::LinuxCpu {
+        shares: (linux.cpu_shares != 0).then_some(linux.cpu_shares as u64),
+        period: (linux.cpu_period != 0).then_some(linux.cpu_period as u64),
+        quota: (linux.cpu_quota != 0).then_some(linux.cpu_quota),
+        cpus: linux.cpuset_cpus.clone(),
+        mems: linux.cpuset_mems.clone(),
+        ..Default::default()
+    };
+    oci_spec_types::runtime::LinuxResources {
+        memory: Some(memory),
+        cpu: Some(cpu),
+        ..Default::default()
+    }
+}
+
 fn container_metadata_to_proto(metadata: &container::ContainerMetadata) -> cri::ContainerMetadata {
     cri::ContainerMetadata {
         name: metadata.name.clone(),
@@ -1482,11 +1515,85 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         }))
     }
 
+    /// Real cri-o (`server/container_update_resources.go`, checked
+    /// directly) applies this to both `Running` and `Created`
+    /// containers, since its own runtime layer already gives every
+    /// created container a live cgroup to write into. This project's
+    /// own `CreateContainer` deliberately doesn't (`docs/design/
+    /// 0237`'s own note: cgroup/process setup is `StartContainer`'s
+    /// job) — a `Created` container here has no live cgroup at all,
+    /// so honestly there is nothing yet to update; `Running` is the
+    /// only state this can act on for real, matching the "absence
+    /// over fabrication" rule this project already applies elsewhere
+    /// (e.g. `ContainerStats`, `docs/design/0241`) rather than
+    /// silently accepting a `Created`-state request that changes
+    /// nothing.
+    ///
+    /// Field mapping onto [`oci_spec_types::runtime::LinuxResources`]
+    /// (the exact same shape `ociman update`/`ocirun update` already
+    /// apply via `oci_runtime_core::cgroups::plan_resources`/`apply`):
+    /// `cpu_shares`/`cpu_period`/`cpu_quota`/`cpuset_cpus`/
+    /// `cpuset_mems` map straight across (`0`/`""` meaning "not
+    /// specified", the proto's own documented default); `memory_
+    /// limit_in_bytes`/`memory_swap_limit_in_bytes` map onto `memory.
+    /// limit`/`memory.swap` directly, honoring the request's own
+    /// explicit swap value (unlike real cri-o's own checked
+    /// `toOCIResources`, which curiously pins `Memory.Swap` to the
+    /// *limit* value whenever swap accounting is available at all and
+    /// never actually reads `GetMemorySwapLimitInBytes()` -- honoring
+    /// what the caller actually asked for is more correct than
+    /// replicating that). `oom_score_adj`/`hugepage_limits`/`unified`
+    /// have no home yet (no oom-score-adj write path, no hugetlb
+    /// support, no raw-cgroup-v2-file passthrough anywhere in this
+    /// project) and are honestly ignored rather than silently
+    /// mis-applied -- matching `oci_runtime_core::cgroups`' own
+    /// existing, narrower-than-the-full-spec scope.
     async fn update_container_resources(
         &self,
-        _request: Request<cri::UpdateContainerResourcesRequest>,
+        request: Request<cri::UpdateContainerResourcesRequest>,
     ) -> Result<Response<cri::UpdateContainerResourcesResponse>, Status> {
-        unimplemented("UpdateContainerResources")
+        let request = request.into_inner();
+        let id = request.container_id;
+        let record = {
+            let _guard = self
+                .sandbox_mutation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(record) = find_container(&id)? else {
+                return Err(Status::not_found(format!(
+                    "could not find container {id:?}"
+                )));
+            };
+            reconcile_container(record)?
+        };
+        if record.state != container::ContainerState::Running {
+            return Err(Status::failed_precondition(format!(
+                "container {} is not running (resources can only be updated on a live cgroup)",
+                record.id
+            )));
+        }
+        let Some(linux) = request.linux else {
+            // Nothing to do -- matches real cri-o's own identical
+            // no-op when the (optional) Linux half of the request is
+            // absent.
+            return Ok(Response::new(cri::UpdateContainerResourcesResponse {}));
+        };
+
+        let pid = record
+            .pid
+            .ok_or_else(|| Status::internal(format!("container {id} has no recorded pid")))?;
+        let cgroup_dir = oci_runtime_core::cgroups::cgroup_dir_for_running_pid(
+            std::path::Path::new("/sys/fs/cgroup"),
+            pid,
+        )
+        .map_err(|e| Status::internal(format!("resolving cgroup for container {id}: {e}")))?;
+
+        let resources = linux_container_resources_to_oci(&linux);
+        let writes = oci_runtime_core::cgroups::plan_resources(&resources);
+        oci_runtime_core::cgroups::apply(&cgroup_dir, &writes)
+            .map_err(|e| Status::internal(format!("updating resources for container {id}: {e}")))?;
+
+        Ok(Response::new(cri::UpdateContainerResourcesResponse {}))
     }
 
     /// Log rotation's other half (`docs/design/0243`): kubelet renames

@@ -1339,6 +1339,154 @@ async fn container_stats_report_real_cgroup_usage() {
         .unwrap();
 }
 
+/// `UpdateContainerResources` (`docs/design/0251`): real, live cgroup
+/// writes for a running container via the same shared
+/// `oci_runtime_core::cgroups::plan_resources`/`apply` pair `ociman
+/// update`/`ocirun update` already use — checked directly against the
+/// real cgroup files afterward, the same way `ociman_update.rs`'s own
+/// `update_changes_the_real_live_cgroup_limits_of_a_running_container`
+/// does. A `Created` (never-started) container has no live cgroup at
+/// all in this project's own model, so it's a clear `FailedPrecondition`
+/// rather than a silent no-op; an unknown ID is a real `NotFound`.
+#[tokio::test]
+async fn update_container_resources_changes_the_real_live_cgroup() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session (containers get no cgroup)");
+        return;
+    }
+
+    // Unknown ID: a real NotFound, before ever touching a real
+    // container.
+    let err = client
+        .update_container_resources(oci_cri_types::UpdateContainerResourcesRequest {
+            container_id: "deadbeef".repeat(8),
+            linux: Some(oci_cri_types::LinuxContainerResources {
+                memory_limit_in_bytes: 64 * 1024 * 1024,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect_err("updating an unknown container should fail");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    // A created-but-never-started container: no live cgroup, so this
+    // is a clear precondition failure, not a silent no-op.
+    let created_only = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(container_config("update-created", 0)),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    let err = client
+        .update_container_resources(oci_cri_types::UpdateContainerResourcesRequest {
+            container_id: created_only,
+            linux: Some(oci_cri_types::LinuxContainerResources {
+                memory_limit_in_bytes: 64 * 1024 * 1024,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect_err("updating a created-only container should fail");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    // A really-running container: real cgroup writes.
+    let mut config = container_config("update-runner", 0);
+    config.command = vec!["/bin/sleep".to_string(), "300".to_string()];
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+
+    client
+        .update_container_resources(oci_cri_types::UpdateContainerResourcesRequest {
+            container_id: container_id.clone(),
+            linux: Some(oci_cri_types::LinuxContainerResources {
+                memory_limit_in_bytes: 64 * 1024 * 1024,
+                cpu_quota: 50_000,
+                cpu_period: 100_000,
+                // Deliberately no `cpuset_cpus`/`cpuset_mems` here:
+                // the `cpuset` controller isn't always delegated into
+                // a real user systemd session's own cgroup subtree
+                // (`plan_cpu`'s own doc comment notes this
+                // requirement directly) -- neither `ociman_update.rs`
+                // nor `ocirun_update.rs` exercises it for the exact
+                // same, already-established reason.
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("UpdateContainerResources failed");
+
+    // Resolve the real cgroup directory from the record's own pid
+    // (verbose ContainerStatus's info blob, the only way a test
+    // outside `ocicri`'s own crate can reach its private container
+    // module) and read the real files back -- not just trusting the
+    // RPC's own empty, content-free success response.
+    let verbose = client
+        .container_status(ContainerStatusRequest {
+            container_id: container_id.clone(),
+            verbose: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let info = verbose.info.get("info").expect("verbose info under 'info'");
+    let parsed: serde_json::Value = serde_json::from_str(info).unwrap();
+    let pid = parsed["pid"].as_i64().expect("running container has a pid") as i32;
+    let cgroup_dir =
+        oci_runtime_core::cgroups::cgroup_dir_for_running_pid(Path::new("/sys/fs/cgroup"), pid)
+            .expect("resolving the real cgroup for a running container");
+
+    let memory_max = std::fs::read_to_string(cgroup_dir.join("memory.max")).unwrap();
+    assert_eq!(memory_max.trim(), (64 * 1024 * 1024).to_string());
+    let cpu_max = std::fs::read_to_string(cgroup_dir.join("cpu.max")).unwrap();
+    assert_eq!(cpu_max.trim(), "50000 100000");
+
+    // An absent `linux` half is a real, documented no-op (matching
+    // real cri-o's own identical behavior) -- never an error.
+    client
+        .update_container_resources(oci_cri_types::UpdateContainerResourcesRequest {
+            container_id: container_id.clone(),
+            linux: None,
+            ..Default::default()
+        })
+        .await
+        .expect("an absent Linux half should be a harmless no-op");
+
+    client
+        .stop_container(oci_cri_types::StopContainerRequest {
+            container_id,
+            timeout: 0,
+        })
+        .await
+        .unwrap();
+}
+
 /// The CRI log path (`docs/design/0242`): a container created with
 /// kubelet's own `log_directory` + `log_path` convention streams its
 /// stdout/stderr into a real, CRI-format log file (`<RFC3339Nano>
