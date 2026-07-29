@@ -186,6 +186,45 @@ fn enter_bind_mounts_a_real_existing_home() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "real-host-home");
 }
 
+/// A real, previously-unnoticed bug this fixes (0292): every box,
+/// regardless of its own real name, used to report the literal
+/// hostname `ocirun` -- a copy-paste artifact of `Spec::example()`'s
+/// own hardcoded template default, never overridden by `enter_spec`.
+/// Now defaults to the box's own name, the same "default to this
+/// resource's own identity" convention `ociman run` already
+/// established for containers.
+#[test]
+fn enter_reports_the_boxs_own_name_as_its_hostname() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "my-real-box-name");
+
+    let out = ocibox(
+        storage_dir.path(),
+        &[
+            "enter",
+            "my-real-box-name",
+            "--",
+            "/bin/cat",
+            "/proc/sys/kernel/hostname",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "my-real-box-name",
+        "the box's own hostname must match its own real name, not the shared spec template's \
+         hardcoded default"
+    );
+}
+
 #[test]
 fn enter_of_an_unknown_box_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();

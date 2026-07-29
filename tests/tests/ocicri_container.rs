@@ -321,6 +321,79 @@ async fn container_create_status_list_remove_lifecycle() {
     assert_eq!(remaining[0].id, second);
 }
 
+/// `PodSandboxConfig.hostname` wiring (0292): a real, previously-
+/// missing per-container UTS setting — every CRI container used to
+/// silently report the shared spec template's own hardcoded
+/// `"ocirun"` hostname regardless of the pod's own real name/config.
+/// Matches real cri-o's own `getHostname` exactly (checked directly
+/// against `~/git/cri-o/server/sandbox_run.go`): the sandbox config's
+/// own `hostname` if non-empty, else the sandbox id's own first 12
+/// hex chars — verified both ways, plus the matching `HOSTNAME=`
+/// process env var real cri-o's own `AddProcessEnv` call site also
+/// sets.
+#[tokio::test]
+async fn create_container_wires_the_pod_sandboxs_own_hostname() {
+    let Some((storage, _socket, _server, mut client, sandbox_id, mut sandbox_config)) =
+        setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    sandbox_config.hostname = "custom-pod-hostname".to_string();
+
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(container_config("hostname-explicit", 0)),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+    let spec: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundle_dir(storage.path(), &container_id).join("config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(spec["hostname"], serde_json::json!("custom-pod-hostname"));
+    assert!(
+        spec["process"]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "HOSTNAME=custom-pod-hostname"),
+        "{spec:?}"
+    );
+
+    // An empty `sandbox_config.hostname` (real kubelet very commonly
+    // never sets it at all) falls back to the sandbox id's own first
+    // 12 hex chars, matching real cri-o's own non-host-network
+    // default exactly -- this project has no host-networking concept
+    // for a sandbox at all, so that's the only real fallback branch
+    // reachable here.
+    let mut no_hostname_config = sandbox_config.clone();
+    no_hostname_config.hostname = String::new();
+    let fallback_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(container_config("hostname-fallback", 0)),
+            sandbox_config: Some(no_hostname_config),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+    let fallback_spec: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundle_dir(storage.path(), &fallback_id).join("config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        fallback_spec["hostname"],
+        serde_json::json!(sandbox_id[..12]),
+        "{fallback_spec:?}"
+    );
+}
+
 /// The CRI-command/args-versus-image-Entrypoint/Cmd merge (real
 /// cri-o's own `SpecSetProcessArgs` rule) lands in the generated
 /// bundle spec — checked end to end through a real image whose config
@@ -388,7 +461,17 @@ async fn bundle_spec_merges_image_and_cri_config_and_rejects_no_command() {
         .iter()
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
-    assert_eq!(env, vec!["FROM_IMAGE=1", "FROM_KUBE=2"]);
+    // `HOSTNAME=` last (0292): `pod_config`'s own default leaves
+    // `hostname` empty, so it falls back to the sandbox id's own
+    // first 12 hex chars.
+    assert_eq!(
+        env,
+        vec![
+            "FROM_IMAGE=1".to_string(),
+            "FROM_KUBE=2".to_string(),
+            format!("HOSTNAME={}", &sandbox_id[..12]),
+        ]
+    );
 
     // Nothing to run anywhere: real cri-o's own "no command
     // specified", and no half-created bundle left behind.

@@ -19,8 +19,9 @@
 //! increment, documented rather than half-implemented): joining the
 //! sandbox's namespaces (none are pinned yet — 0233), per-container
 //! `run_as_user`/security-context mapping, CRI mounts/devices,
-//! resource limits, hostname/`/etc/hosts`/`resolv.conf` wiring, and
-//! the CRI log path.
+//! resource limits, and `/etc/hosts`/`resolv.conf` wiring. Hostname
+//! *is* wired now (0292) — see [`CriProcessConfig::hostname`]'s own
+//! doc comment.
 
 use std::path::{Path, PathBuf};
 
@@ -113,6 +114,17 @@ pub struct CriProcessConfig<'a> {
     pub envs: Vec<String>,
     /// `ContainerConfig.working_dir`.
     pub working_dir: &'a str,
+    /// The pod sandbox's own real hostname (0292) -- already fully
+    /// resolved by the caller (`PodSandboxConfig.hostname` if
+    /// non-empty, else the sandbox id's own first 12 hex chars,
+    /// matching real cri-o's own `getHostname` exactly for the
+    /// non-host-network case, the only one this project supports at
+    /// all): a real, previously-missing per-container UTS setting
+    /// every CRI container used to silently skip, always reporting
+    /// `Spec::example()`'s own hardcoded `"ocirun"` instead (`bundle`
+    /// module's own doc comment already named this exact gap as
+    /// "deliberately out of scope for this slice", closed here).
+    pub hostname: &'a str,
 }
 
 /// Builds the container's own real OCI spec: the same
@@ -142,6 +154,12 @@ fn build_spec(
     let image_env = image_config.env.clone();
     let image_working_dir = image_config.working_dir.clone().unwrap_or_default();
 
+    // The pod sandbox's own real hostname (0292) -- matching real
+    // cri-o's own `specgen.SetHostname(sb.Hostname())` exactly (see
+    // `CriProcessConfig::hostname`'s own doc comment for exactly how
+    // the caller already resolved it).
+    spec.hostname = Some(cri.hostname.to_string());
+
     let process = spec
         .process
         .as_mut()
@@ -153,12 +171,16 @@ fn build_spec(
     // ordering (image config env is added to the spec before the
     // kubelet-supplied ones, so a kube-supplied duplicate key wins by
     // coming later). Nothing declared anywhere falls back to the same
-    // real PATH `ociman` already applies (0194).
+    // real PATH `ociman` already applies (0194). `HOSTNAME` last,
+    // matching real cri-o's own `specgen.AddProcessEnv("HOSTNAME",
+    // sb.Hostname())` call site (right after `SetHostname`, after
+    // every other env source).
     let mut env: Vec<String> = image_env;
     env.extend(cri.envs.iter().cloned());
     if env.is_empty() {
         env.push(DEFAULT_ENV_WHEN_NOTHING_DECLARES_ANY.to_string());
     }
+    env.push(format!("HOSTNAME={}", cri.hostname));
     process.env = env;
 
     // CRI working_dir wins; the image's own WorkingDir is the
@@ -332,14 +354,21 @@ mod tests {
             args: &[],
             envs: strings(&["FROM_KUBE=2"]),
             working_dir: "/from-kube",
+            hostname: "test-pod-hostname",
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();
         assert_eq!(process.args, strings(&["/bin/sh"]));
-        // Image env first, kube env after (later wins for dup keys).
-        assert_eq!(process.env, strings(&["FROM_IMAGE=1", "FROM_KUBE=2"]));
+        // Image env first, kube env after (later wins for dup keys),
+        // `HOSTNAME` last (matching real cri-o's own `AddProcessEnv`
+        // call site).
+        assert_eq!(
+            process.env,
+            strings(&["FROM_IMAGE=1", "FROM_KUBE=2", "HOSTNAME=test-pod-hostname"])
+        );
         assert_eq!(process.cwd, "/from-kube");
         assert!(!spec.root.unwrap().readonly);
+        assert_eq!(spec.hostname.as_deref(), Some("test-pod-hostname"));
     }
 
     #[test]
@@ -353,14 +382,19 @@ mod tests {
             args: &[],
             envs: Vec::new(),
             working_dir: "",
+            hostname: "fallback-hostname-test",
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();
         assert_eq!(process.cwd, "/");
         assert_eq!(
             process.env,
-            vec![DEFAULT_ENV_WHEN_NOTHING_DECLARES_ANY.to_string()],
+            vec![
+                DEFAULT_ENV_WHEN_NOTHING_DECLARES_ANY.to_string(),
+                "HOSTNAME=fallback-hostname-test".to_string(),
+            ],
             "nothing declared anywhere falls back to the same real PATH ociman applies (0194)"
         );
+        assert_eq!(spec.hostname.as_deref(), Some("fallback-hostname-test"));
     }
 }

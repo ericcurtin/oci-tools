@@ -544,6 +544,23 @@ fn enter_spec(
         .as_mut()
         .expect("Spec::example always sets root")
         .readonly = false;
+    // A real, previously-unnoticed bug this fixes: `Spec::example()`'s
+    // own hardcoded `hostname: "ocirun"` was never overridden here, so
+    // *every* box, regardless of its own real name, reported the
+    // literal hostname `ocirun` — a copy-paste artifact from the
+    // shared spec template, not a deliberate choice (no design note
+    // among 0205/0207/0211/0252 ever mentions hostname at all). Real
+    // `distrobox enter` defaults a box's own hostname to the real
+    // host's own (`~/git/distrobox/pkg/commands/create.go`'s own
+    // `getHostname`), which this project has no equivalent host-
+    // hostname read for yet; the box's own name is the same "default
+    // to this resource's own identity" convention `ociman run` already
+    // established for containers (`synthesize_spec`'s own `spec.
+    // hostname = Some(hostname.unwrap_or(id)...)`, 0286) — a real,
+    // useful hostname distinguishing one box's own shell prompt from
+    // another's, rather than every single box claiming to be
+    // `ocirun`.
+    spec.hostname = Some(record.name.clone());
 
     // Only added if `$HOME` resolves to a real, existing host
     // directory — deliberately conditional (unlike real `distrobox

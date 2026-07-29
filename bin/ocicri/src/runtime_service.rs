@@ -1153,6 +1153,17 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             .iter()
             .map(|kv| format!("{}={}", kv.key, kv.value))
             .collect();
+        // Real cri-o's own `getHostname` (0292, checked directly
+        // against `~/git/cri-o/server/sandbox_run.go`): the sandbox
+        // config's own `hostname` if non-empty, else the sandbox id's
+        // own first 12 hex chars -- the host-network branch of that
+        // same function is unreachable here, since this project has
+        // no host-networking concept for a sandbox at all.
+        let hostname = if sandbox_config.hostname.is_empty() {
+            sb.id[..sb.id.len().min(12)].to_string()
+        } else {
+            sandbox_config.hostname.clone()
+        };
         crate::bundle::prepare(
             &store,
             &oci_cli_common::storage::default_root(),
@@ -1164,6 +1175,7 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
                 args: &config.args,
                 envs,
                 working_dir: &config.working_dir,
+                hostname: &hostname,
             },
         )
         .map_err(|e| match e {
