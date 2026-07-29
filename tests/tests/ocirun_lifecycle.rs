@@ -820,3 +820,138 @@ fn pause_and_resume_on_a_stopped_container_are_clear_errors() {
         String::from_utf8_lossy(&resume.stderr)
     );
 }
+
+/// The real pids currently in `id`'s own cgroup, via `ocirun ps
+/// --format json` (a bare JSON array of pids) -- the exact same
+/// `oci_runtime_core::cgroups::all_pids` read `kill --all` itself
+/// uses.
+fn ocirun_ps_pids(root: &Path, id: &str) -> Vec<i64> {
+    let out = ocirun(root, &["ps", id, "--format", "json"]);
+    assert!(
+        out.status.success(),
+        "ps failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("ocirun ps --format json should be a JSON array")
+}
+
+/// `ocirun kill --all` (0277): matches real `crun kill -a`/`--all`
+/// exactly (`runc kill` has no equivalent flag at all, checked
+/// directly against `~/git/crun/src/kill.c`/`cgroup-utils.c`'s own
+/// `cgroup_killall_path`) -- signals every real pid in the
+/// container's own cgroup (not just its recorded init pid, the same
+/// primitive `ocirun ps` itself already reads), via the exact same
+/// freeze/sweep/thaw sequence real crun uses. This test focuses on
+/// the one property that matters most for correctness -- the cgroup
+/// is never left stuck frozen behind a `--all` call, verified by
+/// reading the real `cgroup.freeze` file directly afterward, the same
+/// way `pause_freezes_and_resume_thaws_a_real_running_containers_own_
+/// cpu_usage` above already does.
+#[test]
+fn kill_all_signals_the_real_pid_and_leaves_the_cgroup_unfrozen() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_scope_available() {
+        eprintln!(
+            "skipping: no reachable `systemd --user` session (systemd-run --user --scope failed)"
+        );
+        return;
+    }
+
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    // `ocirun ps`'s own pid listing (and so `kill --all`'s own sweep)
+    // needs a real `cgroupsPath` set -- `ocirun`'s own create/start
+    // pipeline auto-creates the real transient systemd scope for it.
+    let config_path = bundle_dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    let uid = rustix::process::getuid().as_raw();
+    let target = format!(
+        "/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/ocirun-kill-all-test-{}",
+        std::process::id()
+    );
+    config["linux"]["cgroupsPath"] = serde_json::json!(target);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let cgroup_dir = Path::new("/sys/fs/cgroup").join(target.trim_start_matches('/'));
+
+    // `create` is the one invocation that does the real `cgroup.procs`
+    // migration, so it alone needs to run under a real, delegated
+    // `systemd-run --user --scope` carrier -- same reasoning
+    // `create_start_kill_delete_removes_the_cgroup_directory`'s own
+    // sibling test above already established (`start`/`kill`/`delete`
+    // don't touch cgroups themselves).
+    let carrier_unit = format!("ocirun-kill-all-test-carrier-{}.scope", std::process::id());
+    let create = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--slice=app.slice",
+            &format!("--unit={carrier_unit}"),
+            "--",
+        ])
+        .arg(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args(["create", "kill-all-test", "--bundle"])
+        .arg(bundle_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .expect("failed to spawn systemd-run");
+    assert!(
+        create.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let start = ocirun(root_dir.path(), &["start", "kill-all-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "kill-all-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let pids_before = ocirun_ps_pids(root_dir.path(), "kill-all-test");
+    assert!(!pids_before.is_empty(), "expected at least one real pid");
+
+    let kill_all = ocirun(root_dir.path(), &["kill", "--all", "kill-all-test", "KILL"]);
+    assert!(
+        kill_all.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&kill_all.stderr)
+    );
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "kill-all-test",
+            "stopped",
+            Duration::from_secs(5)
+        ),
+        "stopped",
+        "SIGKILL via --all should have terminated the container"
+    );
+
+    // The critical correctness property: `--all` must never leave the
+    // real cgroup stuck frozen behind it, even though it freezes the
+    // cgroup internally partway through its own sweep.
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("cgroup.freeze"))
+            .unwrap()
+            .trim(),
+        "0",
+        "the cgroup must be thawed again after kill --all, never left stuck frozen"
+    );
+
+    ocirun(root_dir.path(), &["delete", "kill-all-test"]);
+}

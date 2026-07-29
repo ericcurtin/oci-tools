@@ -127,6 +127,20 @@ enum Command {
         /// Signal to send: a number, or a name with or without the
         /// `SIG` prefix (case-insensitive) — e.g. `9`, `KILL`, `SIGKILL`.
         signal: Option<String>,
+        /// Send the signal to every process in the container's own
+        /// cgroup, not just its init process — matching real `crun
+        /// kill -a`/`--all` exactly (checked directly against a real
+        /// installed `crun kill --help`/`~/git/crun/src/libcrun/
+        /// cgroup-utils.c`'s own `cgroup_killall_path`; real `runc
+        /// kill` has no equivalent flag at all). The container's own
+        /// cgroup is frozen first (so a process forking a new child
+        /// mid-sweep can't dodge the signal), every real pid in it is
+        /// signaled (a process that already exited by the time its
+        /// own signal is sent is silently tolerated, matching real
+        /// crun's own `errno != ESRCH` check), then unfrozen again —
+        /// the exact same freeze/sweep/thaw sequence real crun uses.
+        #[arg(short, long)]
+        all: bool,
     },
     /// Remove a container's on-disk state. Refuses a still-running
     /// container unless `--force` (which sends `SIGKILL` first).
@@ -313,7 +327,7 @@ fn main() -> std::process::ExitCode {
                 pid_file,
             }) => cmd_create(&root, &id, bundle.as_deref(), pid_file.as_deref()),
             Some(Command::Start { id }) => cmd_start(&root, &id),
-            Some(Command::Kill { id, signal }) => cmd_kill(&root, &id, signal.as_deref()),
+            Some(Command::Kill { id, signal, all }) => cmd_kill(&root, &id, signal.as_deref(), all),
             Some(Command::Delete { id, force }) => cmd_delete(&root, &id, force),
             Some(Command::Exec {
                 id,
@@ -644,7 +658,7 @@ fn cmd_start(root: &Path, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_kill(root: &Path, id: &str, signal: Option<&str>) -> anyhow::Result<()> {
+fn cmd_kill(root: &Path, id: &str, signal: Option<&str>, all: bool) -> anyhow::Result<()> {
     let store = StateStore::open(root)
         .with_context(|| format!("opening container state root {}", root.display()))?;
     let state = store.load(id)?;
@@ -656,8 +670,44 @@ fn cmd_kill(root: &Path, id: &str, signal: Option<&str>) -> anyhow::Result<()> {
     };
 
     let signal = oci_runtime_core::signal::parse(signal.unwrap_or("SIGTERM"))?;
+
+    if all {
+        return kill_all(root, id, signal);
+    }
     oci_runtime_core::process::kill(pid, signal).context("sending signal")?;
     Ok(())
+}
+
+/// `ocirun kill --all`'s own real implementation — see
+/// [`Command::Kill`]'s own doc comment for exactly why this freeze/
+/// sweep/thaw sequence matches real crun's own `cgroup_killall_path`
+/// rather than just signaling every currently-listed pid outright (a
+/// process forking a new child in the middle of an unfrozen sweep
+/// could otherwise dodge the signal entirely). The cgroup is always
+/// unfrozen again before returning, even if listing pids or a
+/// individual `kill(2)` call failed partway through — a `--all` call
+/// must never leave a container's own cgroup stuck frozen behind it.
+fn kill_all(root: &Path, id: &str, signal: i32) -> anyhow::Result<()> {
+    let cgroup_dir = resolve_cgroup_dir(root, id)?;
+    oci_runtime_core::cgroups::set_frozen(&cgroup_dir, true)
+        .with_context(|| format!("freezing {}", cgroup_dir.display()))?;
+
+    let result = oci_runtime_core::cgroups::all_pids(&cgroup_dir)
+        .with_context(|| format!("listing processes in {}", cgroup_dir.display()))
+        .and_then(|pids| {
+            for pid in pids {
+                if let Err(e) = oci_runtime_core::process::kill(pid, signal)
+                    && e.raw_os_error() != Some(libc::ESRCH)
+                {
+                    return Err(e).with_context(|| format!("sending signal to pid {pid}"));
+                }
+            }
+            Ok(())
+        });
+
+    oci_runtime_core::cgroups::set_frozen(&cgroup_dir, false)
+        .with_context(|| format!("unfreezing {}", cgroup_dir.display()))?;
+    result
 }
 
 fn cmd_delete(root: &Path, id: &str, force: bool) -> anyhow::Result<()> {
