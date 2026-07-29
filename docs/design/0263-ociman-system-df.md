@@ -84,8 +84,8 @@ Full workspace: `cargo build`/`test --workspace` (109 test binaries),
 
 ## Still ahead
 
-`-v`/`--verbose` (the real per-image/per-container/per-volume
-breakdown table) and `--format` are still ahead. The precise
+`--format` is still ahead. `-v`/`--verbose` (the real per-image/
+per-container/per-volume breakdown table, including the precise
 per-image "unique vs. shared across other stored images" size
-breakdown (closing the one documented simplification above) would need
-a real digest-reference-count pass across every stored image.
+breakdown that closes the one documented simplification above) is now
+implemented — see `docs/design/0285`.

@@ -1884,10 +1884,21 @@ enum SystemCommand {
     /// `SIZE (PERCENT%)` reclaimable formatting) — see [`cmd_system_df`]'s
     /// own doc comment for exactly how each column is computed and the
     /// one deliberate simplification from real podman's own precise
-    /// per-image "unique size" cross-sharing calculation. The
-    /// `-v`/`--verbose` per-item breakdown and `--format` are still
-    /// ahead.
-    Df,
+    /// per-image "unique size" cross-sharing calculation. `--format`
+    /// is still ahead.
+    Df {
+        /// Show a real, per-item breakdown (one row per image/
+        /// container/volume) instead of just the aggregate summary —
+        /// matching real `podman system df -v`/`--verbose` exactly in
+        /// shape (three headed sections). Unlike real podman (which
+        /// refuses to combine this with its own `--format`), this
+        /// project's own `--json` (a global flag, not a per-command
+        /// one the way podman's `--format` is) composes with
+        /// `--verbose` just fine — a real, honest, deliberate
+        /// divergence, not an oversight.
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
 /// `ociman volume`'s own subcommands — matching real `docker volume`/
@@ -2027,7 +2038,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::History { reference }) => cmd_history(&reference, cli.global.json),
             Some(Command::Prune { all, filter }) => cmd_prune(cli.global.json, all, &filter),
             Some(Command::System { command }) => match command {
-                SystemCommand::Df => cmd_system_df(cli.global.json),
+                SystemCommand::Df { verbose } => cmd_system_df(cli.global.json, verbose),
             },
             Some(Command::Inspect { reference }) => cmd_inspect(&reference, cli.global.json),
             Some(Command::Run {
@@ -3840,6 +3851,73 @@ struct SystemDfView {
     volumes: SystemDfRow,
 }
 
+/// One row of `ociman system df -v`'s own per-image breakdown —
+/// matching real `podman system df -v`'s own `REPOSITORY`/`TAG`/
+/// `IMAGE ID`/`CREATED`/`SIZE`/`SHARED SIZE`/`UNIQUE SIZE`/
+/// `CONTAINERS` columns, except `created` stays a raw RFC3339
+/// timestamp rather than a human-relative duration ("2 months ago") —
+/// the same honest, established simplification `ociman ps`'s own
+/// `CREATED` column already makes, not a byte-for-byte port of real
+/// podman's own `units.HumanDuration`.
+#[derive(Debug, Serialize)]
+struct SystemDfImageRow {
+    /// `None` for this project's own internal untagged-image sentinel
+    /// (`0179`) — shown as `<none>` in the table, matching every
+    /// other command's identical convention.
+    repository: Option<String>,
+    tag: Option<String>,
+    image_id: String,
+    created: String,
+    size_bytes: u64,
+    /// The sum of this image's own config+layer blob sizes that are
+    /// *also* referenced by at least one other distinct (by manifest
+    /// digest) stored image — a real, computed cross-image reference
+    /// count over every blob this image's own manifest names, not an
+    /// approximation.
+    shared_size_bytes: u64,
+    /// The complement of `shared_size_bytes`: blobs only this one
+    /// image references.
+    unique_size_bytes: u64,
+    /// How many containers (running or stopped) were created from
+    /// this exact image.
+    containers: u64,
+}
+
+/// One row of `ociman system df -v`'s own per-container breakdown —
+/// matching real `podman system df -v`'s own `CONTAINER ID`/`IMAGE`/
+/// `COMMAND`/`LOCAL VOLUMES`/`SIZE`/`CREATED`/`STATUS`/`NAMES`
+/// columns (`created` the same raw-timestamp simplification
+/// [`SystemDfImageRow`]'s own doc comment explains).
+#[derive(Debug, Serialize)]
+struct SystemDfContainerRow {
+    id: String,
+    image: String,
+    command: String,
+    local_volumes: u64,
+    size_bytes: u64,
+    created: String,
+    status: String,
+    name: Option<String>,
+}
+
+/// One row of `ociman system df -v`'s own per-volume breakdown —
+/// matching real `podman system df -v`'s own `VOLUME NAME`/`LINKS`/
+/// `SIZE` columns (`links`: how many containers currently mount it).
+#[derive(Debug, Serialize)]
+struct SystemDfVolumeRow {
+    name: String,
+    links: u64,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemDfVerboseView {
+    images: Vec<SystemDfImageRow>,
+    containers: Vec<SystemDfContainerRow>,
+    #[serde(rename = "local_volumes")]
+    volumes: Vec<SystemDfVolumeRow>,
+}
+
 /// Real disk usage across images, containers, and local volumes —
 /// matching real `podman system df`'s own default (no `-v`, no
 /// `--format`) summary table, checked directly against
@@ -3887,10 +3965,14 @@ struct SystemDfView {
 /// breakdown table) and `--format` are still ahead — this is
 /// deliberately just the summary real `podman system df` prints with
 /// neither flag given.
-fn cmd_system_df(json: bool) -> anyhow::Result<()> {
+fn cmd_system_df(json: bool, verbose: bool) -> anyhow::Result<()> {
     let store = open_store()?;
     let containers = open_container_store()?;
     let volume_store = open_volume_store()?;
+
+    if verbose {
+        return cmd_system_df_verbose(&store, &containers, &volume_store, json);
+    }
 
     let mut in_use_digests: std::collections::HashSet<oci_spec_types::Digest> =
         std::collections::HashSet::new();
@@ -3994,6 +4076,273 @@ fn cmd_system_df(json: bool) -> anyhow::Result<()> {
     print_system_df_row("Images", &images);
     print_system_df_row("Containers", &container_rows);
     print_system_df_row("Local Volumes", &volumes);
+    Ok(())
+}
+
+/// `ociman system df -v`/`--verbose` — a real, per-item breakdown
+/// (one row per image reference/container/volume) instead of just the
+/// aggregate summary, matching real `podman system df -v`'s own three
+/// headed sections exactly in shape. Unlike the default summary's own
+/// deliberately simpler "reclaimable = size of wholly unused images"
+/// rule (see [`cmd_system_df`]'s own doc comment for why the *exact*
+/// cross-image shared/unique split was deferred there), this verbose
+/// mode computes that real split properly: every *distinct* (by
+/// manifest digest) stored image's own config+layer blob digests are
+/// counted across every other distinct image too, so a blob
+/// referenced by more than one image counts toward `shared_size` for
+/// each of them, and a blob only one image references counts toward
+/// that one's own `unique_size` — a real, computed answer, not an
+/// approximation, made straightforward by this project's own content-
+/// addressed store (every blob is already keyed by its own digest).
+fn cmd_system_df_verbose(
+    store: &Store,
+    containers: &StateStore,
+    volume_store: &volume::VolumeStore,
+    json: bool,
+) -> anyhow::Result<()> {
+    let container_states = containers.list().context("listing containers")?;
+
+    // How many containers (running or stopped) were created from each
+    // distinct image, keyed by manifest digest.
+    let mut containers_per_digest: std::collections::HashMap<oci_spec_types::Digest, u64> =
+        std::collections::HashMap::new();
+    for state in &container_states {
+        if let Some(image_ref) = state.annotations.get(ANNOTATION_IMAGE)
+            && let Some(record) = store
+                .resolve_image(image_ref)
+                .context("resolving a container's own image reference")?
+        {
+            *containers_per_digest
+                .entry(record.manifest_digest)
+                .or_insert(0) += 1;
+        }
+    }
+
+    // Pass 1: one representative record per distinct image (by
+    // manifest digest), each carrying its own manifest's config+layer
+    // blob digests/sizes -- the real per-blob data the shared/unique
+    // split below is computed from.
+    let all_records = store.list_images().context("listing images")?;
+    let mut seen_digests = std::collections::HashSet::new();
+    let mut distinct: Vec<(ImageRecord, ImageManifest)> = Vec::new();
+    for record in &all_records {
+        if seen_digests.insert(record.manifest_digest.clone()) {
+            let manifest = store
+                .image_manifest(record)
+                .with_context(|| format!("reading manifest for {}", record.reference))?;
+            distinct.push((record.clone(), manifest));
+        }
+    }
+
+    // Pass 2: how many *distinct images* reference each real blob
+    // digest (config or layer) -- a blob referenced by more than one
+    // image is "shared", by exactly one is "unique".
+    let mut images_referencing_blob: std::collections::HashMap<
+        oci_spec_types::Digest,
+        std::collections::HashSet<oci_spec_types::Digest>,
+    > = std::collections::HashMap::new();
+    for (record, manifest) in &distinct {
+        for blob in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
+            images_referencing_blob
+                .entry(blob.digest.clone())
+                .or_default()
+                .insert(record.manifest_digest.clone());
+        }
+    }
+
+    // Pass 3: per-distinct-image shared/unique size split, from the
+    // same blob list, using the real reference counts just computed.
+    let mut shared_by_digest: std::collections::HashMap<oci_spec_types::Digest, u64> =
+        std::collections::HashMap::new();
+    let mut unique_by_digest: std::collections::HashMap<oci_spec_types::Digest, u64> =
+        std::collections::HashMap::new();
+    for (record, manifest) in &distinct {
+        let mut shared = 0u64;
+        let mut unique = 0u64;
+        for blob in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
+            let referencing = images_referencing_blob
+                .get(&blob.digest)
+                .map_or(0, std::collections::HashSet::len);
+            if referencing > 1 {
+                shared += blob.size;
+            } else {
+                unique += blob.size;
+            }
+        }
+        shared_by_digest.insert(record.manifest_digest.clone(), shared);
+        unique_by_digest.insert(record.manifest_digest.clone(), unique);
+    }
+
+    // One row per real reference/tag (matching `ociman images`' own
+    // established one-row-per-tag convention), each reusing its own
+    // image's already-computed shared/unique split and container
+    // count.
+    let mut image_rows = Vec::with_capacity(all_records.len());
+    for record in &all_records {
+        let summary = store
+            .image_summary(record)
+            .with_context(|| format!("summarizing image {}", record.reference))?;
+        let config = store
+            .image_config(record)
+            .with_context(|| format!("reading config for {}", record.reference))?;
+        let (repository, tag) = if is_untagged_reference(&record.reference) {
+            (None, None)
+        } else if let Ok(reference) = Reference::parse(&record.reference) {
+            (
+                Some(reference.repository().to_string()),
+                reference.tag().map(str::to_string),
+            )
+        } else {
+            (Some(record.reference.clone()), None)
+        };
+        let digest_hex = record.manifest_digest.hex();
+        image_rows.push(SystemDfImageRow {
+            repository,
+            tag,
+            image_id: digest_hex[..digest_hex.len().min(12)].to_string(),
+            created: config.created.unwrap_or_else(|| "unknown".to_string()),
+            size_bytes: summary.size,
+            shared_size_bytes: shared_by_digest
+                .get(&record.manifest_digest)
+                .copied()
+                .unwrap_or(0),
+            unique_size_bytes: unique_by_digest
+                .get(&record.manifest_digest)
+                .copied()
+                .unwrap_or(0),
+            containers: containers_per_digest
+                .get(&record.manifest_digest)
+                .copied()
+                .unwrap_or(0),
+        });
+    }
+
+    // Every named volume's own real data directory, as a string, once
+    // -- reused for every container below instead of re-listing the
+    // volume store per mount.
+    let volume_data_dirs: std::collections::HashSet<String> = volume_store
+        .list()
+        .context("listing volumes")?
+        .iter()
+        .map(|v| {
+            volume_store
+                .data_dir(&v.name)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+
+    let mut container_rows = Vec::with_capacity(container_states.len());
+    for state in &container_states {
+        let bundle_dir = Path::new(&state.bundle);
+        let upper = rootfs_setup::upper_dir(bundle_dir);
+        let writable_layer = if upper.is_dir() {
+            upper
+        } else {
+            bundle_dir.join("rootfs")
+        };
+        let size = oci_store::dir_size(&writable_layer).unwrap_or(0);
+        let local_volumes = oci_runtime_core::Bundle::load(bundle_dir).map_or(0, |bundle| {
+            bundle
+                .spec
+                .mounts
+                .iter()
+                .filter(|m| {
+                    m.source
+                        .as_ref()
+                        .is_some_and(|source| volume_data_dirs.contains(source))
+                })
+                .count() as u64
+        });
+        container_rows.push(SystemDfContainerRow {
+            id: state.id.clone(),
+            image: state
+                .annotations
+                .get(ANNOTATION_IMAGE)
+                .cloned()
+                .unwrap_or_default(),
+            command: state
+                .annotations
+                .get(ANNOTATION_COMMAND)
+                .cloned()
+                .unwrap_or_default(),
+            local_volumes,
+            size_bytes: size,
+            created: state.created.clone(),
+            status: display_status(state).to_string(),
+            name: state.annotations.get(ANNOTATION_NAME).cloned(),
+        });
+    }
+
+    let mut volume_rows = Vec::new();
+    for record in volume_store.list().context("listing volumes")? {
+        let size = oci_store::dir_size(&volume_store.data_dir(&record.name)).unwrap_or(0);
+        let links = containers_using_volume(containers, volume_store, &record.name)?.len() as u64;
+        volume_rows.push(SystemDfVolumeRow {
+            name: record.name,
+            links,
+            size_bytes: size,
+        });
+    }
+
+    if json {
+        oci_cli_common::output::print_json(&SystemDfVerboseView {
+            images: image_rows,
+            containers: container_rows,
+            volumes: volume_rows,
+        })?;
+        return Ok(());
+    }
+
+    println!("Images space usage:\n");
+    println!(
+        "{:<40}{:<10}{:<14}{:<12}{:<10}{:<14}{:<14}CONTAINERS",
+        "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE", "SHARED SIZE", "UNIQUE SIZE"
+    );
+    for row in &image_rows {
+        println!(
+            "{:<40}{:<10}{:<14}{:<12}{:<10}{:<14}{:<14}{}",
+            row.repository.as_deref().unwrap_or("<none>"),
+            row.tag.as_deref().unwrap_or("<none>"),
+            row.image_id,
+            row.created,
+            human_size(row.size_bytes),
+            human_size(row.shared_size_bytes),
+            human_size(row.unique_size_bytes),
+            row.containers
+        );
+    }
+
+    println!("\nContainers space usage:\n");
+    println!(
+        "{:<14}{:<40}{:<20}{:<8}{:<10}{:<12}{:<10}NAMES",
+        "CONTAINER ID", "IMAGE", "COMMAND", "LOCAL VOLUMES", "SIZE", "CREATED", "STATUS"
+    );
+    for row in &container_rows {
+        println!(
+            "{:<14}{:<40}{:<20}{:<8}{:<10}{:<12}{:<10}{}",
+            row.id,
+            row.image,
+            row.command,
+            row.local_volumes,
+            human_size(row.size_bytes),
+            row.created,
+            row.status,
+            row.name.as_deref().unwrap_or("")
+        );
+    }
+
+    println!("\nLocal Volumes space usage:\n");
+    println!("{:<30}{:<10}SIZE", "VOLUME NAME", "LINKS");
+    for row in &volume_rows {
+        println!(
+            "{:<30}{:<10}{}",
+            row.name,
+            row.links,
+            human_size(row.size_bytes)
+        );
+    }
+
     Ok(())
 }
 
