@@ -2480,3 +2480,146 @@ async fn create_container_bind_mount_is_genuinely_live_at_runtime() {
         "hello from container\n"
     );
 }
+
+/// A real, previously-shipped bug (0305): `build_cri_bind_mounts` used
+/// to call `fs::create_dir_all` on *every* `host_path`
+/// unconditionally, which fails outright (`EEXIST`) when `host_path`
+/// is already an existing single file -- a common real kubelet case
+/// (`/etc/localtime`, a ConfigMap key, `/etc/machine-id`, ...). Fixed
+/// to match real cri-o's own exact `resolveSymbolicLink` +
+/// conditional-`os.MkdirAll` logic: an already-existing path (file or
+/// directory) is used exactly as given, never touched.
+#[tokio::test]
+async fn create_container_bind_mounts_an_already_existing_single_file() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let host_dir = tempfile::tempdir().unwrap();
+    let host_file = host_dir.path().join("single-file.txt");
+    std::fs::write(&host_file, b"a real single file, not a directory").unwrap();
+
+    let mut config = container_config("single-file-mount-test", 0);
+    config.command = vec!["/bin/sleep".to_string(), "300".to_string()];
+    config.mounts = vec![Mount {
+        container_path: "/etc/injected-file".to_string(),
+        host_path: host_file.display().to_string(),
+        readonly: true,
+        ..Default::default()
+    }];
+
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id,
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .expect("CreateContainer failed -- a single-file host_path should be usable as-is")
+        .into_inner()
+        .container_id;
+
+    // The host's own file must be completely untouched (still a real
+    // file, still its own original content) -- proving it was never
+    // routed through `create_dir_all` at all.
+    assert!(host_file.is_file());
+    assert_eq!(
+        std::fs::read_to_string(&host_file).unwrap(),
+        "a real single file, not a directory"
+    );
+
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .expect("StartContainer failed");
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+
+    let read_back = client
+        .exec_sync(oci_cri_types::ExecSyncRequest {
+            container_id: container_id.clone(),
+            cmd: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "cat /etc/injected-file".to_string(),
+            ],
+            timeout: 0,
+        })
+        .await
+        .expect("ExecSync failed")
+        .into_inner();
+    assert_eq!(read_back.exit_code, 0, "{read_back:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&read_back.stdout),
+        "a real single file, not a directory"
+    );
+}
+
+/// A symlinked `host_path` is followed to its real target (0305),
+/// matching real cri-o's own `resolveSymbolicLink` exactly -- checked
+/// via the mounted content actually being the symlink's own real
+/// target's content, not a failure or an empty/broken mount.
+#[tokio::test]
+async fn create_container_bind_mount_follows_a_symlinked_host_path() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let host_dir = tempfile::tempdir().unwrap();
+    let real_target = host_dir.path().join("real-target.txt");
+    std::fs::write(&real_target, b"the real symlink target content").unwrap();
+    let symlink_path = host_dir.path().join("a-symlink.txt");
+    std::os::unix::fs::symlink(&real_target, &symlink_path).unwrap();
+
+    let mut config = container_config("symlink-mount-test", 0);
+    config.command = vec!["/bin/sleep".to_string(), "300".to_string()];
+    config.mounts = vec![Mount {
+        container_path: "/etc/via-symlink".to_string(),
+        host_path: symlink_path.display().to_string(),
+        readonly: true,
+        ..Default::default()
+    }];
+
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id,
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .expect("StartContainer failed");
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+
+    let read_back = client
+        .exec_sync(oci_cri_types::ExecSyncRequest {
+            container_id: container_id.clone(),
+            cmd: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "cat /etc/via-symlink".to_string(),
+            ],
+            timeout: 0,
+        })
+        .await
+        .expect("ExecSync failed")
+        .into_inner();
+    assert_eq!(read_back.exit_code, 0, "{read_back:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&read_back.stdout),
+        "the real symlink target content"
+    );
+}

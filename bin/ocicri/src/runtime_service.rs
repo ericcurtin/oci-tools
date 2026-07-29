@@ -614,10 +614,7 @@ fn container_metadata_to_proto(metadata: &container::ContainerMetadata) -> cri::
 /// anywhere, matching `ociman run -v`'s own identical, already-
 /// established narrowing); `recursive_read_only`; and any UID/GID
 /// mapping (this project has no user-namespace-remapped mount concept
-/// for CRI containers at all). Symlink-following for `host_path`
-/// (the proto's own documented "if the hostpath is a symbolic link,
-/// runtimes should follow it" contract) is also not implemented yet --
-/// a real, smaller, separately-scoped gap.
+/// for CRI containers at all).
 fn build_cri_bind_mounts(
     mounts: &[cri::Mount],
 ) -> Result<Vec<oci_spec_types::runtime::Mount>, Status> {
@@ -658,12 +655,7 @@ fn build_cri_bind_mounts(
             ));
         }
 
-        // Real cri-o's own identical fallback for a missing host path
-        // (see this function's own doc comment for why this doesn't
-        // match the proto's own stricter documented contract).
-        std::fs::create_dir_all(&m.host_path).map_err(|e| {
-            Status::internal(format!("creating mount source {:?}: {e}", m.host_path))
-        })?;
+        let source = resolve_mount_source(&m.host_path)?;
 
         let mut options = vec!["rbind".to_string(), "rprivate".to_string()];
         if m.readonly {
@@ -671,12 +663,53 @@ fn build_cri_bind_mounts(
         }
         result.push(oci_spec_types::runtime::Mount {
             destination: m.container_path.clone(),
-            source: Some(m.host_path.clone()),
+            source: Some(source),
             kind: Some("bind".to_string()),
             options,
         });
     }
     Ok(result)
+}
+
+/// Resolves one `Mount.host_path` to the real path that should
+/// actually get bind-mounted -- a real, previously-shipped bug fixed
+/// here (0305): [`build_cri_bind_mounts`] used to call
+/// `fs::create_dir_all` on *every* `host_path` unconditionally, which
+/// fails outright (`EEXIST`) for the common real kubelet case of an
+/// already-existing single-file mount source (`/etc/localtime`, a
+/// ConfigMap key, `/etc/machine-id`, ...) — confirmed directly with a
+/// live repro, not assumed. Matches real cri-o's own exact
+/// `resolveSymbolicLink` + conditional-`os.MkdirAll` logic instead
+/// (`~/git/cri-o/server/container_create.go`'s own `resolveSymbolicLink`,
+/// called from `container_create_linux.go`'s `addOCIBindMounts`):
+/// `Lstat` the path first -- an already-existing non-symlink (file or
+/// directory) is used exactly as given, never touched; an already-
+/// existing symlink is followed to its real target (`fs::canonicalize`
+/// here, rather than real cri-o's own `securejoin.SecureJoin`-based
+/// confinement, since this project has no `BindMountPrefix`-style
+/// redirect concept for that confinement to matter against); only a
+/// genuinely *missing* path (`ErrorKind::NotFound`) is auto-created as
+/// a directory, matching real cri-o's own `os.IsNotExist` branch
+/// exactly (real kubelet `HostPath` volumes of type
+/// `DirectoryOrCreate` depend on this). Any other I/O error (e.g.
+/// permission denied) is a real, surfaced error rather than silently
+/// swallowed.
+fn resolve_mount_source(host_path: &str) -> Result<String, Status> {
+    match std::fs::symlink_metadata(host_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => std::fs::canonicalize(host_path)
+            .map(|p| p.display().to_string())
+            .map_err(|e| Status::invalid_argument(format!("resolving symlink {host_path:?}: {e}"))),
+        Ok(_) => Ok(host_path.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(host_path).map_err(|e| {
+                Status::internal(format!("creating mount source {host_path:?}: {e}"))
+            })?;
+            Ok(host_path.to_string())
+        }
+        Err(e) => Err(Status::internal(format!(
+            "checking mount source {host_path:?}: {e}"
+        ))),
+    }
 }
 
 /// Resolves one container for a mutating/status RPC — the container
