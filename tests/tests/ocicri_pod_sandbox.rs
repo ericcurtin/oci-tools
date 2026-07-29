@@ -634,3 +634,45 @@ async fn stream_pod_sandboxes_matches_list_and_streams_nothing_when_empty() {
     assert_eq!(ready_only.len(), 1, "{ready_only:?}");
     assert_eq!(ready_only[0].id, ready_id);
 }
+
+/// `UpdateContainerResources`'s pod-level sibling (`docs/design/
+/// 0254`): checked directly against real cri-o's own real, near-total
+/// no-op default behavior (no NRI plugins configured, which is both
+/// projects' own real default) — a real sandbox resolves to a real,
+/// honest success, an unknown one to a real `NotFound`, matching real
+/// cri-o's own identical `getPodSandboxFromRequest` wrapping.
+#[tokio::test]
+async fn update_pod_sandbox_resources_resolves_the_sandbox_or_reports_not_found() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("ocicri.sock");
+    let _server = spawn_server(storage_dir.path(), &socket_path);
+    wait_for_socket(&socket_path);
+    let mut client = connect(socket_path).await;
+
+    let sandbox_id = client
+        .run_pod_sandbox(run_request(sandbox_config("update-resources", "uid-ur", 0)))
+        .await
+        .unwrap()
+        .into_inner()
+        .pod_sandbox_id;
+
+    client
+        .update_pod_sandbox_resources(oci_cri_types::UpdatePodSandboxResourcesRequest {
+            pod_sandbox_id: sandbox_id,
+            overhead: None,
+            resources: None,
+        })
+        .await
+        .expect("updating a real, existing sandbox should succeed");
+
+    let err = client
+        .update_pod_sandbox_resources(oci_cri_types::UpdatePodSandboxResourcesRequest {
+            pod_sandbox_id: "deadbeef".repeat(8),
+            overhead: None,
+            resources: None,
+        })
+        .await
+        .expect_err("updating an unknown sandbox should fail");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+}

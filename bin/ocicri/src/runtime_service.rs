@@ -2133,11 +2133,34 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         }))
     }
 
+    /// `UpdateContainerResources`'s own pod-level sibling (`docs/
+    /// design/0254`) — checked directly against real cri-o's own
+    /// `server/sandbox_update_resources.go`: beyond resolving the
+    /// sandbox (a real `NotFound` when it doesn't exist, matching its
+    /// own `getPodSandboxFromRequest` wrapping exactly), real cri-o's
+    /// own implementation does *nothing* to the sandbox's own cgroup
+    /// directly here at all — every actual resource change is
+    /// delegated entirely to its own optional NRI (Node Resource
+    /// Interface) plugin framework (`s.nri.updatePodSandbox`), which
+    /// is a real, honest no-op with no plugins configured (the
+    /// default, and the only configuration either project's own CI
+    /// ever runs). This project has no NRI concept at all — a
+    /// materially bigger, separate plugin framework, entirely out of
+    /// scope — so once the sandbox is confirmed to exist, this is
+    /// honestly exactly that same no-op, not a fabricated cgroup
+    /// write this project has nowhere to route (unlike
+    /// `UpdateContainerResources`, `ocicri` has no per-sandbox cgroup
+    /// of its own to write into at all: see `docs/design/0233`'s own
+    /// "no infra process" note).
     async fn update_pod_sandbox_resources(
         &self,
-        _request: Request<cri::UpdatePodSandboxResourcesRequest>,
+        request: Request<cri::UpdatePodSandboxResourcesRequest>,
     ) -> Result<Response<cri::UpdatePodSandboxResourcesResponse>, Status> {
-        unimplemented("UpdatePodSandboxResources")
+        let id = request.into_inner().pod_sandbox_id;
+        if find_sandbox(&id)?.is_none() {
+            return Err(Status::not_found(format!("could not find pod {id:?}")));
+        }
+        Ok(Response::new(cri::UpdatePodSandboxResourcesResponse {}))
     }
 }
 
