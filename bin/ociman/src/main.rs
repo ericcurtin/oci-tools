@@ -972,6 +972,12 @@ enum Command {
         #[arg(long = "filter")]
         filter: Vec<String>,
     },
+    /// `podman system`'s own subcommand family — see [`SystemCommand`]
+    /// for exactly which of its real subcommands this covers so far.
+    System {
+        #[command(subcommand)]
+        command: SystemCommand,
+    },
     /// Print low-level JSON for a container or an image — matching
     /// real `podman inspect`/`docker inspect`'s own default
     /// resolution order: a container (by id or `--name`) is tried
@@ -1646,6 +1652,27 @@ enum HealthcheckCommand {
     },
 }
 
+/// `ociman system`'s own subcommands — matching real `podman system`'s
+/// own real subset this project implements so far: just `df`. Real
+/// podman's own further subcommands (`connection`/`events`/`migrate`/
+/// `renumber`/`reset`/`service`/`prune`) are out of scope for now —
+/// `info` already exists as this project's own top-level `ociman info`
+/// (matching real podman's own identical top-level alias for it).
+#[derive(Debug, clap::Subcommand)]
+enum SystemCommand {
+    /// Real disk usage across images, containers, and local volumes —
+    /// matching real `podman system df`'s own default (no `-v`/
+    /// `--verbose`, no `--format`) summary table exactly in shape
+    /// (`TYPE`/`TOTAL`/`ACTIVE`/`SIZE`/`RECLAIMABLE` columns,
+    /// `SIZE (PERCENT%)` reclaimable formatting) — see [`cmd_system_df`]'s
+    /// own doc comment for exactly how each column is computed and the
+    /// one deliberate simplification from real podman's own precise
+    /// per-image "unique size" cross-sharing calculation. The
+    /// `-v`/`--verbose` per-item breakdown and `--format` are still
+    /// ahead.
+    Df,
+}
+
 /// `ociman volume`'s own subcommands — matching real `docker volume`/
 /// `podman volume`'s own real subset this project implements (`ls`/
 /// `create`/`inspect`/`rm`/`prune`; real podman's own further
@@ -1776,6 +1803,9 @@ fn main() -> std::process::ExitCode {
             Some(Command::Tag { source, target }) => cmd_tag(&source, &target, cli.global.json),
             Some(Command::History { reference }) => cmd_history(&reference, cli.global.json),
             Some(Command::Prune { all, filter }) => cmd_prune(cli.global.json, all, &filter),
+            Some(Command::System { command }) => match command {
+                SystemCommand::Df => cmd_system_df(cli.global.json),
+            },
             Some(Command::Inspect { reference }) => cmd_inspect(&reference, cli.global.json),
             Some(Command::Run {
                 args,
@@ -3265,6 +3295,204 @@ fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// One row of `ociman system df`'s own summary table — real, raw byte
+/// counts (formatting into human-readable strings/percentages is the
+/// caller's own job, [`print_system_df_row`]/`--json`'s choice).
+#[derive(Debug, Serialize)]
+struct SystemDfRow {
+    total: u64,
+    active: u64,
+    size_bytes: u64,
+    reclaimable_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemDfView {
+    images: SystemDfRow,
+    containers: SystemDfRow,
+    #[serde(rename = "local_volumes")]
+    volumes: SystemDfRow,
+}
+
+/// Real disk usage across images, containers, and local volumes —
+/// matching real `podman system df`'s own default (no `-v`, no
+/// `--format`) summary table, checked directly against
+/// `~/git/podman/pkg/domain/infra/abi/system.go`/`cmd/podman/system/
+/// df.go`:
+///
+/// - **Images**: deduplicated by manifest digest (`docs/design/0263`)
+///   — two tags of the same real image count once, matching real
+///   podman's own dedup-by-`ImageID`. `active` counts images
+///   referenced by at least one container (running or stopped, the
+///   same `in_use_digests` computation `ociman prune` already makes);
+///   `size` is the sum of each distinct image's own total size
+///   (config + every layer blob, `Store::image_summary`, already used
+///   by `ociman images`); `reclaimable` is the size of every image
+///   with *zero* referencing containers. Real podman's own formula is
+///   more precise here — `ImagesSize` minus the summed *unique*
+///   (non-cross-image-shared) size of only the *in-use* images, so a
+///   shared-but-unused layer of an in-use image still counts as
+///   reclaimable there — this project doesn't have a per-image
+///   "unique vs. shared across other stored images" size breakdown
+///   anywhere yet, so this reports the simpler, honest "total size of
+///   wholly unused images" instead: never an overcount (an in-use
+///   image's own size is never included), but a real, if narrower,
+///   undercount whenever an unused image happens to share layers with
+///   an in-use one. A materially bigger feature (needs a real
+///   digest-reference-count pass across every stored image) to close
+///   that gap exactly, deliberately deferred.
+/// - **Containers**: `total`/`active` (running) counts are exact;
+///   `size` is each container's own real writable-rootfs directory
+///   size (`oci_store::dir_size`, the same hardlink-aware walk
+///   `ociman prune`'s own rootfs-cache reporting already uses) summed
+///   across every container; `reclaimable` is that same sum restricted
+///   to non-running containers — real podman's own identical
+///   `RWSize`-based rule (`c.Status == "running"` only ever "active",
+///   otherwise `RWSize` counts as `Reclaimable`, checked directly).
+/// - **Local Volumes**: `size`/`total` are exact (`Store::dir_size` on
+///   each volume's own real data directory); `active` counts volumes
+///   with at least one real, mount-referencing dependent container
+///   (`containers_using_volume`, the exact same real check `ociman
+///   volume rm`/`prune` already make); `reclaimable` is the size of
+///   every volume with zero such dependents — matching real podman's
+///   own identical `VolumeInUse`-gated rule.
+///
+/// `-v`/`--verbose` (the real per-image/per-container/per-volume
+/// breakdown table) and `--format` are still ahead — this is
+/// deliberately just the summary real `podman system df` prints with
+/// neither flag given.
+fn cmd_system_df(json: bool) -> anyhow::Result<()> {
+    let store = open_store()?;
+    let containers = open_container_store()?;
+    let volume_store = open_volume_store()?;
+
+    let mut in_use_digests: std::collections::HashSet<oci_spec_types::Digest> =
+        std::collections::HashSet::new();
+    for state in containers.list().context("listing containers")? {
+        if let Some(image_ref) = state.annotations.get(ANNOTATION_IMAGE)
+            && let Some(record) = store
+                .resolve_image(image_ref)
+                .context("resolving a container's own image reference")?
+        {
+            in_use_digests.insert(record.manifest_digest);
+        }
+    }
+
+    let mut images = SystemDfRow {
+        total: 0,
+        active: 0,
+        size_bytes: 0,
+        reclaimable_bytes: 0,
+    };
+    let mut seen_digests = std::collections::HashSet::new();
+    for record in store.list_images().context("listing images")? {
+        if !seen_digests.insert(record.manifest_digest.clone()) {
+            continue;
+        }
+        let summary = store
+            .image_summary(&record)
+            .with_context(|| format!("summarizing image {}", record.reference))?;
+        images.total += 1;
+        images.size_bytes += summary.size;
+        if in_use_digests.contains(&record.manifest_digest) {
+            images.active += 1;
+        } else {
+            images.reclaimable_bytes += summary.size;
+        }
+    }
+
+    let mut container_rows = SystemDfRow {
+        total: 0,
+        active: 0,
+        size_bytes: 0,
+        reclaimable_bytes: 0,
+    };
+    for state in containers.list().context("listing containers")? {
+        // A container using this project's own rootless-overlay
+        // optimization (`docs/design/0108`-`0110`) leaves its own
+        // `rootfs/` directory genuinely empty on disk — the real,
+        // persisted writable delta lives in a separate `upper/`
+        // directory instead (the overlay mount is what populates
+        // `rootfs/`, only while the container's own mount namespace
+        // is alive) — the same directory `resolve_container_root`
+        // already checks for this exact reason. Falls back to
+        // `rootfs/` itself for a plain-`Extract` container, where the
+        // writable content really does live there directly.
+        let bundle_dir = Path::new(&state.bundle);
+        let upper = rootfs_setup::upper_dir(bundle_dir);
+        let writable_layer = if upper.is_dir() {
+            upper
+        } else {
+            bundle_dir.join("rootfs")
+        };
+        let size = oci_store::dir_size(&writable_layer).unwrap_or(0);
+        container_rows.total += 1;
+        container_rows.size_bytes += size;
+        if state.effective_status() == Status::Running {
+            container_rows.active += 1;
+        } else {
+            container_rows.reclaimable_bytes += size;
+        }
+    }
+
+    let mut volumes = SystemDfRow {
+        total: 0,
+        active: 0,
+        size_bytes: 0,
+        reclaimable_bytes: 0,
+    };
+    for record in volume_store.list().context("listing volumes")? {
+        let size = oci_store::dir_size(&volume_store.data_dir(&record.name)).unwrap_or(0);
+        volumes.total += 1;
+        volumes.size_bytes += size;
+        if containers_using_volume(&containers, &volume_store, &record.name)?.is_empty() {
+            volumes.reclaimable_bytes += size;
+        } else {
+            volumes.active += 1;
+        }
+    }
+
+    if json {
+        oci_cli_common::output::print_json(&SystemDfView {
+            images,
+            containers: container_rows,
+            volumes,
+        })?;
+        return Ok(());
+    }
+
+    println!(
+        "{:<15}{:<12}{:<12}{:<12}RECLAIMABLE",
+        "TYPE", "TOTAL", "ACTIVE", "SIZE"
+    );
+    print_system_df_row("Images", &images);
+    print_system_df_row("Containers", &container_rows);
+    print_system_df_row("Local Volumes", &volumes);
+    Ok(())
+}
+
+/// Formats one [`SystemDfRow`] exactly like real `podman system df`'s
+/// own default table: `SIZE (PERCENT%)` for the reclaimable column,
+/// `0%` (never a divide-by-zero) when the row's own total size is
+/// zero, otherwise rounded to the nearest whole percent — matching
+/// real podman's own identical `math.Round` rule
+/// (`cmd/podman/system/df.go`'s own `dfSummary.Reclaimable`).
+fn print_system_df_row(label: &str, row: &SystemDfRow) {
+    let percent = if row.size_bytes == 0 {
+        0
+    } else {
+        ((row.reclaimable_bytes as f64 / row.size_bytes as f64) * 100.0).round() as u64
+    };
+    println!(
+        "{:<15}{:<12}{:<12}{:<12}{} ({percent}%)",
+        label,
+        row.total,
+        row.active,
+        human_size(row.size_bytes),
+        human_size(row.reclaimable_bytes)
+    );
 }
 
 /// Real docker/podman's own default resolution order: try a container
