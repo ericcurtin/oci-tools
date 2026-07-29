@@ -23,6 +23,13 @@ ci/bench.sh
   an identical OCI bundle (`ocirun spec --rootless --bundle`, a real
   `busybox` rootfs, `/bin/true` as the process). The actual runtime
   layer's own combined startup+destroy cost.
+* **`ocirun exec` vs `crun exec` vs `runc exec`**, and **`ociman exec`
+  vs `podman exec` vs `docker exec`** — a hot, frequently-probed path
+  (kubelet liveness/readiness probes route through this exact
+  machinery via `ocicri ExecSync`, `0240`) no other section measures:
+  each tool gets its own real, persistent, long-running container
+  (`sleep 60`), set up once before timing starts, then repeated
+  `exec ... true` calls into it are timed (see `0279` for the wiring).
 * **`ociman run --rm` vs `podman run --rm` vs `docker run --rm`** — the
   same shape one level up, a real already-pulled
   `docker.io/library/busybox:latest`, the full engine-level
@@ -96,6 +103,10 @@ this writing), this project's own aarch64 dev host, `crun 1.14.1`/
 |---|---:|---:|---:|
 | `ocirun run` vs `crun run` | 3.1ms | 6.8ms | 2.20× |
 | `ocirun run` vs `runc run` | 3.1ms | 20.3ms | 6.59× |
+| `ocirun exec` vs `crun exec` (`0279`) | 2.1ms | 3.7ms | 1.75× |
+| `ocirun exec` vs `runc exec` (`0279`) | 2.1ms | 19.2ms | 9.08× |
+| `ociman exec` vs `podman exec` (`0279`) | 2.9ms | 138.1ms | 47.86× |
+| `ociman exec` vs `docker exec` (`0279`) | 2.9ms | 47.5ms | 16.47× |
 | `ociman run --rm` vs `podman run --rm` | 33.2ms | 200.2ms | 6.04× |
 | `ociman run --rm` vs `docker run --rm` | 33.2ms | 298.3ms | 9.00× |
 | `ociman run -d` vs `podman run -d` | 39.5ms | 151.3ms | 3.83× |

@@ -44,14 +44,24 @@ ociman="$repo/target/release/ociman"
 
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/oci-tools-bench.XXXXXX")
 commit_tag=localhost/oci-tools-bench-commit:latest
+image=docker.io/library/busybox:latest
 cleanup() {
     # The ociman half of the commit comparison lives entirely inside
     # $workdir (a scratch storage root), so removing $workdir is its
     # whole cleanup -- the default ociman store is never touched.
+    #
+    # Unlike the plain `ocirun`/`crun`/`runc run` sections (each self-
+    # cleans on exit -- confirmed directly: running the exact same
+    # container id twice in a row via `run` never errors), the exec
+    # section's own `create`+`start` containers are deliberately left
+    # running across every sample and need real, explicit cleanup.
+    "$ocirun" delete --force bench-exec-ocirun >/dev/null 2>&1 || true
+    if need crun; then crun delete --force bench-exec-crun >/dev/null 2>&1 || true; fi
+    if need runc; then runc delete --force bench-exec-runc >/dev/null 2>&1 || true; fi
     rm -rf "$workdir"
-    "$ociman" rm -f benchbox >/dev/null 2>&1 || true
+    "$ociman" rm -f benchbox benchexec >/dev/null 2>&1 || true
     if need podman; then
-        podman rm -f benchbox >/dev/null 2>&1 || true
+        podman rm -f benchbox benchexec >/dev/null 2>&1 || true
         podman rm -f benchcommit >/dev/null 2>&1 || true
         podman rmi "$commit_tag" >/dev/null 2>&1 || true
         # Deliberately no `podman image prune` here: it would sweep
@@ -62,7 +72,7 @@ cleanup() {
         # `created`-timestamped config differs); `podman image prune`
         # reclaims them whenever the host wants.
     fi
-    if need docker; then docker rm -f benchbox >/dev/null 2>&1 || true; fi
+    if need docker; then docker rm -f benchbox benchexec >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
 
@@ -106,8 +116,97 @@ else
 fi
 
 echo
+echo "### ocirun vs crun vs runc: exec (into an already-running container) ###"
+# A hot, frequently-probed path this script had never measured before
+# (kubelet liveness/readiness probes route through the exact same
+# `exec` machinery via `ocicri ExecSync`, 0240) -- every other common
+# verb (`run`, `run -d`, `rm`, `commit`, `build`) already has a section
+# here. Each of the three tools gets its own real, persistent,
+# long-running container (`create`+`start`, left running exactly like
+# the `run` section's own bundle does -- see `ocirun_lifecycle.rs`'s
+# own doc comment for why `create` leaves its process backgrounded),
+# set up *before* timing starts and torn down together afterward,
+# since `exec` itself never mutates the target container's own running
+# state between samples the way `rm`/`commit` do.
+if need busybox; then
+    exec_bundle="$workdir/exec-bundle"
+    mkdir -p "$exec_bundle/rootfs/bin"
+    cp "$(command -v busybox)" "$exec_bundle/rootfs/bin/busybox"
+    for applet in sh echo true false sleep; do
+        ln -sf busybox "$exec_bundle/rootfs/bin/$applet"
+    done
+    "$ocirun" spec --rootless --bundle "$exec_bundle" >/dev/null
+    python3 - "$exec_bundle/config.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path) as f:
+    config = json.load(f)
+config["process"]["terminal"] = False
+config["process"]["args"] = ["/bin/sleep", "60"]
+config["ociVersion"] = "1.1.0"
+with open(path, "w") as f:
+    json.dump(config, f)
+PY
+
+    "$ocirun" delete --force bench-exec-ocirun >/dev/null 2>&1 || true
+    "$ocirun" create --bundle "$exec_bundle" bench-exec-ocirun >/dev/null
+    "$ocirun" start bench-exec-ocirun >/dev/null
+
+    hf_args=(--warmup 5 --command-name "ocirun exec" \
+        "$ocirun exec bench-exec-ocirun /bin/true")
+    if need crun; then
+        crun delete --force bench-exec-crun >/dev/null 2>&1 || true
+        crun create --bundle "$exec_bundle" bench-exec-crun >/dev/null
+        crun start bench-exec-crun >/dev/null
+        hf_args+=(--command-name "crun exec" "crun exec bench-exec-crun /bin/true")
+    fi
+    if need runc; then
+        runc delete --force bench-exec-runc >/dev/null 2>&1 || true
+        runc create --bundle "$exec_bundle" bench-exec-runc >/dev/null
+        runc start bench-exec-runc >/dev/null
+        hf_args+=(--command-name "runc exec" "runc exec bench-exec-runc /bin/true")
+    fi
+    hyperfine -N "${hf_args[@]}"
+
+    "$ocirun" delete --force bench-exec-ocirun >/dev/null 2>&1 || true
+    if need crun; then crun delete --force bench-exec-crun >/dev/null 2>&1 || true; fi
+    if need runc; then runc delete --force bench-exec-runc >/dev/null 2>&1 || true; fi
+else
+    echo "bench: busybox not on \$PATH, skipping (needed for a real rootfs)" >&2
+fi
+
+echo
+echo "### ociman vs podman vs docker: exec (into an already-running container) ###"
+# Same reasoning as the `ocirun`/`crun`/`runc` section just above, one
+# level up: a real, persistent, detached container per tool, set up
+# before timing starts and torn down together afterward.
+"$ociman" rm -f benchexec >/dev/null 2>&1 || true
+if need podman; then podman rm -f benchexec >/dev/null 2>&1 || true; fi
+if need docker; then docker rm -f benchexec >/dev/null 2>&1 || true; fi
+hf_args=()
+if "$ociman" images 2>/dev/null | grep -q "^$image "; then
+    "$ociman" run -d --name benchexec "$image" sleep 60 >/dev/null
+    hf_args+=(--command-name "ociman exec" "$ociman exec benchexec true")
+fi
+if need podman && podman image exists "$image" 2>/dev/null; then
+    podman run -d --name benchexec "$image" sleep 60 >/dev/null
+    hf_args+=(--command-name "podman exec" "podman exec benchexec true")
+fi
+if need docker && docker image inspect "$image" >/dev/null 2>&1; then
+    docker run -d --name benchexec "$image" sleep 60 >/dev/null
+    hf_args+=(--command-name "docker exec" "docker exec benchexec true")
+fi
+if [ "${#hf_args[@]}" -gt 0 ]; then
+    hyperfine --warmup 5 "${hf_args[@]}"
+fi
+"$ociman" rm -f benchexec >/dev/null 2>&1 || true
+if need podman; then podman rm -f benchexec >/dev/null 2>&1 || true; fi
+if need docker; then docker rm -f benchexec >/dev/null 2>&1 || true; fi
+
+echo
 echo "### ociman vs podman vs docker: run --rm (full startup+destroy cycle) ###"
-image=docker.io/library/busybox:latest
 hf_args=()
 if "$ociman" images 2>/dev/null | grep -q "^$image "; then
     hf_args+=(--command-name "ociman run --rm" "$ociman run --rm $image true")
