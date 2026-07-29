@@ -2119,9 +2119,9 @@ enum SystemCommand {
 
 /// `ociman volume`'s own subcommands — matching real `docker volume`/
 /// `podman volume`'s own real subset this project implements (`ls`/
-/// `create`/`inspect`/`rm`/`prune`; real podman's own further
-/// subcommands, `export`/`import`/`mount`/`unmount`/`reload`, are out
-/// of scope for now, see `docs/design/0173`).
+/// `create`/`inspect`/`rm`/`prune`/`export`/`import`; real podman's
+/// own further subcommands, `mount`/`unmount`/`reload`, are out of
+/// scope for now, see `docs/design/0173`/`docs/design/0302`).
 #[derive(Debug, clap::Subcommand)]
 enum VolumeCommand {
     /// Create a new named volume — matching real `docker volume
@@ -2173,6 +2173,42 @@ enum VolumeCommand {
     Exists {
         /// The volume's own name.
         name: String,
+    },
+    /// Write a named volume's entire current content out as a real,
+    /// flat tar — matching real `podman volume export` exactly
+    /// (checked directly against an installed `podman 4.9.3`; real
+    /// docker has no equivalent). Reuses the exact same
+    /// `oci_layer::export_tree` [`cmd_export`] (container filesystem
+    /// export) already established.
+    Export {
+        /// The volume's own name.
+        name: String,
+        /// Write the archive here instead of standard output (real
+        /// `podman volume export`'s own default).
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
+    /// Extract a tar archive's content directly into a named volume —
+    /// matching real `podman volume import` exactly (checked directly
+    /// against an installed `podman 4.9.3`; real docker has no
+    /// equivalent): a real, plain `tar` extraction on top of whatever
+    /// the volume already holds (existing entries at the same path
+    /// are overwritten, matching real podman's own identical
+    /// `chrootarchive.Untar` behavior — nothing pre-existing is wiped
+    /// first). Recognizes gzip by its own magic bytes (matching
+    /// `ociman import`'s own identical "peek two bytes, else assume a
+    /// plain tar" convention); anything else is read as a plain,
+    /// uncompressed tar stream. Unlike real podman, this project
+    /// doesn't auto-detect `bzip2`/`xz`/`zstd` here — matching
+    /// `ociman import`'s own identical, already-established scope
+    /// (`oci_layer::apply` itself *can* decode a `zstd` stream, just
+    /// not auto-sniffed here from two bytes alone the way gzip is).
+    Import {
+        /// The volume's own name.
+        name: String,
+        /// The tar archive to read, or `-` for standard input
+        /// (matching real `podman volume import VOLUME -` exactly).
+        source: String,
     },
 }
 
@@ -2404,6 +2440,10 @@ fn main() -> std::process::ExitCode {
                 VolumeCommand::Rm { name, force } => cmd_volume_rm(&name, force),
                 VolumeCommand::Prune => cmd_volume_prune(cli.global.json),
                 VolumeCommand::Exists { name } => cmd_volume_exists(&name),
+                VolumeCommand::Export { name, output } => {
+                    cmd_volume_export(&name, output.as_deref())
+                }
+                VolumeCommand::Import { name, source } => cmd_volume_import(&name, &source),
             },
             Some(Command::Container { command }) => match command {
                 ContainerCommand::Exists { name, external: _ } => cmd_container_exists(&name),
@@ -8485,6 +8525,79 @@ fn cmd_volume_prune(json: bool) -> anyhow::Result<()> {
             println!("{name}");
         }
     }
+    Ok(())
+}
+
+/// `ociman volume export`: writes `name`'s own entire current content
+/// to `output` (or standard output, matching real `podman volume
+/// export`'s own default) as a real, flat tar via
+/// `oci_layer::export_tree` — the exact same primitive [`cmd_export`]
+/// (container filesystem export) already established, just pointed at
+/// a volume's own `_data` directory instead of a container's rootfs.
+fn cmd_volume_export(name: &str, output: Option<&Path>) -> anyhow::Result<()> {
+    let store = open_volume_store()?;
+    anyhow::ensure!(
+        store.exists(name),
+        "no volume with name {name:?} found: no such volume"
+    );
+    let data_dir = store.data_dir(name);
+
+    use std::io::Write as _;
+    match output {
+        Some(path) => {
+            let file = std::fs::File::create(path)
+                .with_context(|| format!("creating {}", path.display()))?;
+            let mut writer = std::io::BufWriter::new(file);
+            oci_layer::export_tree(&data_dir, &mut writer, None)
+                .with_context(|| format!("exporting volume {name:?}"))?;
+            writer.flush().context("flushing archive file")
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut writer = std::io::BufWriter::new(stdout.lock());
+            oci_layer::export_tree(&data_dir, &mut writer, None)
+                .with_context(|| format!("exporting volume {name:?}"))?;
+            writer.flush().context("flushing archive to stdout")
+        }
+    }
+}
+
+/// `ociman volume import`: extracts `source`'s own tar content
+/// directly into `name`'s own `_data` directory via `oci_layer::apply`
+/// — matching real `podman volume import`'s own identical "plain
+/// extraction on top of whatever's already there" semantics (checked
+/// directly, `~/git/podman/libpod/volume.go`'s own `Import`: a plain
+/// `chrootarchive.Untar` onto the volume's mountpoint, no wipe first).
+/// Gzip is recognized by its own two-byte magic number (matching
+/// `ociman import`'s own identical "peek two bytes, else assume a
+/// plain tar" convention — see its own doc comment); anything else is
+/// read as a plain, uncompressed tar stream.
+fn cmd_volume_import(name: &str, source: &str) -> anyhow::Result<()> {
+    use std::io::Read as _;
+
+    let store = open_volume_store()?;
+    anyhow::ensure!(
+        store.exists(name),
+        "no volume with name {name:?} found: no such volume"
+    );
+    let data_dir = store.data_dir(name);
+
+    let mut reader: Box<dyn std::io::Read> = if source == "-" {
+        Box::new(std::io::stdin())
+    } else {
+        Box::new(std::fs::File::open(source).with_context(|| format!("opening {source}"))?)
+    };
+    let mut peek = [0u8; 2];
+    let peeked = reader.read(&mut peek).context("reading input")?;
+    let compression = if peeked == 2 && peek == [0x1f, 0x8b] {
+        oci_layer::Compression::Gzip
+    } else {
+        oci_layer::Compression::None
+    };
+    let chained = std::io::Cursor::new(peek[..peeked].to_vec()).chain(reader);
+    oci_layer::apply(chained, compression, &data_dir)
+        .with_context(|| format!("importing into volume {name:?}"))?;
+    println!("{name}");
     Ok(())
 }
 

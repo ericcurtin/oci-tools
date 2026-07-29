@@ -441,3 +441,246 @@ fn volume_prune_removes_only_unreferenced_volumes() {
     assert!(stdout.contains("used-vol"), "{stdout}");
     assert!(!stdout.contains("unused-vol"), "{stdout}");
 }
+
+/// `ociman volume export`/`ociman volume import` (0302): a real
+/// round trip through a plain tar preserves a volume's own content
+/// byte-for-byte, matching real `podman volume export`/`podman volume
+/// import` exactly (checked directly against an installed `podman
+/// 4.9.3`, including cross-tool interoperability both directions --
+/// not exercised here, since this test suite is deliberately fully
+/// offline, but verified manually).
+#[test]
+fn volume_export_then_import_round_trips_content_byte_for_byte() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let inspect = ociman(storage_dir.path(), &["volume", "create", "src-vol"]);
+    assert!(inspect.status.success());
+    let mountpoint = volume_mountpoint(storage_dir.path(), "src-vol");
+    std::fs::write(mountpoint.join("greeting.txt"), b"hello volume").unwrap();
+    std::fs::create_dir_all(mountpoint.join("subdir")).unwrap();
+    std::fs::write(mountpoint.join("subdir/nested.txt"), b"nested content").unwrap();
+
+    let archive = storage_dir.path().join("export.tar");
+    let export = ociman(
+        storage_dir.path(),
+        &[
+            "volume",
+            "export",
+            "src-vol",
+            "-o",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert!(archive.is_file());
+
+    ociman(storage_dir.path(), &["volume", "create", "dest-vol"]);
+    let import = ociman(
+        storage_dir.path(),
+        &["volume", "import", "dest-vol", archive.to_str().unwrap()],
+    );
+    assert!(
+        import.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&import.stdout).trim(), "dest-vol");
+
+    let dest_mountpoint = volume_mountpoint(storage_dir.path(), "dest-vol");
+    assert_eq!(
+        std::fs::read(dest_mountpoint.join("greeting.txt")).unwrap(),
+        b"hello volume"
+    );
+    assert_eq!(
+        std::fs::read(dest_mountpoint.join("subdir/nested.txt")).unwrap(),
+        b"nested content"
+    );
+}
+
+/// `ociman volume import` reads from standard input given `-`,
+/// matching real `podman volume import VOLUME -` exactly.
+#[test]
+fn volume_import_reads_from_stdin_given_a_dash() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    ociman(storage_dir.path(), &["volume", "create", "src-vol"]);
+    let mountpoint = volume_mountpoint(storage_dir.path(), "src-vol");
+    std::fs::write(mountpoint.join("f.txt"), b"via stdin").unwrap();
+
+    let export = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["volume", "export", "src-vol"])
+        .output()
+        .expect("failed to run ociman volume export");
+    assert!(export.status.success());
+
+    ociman(storage_dir.path(), &["volume", "create", "dest-vol"]);
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["volume", "import", "dest-vol", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman volume import");
+    {
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&export.stdout)
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let dest_mountpoint = volume_mountpoint(storage_dir.path(), "dest-vol");
+    assert_eq!(
+        std::fs::read(dest_mountpoint.join("f.txt")).unwrap(),
+        b"via stdin"
+    );
+}
+
+/// `ociman volume import` recognizes a gzip-compressed archive by its
+/// own magic bytes, matching `ociman import`'s own identical
+/// convention (and real `podman volume import`'s own gzip support).
+#[test]
+fn volume_import_decompresses_a_gzip_archive() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    ociman(storage_dir.path(), &["volume", "create", "src-vol"]);
+    let mountpoint = volume_mountpoint(storage_dir.path(), "src-vol");
+    std::fs::write(mountpoint.join("f.txt"), b"gzip roundtrip").unwrap();
+
+    let plain = storage_dir.path().join("export.tar");
+    let export = ociman(
+        storage_dir.path(),
+        &["volume", "export", "src-vol", "-o", plain.to_str().unwrap()],
+    );
+    assert!(export.status.success());
+
+    // Compress it ourselves (this project's own export never gzips by
+    // default -- see `cmd_volume_export`'s own doc comment) to prove
+    // import's own decompression path, not just its plain-tar path.
+    use std::io::{Read as _, Write as _};
+    let mut raw = Vec::new();
+    std::fs::File::open(&plain)
+        .unwrap()
+        .read_to_end(&mut raw)
+        .unwrap();
+    let gz_path = storage_dir.path().join("export.tar.gz");
+    let mut encoder = flate2::write::GzEncoder::new(
+        std::fs::File::create(&gz_path).unwrap(),
+        flate2::Compression::default(),
+    );
+    encoder.write_all(&raw).unwrap();
+    encoder.finish().unwrap();
+
+    ociman(storage_dir.path(), &["volume", "create", "dest-vol"]);
+    let import = ociman(
+        storage_dir.path(),
+        &["volume", "import", "dest-vol", gz_path.to_str().unwrap()],
+    );
+    assert!(
+        import.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+
+    let dest_mountpoint = volume_mountpoint(storage_dir.path(), "dest-vol");
+    assert_eq!(
+        std::fs::read(dest_mountpoint.join("f.txt")).unwrap(),
+        b"gzip roundtrip"
+    );
+}
+
+/// `ociman volume import` merges onto existing content rather than
+/// wiping it first -- matching real `podman volume import`'s own
+/// identical plain-extraction semantics (checked directly,
+/// `~/git/podman/libpod/volume.go`'s own `Import`: a bare
+/// `chrootarchive.Untar`, no prior removal of the volume's own
+/// existing content).
+#[test]
+fn volume_import_merges_onto_existing_content_rather_than_wiping_it() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    ociman(storage_dir.path(), &["volume", "create", "src-vol"]);
+    let src_mountpoint = volume_mountpoint(storage_dir.path(), "src-vol");
+    std::fs::write(src_mountpoint.join("new.txt"), b"new content").unwrap();
+    let archive = storage_dir.path().join("export.tar");
+    ociman(
+        storage_dir.path(),
+        &[
+            "volume",
+            "export",
+            "src-vol",
+            "-o",
+            archive.to_str().unwrap(),
+        ],
+    );
+
+    ociman(storage_dir.path(), &["volume", "create", "dest-vol"]);
+    let dest_mountpoint = volume_mountpoint(storage_dir.path(), "dest-vol");
+    std::fs::write(dest_mountpoint.join("preexisting.txt"), b"already here").unwrap();
+
+    let import = ociman(
+        storage_dir.path(),
+        &["volume", "import", "dest-vol", archive.to_str().unwrap()],
+    );
+    assert!(import.status.success());
+
+    assert_eq!(
+        std::fs::read(dest_mountpoint.join("preexisting.txt")).unwrap(),
+        b"already here",
+        "pre-existing content should survive an import"
+    );
+    assert_eq!(
+        std::fs::read(dest_mountpoint.join("new.txt")).unwrap(),
+        b"new content"
+    );
+}
+
+/// `ociman volume export`/`ociman volume import` on an unknown volume
+/// is a clear, real error -- matching `volume_inspect_of_an_unknown_
+/// volume_is_a_clear_error`'s own established convention for this
+/// project's volume commands.
+#[test]
+fn volume_export_and_import_of_an_unknown_volume_are_clear_errors() {
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let export = ociman(storage_dir.path(), &["volume", "export", "never-created"]);
+    assert!(!export.status.success());
+    assert!(
+        String::from_utf8_lossy(&export.stderr).contains("no volume"),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let import = ociman(
+        storage_dir.path(),
+        &["volume", "import", "never-created", "-"],
+    );
+    assert!(!import.status.success());
+    assert!(
+        String::from_utf8_lossy(&import.stderr).contains("no volume"),
+        "{}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+}
+
+/// Resolve a named volume's own real `_data` mountpoint, the same way
+/// `volume_inspect_reports_the_real_mountpoint` already does inline --
+/// factored out here since several of this file's own newer tests
+/// need to read/write real files inside it directly.
+fn volume_mountpoint(storage_root: &Path, name: &str) -> std::path::PathBuf {
+    let inspect = ociman(storage_root, &["volume", "inspect", name, "--json"]);
+    assert!(inspect.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    std::path::PathBuf::from(parsed["mountpoint"].as_str().unwrap())
+}
