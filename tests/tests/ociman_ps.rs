@@ -1580,3 +1580,187 @@ fn ps_no_trunc_and_noheading_control_the_real_table_output() {
         "{no_heading:?}"
     );
 }
+
+/// `ociman rm --cidfile` (0310), matching real `docker rm --cidfile`/
+/// `podman rm --cidfile` exactly (checked directly against real
+/// podman's own `cmd/podman/containers/rm.go`): reads the container id
+/// from a file (repeatable, one per `--cidfile`), merged into the
+/// exact same target list an explicit `ID`/`--name` argument already
+/// builds. Also proves real podman's own "first line only" semantics
+/// (`strings.Cut(content, "\n")`): content after the first newline is
+/// simply ignored, not an error.
+#[test]
+fn rm_cidfile_reads_the_container_id_from_a_file_and_ignores_trailing_content() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rm-cidfile:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    // A plain (blocking, foreground) `run` -- by the time it returns,
+    // the container is guaranteed to already be `Stopped` (matching
+    // this file's own already-established pattern for the identical
+    // reason), so `rm` needs no `--force` afterward. `--name` gives a
+    // known identifier to put in the cidfile without needing to parse
+    // one back out of `run`'s own output (which, unlike `-d`, never
+    // prints anything at all in the foreground case) -- `ociman rm`
+    // already resolves a name exactly like a real id, so this is a
+    // faithful stand-in for "whatever id a real `--cidfile` would
+    // have captured".
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "rm-cidfile-target",
+            "ociman-test/rm-cidfile:latest",
+            "true",
+        ],
+    );
+    assert!(run.status.success(), "{run:?}");
+
+    let cidfile = storage_dir.path().join("cid.txt");
+    // A trailing "garbage" line after the real id: real podman's own
+    // `strings.Cut` takes only the first line, ignoring the rest.
+    std::fs::write(&cidfile, "rm-cidfile-target\ngarbage second line").unwrap();
+
+    let rm = ociman(
+        storage_dir.path(),
+        &["rm", "--cidfile", cidfile.to_str().unwrap()],
+    );
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rm.stdout).trim(),
+        "rm-cidfile-target"
+    );
+
+    let ps_after = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert!(String::from_utf8_lossy(&ps_after.stdout).trim().is_empty());
+}
+
+/// Multiple `--cidfile` flags are merged into the same target list,
+/// exactly like multiple explicit `ID`s already are.
+#[test]
+fn rm_multiple_cidfiles_are_all_merged_into_the_same_target_list() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rm-cidfile-multi:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    // Plain (blocking, foreground) runs -- see the previous test's own
+    // doc comment for why `--name` (not a parsed-from-stdout id) is
+    // used here, and why no `--force` is needed afterward.
+    let run1 = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "rm-cidfile-multi-1",
+            "ociman-test/rm-cidfile-multi:latest",
+            "true",
+        ],
+    );
+    assert!(run1.status.success());
+    let run2 = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "rm-cidfile-multi-2",
+            "ociman-test/rm-cidfile-multi:latest",
+            "true",
+        ],
+    );
+    assert!(run2.status.success());
+
+    let cidfile1 = storage_dir.path().join("cid1.txt");
+    let cidfile2 = storage_dir.path().join("cid2.txt");
+    std::fs::write(&cidfile1, "rm-cidfile-multi-1").unwrap();
+    std::fs::write(&cidfile2, "rm-cidfile-multi-2").unwrap();
+
+    let rm = ociman(
+        storage_dir.path(),
+        &[
+            "rm",
+            "--cidfile",
+            cidfile1.to_str().unwrap(),
+            "--cidfile",
+            cidfile2.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rm.stdout).trim().lines().count(),
+        2
+    );
+
+    let ps_after = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert!(String::from_utf8_lossy(&ps_after.stdout).trim().is_empty());
+}
+
+/// `--all` and `--cidfile` are mutually exclusive, matching real
+/// podman's own exact error text ("--all, --latest, and --cidfile
+/// cannot be used together" -- this project has no `--latest` concept
+/// at all, so its own message correctly omits it).
+#[test]
+fn rm_all_and_cidfile_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let cidfile = storage_dir.path().join("cid.txt");
+    std::fs::write(&cidfile, "whatever").unwrap();
+
+    let out = ociman(
+        storage_dir.path(),
+        &["rm", "--all", "--cidfile", cidfile.to_str().unwrap()],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--all and --cidfile"),
+        "{out:?}"
+    );
+}
+
+/// A `--cidfile` that can't be read at all (missing file) is a clear,
+/// immediate error -- this project has no `--ignore` flag on `ociman
+/// rm` yet to tolerate it (unlike real podman's own `--ignore`-gated
+/// tolerance for exactly this case), so the honest behavior here is a
+/// hard failure, not a silent skip.
+#[test]
+fn rm_cidfile_of_a_missing_file_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &["rm", "--cidfile", "/no/such/cidfile-path.txt"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("reading --cidfile"),
+        "{out:?}"
+    );
+}

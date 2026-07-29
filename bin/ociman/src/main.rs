@@ -1582,6 +1582,25 @@ enum Command {
         /// between the two.
         #[arg(short, long)]
         all: bool,
+        /// Read an additional container ID/name from this file,
+        /// repeatable — matching real `docker rm --cidfile`/`podman
+        /// rm --cidfile` exactly (checked directly against real
+        /// podman's own `cmd/podman/containers/rm.go`): the file's own
+        /// first line only (everything up to, but not including, the
+        /// first `\n` — real podman's own `strings.Cut(content,
+        /// "\n")`, so trailing content after the first line is simply
+        /// ignored, not an error), merged into the exact same target
+        /// list an explicit `ID`/`--name` argument already builds
+        /// (resolved, and only then removed, exactly the same way).
+        /// Mutually exclusive with `--all`, matching real podman's own
+        /// identical rule. Unlike real podman (whose own missing-file
+        /// tolerance is gated behind a separate `--ignore` flag this
+        /// project doesn't have yet), a cidfile that can't be read at
+        /// all is always a clear, immediate error here — the natural,
+        /// honest behavior for a flag with no `--ignore` counterpart
+        /// yet, not a silent divergence.
+        #[arg(long = "cidfile", value_name = "FILE")]
+        cidfile: Vec<PathBuf>,
     },
     /// Copy files/directories between the local filesystem and a
     /// container (running or stopped), or between two containers —
@@ -2437,7 +2456,12 @@ fn main() -> std::process::ExitCode {
             Some(Command::Start { id, attach }) => cmd_start(&id, attach),
             Some(Command::Attach { id }) => cmd_attach(&id),
             Some(Command::Restart { id, time }) => cmd_restart(&id, time),
-            Some(Command::Rm { ids, force, all }) => cmd_rm(&ids, force, all),
+            Some(Command::Rm {
+                ids,
+                force,
+                all,
+                cidfile,
+            }) => cmd_rm(&ids, force, all, &cidfile),
             Some(Command::Cp {
                 src,
                 dest,
@@ -6723,7 +6747,24 @@ fn cmd_ps(
 /// difference from `--all`'s own "keep going past a per-container
 /// failure" policy, which still applies once a name/ID has actually
 /// resolved to something real).
-fn cmd_rm(ids: &[String], force: bool, all: bool) -> anyhow::Result<()> {
+fn cmd_rm(ids: &[String], force: bool, all: bool, cidfiles: &[PathBuf]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        cidfiles.is_empty() || !all,
+        "--all and --cidfile cannot be used together"
+    );
+    // Real podman's own exact semantics (`~/git/podman/cmd/podman/
+    // containers/rm.go`): the file's own first line only
+    // (`strings.Cut(content, "\n")`), merged into the same target list
+    // an explicit `ID`/`--name` argument already builds -- no
+    // distinction after this point.
+    let mut ids: Vec<String> = ids.to_vec();
+    for path in cidfiles {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --cidfile {}", path.display()))?;
+        ids.push(content.split('\n').next().unwrap_or("").to_string());
+    }
+    let ids = &ids;
+
     let containers = open_container_store()?;
     match (ids.is_empty(), all) {
         (false, true) => anyhow::bail!("cannot give both a container ID/name and --all"),
