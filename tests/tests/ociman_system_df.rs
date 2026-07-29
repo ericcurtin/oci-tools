@@ -423,4 +423,70 @@ fn df_verbose_text_output_shows_three_headed_sections() {
         stdout.contains("VOLUME NAME") && stdout.contains("LINKS"),
         "{stdout:?}"
     );
+    // Every column header must be genuinely separated by whitespace
+    // from its neighbor -- a real bug caught by hand: an early version
+    // glued fixed-width columns directly together with no separating
+    // space at all, so a header wider than its own declared column
+    // width (`LOCAL VOLUMES`, 13 characters, in an 8-wide column) ran
+    // straight into the next header with no gap (`LOCAL VOLUMESSIZE`).
+    assert!(
+        !stdout.contains("VOLUMESSIZE") && !stdout.contains("VOLUMESCREATED"),
+        "columns must stay separated even when a header/value is wider than its own column: {stdout:?}"
+    );
+}
+
+/// The same real column-gluing bug above, but for a long *value*
+/// (rather than just a header) overflowing its own column -- a
+/// command long enough to run past its own 20-character column must
+/// still leave a real gap before the next column's own value, not
+/// concatenate directly onto it.
+#[test]
+fn df_verbose_text_output_keeps_columns_separated_even_when_a_command_overflows() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/df-verbose-overflow:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "df-verbose-overflow-test",
+            "ociman-test/df-verbose-overflow:latest",
+            "sh",
+            "-c",
+            "echo this is a genuinely long command line on purpose",
+        ],
+    );
+    assert!(run.status.success(), "{run:?}");
+
+    let out = ociman(storage_dir.path(), &["system", "df", "--verbose"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let row = stdout
+        .lines()
+        .find(|line| line.contains("df-verbose-overflow-test"))
+        .unwrap_or_else(|| panic!("no row for the test container: {stdout:?}"));
+    // The overflowing COMMAND value must still be followed by real
+    // whitespace before the next column's own value begins -- never a
+    // digit (LOCAL VOLUMES) or a size unit glued directly onto it.
+    assert!(
+        row.contains("purpose ") || row.trim_end().ends_with("purpose"),
+        "the overflowing command must be separated from the next column, not concatenated: {row:?}"
+    );
+
+    ociman(
+        storage_dir.path(),
+        &["rm", "--force", "df-verbose-overflow-test"],
+    );
 }

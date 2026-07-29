@@ -4296,12 +4296,12 @@ fn cmd_system_df_verbose(
 
     println!("Images space usage:\n");
     println!(
-        "{:<40}{:<10}{:<14}{:<12}{:<10}{:<14}{:<14}CONTAINERS",
+        "{:<40} {:<10} {:<14} {:<22} {:<10} {:<14} {:<14} CONTAINERS",
         "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE", "SHARED SIZE", "UNIQUE SIZE"
     );
     for row in &image_rows {
         println!(
-            "{:<40}{:<10}{:<14}{:<12}{:<10}{:<14}{:<14}{}",
+            "{:<40} {:<10} {:<14} {:<22} {:<10} {:<14} {:<14} {}",
             row.repository.as_deref().unwrap_or("<none>"),
             row.tag.as_deref().unwrap_or("<none>"),
             row.image_id,
@@ -4315,12 +4315,12 @@ fn cmd_system_df_verbose(
 
     println!("\nContainers space usage:\n");
     println!(
-        "{:<14}{:<40}{:<20}{:<8}{:<10}{:<12}{:<10}NAMES",
+        "{:<14} {:<40} {:<20} {:<16} {:<10} {:<22} {:<10} NAMES",
         "CONTAINER ID", "IMAGE", "COMMAND", "LOCAL VOLUMES", "SIZE", "CREATED", "STATUS"
     );
     for row in &container_rows {
         println!(
-            "{:<14}{:<40}{:<20}{:<8}{:<10}{:<12}{:<10}{}",
+            "{:<14} {:<40} {:<20} {:<16} {:<10} {:<22} {:<10} {}",
             row.id,
             row.image,
             row.command,
@@ -4333,10 +4333,10 @@ fn cmd_system_df_verbose(
     }
 
     println!("\nLocal Volumes space usage:\n");
-    println!("{:<30}{:<10}SIZE", "VOLUME NAME", "LINKS");
+    println!("{:<30} {:<10} SIZE", "VOLUME NAME", "LINKS");
     for row in &volume_rows {
         println!(
-            "{:<30}{:<10}{}",
+            "{:<30} {:<10} {}",
             row.name,
             row.links,
             human_size(row.size_bytes)
