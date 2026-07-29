@@ -794,3 +794,250 @@ fn restarting_a_container_originally_run_interactive_still_forwards_stdin() {
         b"",
     );
 }
+
+/// `--all` (0315) matches real `podman restart --all` exactly: unlike
+/// `kill --all`/`stop --all`, *every* container is genuinely attempted
+/// with no skip category at all -- a never-`start`ed container is
+/// simply started for the first time, an already-stopped one is
+/// started again, and a still-running one is restarted in place (a
+/// new, real pid).
+#[test]
+fn restart_all_restarts_every_container_including_never_started_and_stopped_ones() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/restart-all:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "-d",
+            "--name",
+            "restart-all-run1",
+            "ociman-test/restart-all:latest",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            "restart-all-run1",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+    let first_pid = inspect_json(storage_dir.path(), "restart-all-run1")["pid"]
+        .as_i64()
+        .expect("running container should report a real pid");
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "restart-all-created",
+            "ociman-test/restart-all:latest",
+            "true",
+        ],
+    );
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            "restart-all-created",
+            "created",
+            Duration::from_millis(200)
+        ),
+        "created"
+    );
+
+    let restart_all = ociman(storage_dir.path(), &["restart", "--time", "1", "--all"]);
+    assert!(
+        restart_all.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restart_all.stderr)
+    );
+
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            "restart-all-run1",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running",
+        "restart --all should leave a freshly-restarted long-running container running"
+    );
+    let second_pid = inspect_json(storage_dir.path(), "restart-all-run1")["pid"]
+        .as_i64()
+        .expect("running container should report a real pid");
+    assert_ne!(
+        first_pid, second_pid,
+        "restart --all should have replaced the running container's own process with a new one"
+    );
+
+    // The never-started container should have been started for the
+    // first time (its own `true` command ran and exited immediately).
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            "restart-all-created",
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped",
+        "restart --all should start a never-started container for the first time"
+    );
+
+    ociman(
+        storage_dir.path(),
+        &["stop", "--time", "0", "restart-all-run1"],
+    );
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// Real `podman`'s own `--all` and an explicit container ID/name are
+/// mutually exclusive; giving both is a clear, immediate error rather
+/// than silently picking one.
+#[test]
+fn restart_all_with_an_explicit_id_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["restart", "--all", "some-id"]);
+    assert!(!out.status.success());
+}
+
+/// A genuinely paused container is a real, reported error under
+/// `--all` too (matching real podman's own identical refusal,
+/// `ociman_stop.rs`'s own `stop_and_restart_on_a_paused_container_
+/// are_a_real_immediate_error` for the single-target case) -- every
+/// other container is still attempted regardless.
+#[test]
+fn restart_all_reports_a_real_error_for_a_paused_container_but_still_restarts_the_rest() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/restart-all-paused:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let run1 = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "-d",
+            "--name",
+            "restart-all-paused-run1",
+            "ociman-test/restart-all-paused:latest",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    assert!(run1.status.success());
+    let run2 = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "-d",
+            "--name",
+            "restart-all-paused-paused1",
+            "ociman-test/restart-all-paused:latest",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    assert!(run2.status.success());
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            "restart-all-paused-run1",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            "restart-all-paused-paused1",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+    let pause = ociman(storage_dir.path(), &["pause", "restart-all-paused-paused1"]);
+    assert!(pause.status.success());
+
+    let restart_all = ociman(storage_dir.path(), &["restart", "--time", "1", "--all"]);
+    assert!(
+        !restart_all.status.success(),
+        "a genuinely paused container in the mix should still surface a real error"
+    );
+
+    // The other, non-paused container should still have been
+    // restarted successfully regardless of the paused one's failure.
+    let first_pid_view = inspect_json(storage_dir.path(), "restart-all-paused-run1");
+    assert_eq!(
+        first_pid_view["status"].as_str(),
+        Some("running"),
+        "the non-paused container should still be restarted despite the paused one's failure"
+    );
+
+    // The paused container itself should be completely untouched.
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            "restart-all-paused-paused1",
+            "paused",
+            Duration::from_millis(200)
+        ),
+        "paused"
+    );
+
+    ociman(
+        storage_dir.path(),
+        &["unpause", "restart-all-paused-paused1"],
+    );
+    ociman(storage_dir.path(), &["stop", "--time", "0", "-a"]);
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}

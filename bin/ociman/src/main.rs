@@ -1535,14 +1535,28 @@ enum Command {
     /// exactly. A no-op-then-start for an already-stopped container
     /// (nothing to stop first).
     Restart {
-        /// The container's ID or `--name`.
-        id: String,
+        /// The container's ID or `--name` — omit when using `--all`.
+        /// Mutually exclusive with `--all`, matching real `podman
+        /// restart`'s own identical rule.
+        id: Option<String>,
         /// Seconds to wait after the initial signal before escalating
         /// to `KILL`, if the container is currently running (same
         /// meaning, precedence, and fallback as `ociman stop --time`
         /// -- see [`resolve_stop_timeout`]'s own doc comment).
         #[arg(short, long)]
         time: Option<u64>,
+        /// Restart every real container instead of the one named on
+        /// the command line — matching real `podman restart --all`
+        /// exactly (checked directly, `~/git/podman/cmd/podman/
+        /// containers/restart.go`, `pkg/domain/infra/abi/
+        /// containers.go`'s own `ContainerRestart`/`getContainers`):
+        /// unlike `kill`/`stop --all`, every container is genuinely
+        /// attempted with no skip category at all — a never-started
+        /// or already-stopped one is simply started (for the first
+        /// time, or again); the one real, reported failure is a
+        /// genuinely paused container (0315).
+        #[arg(short, long)]
+        all: bool,
     },
     /// Remove one or more stopped containers' storage — matching real
     /// `podman rm <ID> [ID...]` exactly. Refuses a still-running one
@@ -2510,7 +2524,7 @@ fn main() -> std::process::ExitCode {
             ),
             Some(Command::Start { id, attach }) => cmd_start(&id, attach),
             Some(Command::Attach { id }) => cmd_attach(&id),
-            Some(Command::Restart { id, time }) => cmd_restart(&id, time),
+            Some(Command::Restart { id, time, all }) => cmd_restart(id.as_deref(), time, all),
             Some(Command::Rm {
                 ids,
                 force,
@@ -8253,7 +8267,93 @@ fn attach_and_wait_for_exit(containers: &StateStore, resolved: &str) -> anyhow::
 /// has already forked its own new keeper below — at which point this
 /// function itself never forks again, so a background thread spawned
 /// here can no longer corrupt anything.
-fn cmd_restart(id: &str, time_secs: Option<u64>) -> anyhow::Result<()> {
+///
+/// `--all` (0315) matches real `podman restart --all` exactly (checked
+/// directly, and empirically against a real installed binary given a
+/// real mix of running/created/stopped/paused containers): unlike
+/// `kill --all`/`stop --all`, *every* container is genuinely attempted
+/// with no skip category at all — a never-`start`ed or already-
+/// `Stopped` one is simply started for the first time/again, matching
+/// real podman's own identical "stop only if running, then re-init
+/// regardless" rule applied to a container that was never running in
+/// the first place. The one real, reported failure is a genuinely
+/// `Paused` container (the same upfront refusal `stop_container`
+/// already gives a single-target `restart`, unchanged) — every other
+/// container is still attempted regardless, matching `kill`/`stop
+/// --all`'s own identical "attempt every one, report the first real
+/// failure at the end" shape.
+///
+/// A real, previously-hit bug found while first testing this loop by
+/// hand, not just theorized: [`restart_one`]'s own old-scope cleanup
+/// (see its own doc comment) spawns a background D-Bus thread that is
+/// *deliberately* never joined, on the well-founded assumption (true
+/// for every single-target caller) that the whole process exits
+/// moments later regardless, so an occasionally-abandoned thread costs
+/// nothing. `--all` breaks that assumption outright: this same
+/// process now goes on to `fork()` again for the *next* container,
+/// and this project's own debug-only single-threaded-at-`fork()`
+/// safety net (`0160`) correctly caught the resulting real violation —
+/// reproduced directly (not just theorized), a genuine panic partway
+/// through a real `--all` run. Fixed by passing `defer_scope_reset:
+/// true` here so [`restart_one`] never spawns that thread itself,
+/// instead returning what it would have reset; every one of those is
+/// collected and only actually reset, one at a time, sequentially,
+/// *after* this entire loop (every container's own `fork()` already
+/// long done) — matching `restart_one`'s own already-established
+/// "defer the background thread until no more forking can possibly
+/// happen in this process" reasoning, just widened from "the rest of
+/// this one call" to "the rest of this whole `--all` sweep".
+fn cmd_restart(id: Option<&str>, time_secs: Option<u64>, all: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        id.is_none() || !all,
+        "cannot give both a container ID/name and --all"
+    );
+    if all {
+        let containers = open_container_store()?;
+        let mut first_error = None;
+        let mut deferred_scope_resets = Vec::new();
+        for state in containers.list().context("listing containers")? {
+            match restart_one(&state.id, time_secs, true) {
+                Ok(deferred) => deferred_scope_resets.extend(deferred),
+                Err(e) => {
+                    eprintln!("error restarting {}: {e:#}", state.id);
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        // Only now, with every container's own `fork()` already done,
+        // is it safe to let these background threads run -- see this
+        // function's own doc comment above.
+        for (resolved, old_state) in deferred_scope_resets {
+            reset_failed_systemd_scope(&resolved, &old_state);
+        }
+        return match first_error {
+            Some(e) => Err(e.context("restarting containers")),
+            None => Ok(()),
+        };
+    }
+    let id = id.ok_or_else(|| {
+        anyhow::anyhow!("no container ID/name given (try `ociman restart <ID>` or `--all`)")
+    })?;
+    restart_one(id, time_secs, false)?;
+    Ok(())
+}
+
+/// The actual single-container restart logic, factored out of
+/// [`cmd_restart`] so its own `--all` loop above can call it once per
+/// container.
+///
+/// `defer_scope_reset`: when set, the old scope's own best-effort
+/// "failed" cleanup (see the doc comment on this function's own
+/// `reset_failed_systemd_scope` call below) is *not* performed here at
+/// all — instead returned to the caller to perform later, once it is
+/// actually safe to (`cmd_restart`'s own `--all` doc comment above
+/// explains why a `--all` sweep specifically needs this).
+fn restart_one(
+    id: &str,
+    time_secs: Option<u64>,
+    defer_scope_reset: bool,
+) -> anyhow::Result<Option<(String, oci_runtime_core::PersistedState)>> {
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)?;
     let old_state = containers.load(&resolved).ok();
@@ -8294,9 +8394,12 @@ fn cmd_restart(id: &str, time_secs: Option<u64>) -> anyhow::Result<()> {
     // *before* the stop above, so this resets the correct (old) scope
     // name, not whatever the brand new run's own nonce now is.
     if let Some(old_state) = old_state {
+        if defer_scope_reset {
+            return Ok(Some((resolved, old_state)));
+        }
         reset_failed_systemd_scope(&resolved, &old_state);
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Send `signal` to a running container's own init process, once,
