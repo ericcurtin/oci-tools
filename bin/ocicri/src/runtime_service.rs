@@ -2050,11 +2050,32 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
 
     type GetContainerEventsStream = BoxStream<cri::ContainerEventResponse>;
 
+    /// Real cri-o's own `GetContainerEvents` (`server/
+    /// container_events.go`, checked directly) is entirely gated
+    /// behind its own `enable_pod_events` config toggle — a plain
+    /// `bool` with no explicit default assignment anywhere in
+    /// `pkg/config/config.go`'s own `DefaultConfig` (Go's own zero
+    /// value, `false`), so a real, unconfigured `cri-o` install has it
+    /// off by default. When disabled, its own implementation returns
+    /// `nil` immediately: a real, clean stream that closes with zero
+    /// messages, never actually blocking to wait for an event at all.
+    ///
+    /// This project has no event-generation machinery, or an
+    /// `enable_pod_events`-equivalent toggle, anywhere — so the
+    /// honest, real-cri-o-default-matching answer is that identical
+    /// immediately-closed, empty stream, not a hard `Status::
+    /// unimplemented` (which real cri-o's own default install would
+    /// never actually return for this RPC) — the same "absence over
+    /// fabrication" reasoning `ListPodSandboxMetrics`/
+    /// `StreamPodSandboxMetrics` already established (`docs/design/
+    /// 0255`). A real per-container event bus (needed the moment this
+    /// project ever wants `enable_pod_events`-style behavior turned
+    /// *on*) is a materially bigger feature, deliberately still ahead.
     async fn get_container_events(
         &self,
         _request: Request<cri::GetEventsRequest>,
     ) -> Result<Response<Self::GetContainerEventsStream>, Status> {
-        unimplemented("GetContainerEvents")
+        Ok(Response::new(Box::pin(tokio_stream::empty())))
     }
 
     /// A real, honest empty list — checked directly against real

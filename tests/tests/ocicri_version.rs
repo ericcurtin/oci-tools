@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use oci_cri_types::runtime_service_client::RuntimeServiceClient;
 use oci_cri_types::{
-    CgroupDriver, ListMetricDescriptorsRequest, ListPodSandboxMetricsRequest, RuntimeConfigRequest,
-    StatusRequest, StreamPodSandboxMetricsRequest, UpdateRuntimeConfigRequest, VersionRequest,
+    CgroupDriver, GetEventsRequest, ListMetricDescriptorsRequest, ListPodSandboxMetricsRequest,
+    RuntimeConfigRequest, StatusRequest, StreamPodSandboxMetricsRequest,
+    UpdateRuntimeConfigRequest, VersionRequest,
 };
 use oci_tools_tests::bin_path;
 
@@ -266,6 +267,33 @@ async fn pod_sandbox_metrics_rpcs_report_a_real_honest_empty_answer() {
             .expect("stream should end cleanly")
             .is_none(),
         "an empty answer should stream zero messages before EOF"
+    );
+}
+
+/// `GetContainerEvents` matches real cri-o's own actual default
+/// (`enable_pod_events` off, `docs/design/0258`): a real, clean stream
+/// that closes with zero messages rather than blocking to wait for an
+/// event this project has no machinery to ever produce.
+#[tokio::test]
+async fn get_container_events_closes_immediately_with_no_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("ocicri.sock");
+    let _server = spawn_server(&socket_path);
+    wait_for_socket(&socket_path);
+
+    let mut client = connect(socket_path).await;
+    let mut stream = client
+        .get_container_events(GetEventsRequest {})
+        .await
+        .expect("GetContainerEvents RPC failed")
+        .into_inner();
+    assert!(
+        stream
+            .message()
+            .await
+            .expect("stream should end cleanly")
+            .is_none(),
+        "no event-generation machinery exists, so this must close immediately"
     );
 }
 
