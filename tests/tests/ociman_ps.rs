@@ -1431,3 +1431,152 @@ fn ps_filter_until_matches_containers_created_strictly_before_the_threshold() {
     assert!(no_all.status.success());
     assert!(String::from_utf8_lossy(&no_all.stdout).trim().is_empty());
 }
+
+/// `ociman ps -n`/`--last` (0290), matching real `podman ps -n`
+/// exactly (checked directly against `~/git/podman/pkg/ps/ps.go`): a
+/// positive value overrides the default running-only visibility rule
+/// (same as `--all`) *and* keeps only the `n` most-recently-created
+/// matching containers, still shown in ascending (oldest-of-the-kept-
+/// first) order.
+#[test]
+fn ps_last_overrides_visibility_and_keeps_only_the_n_most_recently_created() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-last:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = |name: &str| {
+        let out = ociman(
+            storage_dir.path(),
+            &[
+                "create",
+                "--name",
+                name,
+                "ociman-test/ps-last:latest",
+                "true",
+            ],
+        );
+        assert!(out.status.success(), "{out:?}");
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+    };
+    create("last1");
+    create("last2");
+    create("last3");
+
+    // No `-a`, no `-n`: every container here is merely `created`
+    // (never started), so a plain `ps` shows nothing at all.
+    let plain = ociman(storage_dir.path(), &["ps", "-q"]);
+    assert!(plain.status.success());
+    assert!(String::from_utf8_lossy(&plain.stdout).trim().is_empty());
+
+    // `-n 2`, still no `-a`: overrides visibility on its own, and
+    // keeps only the 2 most recently created (last2, last3), in
+    // ascending order.
+    let last2 = ociman(storage_dir.path(), &["ps", "-n", "2", "-q"]);
+    assert!(last2.status.success(), "{last2:?}");
+    let ids: Vec<String> = String::from_utf8_lossy(&last2.stdout)
+        .trim()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+
+    let names = ociman(storage_dir.path(), &["ps", "-n", "2", "-a", "--noheading"]);
+    assert!(names.status.success(), "{names:?}");
+    let stdout = String::from_utf8_lossy(&names.stdout);
+    assert!(
+        stdout.contains("last2") && stdout.contains("last3") && !stdout.contains("last1"),
+        "expected only last2/last3 (the two most recent), got: {stdout:?}"
+    );
+    // Ascending order: last2 appears before last3.
+    assert!(
+        stdout.find("last2").unwrap() < stdout.find("last3").unwrap(),
+        "{stdout:?}"
+    );
+
+    // `-n` larger than the real count is a real no-op (every
+    // container still shown, nothing dropped).
+    let last_big = ociman(storage_dir.path(), &["ps", "-n", "100", "-q"]);
+    assert!(last_big.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&last_big.stdout)
+            .trim()
+            .lines()
+            .count(),
+        3,
+        "{last_big:?}"
+    );
+
+    // `-n 0` (and the implicit default, `-1`) is a real no-op: no
+    // visibility override, nothing hidden that wasn't already hidden.
+    let zero = ociman(storage_dir.path(), &["ps", "-n", "0", "-q"]);
+    assert!(zero.status.success());
+    assert!(String::from_utf8_lossy(&zero.stdout).trim().is_empty());
+}
+
+/// `ociman ps --no-trunc`/`--noheading` (0290): the real default
+/// 17-character-plus-`...` command truncation (matching real
+/// `podman ps`'s own `Command()` formatter exactly) is disabled by
+/// `--no-trunc`, and `--noheading` drops the header row entirely.
+#[test]
+fn ps_no_trunc_and_noheading_control_the_real_table_output() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-no-trunc:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "no-trunc-test",
+            "ociman-test/ps-no-trunc:latest",
+            "sh",
+            "-c",
+            "echo this is a genuinely long command line on purpose",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let truncated = ociman(storage_dir.path(), &["ps", "-a"]);
+    assert!(truncated.status.success());
+    let stdout = String::from_utf8_lossy(&truncated.stdout);
+    assert!(
+        stdout.contains("CONTAINER ID") && stdout.contains("...") && !stdout.contains("purpose"),
+        "the default table must truncate the long command and still show a header: {stdout:?}"
+    );
+
+    let full = ociman(storage_dir.path(), &["ps", "-a", "--no-trunc"]);
+    assert!(full.status.success());
+    let stdout = String::from_utf8_lossy(&full.stdout);
+    assert!(
+        stdout.contains("purpose") && !stdout.contains("..."),
+        "--no-trunc must show the full command: {stdout:?}"
+    );
+
+    let no_heading = ociman(storage_dir.path(), &["ps", "-a", "--noheading"]);
+    assert!(no_heading.status.success());
+    assert!(
+        !String::from_utf8_lossy(&no_heading.stdout).contains("CONTAINER ID"),
+        "{no_heading:?}"
+    );
+}

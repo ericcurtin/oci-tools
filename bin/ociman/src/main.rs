@@ -1261,6 +1261,38 @@ enum Command {
         /// pkg/filters/filters.go`'s own `ComputeUntilTimestamp`).
         #[arg(short, long = "filter")]
         filter: Vec<String>,
+        /// Print only the `n` most-recently-created containers,
+        /// regardless of state — matching real `docker ps -n`/`podman
+        /// ps -n`/`--last` exactly (checked directly against
+        /// `~/git/podman/pkg/ps/ps.go`): a positive value both
+        /// overrides the default running-only visibility rule (the
+        /// same override `--all`/`--filter status=` already have) and
+        /// selects only the `n` newest, by creation time, of whatever
+        /// else matched; `0` or negative (the default, matching real
+        /// podman's own literal `-1` default) is a real no-op — no
+        /// override, no limiting, exactly as if this flag were never
+        /// given at all.
+        #[arg(short = 'n', long = "last", default_value_t = -1, allow_hyphen_values = true)]
+        last: i64,
+        /// Show each container's own full, untruncated command
+        /// instead of the default 17-character-plus-`...` truncation
+        /// — matching real `podman ps --no-trunc`'s own checked-
+        /// directly `Command()` formatter exactly
+        /// (`~/git/podman/cmd/podman/containers/ps.go`). Real
+        /// podman's own identical flag also un-truncates the
+        /// container/image/pod *ID* columns, which this project has
+        /// no equivalent truncation of in the first place (`ociman`'s
+        /// own container ids are already always the short, 12-hex-
+        /// character form with no separate full form to reveal) — a
+        /// real, honest no-op for those columns specifically, not an
+        /// oversight.
+        #[arg(long = "no-trunc")]
+        no_trunc: bool,
+        /// Don't print the table's own header row — matching real
+        /// `podman ps --noheading` exactly. Has no effect on `--quiet`/
+        /// `--json`, neither of which ever prints a header at all.
+        #[arg(long)]
+        noheading: bool,
     },
     /// Start an already-`Stopped` container again, reusing its own
     /// existing rootfs/config exactly as `run` originally left it —
@@ -2143,9 +2175,22 @@ fn main() -> std::process::ExitCode {
                 rm,
                 interactive,
             }) => cmd_create(args, rm, interactive),
-            Some(Command::Ps { all, quiet, filter }) => {
-                cmd_ps(all, quiet, cli.global.json, &filter)
-            }
+            Some(Command::Ps {
+                all,
+                quiet,
+                filter,
+                last,
+                no_trunc,
+                noheading,
+            }) => cmd_ps(
+                all,
+                quiet,
+                cli.global.json,
+                &filter,
+                last,
+                no_trunc,
+                noheading,
+            ),
             Some(Command::Start { id, attach }) => cmd_start(&id, attach),
             Some(Command::Attach { id }) => cmd_attach(&id),
             Some(Command::Restart { id, time }) => cmd_restart(&id, time),
@@ -5793,9 +5838,22 @@ fn earliest_referenced_creation(
         .map(|earliest| earliest.expect("references is non-empty when this is called"))
 }
 
-fn cmd_ps(all: bool, quiet: bool, json: bool, filter: &[String]) -> anyhow::Result<()> {
+fn cmd_ps(
+    all: bool,
+    quiet: bool,
+    json: bool,
+    filter: &[String],
+    last: i64,
+    no_trunc: bool,
+    noheading: bool,
+) -> anyhow::Result<()> {
     let filters = parse_ps_filters(filter)?;
     let containers = open_container_store()?;
+    // A positive `--last`/`-n` overrides the default running-only
+    // visibility rule too, matching real podman's own identical
+    // `all := options.All || options.Last > 0` exactly (checked
+    // directly against `~/git/podman/pkg/ps/ps.go`).
+    let all = all || last > 0;
     // Resolved once, up front (each reference container needs a real
     // store lookup) -- not inside the per-container filter closure
     // below, which must stay infallible.
@@ -5928,6 +5986,18 @@ fn cmd_ps(all: bool, quiet: bool, json: bool, filter: &[String]) -> anyhow::Resu
         .map(ContainerView::from_state)
         .collect();
     views.sort_by(|a, b| a.created.cmp(&b.created));
+    // `--last`/`-n`: keep only the `n` most-recently-created --
+    // already-ascending-sorted `views` makes this exactly its own
+    // trailing slice, equivalent to real podman's own "sort
+    // descending, keep the first n" (`~/git/podman/pkg/ps/ps.go`)
+    // without needing a second sort back to ascending order for
+    // display afterward.
+    if last > 0 {
+        let last = last as usize;
+        if last < views.len() {
+            views = views.split_off(views.len() - last);
+        }
+    }
 
     if quiet {
         for view in &views {
@@ -5944,16 +6014,31 @@ fn cmd_ps(all: bool, quiet: bool, json: bool, filter: &[String]) -> anyhow::Resu
         println!("no containers");
         return Ok(());
     }
-    println!(
-        "{:<14} {:<40} {:<30} {:<9} {:<20} CREATED",
-        "CONTAINER ID", "IMAGE", "COMMAND", "STATUS", "NAMES"
-    );
+    if !noheading {
+        println!(
+            "{:<14} {:<40} {:<30} {:<9} {:<20} CREATED",
+            "CONTAINER ID", "IMAGE", "COMMAND", "STATUS", "NAMES"
+        );
+    }
+    // Real `podman ps`'s own default `Command()` formatter truncates
+    // to 17 characters plus `...` (`~/git/podman/cmd/podman/
+    // containers/ps.go`); `--no-trunc` shows it verbatim. Truncates by
+    // real `char`s, not bytes (real Go strings are plain byte slices,
+    // so an identical byte-offset slice there can't panic the way an
+    // arbitrary non-ASCII byte offset would here).
+    let display_command = |command: &str| -> String {
+        if no_trunc || command.chars().count() <= 17 {
+            command.to_string()
+        } else {
+            format!("{}...", command.chars().take(17).collect::<String>())
+        }
+    };
     for view in &views {
         println!(
             "{:<14} {:<40} {:<30} {:<9} {:<20} {}",
             view.id,
             view.image,
-            view.command,
+            display_command(&view.command),
             view.status,
             view.name.as_deref().unwrap_or(""),
             view.created
