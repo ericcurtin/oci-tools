@@ -85,10 +85,8 @@ Full workspace: `cargo build`/`test --workspace`, `cargo fmt --all
 
 `ociman rmi -a/--all` (remove every image, matching real `podman rmi
 --all` — still refuses one a container depends on unless `--force`
-too) remains a real candidate, deliberately deferred here pending a
-dedicated design for its own correct, order-independent interaction
-with the existing by-ID sibling-tag-ambiguity gate when a manifest
-digest has both several real tags and an untagged sentinel record
-present at once.
+too) is implemented in `0271`, including the dedicated fix for its
+own order-independent interaction with the by-ID sibling-tag-ambiguity
+gate noted above.
 </content>
 </invoke>

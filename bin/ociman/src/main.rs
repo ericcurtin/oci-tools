@@ -890,6 +890,16 @@ enum Command {
         /// it first if still running), instead of refusing.
         #[arg(short, long)]
         force: bool,
+        /// Remove every image in local storage instead of the ones
+        /// named on the command line — matching real `podman rmi
+        /// --all`/`-a` exactly. Still refuses one a container depends
+        /// on unless `--force` is *also* given (checked directly
+        /// against a real installed `podman rmi --all`), every other
+        /// image still attempted even if one fails. Mutually
+        /// exclusive with an explicit reference list, same as
+        /// `ociman rm --all`'s own identical rule.
+        #[arg(short, long)]
+        all: bool,
         /// Silently do nothing for a reference that doesn't resolve
         /// to any real image, instead of a clear error — matching
         /// real `podman rmi -i`/`--ignore` exactly. `--force` implies
@@ -1868,8 +1878,9 @@ fn main() -> std::process::ExitCode {
             Some(Command::Rmi {
                 references,
                 force,
+                all,
                 ignore,
-            }) => cmd_rmi(&references, force, ignore, cli.global.json),
+            }) => cmd_rmi(&references, force, all, ignore, cli.global.json),
             Some(Command::Tag { source, target }) => cmd_tag(&source, &target, cli.global.json),
             Some(Command::History { reference }) => cmd_history(&reference, cli.global.json),
             Some(Command::Prune { all, filter }) => cmd_prune(cli.global.json, all, &filter),
@@ -2884,8 +2895,20 @@ fn rmi_one(
 /// the others (a real, checked-directly *different* policy than
 /// `ociman rm`'s own all-or-nothing preflight for multiple explicit
 /// container IDs, 0267).
-fn cmd_rmi(references: &[String], force: bool, ignore: bool, json: bool) -> anyhow::Result<()> {
-    anyhow::ensure!(!references.is_empty(), "no image reference given");
+fn cmd_rmi(
+    references: &[String],
+    force: bool,
+    all: bool,
+    ignore: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    match (references.is_empty(), all) {
+        (false, true) => anyhow::bail!("cannot give both an image reference and --all"),
+        (true, false) => {
+            anyhow::bail!("no image reference given (try `ociman rmi <REFERENCE>` or `--all`)")
+        }
+        _ => {}
+    }
     // Matches real `podman rmi --force`'s own checked-directly behavior
     // exactly: forcing implies ignoring too (a nonexistent reference is
     // a silent no-op under `--force` alone, not just `--ignore`).
@@ -2893,49 +2916,91 @@ fn cmd_rmi(references: &[String], force: bool, ignore: bool, json: bool) -> anyh
     let store = open_store()?;
     let containers = open_container_store()?;
 
-    let mut outcomes = Vec::with_capacity(references.len());
+    let mut outcomes = Vec::new();
     let mut had_error = false;
-    for reference_str in references {
-        let resolved = match resolve_image_by_reference_or_id(&store, reference_str) {
-            Ok(Some(resolved)) => resolved,
-            Ok(None) => {
-                // Real `podman rmi --ignore` only ever silences *this*
-                // specific "doesn't resolve to anything at all" case
-                // (checked directly: an in-use-by-container error is
-                // still reported even with `--ignore`) -- every other
-                // failure kind below is never subject to it.
-                if !ignore {
+
+    if all {
+        // Every already-enumerated record is wrapped as `ResolvedImage
+        // ::Tag` directly, *never* re-resolved through the tag-then-
+        // ID-fallback machinery `references`-mode uses below -- a
+        // deliberate choice, not an oversight: re-resolving each
+        // record's own exact reference string (including this
+        // project's own internal untagged-image sentinel, which
+        // doesn't parse as a real tag at all and would otherwise fall
+        // through to *ID* resolution) could spuriously trip the by-ID
+        // sibling-tag-ambiguity gate depending on processing order,
+        // whenever a manifest digest has both several real tags and an
+        // untagged sentinel record at once. Since every record here is
+        // already known exactly, there is no real ambiguity to
+        // resolve — each one is removed independently by its own
+        // already-known reference, matching this project's own
+        // established one-row-per-reference data model exactly (see
+        // `docs/design/0271`).
+        for record in store.list_images().context("listing images")? {
+            let reference_str = record.reference.clone();
+            let resolved = ResolvedImage::Tag(record);
+            match rmi_one(&store, &containers, &reference_str, resolved, force) {
+                Ok(outcome) => {
+                    if !json {
+                        for reference in &outcome.references_removed {
+                            println!("{}", display_reference(reference));
+                        }
+                    }
+                    outcomes.push(outcome);
+                }
+                Err(e) => {
                     had_error = true;
                     eprintln!(
-                        "error removing {reference_str}: {reference_str}: no such image in local storage"
+                        "error removing {}: {e:#}",
+                        display_reference(&reference_str)
                     );
                 }
-                continue;
             }
-            Err(e) => {
-                had_error = true;
-                eprintln!("error removing {reference_str}: {e:#}");
-                continue;
-            }
-        };
-        match rmi_one(&store, &containers, reference_str, resolved, force) {
-            Ok(outcome) => {
-                if !json {
-                    for reference in &outcome.references_removed {
-                        println!("{}", display_reference(reference));
+        }
+    } else {
+        for reference_str in references {
+            let resolved = match resolve_image_by_reference_or_id(&store, reference_str) {
+                Ok(Some(resolved)) => resolved,
+                Ok(None) => {
+                    // Real `podman rmi --ignore` only ever silences
+                    // *this* specific "doesn't resolve to anything at
+                    // all" case (checked directly: an in-use-by-
+                    // container error is still reported even with
+                    // `--ignore`) -- every other failure kind below is
+                    // never subject to it.
+                    if !ignore {
+                        had_error = true;
+                        eprintln!(
+                            "error removing {reference_str}: {reference_str}: no such image in local storage"
+                        );
                     }
+                    continue;
                 }
-                outcomes.push(outcome);
-            }
-            Err(e) => {
-                had_error = true;
-                eprintln!("error removing {reference_str}: {e:#}");
+                Err(e) => {
+                    had_error = true;
+                    eprintln!("error removing {reference_str}: {e:#}");
+                    continue;
+                }
+            };
+            match rmi_one(&store, &containers, reference_str, resolved, force) {
+                Ok(outcome) => {
+                    if !json {
+                        for reference in &outcome.references_removed {
+                            println!("{}", display_reference(reference));
+                        }
+                    }
+                    outcomes.push(outcome);
+                }
+                Err(e) => {
+                    had_error = true;
+                    eprintln!("error removing {reference_str}: {e:#}");
+                }
             }
         }
     }
 
     if json {
-        if references.len() == 1 {
+        if !all && references.len() == 1 {
             if let Some(outcome) = outcomes.first() {
                 oci_cli_common::output::print_json(&outcome.to_result())?;
             }

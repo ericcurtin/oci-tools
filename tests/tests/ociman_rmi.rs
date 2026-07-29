@@ -934,3 +934,219 @@ fn rmi_ignore_removes_the_valid_reference_and_skips_the_nonexistent_one() {
             .is_none()
     );
 }
+
+/// `ociman rmi --all` (0271) removes every image in local storage,
+/// matching real `podman rmi --all` exactly.
+#[test]
+fn rmi_all_removes_every_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rmi-all-a:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/rmi-all-b:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let rmi = ociman(storage_dir.path(), &["rmi", "--all"]);
+    assert!(
+        rmi.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rmi.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rmi.stdout).trim().lines().count(),
+        2,
+        "{rmi:?}"
+    );
+
+    let images = ociman(storage_dir.path(), &["images", "--json"]);
+    let views: serde_json::Value = serde_json::from_slice(&images.stdout).unwrap();
+    assert!(views.as_array().unwrap().is_empty(), "{views:?}");
+
+    // A real, silent no-op on an already-empty store, matching this
+    // project's own established convention (`ociman rm --all`/`ociman
+    // prune --all`'s own identical rule).
+    let rmi_again = ociman(storage_dir.path(), &["rmi", "--all"]);
+    assert!(rmi_again.status.success());
+    assert!(String::from_utf8_lossy(&rmi_again.stdout).trim().is_empty());
+}
+
+/// `--all` and an explicit reference together is a clear error, never
+/// an ambiguous silent choice between the two (matching this
+/// project's own `ociman rm --all`'s own identical rule).
+#[test]
+fn rmi_all_and_an_explicit_reference_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["rmi", "--all", "some-image:latest"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot give both"),
+        "{out:?}"
+    );
+}
+
+/// `rmi --all` without `--force` still refuses an image a container
+/// depends on (real `podman rmi --all` alone, without `--force`,
+/// leaves it untouched too), but every *other* image is still
+/// attempted, matching real `podman rmi`'s own multi-target behavior.
+#[test]
+fn rmi_all_without_force_skips_an_in_use_image_but_still_removes_the_rest() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rmi-all-mixed-free:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "true".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    seed_image(
+        &store,
+        "ociman-test/rmi-all-mixed-inuse:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "true".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/rmi-all-mixed-inuse:latest"],
+    );
+    assert!(run.status.success(), "{run:?}");
+
+    let rmi = ociman(storage_dir.path(), &["rmi", "--all"]);
+    assert!(
+        !rmi.status.success(),
+        "the one in-use image's own failure should still surface"
+    );
+    assert!(
+        String::from_utf8_lossy(&rmi.stderr).contains("in use"),
+        "{}",
+        String::from_utf8_lossy(&rmi.stderr)
+    );
+
+    // The free image is gone; the in-use one survives untouched.
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-all-mixed-free:latest")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-all-mixed-inuse:latest")
+            .unwrap()
+            .is_some()
+    );
+
+    let forced = ociman(storage_dir.path(), &["rmi", "--all", "--force"]);
+    assert!(forced.status.success(), "{forced:?}");
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-all-mixed-inuse:latest")
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// The specific real edge case `0271`'s own design note flagged and
+/// verified by hand: a single manifest digest with *both* several
+/// real tags *and* an untagged sentinel record (`0179`) present at
+/// once. `--all` must remove every one of them without ever tripping
+/// the by-ID sibling-tag-ambiguity gate (`rmi <id>` needs `--force`
+/// for more than one tag) that only applies to *user-supplied*
+/// ambiguous spec resolution, never to `--all`'s own "remove every
+/// already-enumerated record independently" mode.
+#[test]
+fn rmi_all_removes_a_digest_with_both_multiple_tags_and_an_untagged_sibling() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rmi-all-siblings:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let record = store
+        .resolve_image("docker.io/ociman-test/rmi-all-siblings:latest")
+        .unwrap()
+        .unwrap();
+
+    // A second real tag, plus an untagged sentinel record (0179),
+    // sharing the exact same manifest digest.
+    store
+        .put_image(&ImageRecord {
+            reference: "docker.io/ociman-test/rmi-all-siblings-second:latest".to_string(),
+            manifest_digest: record.manifest_digest.clone(),
+        })
+        .unwrap();
+    let sentinel = record.manifest_digest.to_string();
+    store
+        .put_image(&ImageRecord {
+            reference: sentinel.clone(),
+            manifest_digest: record.manifest_digest.clone(),
+        })
+        .unwrap();
+
+    let rmi = ociman(storage_dir.path(), &["rmi", "--all"]);
+    assert!(
+        rmi.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rmi.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rmi.stdout).trim().lines().count(),
+        3,
+        "all three records sharing the digest should be removed: {rmi:?}"
+    );
+
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-all-siblings:latest")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-all-siblings-second:latest")
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.resolve_image(&sentinel).unwrap().is_none());
+}
