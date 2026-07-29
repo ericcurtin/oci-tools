@@ -972,6 +972,31 @@ enum Command {
         /// `myrepo/myimage:v2`.
         target: String,
     },
+    /// Remove one or more names from a locally-stored image without
+    /// touching its underlying blobs at all — matching real `docker
+    /// untag`/`podman untag` exactly (checked directly against a real
+    /// installed `podman untag`). `IMAGE` resolves the target (by tag
+    /// reference or a real/short image ID, same as `ociman tag`'s own
+    /// `source`) but is only itself untagged if it also appears (or
+    /// is the only argument given) among the references removed.
+    Untag {
+        /// The image to resolve (identifies the target; not itself
+        /// untagged unless also listed in `references`, or unless
+        /// `references` is empty).
+        image: String,
+        /// The specific tag reference(s) to remove — each must
+        /// currently point at the exact same image `IMAGE` resolves
+        /// to, a clear error otherwise (checked directly: real
+        /// `podman untag <image> <unrelated-tag>` refuses with "tag
+        /// not known" and removes nothing at all). If none are given,
+        /// *every* real reference/tag currently pointing at that
+        /// image is removed instead — matching real `podman untag
+        /// <image>` (a single argument) exactly, confirmed directly:
+        /// it untags every one of that image's own names, not just
+        /// the one given.
+        #[arg(trailing_var_arg = true)]
+        references: Vec<String>,
+    },
     /// Show an image's own layer history, matching real `docker
     /// history`/`podman history`: newest (top) layer first, each
     /// row's own creation timestamp, the instruction that produced
@@ -1989,6 +2014,7 @@ fn main() -> std::process::ExitCode {
                 ignore,
             }) => cmd_rmi(&references, force, all, ignore, cli.global.json),
             Some(Command::Tag { source, target }) => cmd_tag(&source, &target, cli.global.json),
+            Some(Command::Untag { image, references }) => cmd_untag(&image, &references),
             Some(Command::History { reference }) => cmd_history(&reference, cli.global.json),
             Some(Command::Prune { all, filter }) => cmd_prune(cli.global.json, all, &filter),
             Some(Command::System { command }) => match command {
@@ -3170,6 +3196,63 @@ fn cmd_tag(source_str: &str, target_str: &str, json: bool) -> anyhow::Result<()>
         })?;
     } else {
         println!("{target}");
+    }
+    Ok(())
+}
+
+/// Remove one or more names from a locally-stored image — see
+/// [`Command::Untag`]'s own doc comment for the exact real, checked-
+/// directly semantics. Unlike `ociman rmi`, this never touches the
+/// underlying blobs at all (not even via a later `ociman prune`
+/// trigger of its own — an untagged image is simply eligible for
+/// `prune` the same way any other dangling one already is), and has
+/// no sibling-tag-ambiguity/`--force` gate: removing a tag *pointer*
+/// is never destructive to any container depending on the image the
+/// way removing the image itself would be.
+fn cmd_untag(image: &str, given_references: &[String]) -> anyhow::Result<()> {
+    let store = open_store()?;
+    let resolved = resolve_image_by_reference_or_id(&store, image)?
+        .ok_or_else(|| anyhow::anyhow!("{image}: no such image in local storage"))?;
+    let digest = resolved.record().manifest_digest.clone();
+
+    let to_remove: Vec<String> = if given_references.is_empty() {
+        // Matches real `podman untag <image>` (a single argument): it
+        // untags *every* real reference currently pointing at that
+        // image, not just the one given -- checked directly.
+        let mut siblings: Vec<String> = store
+            .list_images()
+            .context("listing local images")?
+            .into_iter()
+            .filter(|r| r.manifest_digest == digest)
+            .map(|r| r.reference)
+            .collect();
+        siblings.sort();
+        siblings
+    } else {
+        given_references
+            .iter()
+            .map(|r| {
+                let reference = Reference::parse(r)
+                    .with_context(|| format!("parsing image reference {r:?}"))?
+                    .to_string();
+                let record = store
+                    .resolve_image(&reference)
+                    .with_context(|| format!("resolving {r:?}"))?
+                    .ok_or_else(|| anyhow::anyhow!("{r}: no such tag"))?;
+                anyhow::ensure!(
+                    record.manifest_digest == digest,
+                    "{r}: does not currently point at the same image {image:?} resolves to"
+                );
+                Ok(reference)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?
+    };
+
+    for reference in &to_remove {
+        store
+            .remove_image(reference)
+            .with_context(|| format!("removing {reference}"))?;
+        println!("{}", display_reference(reference));
     }
     Ok(())
 }
