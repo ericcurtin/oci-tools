@@ -2041,11 +2041,36 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         }))
     }
 
+    /// Checked directly against real cri-o's own `server/
+    /// container_checkpoint.go` before writing anything: real cri-o's
+    /// own config actually *defaults* `EnableCriuSupport` to `true`
+    /// (`pkg/config/config.go`'s own `DefaultConfig`) — but at
+    /// startup it's force-disabled again unless a real `criu` binary
+    /// is actually found on `$PATH` (`validateCriuInPath`), which
+    /// essentially no host has installed by default (checkpoint/
+    /// restore is a niche, opt-in capability, not a standard
+    /// dependency). So the overwhelmingly common real behavior is
+    /// still disabled either way — real cri-o's own bare `errors.New
+    /// ("checkpoint/restore support not available")` (never wrapped
+    /// in a `status.Error`, so real gRPC surfaces it as `codes.
+    /// Unknown`, not some more specific code) before ever resolving
+    /// the container or touching anything else.
+    ///
+    /// This project has no CRIU/checkpoint-restore integration at all
+    /// (a real container checkpoint needs matching podman/cri-o's own
+    /// checkpoint archive format field for field — a materially large
+    /// feature, deliberately out of scope) — a structurally different
+    /// reason than real cri-o's own "usually-missing binary" one, but
+    /// the exact same honest, observable answer either way: a real
+    /// error, not a silent success or a fabricated checkpoint. Uses
+    /// real cri-o's own identical message/status code rather than a
+    /// generic `Status::unimplemented`, since that *is* what a real,
+    /// unconfigured `cri-o` install would actually return here too.
     async fn checkpoint_container(
         &self,
         _request: Request<cri::CheckpointContainerRequest>,
     ) -> Result<Response<cri::CheckpointContainerResponse>, Status> {
-        unimplemented("CheckpointContainer")
+        Err(Status::unknown("checkpoint/restore support not available"))
     }
 
     type GetContainerEventsStream = BoxStream<cri::ContainerEventResponse>;

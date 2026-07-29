@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use oci_cri_types::runtime_service_client::RuntimeServiceClient;
 use oci_cri_types::{
-    CgroupDriver, GetEventsRequest, ListMetricDescriptorsRequest, ListPodSandboxMetricsRequest,
-    RuntimeConfigRequest, StatusRequest, StreamPodSandboxMetricsRequest,
-    UpdateRuntimeConfigRequest, VersionRequest,
+    CgroupDriver, CheckpointContainerRequest, GetEventsRequest, ListMetricDescriptorsRequest,
+    ListPodSandboxMetricsRequest, RuntimeConfigRequest, StatusRequest,
+    StreamPodSandboxMetricsRequest, UpdateRuntimeConfigRequest, VersionRequest,
 };
 use oci_tools_tests::bin_path;
 
@@ -295,6 +295,33 @@ async fn get_container_events_closes_immediately_with_no_messages() {
             .is_none(),
         "no event-generation machinery exists, so this must close immediately"
     );
+}
+
+/// `CheckpointContainer` matches real cri-o's own actual
+/// checkpoint-disabled behavior (`docs/design/0259`) — a real error
+/// naming itself, over `codes.Unknown` (real cri-o's own bare Go
+/// `error`, never wrapped in a `status.Error`), not the generic
+/// `Status::unimplemented` every other still-missing RPC uses: this
+/// *is* what a real, unconfigured (or CRIU-less) `cri-o` install
+/// would actually return here too.
+#[tokio::test]
+async fn checkpoint_container_reports_the_real_disabled_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("ocicri.sock");
+    let _server = spawn_server(&socket_path);
+    wait_for_socket(&socket_path);
+
+    let mut client = connect(socket_path).await;
+    let err = client
+        .checkpoint_container(CheckpointContainerRequest {
+            container_id: "deadbeef".repeat(8),
+            location: String::new(),
+            timeout: 0,
+        })
+        .await
+        .expect_err("checkpointing should fail: no CRIU integration exists");
+    assert_eq!(err.code(), tonic::Code::Unknown);
+    assert_eq!(err.message(), "checkpoint/restore support not available");
 }
 
 /// Every other real RPC returns a real, honest `Unimplemented` gRPC
