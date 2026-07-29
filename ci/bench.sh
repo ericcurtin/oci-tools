@@ -238,4 +238,79 @@ if [ "${#hf_args[@]}" -gt 0 ]; then
     hyperfine --warmup 3 "${hf_args[@]}"
 fi
 
+echo
+echo "### ociman vs podman vs docker: build --no-cache (cold, real Containerfile) ###"
+# A real, small multi-step build (base image + 4 RUN steps + one
+# COPY) -- deliberately not benchmarked anywhere before this section
+# existed (docs/design/0264), even though `ociman build`'s own build
+# cache (0101/0121/0130-0133) has had real, measured re-verification
+# work done on it. `--no-cache`/`docker build --no-cache`: every
+# layer genuinely re-executes, the real "cold CI build" scenario
+# rather than one this project's own cache could short-circuit.
+# `ociman`'s own half runs against a scratch storage root under
+# `$workdir` (the same already-established `commit` section technique
+# just above) so repeated builds/tags never touch the default store,
+# and the base image is copied in offline via `save`/`load` (no
+# network) from the same already-pulled default-store image every
+# other section already requires. Docker alone needs `-f Containerfile`
+# explicitly (checked directly: unlike `ociman`/`podman`, it never
+# looks for a plain `Containerfile` by default, only `Dockerfile`).
+build_ctx="$workdir/build-ctx"
+build_store="$workdir/build-store"
+if "$ociman" images 2>/dev/null | grep -q "^$image "; then
+    mkdir -p "$build_ctx"
+    cat >"$build_ctx/Containerfile" <<EOF
+FROM $image
+RUN echo hello > /hello.txt
+RUN echo world >> /hello.txt
+RUN mkdir -p /data
+COPY data.txt /data/data.txt
+RUN cat /data/data.txt >> /hello.txt
+EOF
+    echo "some real file content for the COPY step" >"$build_ctx/data.txt"
+
+    mkdir -p "$build_store"
+    "$ociman" save -o "$workdir/build-image.tar" "$image" >/dev/null
+    OCI_TOOLS_STORAGE_ROOT="$build_store" "$ociman" load -i "$workdir/build-image.tar" >/dev/null
+
+    hf_args=(--command-name "ociman build --no-cache" \
+        "OCI_TOOLS_STORAGE_ROOT=$build_store $ociman build --no-cache $build_ctx")
+    need podman && hf_args+=(--command-name "podman build --no-cache" \
+        "podman build --no-cache $build_ctx")
+    need docker && hf_args+=(--command-name "docker build --no-cache" \
+        "docker build --no-cache -f $build_ctx/Containerfile $build_ctx")
+    hyperfine --warmup 1 "${hf_args[@]}"
+else
+    echo "bench: $image not already pulled into ociman's own store, skipping (run 'ociman pull $image' first)" >&2
+fi
+
+echo
+echo "### ociman vs podman vs docker: build (fully cached, no Containerfile changes) ###"
+# The same real build context, this time with each tool's own real
+# build cache doing its job -- `hyperfine`'s own `--warmup` runs
+# populate it for real (a plain build, no `--no-cache`) before any
+# timed sample starts, so this measures a genuinely warm, unchanged
+# rebuild: the common "iterate on something else, rebuild the same
+# image" case a cold build alone doesn't represent.
+if "$ociman" images 2>/dev/null | grep -q "^$image "; then
+    hf_args=(--command-name "ociman build (cached)" \
+        "OCI_TOOLS_STORAGE_ROOT=$build_store $ociman build $build_ctx")
+    need podman && hf_args+=(--command-name "podman build (cached)" \
+        "podman build $build_ctx")
+    need docker && hf_args+=(--command-name "docker build (cached)" \
+        "docker build -f $build_ctx/Containerfile $build_ctx")
+    hyperfine --warmup 3 "${hf_args[@]}"
+fi
+# Neither build section above ever passes `-t`/tags anything in
+# podman's or docker's own store (matching real `docker build`/
+# `podman build` with no `-t` at all) -- deliberately no
+# `podman image prune`/`docker image prune` here either, the same
+# already-established reasoning the `commit` section's own cleanup
+# gives for not sweeping dangling images this script didn't
+# definitively create alone (a real, deterministic Containerfile like
+# this one may well produce the exact same image ID across every
+# sample anyway, leaving nothing dangling at all); `ociman`'s own half
+# lives entirely inside `$build_store`, reclaimed by `$workdir`'s own
+# cleanup below regardless.
+
 echo "bench: done"

@@ -53,6 +53,20 @@ ci/bench.sh
   forcing every hand-run measurement implicitly relied on, since
   `ociman commit` rejects an overlay-rootfs container (`0146`), now
   encoded in the script (see `0235` for the full story).
+* **`ociman build` vs `podman build` vs `docker build`** — a real,
+  small multi-step build (a base image, four `RUN` steps, one `COPY`)
+  measured two ways (see `0264` for the wiring): `--no-cache` (every
+  layer genuinely re-executes, the "cold CI build" scenario this
+  project's own build cache — 0101/0121/0130-0133 — can't
+  short-circuit) and fully cached (the common "iterate on something
+  else, rebuild the same image" case, `hyperfine`'s own `--warmup`
+  runs populating each tool's real cache for real before any timed
+  sample starts). `ociman`'s own half runs against a scratch storage
+  root, the same technique the `commit` comparison above already
+  established, seeded offline via `save`/`load`; `docker build` alone
+  needs an explicit `-f Containerfile` (checked directly: unlike
+  `ociman`/`podman`, it never looks for a plain `Containerfile` by
+  default, only `Dockerfile`).
 
 Every comparison is opportunistic: any one real equivalent (or
 `busybox`, or an already-pulled image) that isn't actually installed
@@ -88,6 +102,10 @@ this writing), this project's own aarch64 dev host, `crun 1.14.1`/
 | `ociman run -d` vs `docker run -d` | 39.5ms | 175.8ms | 4.45× |
 | `ociman rm` (destroy-only) vs `podman rm` | 1.3ms | 72.9ms | 54.16× |
 | `ociman commit` vs `podman commit` | 3.4ms | 114.8ms | 33.75× |
+| `ociman build --no-cache` vs `podman build --no-cache` | 68.7ms | 1345ms | 19.58× |
+| `ociman build --no-cache` vs `docker build --no-cache` | 68.7ms | 1102ms | 16.04× |
+| `ociman build` (cached) vs `podman build` (cached) | 8.4ms | 178.6ms | 21.23× |
+| `ociman build` (cached) vs `docker build` (cached) | 8.4ms | 226.5ms | 26.93× |
 
 Absolute numbers vary session to session (host load, exact tool
 versions) and will differ on any other host entirely — the relative
@@ -104,8 +122,8 @@ varying with host load, never a real regression.
 
 * Any remaining individual
   `docs/design/*-performance-reverification-*` figure that isn't one
-  of the five comparisons above — the historically hand-run set is
-  now fully folded in (run/run --rm/rm/commit/run -d).
+  of the comparisons above — the historically hand-run set is now
+  fully folded in (run/run --rm/rm/commit/run -d/build).
 * Not wired into `.github/workflows/ci.yml`, deliberately: a shared,
   possibly-contended CI runner (and one that may not even have crun/
   runc/podman/docker installed at all) is a poor host for a benchmark
