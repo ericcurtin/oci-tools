@@ -2068,17 +2068,17 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
     /// `container_last_seen`). `ocicri` has no metrics collection
     /// machinery of its own at all yet — no RPC in `ImageService`/
     /// `RuntimeService` populates any real per-container metric value
-    /// anywhere (`ListPodSandboxMetrics`/`StreamPodSandboxMetrics`
-    /// remain real, honest `Status::unimplemented`s below) — so
-    /// advertising even that one always-on descriptor here would be a
-    /// real, false claim: a caller could reasonably expect a
-    /// following `ListPodSandboxMetrics` call to actually return a
-    /// value for whatever this RPC just told it exists. An empty list
-    /// is genuinely the most honest possible answer, not a
-    /// placeholder — real cri-o's own architecture already
-    /// establishes that returning nothing here is a normal, valid,
-    /// unconfigured-install response, not an error condition kubelet
-    /// needs to special-case.
+    /// anywhere (`ListPodSandboxMetrics`/`StreamPodSandboxMetrics`,
+    /// below, report a real, honest empty list for the identical
+    /// reason — see their own doc comments) — so advertising even
+    /// that one always-on descriptor here would be a real, false
+    /// claim: a caller could reasonably expect a following
+    /// `ListPodSandboxMetrics` call to actually return a value for
+    /// whatever this RPC just told it exists. An empty list is
+    /// genuinely the most honest possible answer, not a placeholder —
+    /// real cri-o's own architecture already establishes that
+    /// returning nothing here is a normal, valid, unconfigured-install
+    /// response, not an error condition kubelet needs to special-case.
     async fn list_metric_descriptors(
         &self,
         _request: Request<cri::ListMetricDescriptorsRequest>,
@@ -2088,20 +2088,52 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         }))
     }
 
+    /// A real, honest empty list, exactly matching `ListMetricDescriptors`'s
+    /// own reasoning (`docs/design/0255`) — checked directly against
+    /// real cri-o's own `server/sandbox_metrics_list.go`: its own
+    /// `listPodSandboxMetrics` walks every real sandbox and asks the
+    /// stats subsystem for that sandbox's own computed metric, but
+    /// with no `included_pod_metrics` configured (this project's own
+    /// only real point of comparison — real cri-o's own default too)
+    /// that computed metric is always absent, so every sandbox
+    /// contributes nothing and the real, unconfigured answer is a
+    /// plain empty list — never an error, and never one entry per
+    /// sandbox with empty fields either. `ocicri` has the identical
+    /// real gap (no metrics-collection machinery at all), so the
+    /// honest, real-cri-o-matching answer here is this same empty
+    /// list unconditionally, not a hard failure — a genuine
+    /// correctness improvement over an earlier `Status::unimplemented`
+    /// placeholder, which real cri-o's own unconfigured install would
+    /// never actually return for this RPC.
     async fn list_pod_sandbox_metrics(
         &self,
         _request: Request<cri::ListPodSandboxMetricsRequest>,
     ) -> Result<Response<cri::ListPodSandboxMetricsResponse>, Status> {
-        unimplemented("ListPodSandboxMetrics")
+        Ok(Response::new(cri::ListPodSandboxMetricsResponse {
+            pod_metrics: Vec::new(),
+        }))
     }
 
     type StreamPodSandboxMetricsStream = BoxStream<cri::StreamPodSandboxMetricsResponse>;
 
+    /// The `CRIListStreaming` sibling of [`list_pod_sandbox_metrics`] —
+    /// see its own doc comment for exactly why an unconditional empty
+    /// list is the real, honest answer here too; zero messages before
+    /// a clean EOF, matching every other `CRIListStreaming` RPC's own
+    /// identical empty-input behavior (`stream.rs`'s own module doc
+    /// comment).
+    ///
+    /// [`list_pod_sandbox_metrics`]: RuntimeServiceImpl::list_pod_sandbox_metrics
     async fn stream_pod_sandbox_metrics(
         &self,
         _request: Request<cri::StreamPodSandboxMetricsRequest>,
     ) -> Result<Response<Self::StreamPodSandboxMetricsStream>, Status> {
-        unimplemented("StreamPodSandboxMetrics")
+        Ok(Response::new(crate::stream::chunked(
+            Vec::new(),
+            |pod_sandbox_metrics| cri::StreamPodSandboxMetricsResponse {
+                pod_sandbox_metrics,
+            },
+        )))
     }
 
     /// Reports the real cgroup driver this project's own container-

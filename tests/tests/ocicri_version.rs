@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use oci_cri_types::runtime_service_client::RuntimeServiceClient;
 use oci_cri_types::{
-    CgroupDriver, ListMetricDescriptorsRequest, RuntimeConfigRequest, StatusRequest,
-    UpdateRuntimeConfigRequest, VersionRequest,
+    CgroupDriver, ListMetricDescriptorsRequest, ListPodSandboxMetricsRequest, RuntimeConfigRequest,
+    StatusRequest, StreamPodSandboxMetricsRequest, UpdateRuntimeConfigRequest, VersionRequest,
 };
 use oci_tools_tests::bin_path;
 
@@ -230,6 +230,43 @@ async fn list_metric_descriptors_reports_a_real_honest_empty_list() {
         .into_inner();
 
     assert!(response.descriptors.is_empty());
+}
+
+/// `ListPodSandboxMetrics`/`StreamPodSandboxMetrics` report the same
+/// real, honest empty answer `ListMetricDescriptors` does, and for the
+/// identical reason (`docs/design/0255`): `ocicri` has no
+/// metrics-collection machinery of its own at all, matching real
+/// cri-o's own actual unconfigured-install behavior (no descriptors
+/// configured means every sandbox's own computed metric is genuinely
+/// absent, so the real answer is a plain empty list — never an error).
+#[tokio::test]
+async fn pod_sandbox_metrics_rpcs_report_a_real_honest_empty_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("ocicri.sock");
+    let _server = spawn_server(&socket_path);
+    wait_for_socket(&socket_path);
+
+    let mut client = connect(socket_path).await;
+    let response = client
+        .list_pod_sandbox_metrics(ListPodSandboxMetricsRequest {})
+        .await
+        .expect("ListPodSandboxMetrics RPC failed")
+        .into_inner();
+    assert!(response.pod_metrics.is_empty());
+
+    let mut stream = client
+        .stream_pod_sandbox_metrics(StreamPodSandboxMetricsRequest {})
+        .await
+        .expect("StreamPodSandboxMetrics RPC failed")
+        .into_inner();
+    assert!(
+        stream
+            .message()
+            .await
+            .expect("stream should end cleanly")
+            .is_none(),
+        "an empty answer should stream zero messages before EOF"
+    );
 }
 
 /// Every other real RPC returns a real, honest `Unimplemented` gRPC
