@@ -150,6 +150,16 @@ enum Command {
         /// it) rather than this low-level runtime's own.
         #[arg(short, long)]
         user: Option<String>,
+        /// Additional (supplementary) GID for the exec'd process,
+        /// repeatable — matching real `runc exec -g`/`--additional-
+        /// gids` exactly (checked directly against a real installed
+        /// `runc exec --help`; real `crun exec` has no equivalent
+        /// flag at all, only `-u`/`--user`'s single primary group).
+        /// Appended to (not replacing) the container's own already-
+        /// declared supplementary groups, matching real runc's own
+        /// checked-directly `append` semantics.
+        #[arg(short = 'g', long = "additional-gids", value_name = "GID")]
+        additional_gids: Vec<u32>,
         /// Current working directory inside the container.
         #[arg(long)]
         cwd: Option<String>,
@@ -308,10 +318,19 @@ fn main() -> std::process::ExitCode {
             Some(Command::Exec {
                 id,
                 user,
+                additional_gids,
                 cwd,
                 env,
                 args,
-            }) => cmd_exec(&root, &id, user.as_deref(), cwd.as_deref(), &env, &args),
+            }) => cmd_exec(
+                &root,
+                &id,
+                user.as_deref(),
+                &additional_gids,
+                cwd.as_deref(),
+                &env,
+                &args,
+            ),
             Some(Command::Features) => oci_cli_common::output::print_json(&features::features()),
             Some(Command::Ps {
                 id,
@@ -964,6 +983,7 @@ fn cmd_exec(
     root: &Path,
     id: &str,
     user: Option<&str>,
+    additional_gids: &[u32],
     cwd: Option<&str>,
     extra_env: &[String],
     args: &[String],
@@ -1011,6 +1031,13 @@ fn cmd_exec(
             effective_user.gid = gid;
         }
     }
+    // Matches real `runc exec -g`/`--additional-gids` exactly: each
+    // given GID is *appended* to the container's own already-declared
+    // supplementary groups, never replacing them (checked directly
+    // against `~/git/runc/exec.go`'s own identical `append`).
+    effective_user
+        .additional_gids
+        .extend(additional_gids.iter().copied());
     let mut effective_env = process_spec.env.clone();
     effective_env.extend(extra_env.iter().cloned());
 

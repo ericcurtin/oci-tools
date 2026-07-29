@@ -263,6 +263,65 @@ fn exec_user_flag_to_root_succeeds() {
     );
 }
 
+/// `ocirun exec -g`/`--additional-gids`, matching real `runc exec
+/// -g`/`--additional-gids` exactly (`crun exec` has no equivalent flag
+/// at all, checked directly). Only verifies the flag is accepted and
+/// composes correctly with `--user` and multiple repeated values --
+/// this rootless test environment's own `/proc/self/setgroups` reads
+/// `deny` (a real, environment-dependent kernel restriction real
+/// `runc`/`crun` are equally subject to, not a bug — see
+/// `identity::apply_supplementary_groups`'s own doc comment), so the
+/// actual resulting group list isn't independently checkable here the
+/// way it would be under a real, unprivileged-user-namespace-free
+/// root install.
+#[test]
+fn exec_additional_gids_flag_is_accepted_and_composes_with_user() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    ocirun_create(root_dir.path(), bundle_dir.path(), "exec-gids-test");
+    let start = ocirun(root_dir.path(), &["start", "exec-gids-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-gids-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let exec = ocirun(
+        root_dir.path(),
+        &[
+            "exec",
+            "--user",
+            "0:0",
+            "-g",
+            "100",
+            "-g",
+            "200",
+            "exec-gids-test",
+            "/bin/sh",
+            "-c",
+            "true",
+        ],
+    );
+    assert!(
+        exec.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+
+    ocirun(root_dir.path(), &["delete", "--force", "exec-gids-test"]);
+}
+
 #[test]
 fn exec_user_flag_to_a_non_root_uid_is_rejected() {
     let Some(busybox) = busybox_path() else {
