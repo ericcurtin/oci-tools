@@ -19,9 +19,10 @@
 //! increment, documented rather than half-implemented): joining the
 //! sandbox's namespaces (none are pinned yet — 0233), per-container
 //! `run_as_user`/security-context mapping, CRI mounts/devices,
-//! resource limits, and `/etc/hosts`/`resolv.conf` wiring. Hostname
-//! *is* wired now (0292) — see [`CriProcessConfig::hostname`]'s own
-//! doc comment.
+//! resource limits, and `resolv.conf` wiring. Hostname and a real,
+//! synthesized `/etc/hosts` *are* wired now (0292, 0296) — see
+//! [`CriProcessConfig::hostname`]'s own doc comment and
+//! [`prepare_in`]'s own `write_etc_hosts` call site.
 
 use std::path::{Path, PathBuf};
 
@@ -266,6 +267,20 @@ fn prepare_in(
         })()
         .map_err(PrepareError::Other)?;
     }
+
+    // A real, synthesized `/etc/hosts` (0296), matching real cri-o's
+    // own non-host-network default (`ociman run`'s own identical
+    // `--network=none`-shaped case, `0147`): this project sets up no
+    // container networking of its own at all, so `cri.hostname`
+    // (already resolved by the caller, `0292`) maps to `127.0.0.1`,
+    // the same address a real, network-isolated container's own
+    // loopback-only view would resolve it to. No `--add-host`
+    // equivalent yet -- real Kubernetes' own `PodSpec.HostAliases` is
+    // a real, separately-scoped source this project's own
+    // `PodSandboxConfig` parsing doesn't read yet.
+    oci_runtime_core::etc_hosts::write_etc_hosts(&rootfs, &[cri.hostname], &[])
+        .context("writing /etc/hosts")
+        .map_err(PrepareError::Other)?;
 
     let config_path = dir.join(oci_runtime_core::bundle::CONFIG_FILENAME);
     (|| -> anyhow::Result<()> {

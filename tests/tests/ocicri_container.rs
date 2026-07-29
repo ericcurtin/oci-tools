@@ -394,6 +394,49 @@ async fn create_container_wires_the_pod_sandboxs_own_hostname() {
     );
 }
 
+/// A real, synthesized `/etc/hosts` (0296): a previously-missing
+/// primitive `bundle.rs`'s own module doc comment had explicitly
+/// named as out of scope until now, closed by reusing the exact same
+/// `oci_runtime_core::etc_hosts::write_etc_hosts` `ociman run` already
+/// established (`0147`) — this project sets up no container
+/// networking of its own at all, so the sandbox's own real hostname
+/// maps to `127.0.0.1`, matching real cri-o's own non-host-network
+/// default and `ociman run`'s own `--network=none`-shaped case
+/// exactly.
+#[tokio::test]
+async fn create_container_writes_a_real_etc_hosts_mapping_its_own_hostname_to_loopback() {
+    let Some((storage, _socket, _server, mut client, sandbox_id, mut sandbox_config)) =
+        setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    sandbox_config.hostname = "hosts-test-hostname".to_string();
+
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(container_config("hosts-test", 0)),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+
+    let hosts_content =
+        std::fs::read_to_string(bundle_dir(storage.path(), &container_id).join("rootfs/etc/hosts"))
+            .expect("a real /etc/hosts should have been written into the extracted rootfs");
+    assert!(
+        hosts_content.contains("127.0.0.1\tlocalhost"),
+        "{hosts_content:?}"
+    );
+    assert!(
+        hosts_content.contains("127.0.0.1\thosts-test-hostname"),
+        "{hosts_content:?}"
+    );
+}
+
 /// The CRI-command/args-versus-image-Entrypoint/Cmd merge (real
 /// cri-o's own `SpecSetProcessArgs` rule) lands in the generated
 /// bundle spec — checked end to end through a real image whose config

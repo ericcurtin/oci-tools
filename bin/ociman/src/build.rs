@@ -928,7 +928,7 @@ fn build_stage(
         // `ociman run`'s own call site): a build has no single, fixed
         // hostname/container-name identity of its own the way a real
         // running container does.
-        crate::write_etc_hosts(&rootfs_dir, &[], add_host)
+        oci_runtime_core::etc_hosts::write_etc_hosts(&rootfs_dir, &[], add_host)
             .context("writing /etc/hosts for the build container")?;
 
         Some(dir)

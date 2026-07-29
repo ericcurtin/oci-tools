@@ -76,6 +76,7 @@
 
 pub mod bundle;
 pub mod cgroups;
+pub mod etc_hosts;
 pub mod exec;
 pub mod exec_fifo;
 pub mod hooks;
