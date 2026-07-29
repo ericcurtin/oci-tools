@@ -843,7 +843,15 @@ enum Command {
         timestamp: Option<i64>,
     },
     /// List images in local storage.
-    Images,
+    Images {
+        /// Display only image IDs (the same short 12-hex-char digest
+        /// prefix the plain table's own `DIGEST` column already
+        /// shows) — matching real `docker images -q`/`podman images
+        /// -q` exactly, and this project's own `ociman ps -q`'s
+        /// identical shape for containers.
+        #[arg(short, long)]
+        quiet: bool,
+    },
     /// Remove an image from local storage, matching real `docker
     /// rmi`/`podman rmi`. Resolves by tag reference or by a real or
     /// short image ID (the same short ID `ociman images`' own
@@ -1798,7 +1806,7 @@ fn main() -> std::process::ExitCode {
                 cli.global.json,
                 timestamp,
             ),
-            Some(Command::Images) => cmd_images(cli.global.json),
+            Some(Command::Images { quiet }) => cmd_images(quiet, cli.global.json),
             Some(Command::Rmi { reference, force }) => cmd_rmi(&reference, force, cli.global.json),
             Some(Command::Tag { source, target }) => cmd_tag(&source, &target, cli.global.json),
             Some(Command::History { reference }) => cmd_history(&reference, cli.global.json),
@@ -2572,7 +2580,7 @@ fn cmd_info(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_images(json: bool) -> anyhow::Result<()> {
+fn cmd_images(quiet: bool, json: bool) -> anyhow::Result<()> {
     let store = open_store()?;
     let records = store.list_images().context("listing local images")?;
 
@@ -2584,6 +2592,22 @@ fn cmd_images(json: bool) -> anyhow::Result<()> {
         views.push(ImageView::from_summary(summary));
     }
 
+    // The exact same 12-hex-char prefix the plain table's own
+    // `DIGEST` column already computes below -- factored out so
+    // `--quiet` and the table print identical IDs for the identical
+    // image, never two different truncation rules silently drifting
+    // apart from each other.
+    let short_digest = |view: &ImageView| -> String {
+        let digest = view.digest.strip_prefix("sha256:").unwrap_or(&view.digest);
+        digest[..digest.len().min(12)].to_string()
+    };
+
+    if quiet {
+        for view in &views {
+            println!("{}", short_digest(view));
+        }
+        return Ok(());
+    }
     if json {
         oci_cli_common::output::print_json(&views)?;
         return Ok(());
@@ -2595,7 +2619,6 @@ fn cmd_images(json: bool) -> anyhow::Result<()> {
     }
     println!("{:<50} {:<15} {:>12}", "REFERENCE", "DIGEST", "SIZE");
     for view in &views {
-        let short_digest = view.digest.strip_prefix("sha256:").unwrap_or(&view.digest);
         // Matches real `docker images`/`podman images`'s own `<none>`
         // convention for an untagged image's `REPOSITORY`/`TAG`
         // columns (this project's own single, narrower `REFERENCE`
@@ -2604,7 +2627,7 @@ fn cmd_images(json: bool) -> anyhow::Result<()> {
         println!(
             "{:<50} {:<15} {:>12}",
             reference,
-            &short_digest[..short_digest.len().min(12)],
+            short_digest(view),
             view.size
         );
     }
