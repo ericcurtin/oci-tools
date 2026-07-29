@@ -532,3 +532,144 @@ fn rm_all_without_force_skips_a_non_stopped_container_but_still_removes_the_rest
     let ps_final = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
     assert!(String::from_utf8_lossy(&ps_final.stdout).trim().is_empty());
 }
+
+/// `ociman ps --filter status=created` (0272), given *without* `-a`,
+/// still shows a `created` (never-started) container — real `podman
+/// ps --filter status=` (checked directly) overrides the default
+/// running-only filter entirely, exactly like this.
+#[test]
+fn ps_filter_status_created_shows_a_never_started_container_without_all() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-filter-status:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "created-only",
+            "ociman-test/ps-filter-status:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    // A plain `ps` (no `-a`, no filter) hides it, matching the
+    // existing established default.
+    let plain = ociman(storage_dir.path(), &["ps", "-q"]);
+    assert!(String::from_utf8_lossy(&plain.stdout).trim().is_empty());
+
+    // `--filter status=created` alone (still no `-a`) shows it.
+    let filtered = ociman(
+        storage_dir.path(),
+        &["ps", "--filter", "status=created", "-q"],
+    );
+    assert!(filtered.status.success(), "{filtered:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&filtered.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "{filtered:?}"
+    );
+
+    // `--filter status=running` finds nothing (it never started).
+    let no_match = ociman(
+        storage_dir.path(),
+        &["ps", "--filter", "status=running", "-q"],
+    );
+    assert!(no_match.status.success());
+    assert!(String::from_utf8_lossy(&no_match.stdout).trim().is_empty());
+}
+
+/// Multiple `--filter status=` values are OR'd together, matching
+/// real `podman ps --filter status=` exactly (checked directly).
+#[test]
+fn ps_filter_status_multiple_values_are_ored_together() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-filter-or:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "created-c",
+            "ociman-test/ps-filter-or:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "stopped-c",
+            "ociman-test/ps-filter-or:latest",
+            "true",
+        ],
+    );
+    assert!(run.status.success(), "{run:?}");
+
+    let both = ociman(
+        storage_dir.path(),
+        &[
+            "ps",
+            "--filter",
+            "status=created",
+            "--filter",
+            "status=stopped",
+            "-q",
+        ],
+    );
+    assert!(both.status.success(), "{both:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&both.stdout).trim().lines().count(),
+        2,
+        "{both:?}"
+    );
+}
+
+/// An unrecognized `--filter` key, or an unrecognized `status=` value,
+/// is a clear, immediate error rather than a silently-ignored no-op.
+#[test]
+fn ps_filter_with_an_unrecognized_key_or_value_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let bad_key = ociman(storage_dir.path(), &["ps", "--filter", "name=foo"]);
+    assert!(!bad_key.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad_key.stderr).contains("not yet supported"),
+        "{bad_key:?}"
+    );
+
+    let bad_value = ociman(storage_dir.path(), &["ps", "--filter", "status=bogus"]);
+    assert!(!bad_value.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad_value.stderr).contains("invalid value"),
+        "{bad_value:?}"
+    );
+}

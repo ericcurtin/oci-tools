@@ -1110,6 +1110,20 @@ enum Command {
         /// Display only container IDs.
         #[arg(short, long)]
         quiet: bool,
+        /// Filter the listed containers — currently only
+        /// `status=<creating|created|running|stopped|paused>`
+        /// (this project's own real status vocabulary, the exact
+        /// strings its own `STATUS` column/`--json` already show —
+        /// real `docker`/`podman` use a finer-grained vocabulary this
+        /// project has no equivalent states for). May be given more
+        /// than once (OR'd together, matching real `podman ps
+        /// --filter status=` exactly). Giving this at all overrides
+        /// the default running-only behavior entirely — checked
+        /// directly against a real installed `podman ps --filter
+        /// status=created` (no `-a`): it shows a `created` container
+        /// even though a plain, filterless `podman ps` would hide it.
+        #[arg(short, long = "filter")]
+        filter: Vec<String>,
     },
     /// Start an already-`Stopped` container again, reusing its own
     /// existing rootfs/config exactly as `run` originally left it —
@@ -1899,7 +1913,9 @@ fn main() -> std::process::ExitCode {
                 rm,
                 interactive,
             }) => cmd_create(args, rm, interactive),
-            Some(Command::Ps { all, quiet }) => cmd_ps(all, quiet, cli.global.json),
+            Some(Command::Ps { all, quiet, filter }) => {
+                cmd_ps(all, quiet, cli.global.json, &filter)
+            }
             Some(Command::Start { id, attach }) => cmd_start(&id, attach),
             Some(Command::Attach { id }) => cmd_attach(&id),
             Some(Command::Restart { id, time }) => cmd_restart(&id, time),
@@ -4865,17 +4881,58 @@ impl ContainerInspectView {
     }
 }
 
-fn cmd_ps(all: bool, quiet: bool, json: bool) -> anyhow::Result<()> {
+/// Parse `ociman ps`'s own `--filter status=<value>` values -- see
+/// [`Command::Ps`]'s own doc comment for exactly why this project's
+/// own five-value status vocabulary is used verbatim rather than real
+/// podman's own finer-grained one, and why giving this at all
+/// overrides the default running-only filter entirely.
+fn parse_ps_status_filters(filters: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut statuses = Vec::new();
+    for f in filters {
+        let Some(value) = f.strip_prefix("status=") else {
+            anyhow::bail!(
+                "ociman ps: --filter {f:?} is not yet supported (only status=<creating|created|\
+                 running|stopped|paused> is)"
+            );
+        };
+        anyhow::ensure!(
+            matches!(
+                value,
+                "creating" | "created" | "running" | "stopped" | "paused"
+            ),
+            "ociman ps: --filter status={value:?}: invalid value (expected one of creating, \
+             created, running, stopped, paused)"
+        );
+        statuses.push(value.to_string());
+    }
+    Ok(statuses)
+}
+
+fn cmd_ps(all: bool, quiet: bool, json: bool, filter: &[String]) -> anyhow::Result<()> {
+    let status_filters = parse_ps_status_filters(filter)?;
     let containers = open_container_store()?;
     let mut views: Vec<ContainerView> = containers
         .list()
         .context("listing containers")?
         .iter()
-        // A never-started (`ociman create`, 0157) container is hidden
-        // by default exactly like a `Stopped` one -- confirmed
-        // directly against a real `podman create` followed by a plain
-        // `podman ps` (nothing shown; only `podman ps -a` does).
-        .filter(|s| all || !matches!(s.effective_status(), Status::Stopped | Status::Created))
+        .filter(|s| {
+            if status_filters.is_empty() {
+                // A never-started (`ociman create`, 0157) container is
+                // hidden by default exactly like a `Stopped` one --
+                // confirmed directly against a real `podman create`
+                // followed by a plain `podman ps` (nothing shown;
+                // only `podman ps -a` does).
+                all || !matches!(s.effective_status(), Status::Stopped | Status::Created)
+            } else {
+                // An explicit `--filter status=` overrides the
+                // default running-only behavior entirely, `--all` or
+                // not -- checked directly against a real installed
+                // `podman ps --filter status=created` (no `-a`): it
+                // shows a `created` container a plain, filterless
+                // `podman ps` would otherwise hide.
+                status_filters.contains(&display_status(s).to_string())
+            }
+        })
         .map(ContainerView::from_state)
         .collect();
     views.sort_by(|a, b| a.created.cmp(&b.created));
