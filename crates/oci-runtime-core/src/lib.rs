@@ -86,6 +86,7 @@ pub mod namespaces;
 pub mod nsenter;
 pub mod overlay;
 pub mod process;
+pub mod resolv_conf;
 pub mod rlimits;
 pub mod rootfs;
 pub mod seccomp;

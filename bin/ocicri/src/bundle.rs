@@ -18,11 +18,12 @@
 //! Deliberately out of scope for this slice (each a real, later
 //! increment, documented rather than half-implemented): joining the
 //! sandbox's namespaces (none are pinned yet — 0233), per-container
-//! `run_as_user`/security-context mapping, CRI mounts/devices,
-//! resource limits, and `resolv.conf` wiring. Hostname and a real,
-//! synthesized `/etc/hosts` *are* wired now (0292, 0296) — see
+//! `run_as_user`/security-context mapping, CRI mounts/devices, and
+//! resource limits. Hostname, a real, synthesized `/etc/hosts`, and a
+//! real `/etc/resolv.conf` *are* wired now (0292, 0296, 0297) — see
 //! [`CriProcessConfig::hostname`]'s own doc comment and
-//! [`prepare_in`]'s own `write_etc_hosts` call site.
+//! [`prepare_in`]'s own `write_etc_hosts`/`write_resolv_conf` call
+//! sites.
 
 use std::path::{Path, PathBuf};
 
@@ -126,6 +127,16 @@ pub struct CriProcessConfig<'a> {
     /// module's own doc comment already named this exact gap as
     /// "deliberately out of scope for this slice", closed here).
     pub hostname: &'a str,
+    /// `PodSandboxConfig.dns_config.servers`/`.searches`/`.options`
+    /// (0297, closing `0296`'s own "still ahead") -- all empty for the
+    /// common, unconfigured case (`crictl`'s own bare default, and
+    /// what a `None` `dns_config` becomes), which `oci_runtime_core::
+    /// resolv_conf::write_resolv_conf` treats identically to real
+    /// cri-o's own `ParseDNSOptions`: copy the real host's own
+    /// `/etc/resolv.conf` verbatim.
+    pub dns_servers: &'a [String],
+    pub dns_searches: &'a [String],
+    pub dns_options: &'a [String],
 }
 
 /// Builds the container's own real OCI spec: the same
@@ -282,6 +293,25 @@ fn prepare_in(
         .context("writing /etc/hosts")
         .map_err(PrepareError::Other)?;
 
+    // A real `/etc/resolv.conf` (0297, closing `0296`'s own "still
+    // ahead"), matching real cri-o's own `ParseDNSOptions` exactly:
+    // the sandbox's own explicit DNS config if given, else a straight
+    // copy of the real host's own `/etc/resolv.conf` -- meaningful,
+    // not just cosmetic, precisely because this project's own
+    // containers already share the host's real network namespace
+    // unmodified (see `oci_runtime_core::resolv_conf`'s own doc
+    // comment for exactly why no namespace-aware filtering, unlike
+    // real podman's own richer `libnetwork/resolvconf`, is needed
+    // here).
+    oci_runtime_core::resolv_conf::write_resolv_conf(
+        &rootfs,
+        cri.dns_servers,
+        cri.dns_searches,
+        cri.dns_options,
+    )
+    .context("writing /etc/resolv.conf")
+    .map_err(PrepareError::Other)?;
+
     let config_path = dir.join(oci_runtime_core::bundle::CONFIG_FILENAME);
     (|| -> anyhow::Result<()> {
         std::fs::write(&config_path, serde_json::to_vec_pretty(&spec)?)
@@ -370,6 +400,9 @@ mod tests {
             envs: strings(&["FROM_KUBE=2"]),
             working_dir: "/from-kube",
             hostname: "test-pod-hostname",
+            dns_servers: &[],
+            dns_searches: &[],
+            dns_options: &[],
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();
@@ -398,6 +431,9 @@ mod tests {
             envs: Vec::new(),
             working_dir: "",
             hostname: "fallback-hostname-test",
+            dns_servers: &[],
+            dns_searches: &[],
+            dns_options: &[],
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();

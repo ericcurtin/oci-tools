@@ -1164,6 +1164,17 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         } else {
             sandbox_config.hostname.clone()
         };
+        // Real cri-o's own identical default (`internal/lib/sandbox/
+        // infra.go`: `if b.config.GetDnsConfig() == nil { b.config.
+        // DnsConfig = &types.DNSConfig{} }`) -- an absent `dns_config`
+        // becomes all-empty, which `write_resolv_conf` treats the
+        // same way real cri-o's own `ParseDNSOptions` does: copy the
+        // real host's own `/etc/resolv.conf` verbatim.
+        let empty_dns = Vec::new();
+        let (dns_servers, dns_searches, dns_options) = match &sandbox_config.dns_config {
+            Some(dns) => (&dns.servers, &dns.searches, &dns.options),
+            None => (&empty_dns, &empty_dns, &empty_dns),
+        };
         crate::bundle::prepare(
             &store,
             &oci_cli_common::storage::default_root(),
@@ -1176,6 +1187,9 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
                 envs,
                 working_dir: &config.working_dir,
                 hostname: &hostname,
+                dns_servers,
+                dns_searches,
+                dns_options,
             },
         )
         .map_err(|e| match e {

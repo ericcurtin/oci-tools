@@ -15,7 +15,7 @@ use std::time::Duration;
 use oci_cri_types::runtime_service_client::RuntimeServiceClient;
 use oci_cri_types::{
     ContainerConfig as CriContainerConfig, ContainerFilter, ContainerMetadata, ContainerState,
-    ContainerStateValue, ContainerStatusRequest, CreateContainerRequest, ImageSpec,
+    ContainerStateValue, ContainerStatusRequest, CreateContainerRequest, DnsConfig, ImageSpec,
     ListContainersRequest, PodSandboxConfig, PodSandboxMetadata, RemoveContainerRequest,
     RemovePodSandboxRequest, RunPodSandboxRequest, StopPodSandboxRequest,
 };
@@ -435,6 +435,82 @@ async fn create_container_writes_a_real_etc_hosts_mapping_its_own_hostname_to_lo
         hosts_content.contains("127.0.0.1\thosts-test-hostname"),
         "{hosts_content:?}"
     );
+}
+
+/// A real `/etc/resolv.conf` (0297, closing `0296`'s own "still
+/// ahead"), matching real cri-o's own `ParseDNSOptions` exactly
+/// (checked directly against `~/git/cri-o/internal/lib/sandbox/
+/// infra.go`): an explicit `PodSandboxConfig.dns_config` is
+/// synthesized from scratch, `search`/`nameserver`/`options` in that
+/// real order.
+#[tokio::test]
+async fn create_container_writes_a_real_resolv_conf_from_explicit_dns_config() {
+    let Some((storage, _socket, _server, mut client, sandbox_id, mut sandbox_config)) =
+        setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    sandbox_config.dns_config = Some(DnsConfig {
+        servers: vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()],
+        searches: vec!["example.com".to_string()],
+        options: vec!["ndots:5".to_string()],
+    });
+
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(container_config("resolv-explicit-test", 0)),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+
+    let resolv_content = std::fs::read_to_string(
+        bundle_dir(storage.path(), &container_id).join("rootfs/etc/resolv.conf"),
+    )
+    .expect("a real /etc/resolv.conf should have been written into the extracted rootfs");
+    assert_eq!(
+        resolv_content,
+        "search example.com\nnameserver 10.0.0.1\nnameserver 10.0.0.2\noptions ndots:5\n"
+    );
+}
+
+/// With no `dns_config` at all (real kubelet's own common case for a
+/// pod with no special DNS policy, and `crictl`'s own bare default),
+/// the real host's own `/etc/resolv.conf` is copied verbatim into the
+/// container — meaningful, not just cosmetic, precisely because this
+/// project's own containers already share the host's real network
+/// namespace unmodified, so the host's own real nameservers genuinely
+/// are reachable from inside the container too.
+#[tokio::test]
+async fn create_container_falls_back_to_a_real_copy_of_the_hosts_own_resolv_conf() {
+    let Some((storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(container_config("resolv-fallback-test", 0)),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+
+    let resolv_content = std::fs::read_to_string(
+        bundle_dir(storage.path(), &container_id).join("rootfs/etc/resolv.conf"),
+    )
+    .expect("a real /etc/resolv.conf should have been written into the extracted rootfs");
+    let host_resolv_content = std::fs::read_to_string("/etc/resolv.conf")
+        .expect("this real dev/CI host should have a real /etc/resolv.conf of its own");
+    assert_eq!(resolv_content, host_resolv_content);
 }
 
 /// The CRI-command/args-versus-image-Entrypoint/Cmd merge (real
