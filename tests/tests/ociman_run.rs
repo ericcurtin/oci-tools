@@ -3505,3 +3505,136 @@ echo DEV-OK
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "DEV-OK");
 }
+
+/// `ociman run --cidfile` (0309), matching real `docker run --cidfile`/
+/// `podman run --cidfile` exactly (checked directly against real
+/// podman's own `pkg/util.CreateIDFile`): the container's own id,
+/// written verbatim with no trailing newline, right after creation.
+/// Also proves an already-existing file at that path is silently
+/// overwritten (a plain create-or-truncate write, not an
+/// already-exists guard), matching real podman's own identical
+/// `os.Create` semantics. `-d`/`--detach` (the one mode that actually
+/// prints the container's own id to stdout, matching `cmd_run`'s own
+/// established shape) is used here specifically so the printed id
+/// itself is available to cross-check the cidfile's own content
+/// against.
+#[test]
+fn run_cidfile_writes_the_real_container_id_and_overwrites_an_existing_file() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cidfile:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let cidfile = storage_dir.path().join("cid.txt");
+    std::fs::write(&cidfile, b"stale placeholder content").unwrap();
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/cidfile:latest",
+        &[
+            "-d",
+            "--cidfile",
+            cidfile.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(!printed_id.is_empty());
+    let cidfile_content = std::fs::read_to_string(&cidfile).unwrap();
+    assert_eq!(
+        cidfile_content, printed_id,
+        "the cidfile's own content should be exactly the printed container id"
+    );
+    assert!(
+        !cidfile_content.ends_with('\n'),
+        "real podman/docker never write a trailing newline: {cidfile_content:?}"
+    );
+
+    Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .args(["kill", &printed_id])
+        .output()
+        .unwrap();
+}
+
+/// A `--cidfile` write failure (e.g. a nonexistent parent directory)
+/// is logged and tolerated, not fatal -- a real, deliberate divergence
+/// from real podman's own inconsistent-between-`run`-and-`create`
+/// fatal behavior here, matching this project's own already-
+/// established convention for this exact class of auxiliary
+/// bookkeeping write (`ocirun run --pid-file`'s own identical choice).
+/// The container itself must still exist afterward (proved directly
+/// via `ociman ps`, not just a nonzero exit code).
+#[test]
+fn run_cidfile_write_failure_is_tolerated_not_fatal() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cidfile-bad-path:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/cidfile-bad-path:latest",
+        &[
+            "-d",
+            "--cidfile",
+            "/this/directory/does/not/exist/cid.txt",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "a --cidfile write failure should not fail the whole run: stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        !printed_id.is_empty(),
+        "the container's own real id should still be printed despite the --cidfile write \
+         failure"
+    );
+
+    let ps = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .args(["ps", "-q"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&ps.stdout).trim(),
+        printed_id,
+        "the container should genuinely exist and be running, not silently rolled back"
+    );
+
+    Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .args(["kill", &printed_id])
+        .output()
+        .unwrap();
+}

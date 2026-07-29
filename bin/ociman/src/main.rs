@@ -673,6 +673,29 @@ struct RunArgs {
     /// having no cross-architecture emulation of any kind).
     #[arg(long, value_name = "os/arch[/variant]")]
     platform: Option<String>,
+    /// Write the container's own id to this file right after it's
+    /// created — matching real `docker run --cidfile`/`podman run
+    /// --cidfile` exactly (checked directly against real podman's own
+    /// `pkg/util.CreateIDFile`): a plain, non-atomic create-or-
+    /// truncate write (unlike `ocirun run --pid-file`'s own atomic
+    /// temp-file-then-rename dance, which matches a *different* real
+    /// tool's own different guarantee — real podman's own `os.Create`
+    /// here has none), the raw id with no trailing newline. This
+    /// project's own containers have only ever had one, short id
+    /// (unlike real podman/docker's separate full-64-hex-then-
+    /// truncated-for-display pair), so that's what gets written here
+    /// too — the honest, only id this container actually has. A write
+    /// failure is logged and tolerated, not fatal, matching this
+    /// project's own already-established convention for this exact
+    /// class of auxiliary bookkeeping write (`ocirun run --pid-file`'s
+    /// own identical choice) — a deliberate divergence from real
+    /// podman's own inconsistent-between-`run`-and-`create` fatal
+    /// behavior here (checked directly: a real `podman create
+    /// --cidfile <bad path>` leaves the container behind despite
+    /// reporting failure, while `podman run` with the same bad path
+    /// does not).
+    #[arg(long, value_name = "FILE")]
+    cidfile: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -5125,6 +5148,21 @@ struct PreparedContainer {
     log_path: PathBuf,
 }
 
+/// `--cidfile`'s own write (0309) — a plain create-or-truncate write
+/// of the raw container id, no trailing newline, matching real
+/// podman's own `pkg/util.CreateIDFile` exactly (`os.Create` +
+/// `WriteString`, no atomic temp-file-then-rename dance — that's
+/// `ocirun run --pid-file`'s own different precedent, matching a
+/// different real tool's different guarantee). Logged and tolerated
+/// on failure, not fatal — see [`RunArgs::cidfile`]'s own doc comment
+/// for why this is a deliberate divergence from real podman's own
+/// fatal-but-inconsistent-between-`run`-and-`create` behavior here.
+fn write_cidfile(path: &Path, container_id: &str) {
+    if let Err(e) = std::fs::write(path, container_id) {
+        tracing::warn!(path = %path.display(), error = %e, "writing --cidfile (tolerated)");
+    }
+}
+
 /// Resolve/pull `args.image`, extract (or overlay-mount) its rootfs,
 /// write `/etc/hosts`, capture the base filesystem snapshot a future
 /// `ociman diff`/`commit` needs, synthesize and write `config.json`,
@@ -5281,6 +5319,9 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
     }
     let (container_id, mut state) = create_container_record(&containers, &annotations)?;
     tracing::debug!(container_id, %reference_display, "preparing container");
+    if let Some(path) = &args.cidfile {
+        write_cidfile(path, &container_id);
+    }
 
     let bundle_dir = containers.container_dir(&container_id);
     let rootfs_dir = bundle_dir.join("rootfs");

@@ -330,3 +330,39 @@ fn create_by_short_image_id_works() {
         String::from_utf8_lossy(&start.stderr)
     );
 }
+
+/// `ociman create --cidfile` (0309), matching real `docker create
+/// --cidfile`/`podman create --cidfile` exactly — the same real flag
+/// `ociman run --cidfile` shares via `RunArgs`, verified here on its
+/// own separate `create` path too (`ociman create` always prints the
+/// container's own id, regardless of any detach flag, unlike `run`).
+#[test]
+fn create_cidfile_writes_the_real_container_id() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_marker_image(&store, "ociman-test/create-cidfile:latest", &busybox);
+
+    let cidfile = storage_dir.path().join("cid.txt");
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--cidfile",
+            cidfile.to_str().unwrap(),
+            "ociman-test/create-cidfile:latest",
+        ],
+    );
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let printed_id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    assert_eq!(std::fs::read_to_string(&cidfile).unwrap(), printed_id);
+
+    ociman(storage_dir.path(), &["rm", &printed_id]);
+}
