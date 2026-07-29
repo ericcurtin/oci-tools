@@ -583,6 +583,102 @@ fn container_metadata_to_proto(metadata: &container::ContainerMetadata) -> cri::
     }
 }
 
+/// `ContainerConfig.mounts` (0304, closing part of `0237`'s own
+/// deferred "CRI mounts" gap) -- a real, deliberately narrow first
+/// slice: an ordinary bind mount (`container_path`/`host_path`/
+/// `readonly`), matching the exact same `Mount{Type: "bind", Options:
+/// ["rbind", ...]}` shape `ociman run -v`'s own `synthesize_spec`
+/// already builds. Real cri-o's own much richer `addOCIBindMounts`
+/// (`~/git/cri-o/server/container_create_linux.go`) is read directly
+/// here for two real, checked-directly behaviors this matches
+/// faithfully rather than assuming from the proto's own comments
+/// alone: a missing `host_path` is auto-created as a directory
+/// (`os.MkdirAll`) rather than treated as an error -- the proto's own
+/// doc comment says runtimes "should report an error", but the actual
+/// installed cri-o's own real code doesn't, since kubelet's own
+/// `HostPath` volumes of type `DirectoryOrCreate` depend on exactly
+/// this real runtime behavior; and `PROPAGATION_PRIVATE` (the field's
+/// own zero/default value, `types.MountPropagation_PROPAGATION_
+/// PRIVATE`) maps to real cri-o's own exact `["rbind", "rprivate"]`
+/// option pair.
+///
+/// Deliberately out of scope for this slice (each a clear,
+/// `Status::unimplemented` error rather than a silent
+/// misinterpretation, matching this project's own established "narrow
+/// first slice" convention): image volume mounts (`Mount.image`, the
+/// Image Volume Source KEP -- a real, separate mechanism, not a bind
+/// mount at all); any propagation mode other than the private
+/// default (`HOST_TO_CONTAINER`/`BIDIRECTIONAL` both need a real
+/// shared-mount-namespace setup this project has none of);
+/// `selinux_relabel` (this project implements no SELinux concept
+/// anywhere, matching `ociman run -v`'s own identical, already-
+/// established narrowing); `recursive_read_only`; and any UID/GID
+/// mapping (this project has no user-namespace-remapped mount concept
+/// for CRI containers at all). Symlink-following for `host_path`
+/// (the proto's own documented "if the hostpath is a symbolic link,
+/// runtimes should follow it" contract) is also not implemented yet --
+/// a real, smaller, separately-scoped gap.
+fn build_cri_bind_mounts(
+    mounts: &[cri::Mount],
+) -> Result<Vec<oci_spec_types::runtime::Mount>, Status> {
+    let mut result = Vec::with_capacity(mounts.len());
+    for m in mounts {
+        // Real cri-o's own exact validation strings
+        // (`container_create_linux.go`'s own `addOCIBindMounts`).
+        if m.container_path.is_empty() {
+            return Err(Status::invalid_argument("mount.ContainerPath is empty"));
+        }
+        if m.image.is_some() {
+            return Err(Status::unimplemented(
+                "image volume mounts (Mount.image) are not yet supported",
+            ));
+        }
+        if m.host_path.is_empty() {
+            return Err(Status::invalid_argument("mount.HostPath is empty"));
+        }
+        if m.selinux_relabel {
+            return Err(Status::unimplemented(
+                "mount.SelinuxRelabel is not yet supported (this project implements no SELinux \
+                 concept at all)",
+            ));
+        }
+        if m.propagation != cri::MountPropagation::PropagationPrivate as i32 {
+            return Err(Status::unimplemented(
+                "mount propagation modes other than the private default are not yet supported",
+            ));
+        }
+        if m.recursive_read_only {
+            return Err(Status::unimplemented(
+                "mount.RecursiveReadOnly is not yet supported",
+            ));
+        }
+        if !m.uid_mappings.is_empty() || !m.gid_mappings.is_empty() {
+            return Err(Status::unimplemented(
+                "mount UID/GID mappings are not yet supported",
+            ));
+        }
+
+        // Real cri-o's own identical fallback for a missing host path
+        // (see this function's own doc comment for why this doesn't
+        // match the proto's own stricter documented contract).
+        std::fs::create_dir_all(&m.host_path).map_err(|e| {
+            Status::internal(format!("creating mount source {:?}: {e}", m.host_path))
+        })?;
+
+        let mut options = vec!["rbind".to_string(), "rprivate".to_string()];
+        if m.readonly {
+            options.push("ro".to_string());
+        }
+        result.push(oci_spec_types::runtime::Mount {
+            destination: m.container_path.clone(),
+            source: Some(m.host_path.clone()),
+            kind: Some("bind".to_string()),
+            options,
+        });
+    }
+    Ok(result)
+}
+
 /// Resolves one container for a mutating/status RPC — the container
 /// counterpart of [`find_sandbox`], with the identical per-caller
 /// "not found" mapping rules (`docs/design/0236`).
@@ -1175,6 +1271,13 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             Some(dns) => (&dns.servers, &dns.searches, &dns.options),
             None => (&empty_dns, &empty_dns, &empty_dns),
         };
+        // `ContainerConfig.mounts` (0304): validated and translated to
+        // plain bind mounts *before* `bundle::prepare` ever extracts a
+        // single layer -- a config-shaped client error here should
+        // never cost a real, wasted rootfs extraction, the same
+        // reasoning `build_spec`'s own doc comment already establishes
+        // for `PrepareError::NoCommand`.
+        let mounts = build_cri_bind_mounts(&config.mounts)?;
         crate::bundle::prepare(
             &store,
             &oci_cli_common::storage::default_root(),
@@ -1190,6 +1293,7 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
                 dns_servers,
                 dns_searches,
                 dns_options,
+                mounts: &mounts,
             },
         )
         .map_err(|e| match e {

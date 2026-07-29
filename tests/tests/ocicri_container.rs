@@ -15,9 +15,10 @@ use std::time::Duration;
 use oci_cri_types::runtime_service_client::RuntimeServiceClient;
 use oci_cri_types::{
     ContainerConfig as CriContainerConfig, ContainerFilter, ContainerMetadata, ContainerState,
-    ContainerStateValue, ContainerStatusRequest, CreateContainerRequest, DnsConfig, ImageSpec,
-    ListContainersRequest, PodSandboxConfig, PodSandboxMetadata, RemoveContainerRequest,
-    RemovePodSandboxRequest, RunPodSandboxRequest, StopPodSandboxRequest,
+    ContainerStateValue, ContainerStatusRequest, CreateContainerRequest, DnsConfig, IdMapping,
+    ImageSpec, ListContainersRequest, Mount, MountPropagation, PodSandboxConfig,
+    PodSandboxMetadata, RemoveContainerRequest, RemovePodSandboxRequest, RunPodSandboxRequest,
+    StopPodSandboxRequest,
 };
 use oci_spec_types::image::ContainerConfig;
 use oci_store::Store;
@@ -2149,5 +2150,333 @@ async fn stop_container_honors_the_images_stopsignal() {
     assert_eq!(
         status.exit_code, 43,
         "the USR1 trap's own exit code proves STOPSIGNAL was sent: {status:?}"
+    );
+}
+
+/// `ContainerConfig.mounts` (0304): a plain bind mount translates
+/// into a real OCI spec `Mount` entry -- matching real cri-o's own
+/// `["rbind", "rprivate"]` option pair for the private-propagation
+/// default, plus `"ro"` when `readonly` is set. Also covers real
+/// cri-o's own checked-directly "auto-create a missing host path"
+/// behavior (`~/git/cri-o/server/container_create_linux.go`'s own
+/// `addOCIBindMounts`: `os.MkdirAll`, not an error, despite the
+/// proto's own stricter-sounding doc comment).
+#[tokio::test]
+async fn create_container_translates_a_plain_bind_mount_into_the_generated_spec() {
+    let Some((storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let host_dir = tempfile::tempdir().unwrap();
+    // A real subdirectory that doesn't exist yet -- proves the
+    // missing-host-path auto-mkdir behavior, not just the mount-
+    // translation shape.
+    let missing_host_path = host_dir.path().join("not-yet-created");
+
+    let mut config = container_config("bind-mount-test", 0);
+    config.mounts = vec![
+        Mount {
+            container_path: "/data".to_string(),
+            host_path: missing_host_path.display().to_string(),
+            readonly: false,
+            ..Default::default()
+        },
+        Mount {
+            container_path: "/readonly-data".to_string(),
+            host_path: host_dir.path().display().to_string(),
+            readonly: true,
+            ..Default::default()
+        },
+    ];
+
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id,
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+
+    assert!(
+        missing_host_path.is_dir(),
+        "a missing host_path should be auto-created as a real directory, matching real cri-o"
+    );
+
+    let spec: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundle_dir(storage.path(), &container_id).join("config.json")).unwrap(),
+    )
+    .unwrap();
+    let mounts = spec["mounts"].as_array().unwrap();
+    let rw_mount = mounts
+        .iter()
+        .find(|m| m["destination"] == "/data")
+        .expect("the read-write bind mount should be present");
+    assert_eq!(rw_mount["type"], "bind");
+    assert_eq!(rw_mount["source"], missing_host_path.display().to_string());
+    let rw_options: Vec<&str> = rw_mount["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(rw_options.contains(&"rbind"), "{rw_options:?}");
+    assert!(rw_options.contains(&"rprivate"), "{rw_options:?}");
+    assert!(!rw_options.contains(&"ro"), "{rw_options:?}");
+
+    let ro_mount = mounts
+        .iter()
+        .find(|m| m["destination"] == "/readonly-data")
+        .expect("the read-only bind mount should be present");
+    let ro_options: Vec<&str> = ro_mount["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(ro_options.contains(&"ro"), "{ro_options:?}");
+}
+
+/// Every deliberately-out-of-scope `Mount` field (0304's own doc
+/// comment) is a real, honest `Status::unimplemented` rather than a
+/// silent misinterpretation -- matching this project's own
+/// established convention for every other "narrow first slice"
+/// feature. Empty `ContainerPath`/`HostPath` are real client-input
+/// errors instead, matching real cri-o's own exact error strings.
+#[tokio::test]
+async fn create_container_rejects_unsupported_mount_fields_clearly() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    async fn expect_status(
+        client: &mut RuntimeServiceClient<tonic::transport::Channel>,
+        sandbox_id: &str,
+        sandbox_config: &PodSandboxConfig,
+        name: &str,
+        mount: Mount,
+    ) -> tonic::Status {
+        let mut config = container_config(name, 0);
+        config.mounts = vec![mount];
+        client
+            .create_container(CreateContainerRequest {
+                pod_sandbox_id: sandbox_id.to_string(),
+                config: Some(config),
+                sandbox_config: Some(sandbox_config.clone()),
+            })
+            .await
+            .expect_err("should have been rejected")
+    }
+
+    let empty_container_path = expect_status(
+        &mut client,
+        &sandbox_id,
+        &sandbox_config,
+        "empty-container-path",
+        Mount {
+            host_path: "/tmp".to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(empty_container_path.code(), tonic::Code::InvalidArgument);
+    assert!(
+        empty_container_path
+            .message()
+            .contains("mount.ContainerPath is empty"),
+        "{empty_container_path:?}"
+    );
+
+    let empty_host_path = expect_status(
+        &mut client,
+        &sandbox_id,
+        &sandbox_config,
+        "empty-host-path",
+        Mount {
+            container_path: "/data".to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(empty_host_path.code(), tonic::Code::InvalidArgument);
+    assert!(
+        empty_host_path
+            .message()
+            .contains("mount.HostPath is empty"),
+        "{empty_host_path:?}"
+    );
+
+    let image_mount = expect_status(
+        &mut client,
+        &sandbox_id,
+        &sandbox_config,
+        "image-mount",
+        Mount {
+            container_path: "/data".to_string(),
+            image: Some(ImageSpec {
+                image: IMAGE.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(image_mount.code(), tonic::Code::Unimplemented);
+
+    let selinux = expect_status(
+        &mut client,
+        &sandbox_id,
+        &sandbox_config,
+        "selinux-mount",
+        Mount {
+            container_path: "/data".to_string(),
+            host_path: "/tmp".to_string(),
+            selinux_relabel: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(selinux.code(), tonic::Code::Unimplemented);
+
+    let propagation = expect_status(
+        &mut client,
+        &sandbox_id,
+        &sandbox_config,
+        "propagation-mount",
+        Mount {
+            container_path: "/data".to_string(),
+            host_path: "/tmp".to_string(),
+            propagation: MountPropagation::PropagationHostToContainer as i32,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(propagation.code(), tonic::Code::Unimplemented);
+
+    let recursive_ro = expect_status(
+        &mut client,
+        &sandbox_id,
+        &sandbox_config,
+        "recursive-ro-mount",
+        Mount {
+            container_path: "/data".to_string(),
+            host_path: "/tmp".to_string(),
+            readonly: true,
+            recursive_read_only: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(recursive_ro.code(), tonic::Code::Unimplemented);
+
+    let id_mapped = expect_status(
+        &mut client,
+        &sandbox_id,
+        &sandbox_config,
+        "id-mapped-mount",
+        Mount {
+            container_path: "/data".to_string(),
+            host_path: "/tmp".to_string(),
+            uid_mappings: vec![IdMapping {
+                host_id: 0,
+                container_id: 0,
+                length: 1,
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(id_mapped.code(), tonic::Code::Unimplemented);
+}
+
+/// End-to-end proof the bind mount is genuinely live at runtime, not
+/// just declared in `config.json`: a real file written on the host
+/// side of the mount is readable from *inside* the running container
+/// via a real `ExecSync`, and a file the container itself writes
+/// through the mount is visible back on the host side too.
+#[tokio::test]
+async fn create_container_bind_mount_is_genuinely_live_at_runtime() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let host_dir = tempfile::tempdir().unwrap();
+    std::fs::write(host_dir.path().join("from-host.txt"), b"hello from host").unwrap();
+
+    let mut config = container_config("live-mount-test", 0);
+    config.command = vec!["/bin/sleep".to_string(), "300".to_string()];
+    config.mounts = vec![Mount {
+        container_path: "/mnt/shared".to_string(),
+        host_path: host_dir.path().display().to_string(),
+        readonly: false,
+        ..Default::default()
+    }];
+
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id,
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .expect("StartContainer failed");
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+
+    let read_back = client
+        .exec_sync(oci_cri_types::ExecSyncRequest {
+            container_id: container_id.clone(),
+            cmd: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "cat /mnt/shared/from-host.txt".to_string(),
+            ],
+            timeout: 0,
+        })
+        .await
+        .expect("ExecSync failed")
+        .into_inner();
+    assert_eq!(read_back.exit_code, 0, "{read_back:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&read_back.stdout),
+        "hello from host"
+    );
+
+    let write_from_container = client
+        .exec_sync(oci_cri_types::ExecSyncRequest {
+            container_id: container_id.clone(),
+            cmd: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo hello from container > /mnt/shared/from-container.txt".to_string(),
+            ],
+            timeout: 0,
+        })
+        .await
+        .expect("ExecSync failed")
+        .into_inner();
+    assert_eq!(
+        write_from_container.exit_code, 0,
+        "{write_from_container:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(host_dir.path().join("from-container.txt")).unwrap(),
+        "hello from container\n"
     );
 }

@@ -18,12 +18,13 @@
 //! Deliberately out of scope for this slice (each a real, later
 //! increment, documented rather than half-implemented): joining the
 //! sandbox's namespaces (none are pinned yet — 0233), per-container
-//! `run_as_user`/security-context mapping, CRI mounts/devices, and
-//! resource limits. Hostname, a real, synthesized `/etc/hosts`, and a
-//! real `/etc/resolv.conf` *are* wired now (0292, 0296, 0297) — see
-//! [`CriProcessConfig::hostname`]'s own doc comment and
+//! `run_as_user`/security-context mapping, CRI devices, and resource
+//! limits. Hostname, a real, synthesized `/etc/hosts`, a real
+//! `/etc/resolv.conf`, and plain bind mounts from `ContainerConfig.
+//! mounts` *are* wired now (0292, 0296, 0297, 0304) — see
+//! [`CriProcessConfig::hostname`]'s own doc comment,
 //! [`prepare_in`]'s own `write_etc_hosts`/`write_resolv_conf` call
-//! sites.
+//! sites, and `runtime_service.rs`'s own `build_cri_bind_mounts`.
 
 use std::path::{Path, PathBuf};
 
@@ -137,6 +138,16 @@ pub struct CriProcessConfig<'a> {
     pub dns_servers: &'a [String],
     pub dns_searches: &'a [String],
     pub dns_options: &'a [String],
+    /// `ContainerConfig.mounts` (0304), already validated and
+    /// translated into plain OCI bind mounts by the RPC layer's own
+    /// `build_cri_bind_mounts` -- see its own doc comment for exactly
+    /// which real cases are supported (a plain bind mount, real
+    /// cri-o's own missing-host-path auto-`mkdir` behavior, the
+    /// private-propagation default) and which are a clear
+    /// `Status::unimplemented` instead (image volume mounts, non-
+    /// default propagation, SELinux relabeling, recursive read-only,
+    /// UID/GID mappings).
+    pub mounts: &'a [oci_spec_types::runtime::Mount],
 }
 
 /// Builds the container's own real OCI spec: the same
@@ -219,6 +230,16 @@ fn build_spec(
     linux.seccomp = Some(oci_runtime_core::seccomp::filter_to_supported_syscalls(
         &oci_runtime_core::seccomp::default_profile(),
     ));
+
+    // `ContainerConfig.mounts` (0304), appended after the standard
+    // proc/sys/dev/... set `Spec::example()` already provides --
+    // matching `ociman run -v`'s own identical "append after the
+    // defaults" convention (`synthesize_spec`'s own doc comment).
+    // Unlike real cri-o's own `addOCIBindMounts`, a CRI mount here
+    // doesn't remove/override a default mount at the same destination
+    // first -- a real, narrower first-slice behavior, not a full port
+    // of that logic yet.
+    spec.mounts.extend(cri.mounts.iter().cloned());
 
     Ok(spec)
 }
@@ -403,6 +424,7 @@ mod tests {
             dns_servers: &[],
             dns_searches: &[],
             dns_options: &[],
+            mounts: &[],
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();
@@ -434,6 +456,7 @@ mod tests {
             dns_servers: &[],
             dns_searches: &[],
             dns_options: &[],
+            mounts: &[],
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();
