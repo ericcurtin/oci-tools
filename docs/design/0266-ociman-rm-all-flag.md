@@ -59,5 +59,5 @@ Full workspace: `cargo build`/`test --workspace` (110 test binaries),
 
 `ociman rm <id1> <id2> ...` (multiple explicit IDs in one call, real
 podman's own additional supported shape beyond just one name or
-`--all`) and `ociman images --filter` remain real, similarly-scoped
-next candidates.
+`--all`) is implemented in `0267`. `ociman images --filter` remains a
+real, similarly-scoped next candidate.

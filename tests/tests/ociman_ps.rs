@@ -254,6 +254,207 @@ fn rm_all_removes_every_stopped_container() {
     );
 }
 
+/// `ociman rm id1 id2` removes multiple explicit containers in one
+/// call, matching real `podman rm id1 id2` exactly.
+#[test]
+fn rm_accepts_multiple_explicit_ids_and_removes_them_all() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rm-multi:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let run1 = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "multi-1",
+            "ociman-test/rm-multi:latest",
+            "true",
+        ],
+    );
+    assert!(run1.status.success(), "{run1:?}");
+    let run2 = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "multi-2",
+            "ociman-test/rm-multi:latest",
+            "true",
+        ],
+    );
+    assert!(run2.status.success(), "{run2:?}");
+
+    let rm = ociman(storage_dir.path(), &["rm", "multi-1", "multi-2"]);
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rm.stdout).trim().lines().count(),
+        2,
+        "each removed container's own id should be printed: {rm:?}"
+    );
+
+    let ps_after = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert!(String::from_utf8_lossy(&ps_after.stdout).trim().is_empty());
+}
+
+/// A single unresolvable name among otherwise-valid ones aborts the
+/// *whole* call before anything is removed — checked directly against
+/// real `podman rm id1 nonexistent id2`: neither `id1` nor `id2` gets
+/// removed either, unlike `--all`'s own continue-past-failure policy.
+#[test]
+fn rm_with_one_unresolvable_id_among_valid_ones_removes_nothing() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rm-multi-bogus:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let run1 = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "valid-1",
+            "ociman-test/rm-multi-bogus:latest",
+            "true",
+        ],
+    );
+    assert!(run1.status.success(), "{run1:?}");
+    let run2 = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "valid-2",
+            "ociman-test/rm-multi-bogus:latest",
+            "true",
+        ],
+    );
+    assert!(run2.status.success(), "{run2:?}");
+
+    let rm = ociman(
+        storage_dir.path(),
+        &["rm", "valid-1", "does-not-exist-xyz", "valid-2"],
+    );
+    assert!(
+        !rm.status.success(),
+        "an unresolvable name in the list should fail the whole call"
+    );
+    assert!(String::from_utf8_lossy(&rm.stderr).contains("does not exist"));
+
+    // Neither valid container was removed.
+    let ps_after = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert_eq!(
+        String::from_utf8_lossy(&ps_after.stdout)
+            .trim()
+            .lines()
+            .count(),
+        2,
+        "both valid containers should still be present: {ps_after:?}"
+    );
+}
+
+/// Once every name has resolved, a *different* per-container failure
+/// (still running, no `--force`) does NOT block removing the other
+/// already-resolved targets — checked directly against real `podman
+/// rm a b c` where `b` is running without `--force`: `a` and `c` are
+/// still removed, only `b` is refused. A different policy than the
+/// unresolvable-name case above, matching `--all`'s own behavior.
+#[test]
+fn rm_with_one_non_stopped_id_among_valid_ones_still_removes_the_rest() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rm-multi-running:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let run1 = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "stopped-a",
+            "ociman-test/rm-multi-running:latest",
+            "true",
+        ],
+    );
+    assert!(run1.status.success(), "{run1:?}");
+    let run2 = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "stopped-c",
+            "ociman-test/rm-multi-running:latest",
+            "true",
+        ],
+    );
+    assert!(run2.status.success(), "{run2:?}");
+
+    // A bare "created" (never-run) record standing in for a running
+    // container, the same technique used by the `--all` tests above.
+    let containers_root = storage_dir.path().join("containers");
+    let containers = oci_runtime_core::StateStore::open(&containers_root).unwrap();
+    containers
+        .create(
+            "running-b",
+            Path::new("/bundle"),
+            Path::new("/bundle/rootfs"),
+            Default::default(),
+        )
+        .unwrap();
+
+    let rm = ociman(
+        storage_dir.path(),
+        &["rm", "stopped-a", "running-b", "stopped-c"],
+    );
+    assert!(
+        !rm.status.success(),
+        "running-b's own failure should still surface"
+    );
+
+    let ps_after = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    let remaining = String::from_utf8_lossy(&ps_after.stdout);
+    assert_eq!(
+        remaining.trim().lines().count(),
+        1,
+        "only running-b should remain: {remaining:?}"
+    );
+
+    let forced = ociman(storage_dir.path(), &["rm", "--force", "running-b"]);
+    assert!(forced.status.success(), "{forced:?}");
+}
+
 /// `--all` and an explicit ID together is a clear error, never an
 /// ambiguous silent choice between the two (matching this project's
 /// own `ocibox rm --all`'s own identical rule).

@@ -1131,15 +1131,24 @@ enum Command {
         #[arg(short, long, default_value_t = 10)]
         time: u64,
     },
-    /// Remove a stopped container's storage. Refuses a still-running
-    /// one unless `--force` (which kills it first).
+    /// Remove one or more stopped containers' storage — matching real
+    /// `podman rm <ID> [ID...]` exactly. Refuses a still-running one
+    /// unless `--force` (which kills it first).
     Rm {
-        /// The container's ID or `--name` — omit when using `--all`.
-        id: Option<String>,
+        /// The container ID(s)/`--name`(s) to remove — omit when
+        /// using `--all`. Real `podman rm id1 id2 id3` (checked
+        /// directly) resolves *every* given identifier to a real
+        /// container *before* removing any of them: an unresolvable
+        /// one aborts the whole call, removing nothing at all, rather
+        /// than partially removing whichever earlier ones happened to
+        /// resolve — a real user typo in one name shouldn't
+        /// accidentally take down unrelated, correctly-named
+        /// containers alongside it.
+        ids: Vec<String>,
         /// Kill the container first if it is still running.
         #[arg(short, long)]
         force: bool,
-        /// Remove every container instead of one named on the
+        /// Remove every container instead of the ones named on the
         /// command line — matching real `podman rm --all` exactly
         /// (real `docker rm` has no such flag at all: `docker rm
         /// $(docker ps -aq)` is its own closest equivalent). Still
@@ -1150,9 +1159,14 @@ enum Command {
         /// an earlier one fails, matching real `podman rm`'s own
         /// identical multi-target behavior (and this project's own
         /// `ocibox rm --all`, the same real pattern already
-        /// established there). Mutually exclusive with an explicit
-        /// `id` — a clear error either way rather than an ambiguous
-        /// silent choice between the two.
+        /// established there) — a real, checked-directly difference
+        /// from the *unresolvable-name* rule above: once a name/ID
+        /// has actually resolved to a real container, a *different*
+        /// reason it can't be removed (still running, no `--force`)
+        /// never blocks removing any other already-resolved target.
+        /// Mutually exclusive with an explicit id list — a clear
+        /// error either way rather than an ambiguous silent choice
+        /// between the two.
         #[arg(short, long)]
         all: bool,
     },
@@ -1846,7 +1860,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Start { id, attach }) => cmd_start(&id, attach),
             Some(Command::Attach { id }) => cmd_attach(&id),
             Some(Command::Restart { id, time }) => cmd_restart(&id, time),
-            Some(Command::Rm { id, force, all }) => cmd_rm(id.as_deref(), force, all),
+            Some(Command::Rm { ids, force, all }) => cmd_rm(&ids, force, all),
             Some(Command::Cp {
                 src,
                 dest,
@@ -4640,19 +4654,43 @@ fn cmd_ps(all: bool, quiet: bool, json: bool) -> anyhow::Result<()> {
 /// respects `--force`'s existing gate per container rather than
 /// forcing everything unconditionally, and for the "every container
 /// still attempted even if one fails" policy.
-fn cmd_rm(id: Option<&str>, force: bool, all: bool) -> anyhow::Result<()> {
+/// `ociman rm <ID> [ID...]` / `ociman rm --all` — see [`Command::Rm`]'s
+/// own doc comment for exactly why an explicit id list resolves every
+/// identifier *before* removing any of them (a real, checked-directly
+/// difference from `--all`'s own "keep going past a per-container
+/// failure" policy, which still applies once a name/ID has actually
+/// resolved to something real).
+fn cmd_rm(ids: &[String], force: bool, all: bool) -> anyhow::Result<()> {
     let containers = open_container_store()?;
-    match (id, all) {
-        (Some(_), true) => anyhow::bail!("cannot give both a container ID/name and --all"),
-        (None, false) => {
+    match (ids.is_empty(), all) {
+        (false, true) => anyhow::bail!("cannot give both a container ID/name and --all"),
+        (true, false) => {
             anyhow::bail!("no container ID/name given (try `ociman rm <ID>` or `--all`)")
         }
-        (Some(id), false) => {
-            remove_container(&containers, id, force)?;
-            println!("{id}");
-            Ok(())
+        (false, false) => {
+            // Resolve every given identifier first: an unresolvable
+            // one aborts before anything at all is removed (checked
+            // directly against a real `podman rm id1 nonexistent
+            // id2`: neither `id1` nor `id2` gets removed either).
+            for id in ids {
+                resolve_container_id(&containers, id)
+                    .with_context(|| format!("resolving {id:?}"))?;
+            }
+            let mut first_error = None;
+            for id in ids {
+                if let Err(e) = remove_container(&containers, id, force) {
+                    eprintln!("error removing {id}: {e:#}");
+                    first_error.get_or_insert(e);
+                    continue;
+                }
+                println!("{id}");
+            }
+            match first_error {
+                Some(e) => Err(e.context("removing containers")),
+                None => Ok(()),
+            }
         }
-        (None, true) => {
+        (true, true) => {
             let mut first_error = None;
             for state in containers.list().context("listing containers")? {
                 if let Err(e) = remove_container(&containers, &state.id, force) {
