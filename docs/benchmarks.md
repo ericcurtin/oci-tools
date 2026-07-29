@@ -7,7 +7,7 @@ performance-sensitive change has been measured directly against a real
 installed `crun`/`runc`/`podman`/`docker`, by hand, with `hyperfine` —
 see the many `docs/design/NNNN-performance-reverification-N.md` notes
 (0018, 0105, 0113, 0120, 0139, 0150, 0161, 0170, 0176, 0183, 0221, 0245,
-0288) for the full, individual, dated results.
+0288, 0314) for the full, individual, dated results.
 
 `ci/bench.sh` consolidates that same, previously ad hoc (re-typed by
 hand each time) methodology into one reusable, runnable script:
@@ -95,28 +95,28 @@ it just stops it from failing outright on `crun`.
 
 ## Representative historical results
 
-From `docs/design/0288` (the most recent full re-verification as of
+From `docs/design/0314` (the most recent full re-verification as of
 this writing), this project's own aarch64 dev host, `crun 1.14.1`/
 `runc 1.3.4`/`podman 4.9.3`/`docker 29.2.1`:
 
 | comparison | this project | real equivalent | speedup |
 |---|---:|---:|---:|
-| `ocirun run` vs `crun run` | 3.1ms | 6.9ms | 2.23× |
-| `ocirun run` vs `runc run` | 3.1ms | 21.3ms | 6.89× |
-| `ocirun exec` vs `crun exec` (`0279`) | 2.0ms | 3.7ms | 1.82× |
-| `ocirun exec` vs `runc exec` (`0279`) | 2.0ms | 19.1ms | 9.34× |
-| `ociman exec` vs `podman exec` (`0279`) | 2.7ms | 137.8ms | 50.76× |
-| `ociman exec` vs `docker exec` (`0279`) | 2.7ms | 47.1ms | 17.34× |
-| `ociman run --rm` vs `podman run --rm` | 30.7ms | 189.0ms | 6.15× |
-| `ociman run --rm` vs `docker run --rm` | 30.7ms | 286.8ms | 9.33× |
-| `ociman run -d` vs `podman run -d` | 37.7ms | 139.8ms | 3.71× |
-| `ociman run -d` vs `docker run -d` | 37.7ms | 170.3ms | 4.52× |
-| `ociman rm` (destroy-only) vs `podman rm` | 1.8ms | 70.2ms | 39.66× |
-| `ociman commit` vs `podman commit` | 3.9ms | 96.3ms | 24.51× |
-| `ociman build --no-cache` vs `podman build --no-cache` | 65.9ms | 1363ms | 20.67× |
-| `ociman build --no-cache` vs `docker build --no-cache` | 65.9ms | 1097ms | 16.65× |
-| `ociman build` (cached) vs `podman build` (cached) | 9.1ms | 178.5ms | 19.66× |
-| `ociman build` (cached) vs `docker build` (cached) | 9.1ms | 237.5ms | 26.16× |
+| `ocirun run` vs `crun run` | 3.1ms | 7.1ms | 2.29× |
+| `ocirun run` vs `runc run` | 3.1ms | 21.3ms | 6.82× |
+| `ocirun exec` vs `crun exec` (`0279`) | 2.1ms | 3.7ms | 1.71× |
+| `ocirun exec` vs `runc exec` (`0279`) | 2.1ms | 19.5ms | 9.06× |
+| `ociman exec` vs `podman exec` (`0279`) | 2.8ms | 136.6ms | 48.43× |
+| `ociman exec` vs `docker exec` (`0279`) | 2.8ms | 46.0ms | 16.30× |
+| `ociman run --rm` vs `podman run --rm` | 34.3ms | 181.1ms | 5.28× |
+| `ociman run --rm` vs `docker run --rm` | 34.3ms | 283.4ms | 8.26× |
+| `ociman run -d` vs `podman run -d` | 33.9ms | 134.9ms | 3.98× |
+| `ociman run -d` vs `docker run -d` | 33.9ms | 172.9ms | 5.11× |
+| `ociman rm` (destroy-only) vs `podman rm` | 1.5ms | 67.9ms | 44.57× |
+| `ociman commit` vs `podman commit` | 3.5ms | 95.0ms | 27.46× |
+| `ociman build --no-cache` vs `podman build --no-cache` | 71.7ms | 1302ms | 18.17× |
+| `ociman build --no-cache` vs `docker build --no-cache` | 71.7ms | 1141ms | 15.93× |
+| `ociman build` (cached) vs `podman build` (cached) | 8.9ms | 174.7ms | 19.68× |
+| `ociman build` (cached) vs `docker build` (cached) | 8.9ms | 247.0ms | 27.82× |
 
 Absolute numbers vary session to session (host load, exact tool
 versions) and will differ on any other host entirely — the relative
@@ -124,8 +124,8 @@ gap holding steady release after release, re-verified repeatedly
 rather than assumed to still be true forever, is the actual point.
 Reconfirmed at every single increment since 0219 (each commit message
 carries its own `ci/bench.sh` figures), most recently and formally in
-`docs/design/0288` (spanning 0246-0287, forty-two increments since
-`0245`, none a large hot-path rewrite) — every figure above still a
+`docs/design/0314` (spanning 0289-0313, twenty-five increments since
+`0288`, none a hot-path rewrite) — every figure above still a
 decisive win, sessions varying with host load, never a real
 regression.
 
