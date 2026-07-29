@@ -2378,6 +2378,205 @@ fn run_rejects_a_named_non_root_user() {
     assert!(stderr.contains("cannot map"), "got stderr: {stderr:?}");
 }
 
+/// `-u`/`--user` (matching real `docker run -u`/`podman run -u`
+/// exactly): overrides the image's own declared `USER`, reusing the
+/// exact same `resolve_user` this project's own image-`USER`
+/// resolution and `ociman exec --user` already share. Here it
+/// overrides a *non-root* image default back to root — the one
+/// direction this rootless runtime can actually satisfy (only
+/// container uid 0 is mappable yet, see `run_rejects_a_non_root_
+/// numeric_user`'s own doc comment) — proving the override genuinely
+/// takes effect rather than the image's own `USER app` silently
+/// winning.
+#[test]
+fn run_user_flag_overrides_the_images_declared_non_root_user_back_to_root() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image_with_files(
+        &store,
+        "ociman-test/user-flag-override:latest",
+        &busybox,
+        &["sh"],
+        &[(
+            "etc/passwd",
+            b"root:x:0:0:root:/root:/bin/sh\napp:x:1000:1000:App:/home/app:/bin/sh\n".as_slice(),
+        )],
+        ContainerConfig {
+            user: Some("app".to_string()),
+            ..Default::default()
+        },
+    );
+
+    // With no override at all, the image's own non-root `USER app`
+    // still hits the usual "can't map it" wall.
+    let unoverridden = ociman_run(
+        storage_dir.path(),
+        "ociman-test/user-flag-override:latest",
+        &["/bin/sh", "-c", "true"],
+    );
+    assert!(
+        !unoverridden.status.success(),
+        "sanity check: the image's own default USER must still be non-root here"
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/user-flag-override:latest",
+        &["--user", "root", "/bin/sh", "-c", "echo user-flag-worked"],
+    );
+    assert!(
+        out.status.success(),
+        "--user root should override the image's own non-root default: stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("user-flag-worked"),
+        "got stdout: {stdout:?}"
+    );
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    let config_path = storage_dir
+        .path()
+        .join("containers")
+        .join(&container_id)
+        .join("config.json");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    assert_eq!(config["process"]["user"]["uid"], 0, "{config:?}");
+    assert_eq!(config["process"]["user"]["gid"], 0, "{config:?}");
+}
+
+/// `--user`'s own numeric override hits the exact same "can't map a
+/// non-root uid yet" wall as an image's own declared `USER` does —
+/// proving the CLI override is wired through the identical
+/// `resolve_user` validation path, not some separate, unchecked one.
+#[test]
+fn run_user_flag_rejects_a_non_root_override_same_as_the_image_default() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/user-flag-non-root:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/user-flag-non-root:latest",
+        &["--user", "1000", "/bin/sh", "-c", "true"],
+    );
+    assert!(
+        !out.status.success(),
+        "--user 1000 should be rejected the same way a non-root image USER is"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot map"), "got stderr: {stderr:?}");
+}
+
+/// `--user user:group` resolves the group half too, matching real
+/// `podman run -u user:group` exactly — reusing the exact same
+/// `user_resolve::resolve` colon-split already established for image
+/// `USER`/`ociman exec --user`. `0:0` is the one group override this
+/// rootless runtime can actually satisfy (only container gid 0 is
+/// mappable, same limitation as uid).
+#[test]
+fn run_user_flag_with_an_explicit_root_group_resolves_both_halves() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image_with_files(
+        &store,
+        "ociman-test/user-flag-group:latest",
+        &busybox,
+        &["sh"],
+        &[("etc/group", b"root:x:0:\n".as_slice())],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/user-flag-group:latest",
+        &["--user", "0:root", "/bin/sh", "-c", "true"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    let config_path = storage_dir
+        .path()
+        .join("containers")
+        .join(&container_id)
+        .join("config.json");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    assert_eq!(config["process"]["user"]["uid"], 0, "{config:?}");
+    assert_eq!(config["process"]["user"]["gid"], 0, "{config:?}");
+}
+
+/// A real, previously-unnoticed bug found and fixed while adding this
+/// same `--user` flag (0286): `resolve_user` used to only ever check
+/// the resolved *uid* for mappability, never the *gid* — so `USER
+/// 0:<non-zero-gid>` (a mappable root uid, but an unmapped non-zero
+/// gid) sailed straight through and crashed much later, deep inside
+/// `identity::apply`'s own `setresgid(2)`, as a bare, confusing
+/// `EINVAL` with no indication of what was actually wrong. Now
+/// surfaced as the same clear "cannot map" error the uid case already
+/// gives.
+#[test]
+fn run_user_flag_rejects_a_non_root_group_with_a_clear_error_not_a_raw_setresgid_crash() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image_with_files(
+        &store,
+        "ociman-test/user-flag-non-root-group:latest",
+        &busybox,
+        &["sh"],
+        &[("etc/group", b"staff:x:50:\n".as_slice())],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/user-flag-non-root-group:latest",
+        &["--user", "0:staff", "/bin/sh", "-c", "true"],
+    );
+    assert!(
+        !out.status.success(),
+        "--user 0:staff should be rejected with a clear error, not left to crash setresgid"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot map") && stderr.contains("gid"),
+        "expected a clear, gid-specific mapping error, got stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("Invalid argument"),
+        "must fail at spec-synthesis time with a clear message, not deep inside a raw \
+         setresgid(2) EINVAL: {stderr:?}"
+    );
+}
+
 /// Real registries increasingly serve `tar+zstd` layers, not just
 /// `tar+gzip` (see `docs/design/0029`) — this proves `ociman run`
 /// actually extracts one and runs the resulting container, not just

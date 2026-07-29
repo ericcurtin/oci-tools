@@ -496,6 +496,16 @@ struct RunArgs {
     /// `labels` field.
     #[arg(long = "label", value_name = "KEY=VALUE")]
     label: Vec<String>,
+    /// Run as this user instead of the image's own declared `USER`,
+    /// matching real `docker run -u`/`--user`/`podman run
+    /// -u`/`--user` exactly: `<user|uid>[:<group|gid>]`, resolved
+    /// against the container's own `/etc/passwd`/`/etc/group` —
+    /// reuses the exact same `user_resolve::resolve` this project's
+    /// own `ociman exec --user`/image-`USER` resolution already share
+    /// (0024, 0028), just threaded onto this one remaining CLI
+    /// surface that never got it.
+    #[arg(short, long)]
+    user: Option<String>,
     /// Add an additional supplementary group to the container's own
     /// primary process: a numeric GID (used as-is even without a
     /// matching `/etc/group` entry) or a group name (resolved against
@@ -4666,6 +4676,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             entrypoint.as_deref(),
             &volumes,
             &args.group_add,
+            args.user.as_deref(),
         )?;
         // Prepended, not appended: `spec.mounts`' own already-present
         // entries (`/proc`, `/dev`, ...) are all subdirectories of the
@@ -8135,6 +8146,7 @@ fn synthesize_spec(
     entrypoint: Option<&[String]>,
     volumes: &[ParsedVolume],
     group_add: &[String],
+    user: Option<&str>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -8162,7 +8174,13 @@ fn synthesize_spec(
 
     let container_config = config.config.clone().unwrap_or_default();
     let full_args = command_for(&container_config, entrypoint, args)?;
-    let (uid, gid) = resolve_user(rootfs, container_config.user.as_deref().unwrap_or(""))?;
+    // `--user` overrides the image's own declared `USER`, matching
+    // real `docker run -u`/`podman run -u` exactly — the same
+    // "override if given, else fall back to the image's own config"
+    // pattern already used for `--workdir`/`--hostname`/`--entrypoint`
+    // just below.
+    let effective_user = user.unwrap_or(container_config.user.as_deref().unwrap_or(""));
+    let (uid, gid) = resolve_user(rootfs, effective_user)?;
 
     let process = spec
         .process
@@ -8997,21 +9015,46 @@ pub(crate) fn write_etc_hosts(
     Ok(())
 }
 
-/// Resolve an image's `USER` string to a numeric `(uid, gid)` pair
-/// (see [`user_resolve::resolve`] for the name/`/etc/passwd`/
-/// `/etc/group` resolution rules), then reject anything this
-/// rootless runtime can't actually satisfy yet: only container uid 0
-/// is mapped (to the host's own euid), so a resolved non-root uid —
-/// whether given numerically or via a name — still can't run. A
-/// subordinate uid range via `/etc/subuid` would be needed for
-/// anything else.
+/// Resolve a `USER` string (an image's own declared default, or an
+/// explicit `ociman run`/`create -u`/`--user` or `exec -u`/`--user`
+/// override — every caller shares this one function) to a numeric
+/// `(uid, gid)` pair (see [`user_resolve::resolve`] for the name/
+/// `/etc/passwd`/`/etc/group` resolution rules), then reject anything
+/// this rootless runtime can't actually satisfy yet: only container
+/// uid 0 and gid 0 are mapped (both to the host's own euid/egid, see
+/// [`oci_spec_types::runtime::Spec::into_rootless`]'s own single-entry
+/// `uid_mappings`/`gid_mappings`), so a resolved non-root uid *or*
+/// gid — whether given numerically or via a name — still can't run. A
+/// subordinate uid/gid range via `/etc/subuid`/`/etc/subgid` would be
+/// needed for anything else.
+///
+/// A real, previously-unnoticed gap this closes: only `uid` was ever
+/// checked here before, so a `USER 0:<non-zero-gid>` (an explicit
+/// group override resolving to a mappable root *uid* but an unmapped
+/// non-zero *gid*, e.g. an image's own declared `USER root:staff`, or
+/// `ociman run --user 0:staff`) sailed straight through this check and
+/// only failed much later, deep inside `identity::apply`'s own
+/// `setresgid(2)`, as a bare, confusing `EINVAL` ("Invalid argument")
+/// with no indication at all of what was actually wrong or why —
+/// found by hand while adding `--user` support for `ociman run`/
+/// `create` and testing an explicit `:group` override end to end
+/// (0286), not merely inspected. Now surfaced as the same clear,
+/// actionable error the uid case already gave.
 fn resolve_user(rootfs: &Path, user: &str) -> anyhow::Result<(u32, u32)> {
     let (uid, gid) = user_resolve::resolve(rootfs, user)?;
     if uid != 0 {
         anyhow::bail!(
-            "image USER {user:?} resolves to non-root container uid {uid}, which this \
+            "USER {user:?} resolves to non-root container uid {uid}, which this \
              rootless runtime cannot map yet (only container uid 0 is mapped, to the \
              host's own euid; a subordinate uid range via /etc/subuid would be needed \
+             for anything else)"
+        );
+    }
+    if gid != 0 {
+        anyhow::bail!(
+            "USER {user:?} resolves to non-root container gid {gid}, which this \
+             rootless runtime cannot map yet (only container gid 0 is mapped, to the \
+             host's own egid; a subordinate gid range via /etc/subgid would be needed \
              for anything else)"
         );
     }
