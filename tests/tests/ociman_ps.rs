@@ -185,3 +185,149 @@ fn rm_of_a_nonexistent_container_is_a_clear_error() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("does not exist"));
 }
+
+/// `ociman rm --all` (`docs/design/0266`): removes every real, stopped
+/// container in one call, matching real `podman rm --all` exactly.
+#[test]
+fn rm_all_removes_every_stopped_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rm-all:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    for _ in 0..2 {
+        let run = ociman(
+            storage_dir.path(),
+            &["run", "ociman-test/rm-all:latest", "true"],
+        );
+        assert!(run.status.success(), "{run:?}");
+    }
+    let ps_all = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert_eq!(
+        String::from_utf8_lossy(&ps_all.stdout)
+            .trim()
+            .lines()
+            .count(),
+        2,
+        "expected exactly two real stopped containers before --all"
+    );
+
+    let rm_all = ociman(storage_dir.path(), &["rm", "--all"]);
+    assert!(
+        rm_all.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm_all.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rm_all.stdout)
+            .trim()
+            .lines()
+            .count(),
+        2,
+        "each removed container's own id should be printed: {rm_all:?}"
+    );
+
+    let ps_after = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert!(
+        String::from_utf8_lossy(&ps_after.stdout).trim().is_empty(),
+        "every container should be gone after --all"
+    );
+
+    // A real, silent no-op on an already-empty store, matching this
+    // project's own established "empty is a valid, unremarkable
+    // state" convention (`ocibox rm --all`'s own identical rule).
+    let rm_all_again = ociman(storage_dir.path(), &["rm", "--all"]);
+    assert!(rm_all_again.status.success());
+    assert!(
+        String::from_utf8_lossy(&rm_all_again.stdout)
+            .trim()
+            .is_empty()
+    );
+}
+
+/// `--all` and an explicit ID together is a clear error, never an
+/// ambiguous silent choice between the two (matching this project's
+/// own `ocibox rm --all`'s own identical rule).
+#[test]
+fn rm_all_and_an_explicit_id_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["rm", "--all", "some-id"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot give both"),
+        "{out:?}"
+    );
+}
+
+/// `rm --all` without `--force` still refuses a non-stopped container
+/// (real `podman rm --all` alone, without `--force`, leaves a running
+/// container untouched too) — but every *other* container is still
+/// attempted, matching real `podman rm`'s own multi-target behavior
+/// and this project's own `ocibox rm --all`'s identical policy.
+#[test]
+fn rm_all_without_force_skips_a_non_stopped_container_but_still_removes_the_rest() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rm-all-mixed:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/rm-all-mixed:latest", "true"],
+    );
+    assert!(run.status.success(), "{run:?}");
+
+    // A bare "created" (never-run) record, the same
+    // `rm_without_force_refuses_to_remove_a_container_still_marked_running`
+    // technique above: `effective_status` isn't `Stopped`, so `--all`
+    // without `--force` must skip it rather than fail outright.
+    let containers_root = storage_dir.path().join("containers");
+    let containers = oci_runtime_core::StateStore::open(&containers_root).unwrap();
+    containers
+        .create(
+            "still-creating-2",
+            Path::new("/bundle"),
+            Path::new("/bundle/rootfs"),
+            Default::default(),
+        )
+        .unwrap();
+
+    let rm_all = ociman(storage_dir.path(), &["rm", "--all"]);
+    assert!(
+        !rm_all.status.success(),
+        "the one non-stopped container's own failure should still surface"
+    );
+
+    // The real, stopped container is gone; the non-stopped one
+    // survives untouched.
+    let ps_after = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    let remaining = String::from_utf8_lossy(&ps_after.stdout);
+    assert_eq!(
+        remaining.trim().lines().count(),
+        1,
+        "the stopped container should be gone, the non-stopped one left: {remaining:?}"
+    );
+
+    let forced = ociman(storage_dir.path(), &["rm", "--all", "--force"]);
+    assert!(forced.status.success(), "{forced:?}");
+    let ps_final = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert!(String::from_utf8_lossy(&ps_final.stdout).trim().is_empty());
+}

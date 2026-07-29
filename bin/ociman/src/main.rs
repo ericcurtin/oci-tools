@@ -1134,11 +1134,27 @@ enum Command {
     /// Remove a stopped container's storage. Refuses a still-running
     /// one unless `--force` (which kills it first).
     Rm {
-        /// The container's ID or `--name`.
-        id: String,
+        /// The container's ID or `--name` — omit when using `--all`.
+        id: Option<String>,
         /// Kill the container first if it is still running.
         #[arg(short, long)]
         force: bool,
+        /// Remove every container instead of one named on the
+        /// command line — matching real `podman rm --all` exactly
+        /// (real `docker rm` has no such flag at all: `docker rm
+        /// $(docker ps -aq)` is its own closest equivalent). Still
+        /// refuses a running container unless `--force` is *also*
+        /// given (checked directly: real `podman rm --all` alone,
+        /// without `--force`, still leaves a running container
+        /// untouched) — every container is still attempted even if
+        /// an earlier one fails, matching real `podman rm`'s own
+        /// identical multi-target behavior (and this project's own
+        /// `ocibox rm --all`, the same real pattern already
+        /// established there). Mutually exclusive with an explicit
+        /// `id` — a clear error either way rather than an ambiguous
+        /// silent choice between the two.
+        #[arg(short, long)]
+        all: bool,
     },
     /// Copy files/directories between the local filesystem and a
     /// container (running or stopped), or between two containers —
@@ -1830,7 +1846,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Start { id, attach }) => cmd_start(&id, attach),
             Some(Command::Attach { id }) => cmd_attach(&id),
             Some(Command::Restart { id, time }) => cmd_restart(&id, time),
-            Some(Command::Rm { id, force }) => cmd_rm(&id, force),
+            Some(Command::Rm { id, force, all }) => cmd_rm(id.as_deref(), force, all),
             Some(Command::Cp {
                 src,
                 dest,
@@ -4618,11 +4634,40 @@ fn cmd_ps(all: bool, quiet: bool, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_rm(id: &str, force: bool) -> anyhow::Result<()> {
+/// `ociman rm <ID>` / `ociman rm --all` (matching real `podman rm
+/// --all`, `docker rm` having no such flag at all) — see
+/// [`Command::Rm`]'s own doc comment for exactly why `--all` still
+/// respects `--force`'s existing gate per container rather than
+/// forcing everything unconditionally, and for the "every container
+/// still attempted even if one fails" policy.
+fn cmd_rm(id: Option<&str>, force: bool, all: bool) -> anyhow::Result<()> {
     let containers = open_container_store()?;
-    remove_container(&containers, id, force)?;
-    println!("{id}");
-    Ok(())
+    match (id, all) {
+        (Some(_), true) => anyhow::bail!("cannot give both a container ID/name and --all"),
+        (None, false) => {
+            anyhow::bail!("no container ID/name given (try `ociman rm <ID>` or `--all`)")
+        }
+        (Some(id), false) => {
+            remove_container(&containers, id, force)?;
+            println!("{id}");
+            Ok(())
+        }
+        (None, true) => {
+            let mut first_error = None;
+            for state in containers.list().context("listing containers")? {
+                if let Err(e) = remove_container(&containers, &state.id, force) {
+                    eprintln!("error removing {}: {e:#}", state.id);
+                    first_error.get_or_insert(e);
+                    continue;
+                }
+                println!("{}", state.id);
+            }
+            match first_error {
+                Some(e) => Err(e.context("removing every container")),
+                None => Ok(()),
+            }
+        }
+    }
 }
 
 /// `docker cp`/`podman cp`-style file copy between the local
