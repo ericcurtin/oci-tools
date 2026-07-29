@@ -95,6 +95,8 @@ Full workspace: `cargo build`/`test --workspace`, `cargo fmt --all
 
 `ociman rmi -a/--all`, `-i/--ignore`, and `--no-prune` (real podman's
 own remaining `rmi`-specific flags, checked directly above) remain
-real, similarly-scoped next candidates.
+real, similarly-scoped next candidates. (`-i/--ignore` is implemented
+in `0270`, which also found `--no-prune` doesn't actually apply to
+this project's own content-addressed store at all.)
 </content>
 </invoke>

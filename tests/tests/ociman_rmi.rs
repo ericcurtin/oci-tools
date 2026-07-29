@@ -793,3 +793,144 @@ fn rmi_json_with_multiple_references_prints_an_array() {
         "docker.io/ociman-test/rmi-multi-json-b:latest"
     );
 }
+
+/// `ociman rmi --ignore` (0270): a reference that doesn't resolve to
+/// any real image is a silent no-op, matching real `podman rmi
+/// --ignore`/`-i` exactly (checked directly: without `--ignore`, the
+/// identical call is a clear error, see
+/// `rmi_of_an_unknown_reference_is_a_clear_error`).
+#[test]
+fn rmi_ignore_silently_succeeds_on_a_nonexistent_reference() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let rmi = ociman(
+        storage_dir.path(),
+        &["rmi", "--ignore", "does-not-exist:latest"],
+    );
+    assert!(
+        rmi.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rmi.stderr)
+    );
+    assert!(rmi.stdout.is_empty(), "{rmi:?}");
+    assert!(rmi.stderr.is_empty(), "{rmi:?}");
+}
+
+/// `--force` implies `--ignore` too, matching real `podman rmi
+/// --force`'s own checked-directly behavior exactly: a nonexistent
+/// reference is a silent no-op under `--force` alone, with no
+/// `--ignore` given at all.
+#[test]
+fn rmi_force_alone_also_silently_succeeds_on_a_nonexistent_reference() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let rmi = ociman(
+        storage_dir.path(),
+        &["rmi", "--force", "does-not-exist:latest"],
+    );
+    assert!(
+        rmi.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rmi.stderr)
+    );
+}
+
+/// `--ignore` only ever silences the "doesn't resolve to anything at
+/// all" case -- checked directly against a real installed `podman
+/// rmi --ignore`, an in-use-by-container refusal is still reported.
+#[test]
+fn rmi_ignore_does_not_silence_an_in_use_by_container_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rmi-ignore-in-use:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "true".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/rmi-ignore-in-use:latest"],
+    );
+    assert!(run.status.success());
+
+    let rmi = ociman(
+        storage_dir.path(),
+        &["rmi", "--ignore", "ociman-test/rmi-ignore-in-use:latest"],
+    );
+    assert!(
+        !rmi.status.success(),
+        "an in-use-by-container error should still surface even with --ignore"
+    );
+    assert!(
+        String::from_utf8_lossy(&rmi.stderr).contains("in use"),
+        "{}",
+        String::from_utf8_lossy(&rmi.stderr)
+    );
+    // The image survives, untouched by the refused attempt.
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-ignore-in-use:latest")
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// `--ignore` combined with a mix of a real, valid reference and a
+/// nonexistent one: the valid one is removed, the nonexistent one is
+/// silently skipped, and the overall call succeeds.
+#[test]
+fn rmi_ignore_removes_the_valid_reference_and_skips_the_nonexistent_one() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rmi-ignore-mixed:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let rmi = ociman(
+        storage_dir.path(),
+        &[
+            "rmi",
+            "--ignore",
+            "ociman-test/rmi-ignore-mixed:latest",
+            "does-not-exist:latest",
+        ],
+    );
+    assert!(
+        rmi.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rmi.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rmi.stdout).trim(),
+        "docker.io/ociman-test/rmi-ignore-mixed:latest"
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-ignore-mixed:latest")
+            .unwrap()
+            .is_none()
+    );
+}

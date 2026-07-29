@@ -890,6 +890,17 @@ enum Command {
         /// it first if still running), instead of refusing.
         #[arg(short, long)]
         force: bool,
+        /// Silently do nothing for a reference that doesn't resolve
+        /// to any real image, instead of a clear error — matching
+        /// real `podman rmi -i`/`--ignore` exactly. `--force` implies
+        /// this too (checked directly against a real installed
+        /// `podman rmi --force`: a nonexistent reference is a silent
+        /// no-op there as well). Never silences any *other* failure
+        /// (an in-use-by-container refusal, a sibling-tag-ambiguity
+        /// refusal) — checked directly: real `podman rmi --ignore`
+        /// still reports those.
+        #[arg(short, long)]
+        ignore: bool,
     },
     /// Tag an already-stored image under a second reference, matching
     /// real `docker tag`/`podman tag`: both references end up
@@ -1854,9 +1865,11 @@ fn main() -> std::process::ExitCode {
                 timestamp,
             ),
             Some(Command::Images { quiet, filter }) => cmd_images(quiet, cli.global.json, &filter),
-            Some(Command::Rmi { references, force }) => {
-                cmd_rmi(&references, force, cli.global.json)
-            }
+            Some(Command::Rmi {
+                references,
+                force,
+                ignore,
+            }) => cmd_rmi(&references, force, ignore, cli.global.json),
             Some(Command::Tag { source, target }) => cmd_tag(&source, &target, cli.global.json),
             Some(Command::History { reference }) => cmd_history(&reference, cli.global.json),
             Some(Command::Prune { all, filter }) => cmd_prune(cli.global.json, all, &filter),
@@ -2763,13 +2776,17 @@ impl RmiOutcome {
     }
 }
 
-/// Remove one image reference from local storage — the real, full
-/// per-reference `ociman rmi` logic (resolve, sibling-tag ambiguity
-/// gate, dependent-container gate, actual removal), shared by every
-/// reference [`cmd_rmi`] is given. See [`Command::Rmi`]'s own doc
-/// comment for the exact `--force` policy. Matches real `docker
-/// rmi`/`podman rmi`'s own refusal to remove an image a container
-/// still depends on: unlike a plain tag/reference removal, silently
+/// Remove one already-resolved image reference from local storage —
+/// the real, full per-reference `ociman rmi` logic (sibling-tag
+/// ambiguity gate, dependent-container gate, actual removal), shared
+/// by every reference [`cmd_rmi`] is given. `reference_str` is only
+/// used for error messages here; whether it resolves to anything at
+/// all is [`cmd_rmi`]'s own job (so its `--ignore` handling can act on
+/// that specific outcome before ever calling this). See
+/// [`Command::Rmi`]'s own doc comment for the exact `--force` policy.
+/// Matches real `docker rmi`/`podman rmi`'s own refusal to remove an
+/// image a container still depends on: unlike a plain tag/reference
+/// removal, silently
 /// untagging an image out from under an existing container (even a
 /// stopped one, which real podman can still `start` again later)
 /// would leave that container's own `ociman inspect`/`ps` output
@@ -2780,9 +2797,10 @@ impl RmiOutcome {
 /// project's own content-addressed dedup) are reclaimed later by
 /// `ociman prune`, not implicitly here.
 ///
-/// Resolves by tag *or* image ID (`resolve_image_by_reference_or_id`,
-/// 0122) — but removing *by ID* when more than one tag points at that
-/// exact image needs `--force`, matching real `podman rmi`'s own
+/// `resolved` may have matched by tag *or* image ID
+/// (`resolve_image_by_reference_or_id`, 0122) — but removing *by ID*
+/// when more than one tag points at that exact image needs `--force`,
+/// matching real `podman rmi`'s own
 /// identical policy exactly (checked directly: `podman rmi <id>`
 /// against a real two-tags-one-image local store refuses with "unable
 /// to delete image ... by ID with more than one tag ... please force
@@ -2795,11 +2813,9 @@ fn rmi_one(
     store: &Store,
     containers: &StateStore,
     reference_str: &str,
+    resolved: ResolvedImage,
     force: bool,
 ) -> anyhow::Result<RmiOutcome> {
-    let resolved = resolve_image_by_reference_or_id(store, reference_str)?
-        .ok_or_else(|| anyhow::anyhow!("{reference_str}: no such image in local storage"))?;
-
     let references_to_remove: Vec<String> = match &resolved {
         ResolvedImage::Tag(record) => vec![record.reference.clone()],
         ResolvedImage::Id(record) => {
@@ -2868,15 +2884,41 @@ fn rmi_one(
 /// the others (a real, checked-directly *different* policy than
 /// `ociman rm`'s own all-or-nothing preflight for multiple explicit
 /// container IDs, 0267).
-fn cmd_rmi(references: &[String], force: bool, json: bool) -> anyhow::Result<()> {
+fn cmd_rmi(references: &[String], force: bool, ignore: bool, json: bool) -> anyhow::Result<()> {
     anyhow::ensure!(!references.is_empty(), "no image reference given");
+    // Matches real `podman rmi --force`'s own checked-directly behavior
+    // exactly: forcing implies ignoring too (a nonexistent reference is
+    // a silent no-op under `--force` alone, not just `--ignore`).
+    let ignore = ignore || force;
     let store = open_store()?;
     let containers = open_container_store()?;
 
     let mut outcomes = Vec::with_capacity(references.len());
     let mut had_error = false;
     for reference_str in references {
-        match rmi_one(&store, &containers, reference_str, force) {
+        let resolved = match resolve_image_by_reference_or_id(&store, reference_str) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                // Real `podman rmi --ignore` only ever silences *this*
+                // specific "doesn't resolve to anything at all" case
+                // (checked directly: an in-use-by-container error is
+                // still reported even with `--ignore`) -- every other
+                // failure kind below is never subject to it.
+                if !ignore {
+                    had_error = true;
+                    eprintln!(
+                        "error removing {reference_str}: {reference_str}: no such image in local storage"
+                    );
+                }
+                continue;
+            }
+            Err(e) => {
+                had_error = true;
+                eprintln!("error removing {reference_str}: {e:#}");
+                continue;
+            }
+        };
+        match rmi_one(&store, &containers, reference_str, resolved, force) {
             Ok(outcome) => {
                 if !json {
                     for reference in &outcome.references_removed {
