@@ -1110,18 +1110,31 @@ enum Command {
         /// Display only container IDs.
         #[arg(short, long)]
         quiet: bool,
-        /// Filter the listed containers — currently only
-        /// `status=<creating|created|running|stopped|paused>`
-        /// (this project's own real status vocabulary, the exact
-        /// strings its own `STATUS` column/`--json` already show —
-        /// real `docker`/`podman` use a finer-grained vocabulary this
-        /// project has no equivalent states for). May be given more
-        /// than once (OR'd together, matching real `podman ps
-        /// --filter status=` exactly). Giving this at all overrides
+        /// Filter the listed containers:
+        /// `status=<creating|created|running|stopped|paused>` (this
+        /// project's own real status vocabulary, the exact strings
+        /// its own `STATUS` column/`--json` already show — real
+        /// `docker`/`podman` use a finer-grained vocabulary this
+        /// project has no equivalent states for), `id=<prefix>`
+        /// (matching real `podman ps --filter id=`'s own checked-
+        /// directly prefix-match semantics for a plain hex value), or
+        /// `name=<substring>` (matching real `docker`/`podman ps
+        /// --filter name=`'s own checked-directly behavior for a
+        /// plain, non-regex value — both really run a full regex
+        /// search against the name, which for ordinary alphanumeric
+        /// text is behaviorally identical to a substring search; an
+        /// actual regex pattern with metacharacters is a deliberate,
+        /// honest simplification not yet supported here, avoiding a
+        /// new dependency this project has nowhere else). Multiple
+        /// values for the *same* key are OR'd together; different
+        /// keys are ANDed (both checked directly against a real
+        /// installed `podman ps`). Giving `status=` at all overrides
         /// the default running-only behavior entirely — checked
-        /// directly against a real installed `podman ps --filter
-        /// status=created` (no `-a`): it shows a `created` container
-        /// even though a plain, filterless `podman ps` would hide it.
+        /// directly: `podman ps --filter status=created` (no `-a`)
+        /// shows a `created` container a plain, filterless `podman
+        /// ps` would hide — but `id=`/`name=` do *not* have this same
+        /// override effect, still respecting the default running-
+        /// only/`--all` visibility rule on top of matching.
         #[arg(short, long = "filter")]
         filter: Vec<String>,
     },
@@ -4881,42 +4894,67 @@ impl ContainerInspectView {
     }
 }
 
-/// Parse `ociman ps`'s own `--filter status=<value>` values -- see
-/// [`Command::Ps`]'s own doc comment for exactly why this project's
-/// own five-value status vocabulary is used verbatim rather than real
-/// podman's own finer-grained one, and why giving this at all
-/// overrides the default running-only filter entirely.
-fn parse_ps_status_filters(filters: &[String]) -> anyhow::Result<Vec<String>> {
-    let mut statuses = Vec::new();
+/// Every `--filter` value `ociman ps` accepts, parsed once up front --
+/// see [`Command::Ps`]'s own doc comment for the exact real semantics
+/// each one matches (checked directly, not assumed) and for why
+/// `status` alone overrides the default running-only visibility rule
+/// while `id`/`name` don't.
+#[derive(Default)]
+struct PsFilters {
+    /// `status=`, OR'd together -- see `Command::Ps`'s own doc
+    /// comment for this project's own five-value vocabulary.
+    status: Vec<String>,
+    /// `id=<prefix>`, OR'd together.
+    id: Vec<String>,
+    /// `name=<substring>`, OR'd together.
+    name: Vec<String>,
+}
+
+/// Parse `ociman ps`'s own `--filter` values into a [`PsFilters`].
+fn parse_ps_filters(filters: &[String]) -> anyhow::Result<PsFilters> {
+    let mut parsed = PsFilters::default();
     for f in filters {
-        let Some(value) = f.strip_prefix("status=") else {
+        if let Some(value) = f.strip_prefix("status=") {
+            anyhow::ensure!(
+                matches!(
+                    value,
+                    "creating" | "created" | "running" | "stopped" | "paused"
+                ),
+                "ociman ps: --filter status={value:?}: invalid value (expected one of creating, \
+                 created, running, stopped, paused)"
+            );
+            parsed.status.push(value.to_string());
+        } else if let Some(value) = f.strip_prefix("id=") {
+            anyhow::ensure!(
+                !value.is_empty(),
+                "ociman ps: --filter {f:?} is missing a value"
+            );
+            parsed.id.push(value.to_ascii_lowercase());
+        } else if let Some(value) = f.strip_prefix("name=") {
+            anyhow::ensure!(
+                !value.is_empty(),
+                "ociman ps: --filter {f:?} is missing a value"
+            );
+            parsed.name.push(value.to_string());
+        } else {
             anyhow::bail!(
                 "ociman ps: --filter {f:?} is not yet supported (only status=<creating|created|\
-                 running|stopped|paused> is)"
+                 running|stopped|paused>, id=<prefix>, or name=<substring> are)"
             );
-        };
-        anyhow::ensure!(
-            matches!(
-                value,
-                "creating" | "created" | "running" | "stopped" | "paused"
-            ),
-            "ociman ps: --filter status={value:?}: invalid value (expected one of creating, \
-             created, running, stopped, paused)"
-        );
-        statuses.push(value.to_string());
+        }
     }
-    Ok(statuses)
+    Ok(parsed)
 }
 
 fn cmd_ps(all: bool, quiet: bool, json: bool, filter: &[String]) -> anyhow::Result<()> {
-    let status_filters = parse_ps_status_filters(filter)?;
+    let filters = parse_ps_filters(filter)?;
     let containers = open_container_store()?;
     let mut views: Vec<ContainerView> = containers
         .list()
         .context("listing containers")?
         .iter()
         .filter(|s| {
-            if status_filters.is_empty() {
+            let visible = if filters.status.is_empty() {
                 // A never-started (`ociman create`, 0157) container is
                 // hidden by default exactly like a `Stopped` one --
                 // confirmed directly against a real `podman create`
@@ -4930,8 +4968,35 @@ fn cmd_ps(all: bool, quiet: bool, json: bool, filter: &[String]) -> anyhow::Resu
                 // `podman ps --filter status=created` (no `-a`): it
                 // shows a `created` container a plain, filterless
                 // `podman ps` would otherwise hide.
-                status_filters.contains(&display_status(s).to_string())
+                filters.status.contains(&display_status(s).to_string())
+            };
+            if !visible {
+                return false;
             }
+            // `id=`/`name=` are ordinary additional constraints
+            // (ANDed with the visibility rule above and with each
+            // other) -- checked directly: unlike `status=`, neither
+            // overrides the default running-only/`--all` rule on its
+            // own.
+            if !filters.id.is_empty()
+                && !filters
+                    .id
+                    .iter()
+                    .any(|want| s.id.to_ascii_lowercase().starts_with(want.as_str()))
+            {
+                return false;
+            }
+            if !filters.name.is_empty() {
+                let name = s
+                    .annotations
+                    .get(ANNOTATION_NAME)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if !filters.name.iter().any(|want| name.contains(want.as_str())) {
+                    return false;
+                }
+            }
+            true
         })
         .map(ContainerView::from_state)
         .collect();

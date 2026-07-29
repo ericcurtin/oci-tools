@@ -659,7 +659,7 @@ fn ps_filter_with_an_unrecognized_key_or_value_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();
     Store::open(storage_dir.path()).unwrap();
 
-    let bad_key = ociman(storage_dir.path(), &["ps", "--filter", "name=foo"]);
+    let bad_key = ociman(storage_dir.path(), &["ps", "--filter", "label=foo"]);
     assert!(!bad_key.status.success());
     assert!(
         String::from_utf8_lossy(&bad_key.stderr).contains("not yet supported"),
@@ -671,5 +671,195 @@ fn ps_filter_with_an_unrecognized_key_or_value_is_a_clear_error() {
     assert!(
         String::from_utf8_lossy(&bad_value.stderr).contains("invalid value"),
         "{bad_value:?}"
+    );
+}
+
+/// `ociman ps --filter name=<substring>` (0273), matching real
+/// `docker`/`podman ps --filter name=`'s own checked-directly plain-
+/// text behavior (a substring match) — but, unlike `status=`, does
+/// *not* override the default running-only visibility rule on its
+/// own.
+#[test]
+fn ps_filter_name_matches_a_substring_and_still_respects_default_visibility() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-filter-name:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "mycontainer123",
+            "ociman-test/ps-filter-name:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    // A substring, not the full name, still matches.
+    let matched = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "name=contain", "-q"],
+    );
+    assert!(matched.status.success(), "{matched:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&matched.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "{matched:?}"
+    );
+
+    // A non-matching substring finds nothing.
+    let no_match = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "name=zzz", "-q"],
+    );
+    assert!(no_match.status.success());
+    assert!(String::from_utf8_lossy(&no_match.stdout).trim().is_empty());
+
+    // Unlike `status=`, `name=` alone (no `-a`) does *not* override
+    // the default running-only visibility rule -- the never-started
+    // container stays hidden.
+    let no_all = ociman(
+        storage_dir.path(),
+        &["ps", "--filter", "name=contain", "-q"],
+    );
+    assert!(no_all.status.success());
+    assert!(String::from_utf8_lossy(&no_all.stdout).trim().is_empty());
+}
+
+/// `ociman ps --filter id=<prefix>` (0273), matching real `podman ps
+/// --filter id=`'s own checked-directly prefix-match semantics for a
+/// plain hex value.
+#[test]
+fn ps_filter_id_matches_by_prefix() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-filter-id:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/ps-filter-id:latest", "true"],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let full_id = String::from_utf8_lossy(&ociman(storage_dir.path(), &["ps", "-a", "-q"]).stdout)
+        .trim()
+        .to_string();
+    let prefix = &full_id[..6];
+
+    let matched = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", &format!("id={prefix}"), "-q"],
+    );
+    assert!(matched.status.success(), "{matched:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&matched.stdout).trim(),
+        full_id,
+        "{matched:?}"
+    );
+
+    let no_match = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "id=zzzzzz", "-q"],
+    );
+    assert!(no_match.status.success());
+    assert!(String::from_utf8_lossy(&no_match.stdout).trim().is_empty());
+}
+
+/// Different filter *keys* are ANDed together, matching real `podman
+/// ps` exactly (checked directly): `status=running --filter
+/// name=<name-of-a-non-running-container>` finds nothing, even though
+/// each condition alone would match a *different* real container.
+#[test]
+fn ps_filter_different_keys_are_anded_together() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-filter-and:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "created-and",
+            "ociman-test/ps-filter-and:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let neither = ociman(
+        storage_dir.path(),
+        &[
+            "ps",
+            "-a",
+            "--filter",
+            "status=running",
+            "--filter",
+            "name=created-and",
+            "-q",
+        ],
+    );
+    assert!(neither.status.success(), "{neither:?}");
+    assert!(
+        String::from_utf8_lossy(&neither.stdout).trim().is_empty(),
+        "a stopped-state container named created-and should match neither an AND of \
+         status=running and name=created-and: {neither:?}"
+    );
+
+    // But the same `name=` filter alone (with a matching status) does
+    // find it, confirming the AND is real and not just a bug hiding
+    // everything.
+    let matches_alone = ociman(
+        storage_dir.path(),
+        &[
+            "ps",
+            "-a",
+            "--filter",
+            "status=created",
+            "--filter",
+            "name=created-and",
+            "-q",
+        ],
+    );
+    assert!(matches_alone.status.success(), "{matches_alone:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&matches_alone.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "{matches_alone:?}"
     );
 }
