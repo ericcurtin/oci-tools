@@ -266,6 +266,10 @@ fn run(args: &[String]) -> anyhow::Result<()> {
             // and is discarded otherwise.
             true,
             discard_output,
+            // `preserve_fds: 0` -- `ocicri` never accepts extra fds
+            // from kubelet for a container's own init process; real
+            // `cri-o` has no equivalent concept at this layer either.
+            0,
             |pid| {
                 let _ = write_atomic(&dir_for_pid, PID_FILENAME, pid.to_string().as_bytes());
             },

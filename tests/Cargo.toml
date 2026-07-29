@@ -19,6 +19,7 @@ tar.workspace = true
 
 [dev-dependencies]
 hyper-util.workspace = true
+libc.workspace = true
 oci-cri-types.workspace = true
 oci-runtime-core.workspace = true
 rustix = { workspace = true, features = ["fs"] }

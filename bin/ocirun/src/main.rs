@@ -99,6 +99,26 @@ enum Command {
         /// running".
         #[arg(long, value_name = "FILE")]
         pid_file: Option<PathBuf>,
+        /// Pass `N` additional file descriptors, starting at fd 3
+        /// (right after stdio), through to the container's own
+        /// process untouched — matching real `runc run`/`crun run
+        /// --preserve-fds` exactly (checked directly against
+        /// `~/git/runc/utils_linux.go`'s own `baseFd := 3 +
+        /// len(process.ExtraFiles)` window and `~/git/crun/src/
+        /// libcrun/container.c`'s own `context->preserve_fds + 3`
+        /// threshold): the caller (a supervisor like containerd/
+        /// systemd, using socket activation) must already have those
+        /// `N` fds open at exactly fd 3.. before invoking `ocirun` at
+        /// all. `0` (the default) closes every fd above stdio before
+        /// the container's own process ever runs — a real,
+        /// previously-missing step this project's own launch sequence
+        /// never performed at all before this, matching real runc/
+        /// crun's own identical default (this had been a real, latent
+        /// fd-leak gap: *any* fd this project's own caller happened to
+        /// have open beyond stdio would have leaked straight into
+        /// every container, regardless of this flag ever existing).
+        #[arg(long = "preserve-fds", default_value_t = 0)]
+        preserve_fds: u32,
     },
     /// Create a container: set up namespaces/mounts/cgroups and leave
     /// its process blocked, waiting for `start`. Returns once setup
@@ -114,6 +134,9 @@ enum Command {
         /// Same as `run --pid-file` — see its own doc comment.
         #[arg(long, value_name = "FILE")]
         pid_file: Option<PathBuf>,
+        /// Same as `run --preserve-fds` — see its own doc comment.
+        #[arg(long = "preserve-fds", default_value_t = 0)]
+        preserve_fds: u32,
     },
     /// Start a previously `create`d container's process running.
     Start {
@@ -320,12 +343,20 @@ fn main() -> std::process::ExitCode {
                 id,
                 bundle,
                 pid_file,
-            }) => cmd_run(&id, bundle.as_deref(), pid_file.as_deref()),
+                preserve_fds,
+            }) => cmd_run(&id, bundle.as_deref(), pid_file.as_deref(), preserve_fds),
             Some(Command::Create {
                 id,
                 bundle,
                 pid_file,
-            }) => cmd_create(&root, &id, bundle.as_deref(), pid_file.as_deref()),
+                preserve_fds,
+            }) => cmd_create(
+                &root,
+                &id,
+                bundle.as_deref(),
+                pid_file.as_deref(),
+                preserve_fds,
+            ),
             Some(Command::Start { id }) => cmd_start(&root, &id),
             Some(Command::Kill { id, signal, all }) => cmd_kill(&root, &id, signal.as_deref(), all),
             Some(Command::Delete { id, force }) => cmd_delete(&root, &id, force),
@@ -468,9 +499,15 @@ fn cmd_list(root: &Path, format: &str, quiet: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_run(id: &str, bundle: Option<&Path>, pid_file: Option<&Path>) -> anyhow::Result<()> {
+fn cmd_run(
+    id: &str,
+    bundle: Option<&Path>,
+    pid_file: Option<&Path>,
+    preserve_fds: u32,
+) -> anyhow::Result<()> {
     let dir = bundle.unwrap_or_else(|| Path::new("."));
     tracing::debug!(container_id = id, bundle = %dir.display(), "run starting");
+    verify_preserve_fds(preserve_fds)?;
 
     let bundle = oci_runtime_core::Bundle::load(dir)
         .with_context(|| format!("loading bundle from {}", dir.display()))?;
@@ -507,6 +544,7 @@ fn cmd_run(id: &str, bundle: Option<&Path>, pid_file: Option<&Path>) -> anyhow::
             // stdout/stderr are always forwarded verbatim, matching
             // real `runc run`/`crun run` exactly (0196).
             false,
+            preserve_fds,
             |pid| {
                 if let Some(path) = pid_file {
                     write_pid_file(path, pid);
@@ -528,9 +566,11 @@ fn cmd_create(
     id: &str,
     bundle: Option<&Path>,
     pid_file: Option<&Path>,
+    preserve_fds: u32,
 ) -> anyhow::Result<()> {
     let dir = bundle.unwrap_or_else(|| Path::new("."));
     tracing::debug!(container_id = id, bundle = %dir.display(), "create starting");
+    verify_preserve_fds(preserve_fds)?;
 
     let loaded = oci_runtime_core::Bundle::load(dir)
         .with_context(|| format!("loading bundle from {}", dir.display()))?;
@@ -549,8 +589,10 @@ fn cmd_create(
         // SAFETY: `ocirun`'s own process has not spawned any additional
         // threads by this point, same as `run`'s own safety note.
         #[allow(unsafe_code)]
-        let pid = unsafe { oci_runtime_core::launch::create(id, &loaded, &rootfs, &fifo_path) }
-            .context("creating container")?;
+        let pid = unsafe {
+            oci_runtime_core::launch::create(id, &loaded, &rootfs, &fifo_path, preserve_fds)
+        }
+        .context("creating container")?;
         Ok(pid)
     })();
 
@@ -574,6 +616,30 @@ fn cmd_create(
     state.status = Status::Created;
     state.pid = Some(pid);
     store.write(&state)?;
+    Ok(())
+}
+
+/// Fail fast, with a clear error, if `--preserve-fds N` claims more
+/// fds than this process's own caller actually left open — matching
+/// real runc's own identical upfront check exactly
+/// (`~/git/runc/utils_linux.go`'s own `unix.Faccessat` loop over
+/// `baseFd..baseFd+preserveFDs`): every fd `3..3+n` must already
+/// exist by the time `ocirun` itself starts (the caller, e.g. a
+/// supervisor doing socket activation, is responsible for having
+/// opened them *before* invoking `ocirun` at all) — a clear error here
+/// is far more useful than silently closing a "preserved" fd that was
+/// never really there, or than an equally silent failure deep inside
+/// the forked container process itself.
+fn verify_preserve_fds(n: u32) -> anyhow::Result<()> {
+    for offset in 0..n {
+        let fd = 3 + offset;
+        let path = format!("/proc/self/fd/{fd}");
+        anyhow::ensure!(
+            Path::new(&path).exists(),
+            "--preserve-fds {n}: fd {fd} (of {n} claimed, starting at fd 3) is not open in this \
+             process; the caller must have it open *before* invoking ocirun"
+        );
+    }
     Ok(())
 }
 

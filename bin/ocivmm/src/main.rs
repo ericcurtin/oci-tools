@@ -600,12 +600,15 @@ fn provision_vm(rootfs: &Path, name: &str) -> anyhow::Result<()> {
         // through for progress.
         #[allow(unsafe_code)]
         let exit_code = unsafe {
+            // `preserve_fds: 0` -- `ocivmm` has no `--preserve-fds`
+            // flag of its own.
             oci_runtime_core::launch::run(
                 &format!("ocivmm-provision-{name}"),
                 &bundle,
                 &validated_rootfs,
                 true,
                 false,
+                0,
             )
         }
         .context("running the provisioning container")?;

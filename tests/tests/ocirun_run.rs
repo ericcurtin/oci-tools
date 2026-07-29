@@ -517,3 +517,137 @@ fn run_isolates_hostname_from_the_host() {
     // container's own UTS namespace.
     assert_eq!(stdout.trim(), "ocirun");
 }
+
+/// `ocirun run --preserve-fds` (0291), matching real `runc run`/`crun
+/// run --preserve-fds` exactly: by default, every fd above stdio is
+/// closed before the container's own process ever runs -- a real,
+/// previously-missing step this project's own launch sequence never
+/// performed at all before this (any fd this process's own caller
+/// happened to have open beyond stdio would have leaked straight into
+/// the container, unconditionally). `--preserve-fds N` keeps exactly
+/// the first `N` of them (starting at fd 3, right after stdio)
+/// instead.
+///
+/// Uses a real `pre_exec` closure on the *test's own* spawned
+/// `ocirun run` subprocess to `dup2` an already-open, real file onto
+/// exactly fd 3 in that one child only (never touching this test
+/// process's own fd 3) -- the same "starts right after stdio" slot
+/// real `--preserve-fds` semantics assume, needed to make the test
+/// deterministic regardless of whatever fd numbers the test harness
+/// itself already happens to have open.
+#[test]
+fn run_preserve_fds_closes_extra_fds_by_default_but_keeps_them_with_the_flag() {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(
+        dir.path(),
+        &busybox,
+        &[
+            "/bin/sh",
+            "-c",
+            "test -e /proc/self/fd/3 && echo fd3-present || echo fd3-absent",
+        ],
+    );
+
+    let run_with_fd3_open = |extra_args: &[&str]| -> std::process::Output {
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let raw_fd = marker.as_file().as_raw_fd();
+        let mut cmd = Command::new(bin_path("ocirun"));
+        cmd.arg("run")
+            .args(extra_args)
+            .arg("preserve-fds-test")
+            .current_dir(dir.path())
+            .env_remove("OCI_TOOLS_LOG");
+        // SAFETY: only calls `dup2(2)`/`fcntl(2)` (both async-signal-
+        // safe, no allocation) in the forked-but-not-yet-exec'd child,
+        // only ever affecting that child's own fd table.
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(raw_fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // A real, easy-to-hit POSIX gotcha, found by hand: if
+                // `raw_fd` already happens to equal `3` in this
+                // process (a real possibility -- fd numbers depend on
+                // whatever this test binary's own harness already has
+                // open), `dup2(3, 3)` is specified to be a genuine
+                // no-op that leaves fd 3's own `FD_CLOEXEC` flag
+                // untouched (unlike an ordinary `dup2` to a
+                // *different* target fd, which always clears it on
+                // the new descriptor) -- so if the tempfile crate
+                // happened to open its own fd with `O_CLOEXEC` (a
+                // sensible default), fd 3 would still get silently
+                // closed by the kernel at the real `execve()` just
+                // below, with no error at all, indistinguishable from
+                // `--preserve-fds` genuinely not working. Clearing
+                // `FD_CLOEXEC` explicitly here, unconditionally,
+                // closes that gap regardless of which case applies.
+                if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = cmd.output().expect("failed to spawn ocirun run");
+        drop(marker);
+        out
+    };
+
+    let without_flag = run_with_fd3_open(&[]);
+    assert!(
+        without_flag.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&without_flag.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&without_flag.stdout).trim(),
+        "fd3-absent",
+        "fd 3 must be closed by default, matching real runc/crun: {without_flag:?}"
+    );
+
+    let with_flag = run_with_fd3_open(&["--preserve-fds", "1"]);
+    assert!(
+        with_flag.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_flag.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&with_flag.stdout).trim(),
+        "fd3-present",
+        "fd 3 must be preserved with --preserve-fds 1: {with_flag:?}"
+    );
+}
+
+/// `--preserve-fds N` fails fast, before ever forking a container at
+/// all, if fewer than `N` fds are actually open starting at fd 3 --
+/// matching real runc's own identical upfront `Faccessat` check
+/// exactly (see `verify_preserve_fds`'s own doc comment in
+/// `bin/ocirun/src/main.rs`).
+#[test]
+fn run_preserve_fds_rejects_a_claim_with_no_matching_open_fd() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(dir.path(), &busybox, &["/bin/sh", "-c", "true"]);
+
+    let out = Command::new(bin_path("ocirun"))
+        .args(["run", "--preserve-fds", "5", "preserve-fds-reject-test"])
+        .current_dir(dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .output()
+        .expect("failed to spawn ocirun run");
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is not open in this process"),
+        "{out:?}"
+    );
+}

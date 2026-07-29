@@ -663,9 +663,12 @@ fn enter_and_get_exit_code(name: &str, command: &[String]) -> anyhow::Result<i32
     // `ociman build`'s own `RUN` steps, which always close stdin and
     // may discard output under `--quiet`.
     #[allow(unsafe_code)]
-    let exit_code =
-        unsafe { oci_runtime_core::launch::run(name, &bundle, &validated_rootfs, false, false) }
-            .with_context(|| format!("running inside box {name}"))?;
+    let exit_code = unsafe {
+        // `preserve_fds: 0` -- `ocibox` has no `--preserve-fds` flag of
+        // its own (real `distrobox` has no equivalent either).
+        oci_runtime_core::launch::run(name, &bundle, &validated_rootfs, false, false, 0)
+    }
+    .with_context(|| format!("running inside box {name}"))?;
     Ok(exit_code)
 }
 

@@ -85,12 +85,14 @@ pub const COMMAND_NOT_FOUND_EXIT_CODE: i32 = 127;
 /// Must be called from a single-threaded process — this forks (see
 /// [`crate::process::fork_and_wait`]'s safety note, which this inherits).
 #[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn run(
     id: &str,
     bundle: &Bundle,
     rootfs: &Path,
     close_stdin: bool,
     discard_output: bool,
+    preserve_fds: u32,
 ) -> io::Result<i32> {
     // SAFETY: forwarded from this function's own contract.
     unsafe {
@@ -102,6 +104,7 @@ pub unsafe fn run(
             CgroupSetup::FromSpec,
             close_stdin,
             discard_output,
+            preserve_fds,
             |_pid| {},
         )
     }
@@ -207,9 +210,11 @@ pub unsafe fn run_reporting_pid(
     cgroup_setup: CgroupSetup,
     close_stdin: bool,
     discard_output: bool,
+    preserve_fds: u32,
     on_pid: impl FnOnce(i32),
 ) -> io::Result<i32> {
     let mut child_setup = build_child_setup(bundle, rootfs, id)?;
+    child_setup.preserve_fds = preserve_fds;
     if close_stdin {
         child_setup.stdin_fd = Some(
             std::fs::File::open("/dev/null")
@@ -641,8 +646,10 @@ pub unsafe fn create(
     bundle: &Bundle,
     rootfs: &Path,
     exec_fifo_path: &Path,
+    preserve_fds: u32,
 ) -> io::Result<i32> {
     let mut child_setup = build_child_setup(bundle, rootfs, id)?;
+    child_setup.preserve_fds = preserve_fds;
     let (read_fd, write_fd) =
         rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)?;
     child_setup.exec_fifo = Some(exec_fifo_path.to_path_buf());
@@ -816,6 +823,7 @@ fn build_child_setup(bundle: &Bundle, rootfs: &Path, id: &str) -> io::Result<Chi
         args: process_spec.args.clone(),
         env: process_spec.env.clone(),
         cwd: process_spec.cwd.clone(),
+        preserve_fds: 0,
     })
 }
 
@@ -953,6 +961,22 @@ struct ChildSetup {
     args: Vec<String>,
     env: Vec<String>,
     cwd: String,
+    /// `ocirun run/create/exec --preserve-fds N` (0291): the number of
+    /// extra file descriptors, starting at fd 3 (right after stdio),
+    /// that this process's own caller has already arranged to have
+    /// open and wants passed through into the container's own process
+    /// untouched — matching real `runc`/`crun --preserve-fds` exactly
+    /// (checked directly against `~/git/runc/utils_linux.go`'s own
+    /// `baseFd := 3 + len(process.ExtraFiles)` window and
+    /// `~/git/crun/src/libcrun/container.c`'s own threshold, `context.
+    /// preserve_fds` plus 3). `0` (the default for every caller except
+    /// `ocirun`'s own CLI) closes every fd above stdio, matching real
+    /// runc/crun's own identical default — a real, previously-missing
+    /// step this project's own `mount_pivot_and_exec` never performed
+    /// at all before this, meaning any fd this process's own caller
+    /// happened to have open (beyond stdio) would have leaked straight
+    /// into the container's exec'd process regardless of this flag.
+    preserve_fds: u32,
 }
 
 impl ChildSetup {
@@ -1279,6 +1303,22 @@ impl ChildSetup {
         if let Some(fd) = &self.stderr_log_fd {
             command.stderr(unsafe { std::process::Stdio::from_raw_fd(fd.as_raw_fd()) });
         }
+        // Close every fd above stdio (+ any explicitly `--preserve-fds`d
+        // ones), matching real runc/crun's own identical default (see
+        // `Self::preserve_fds`'s own doc comment). A `pre_exec` closure
+        // -- not a plain call right here -- specifically because it
+        // runs *after* `Command`'s own internal stdio `dup2`s (already
+        // registered above) but *before* the real `execve`: the raw
+        // source fds behind `stdin_fd`/`stdout_log_fd`/`stderr_log_fd`
+        // are themselves ordinary fds `>= 3` that this same cleanup
+        // would otherwise close *before* `Command` ever got a chance to
+        // `dup2` them onto 0/1/2, breaking every existing stdio-
+        // redirection caller outright.
+        let preserve_fds = self.preserve_fds;
+        #[allow(unsafe_code)]
+        unsafe {
+            command.pre_exec(move || close_fds_ge_than(3 + preserve_fds));
+        }
         // `exec` only returns (as an `Err`) if it failed; on success the
         // process image is replaced and this line never returns at all.
         let err = command.exec();
@@ -1296,6 +1336,25 @@ impl ChildSetup {
 fn fail(code: i32, message: &str) -> ! {
     eprintln!("error: {message}");
     std::process::exit(code);
+}
+
+/// Close every open file descriptor numbered `first_fd` or higher --
+/// see [`ChildSetup::preserve_fds`]'s own doc comment for why. Uses
+/// the `close_range(2)` syscall directly (Linux 5.9+, glibc 2.34+):
+/// this project's own two first-class target distros (CentOS Stream
+/// 10, Ubuntu 26.04) are both comfortably new enough, the same
+/// "assume a modern kernel, no legacy `/proc/self/fd`-iteration
+/// fallback" precedent `user_resolve.rs`'s own `openat2(2)` use
+/// already established. Called from a `pre_exec` closure (see its own
+/// call site), so this must stay allocation-free and async-signal-
+/// safe: a single raw syscall via `libc`, no heap use at all.
+fn close_fds_ge_than(first_fd: u32) -> io::Result<()> {
+    #[allow(unsafe_code)]
+    let ret = unsafe { libc::close_range(first_fd, u32::MAX, 0) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Perform one planned rootfs-setup step for real.

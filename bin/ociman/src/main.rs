@@ -5232,6 +5232,12 @@ fn run_and_finalize(
             // too) verbatim, matching real `docker run`/`podman run`
             // exactly (0196).
             false,
+            // `preserve_fds: 0` -- `ociman run`/`create` have no
+            // `--preserve-fds` flag of their own (real `docker run`/
+            // `podman run` don't either; this is a `runc`/`crun`-level
+            // concept for specialized orchestrators, not a container-
+            // engine-level one).
+            0,
             record_running,
         )
     }
