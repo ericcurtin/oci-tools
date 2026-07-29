@@ -13,10 +13,11 @@ use std::time::Duration;
 
 use oci_cri_types::runtime_service_client::RuntimeServiceClient;
 use oci_cri_types::{
-    LinuxPodSandboxConfig, LinuxSandboxSecurityContext, ListPodSandboxRequest, NamespaceMode,
-    NamespaceOption, PodSandboxConfig, PodSandboxFilter, PodSandboxMetadata, PodSandboxState,
-    PodSandboxStateValue, PodSandboxStatusRequest, RemovePodSandboxRequest, RunPodSandboxRequest,
-    StopPodSandboxRequest, StreamPodSandboxesRequest,
+    LinuxPodSandboxConfig, LinuxSandboxSecurityContext, ListPodSandboxRequest,
+    ListPodSandboxStatsRequest, NamespaceMode, NamespaceOption, PodSandboxConfig, PodSandboxFilter,
+    PodSandboxMetadata, PodSandboxState, PodSandboxStateValue, PodSandboxStatsFilter,
+    PodSandboxStatsRequest, PodSandboxStatusRequest, RemovePodSandboxRequest, RunPodSandboxRequest,
+    StopPodSandboxRequest, StreamPodSandboxStatsRequest, StreamPodSandboxesRequest,
 };
 use oci_tools_tests::bin_path;
 
@@ -675,4 +676,101 @@ async fn update_pod_sandbox_resources_resolves_the_sandbox_or_reports_not_found(
         .await
         .expect_err("updating an unknown sandbox should fail");
     assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
+/// `PodSandboxStats`/`ListPodSandboxStats`/`StreamPodSandboxStats`
+/// (`docs/design/0262`): a real sandbox's real `Attributes` (id/
+/// metadata/labels/annotations) are reported, but `linux` is always
+/// absent — this project has no infra process or per-sandbox cgroup
+/// of its own at all (`docs/design/0233`), so there is honestly
+/// nothing live to report there. An unknown sandbox is a real
+/// `NotFound` for the single-sandbox RPC; the list/stream siblings
+/// filter by id/label exactly like their container-stats analogues.
+#[tokio::test]
+async fn pod_sandbox_stats_reports_real_attributes_with_no_linux_section() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("ocicri.sock");
+    let _server = spawn_server(storage_dir.path(), &socket_path);
+    wait_for_socket(&socket_path);
+    let mut client = connect(socket_path).await;
+
+    // Unknown sandbox: a real NotFound, before ever touching a real
+    // one.
+    let err = client
+        .pod_sandbox_stats(PodSandboxStatsRequest {
+            pod_sandbox_id: "deadbeef".repeat(8),
+        })
+        .await
+        .expect_err("stats of an unknown sandbox should fail");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    let sandbox_id = client
+        .run_pod_sandbox(run_request(sandbox_config("stats-sandbox", "uid-ss", 0)))
+        .await
+        .unwrap()
+        .into_inner()
+        .pod_sandbox_id;
+
+    let single = client
+        .pod_sandbox_stats(PodSandboxStatsRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+        })
+        .await
+        .expect("PodSandboxStats failed")
+        .into_inner()
+        .stats
+        .expect("a real, existing sandbox always gets a real response");
+    assert!(
+        single.linux.is_none(),
+        "no infra process/cgroup exists, so linux stats must be honestly absent"
+    );
+    let attributes = single.attributes.expect("attributes should be present");
+    assert_eq!(attributes.id, sandbox_id);
+    assert_eq!(
+        attributes.labels.get("app"),
+        Some(&"stats-sandbox".to_string())
+    );
+
+    // List: the one real sandbox appears, matching the single-sandbox
+    // response's own attributes exactly.
+    let listed = client
+        .list_pod_sandbox_stats(ListPodSandboxStatsRequest { filter: None })
+        .await
+        .expect("ListPodSandboxStats failed")
+        .into_inner()
+        .stats;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(
+        listed[0].attributes.as_ref().unwrap().id,
+        sandbox_id,
+        "{listed:?}"
+    );
+
+    // A label filter behaves identically to the plain list RPC's own.
+    let by_label = client
+        .list_pod_sandbox_stats(ListPodSandboxStatsRequest {
+            filter: Some(PodSandboxStatsFilter {
+                label_selector: HashMap::from([("app".to_string(), "no-such-app".to_string())]),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .stats;
+    assert!(by_label.is_empty(), "{by_label:?}");
+
+    // The streaming sibling reports the same set (0234's chunking).
+    let mut stream = client
+        .stream_pod_sandbox_stats(StreamPodSandboxStatsRequest { filter: None })
+        .await
+        .expect("StreamPodSandboxStats failed")
+        .into_inner();
+    let mut streamed = Vec::new();
+    while let Some(response) = stream.message().await.expect("stream should end cleanly") {
+        streamed.extend(response.pod_sandbox_stats);
+    }
+    assert_eq!(streamed.len(), 1);
+    assert_eq!(streamed[0].attributes.as_ref().unwrap().id, sandbox_id);
 }

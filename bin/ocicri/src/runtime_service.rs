@@ -205,6 +205,66 @@ fn sandbox_list_items(
         .collect())
 }
 
+/// The one real filtered computation behind `PodSandboxStats`/
+/// `ListPodSandboxStats`/`StreamPodSandboxStats` (`docs/design/0262`)
+/// — the exact same `id`/`label_selector`-resolution shape
+/// `sandbox_list_items` already uses (its own `state` field simply
+/// doesn't exist on `PodSandboxStatsFilter`, matching the real proto's
+/// own narrower filter message), the same "reuse the list resolution
+/// by mapping the stats filter onto the list filter's own identical
+/// fields" pattern `container_stats_items` already established for
+/// its own container-level sibling.
+///
+/// `Linux` is always `None`: real cri-o's own `PodSandboxStats`
+/// reports live cgroup/network numbers from the sandbox's own infra
+/// ("pause") container's cgroup — this project deliberately has no
+/// infra process or per-sandbox cgroup of its own at all
+/// (`docs/design/0233`), so there is honestly nothing to report there,
+/// the same "absence over fabrication" rule `ContainerStats`
+/// (`docs/design/0241`) already applies for a container with no live
+/// cgroup. `Attributes` (id/metadata/labels/annotations) *are* real
+/// and always available from the sandbox record regardless, so they're
+/// reported in full rather than omitting the whole response.
+fn pod_sandbox_stats_items(
+    filter: Option<cri::PodSandboxStatsFilter>,
+) -> Result<Vec<cri::PodSandboxStats>, Status> {
+    let list_filter = filter.map(|f| cri::PodSandboxFilter {
+        id: f.id,
+        label_selector: f.label_selector,
+        state: None,
+    });
+    let records = match list_filter.as_ref().map(|f| f.id.as_str()) {
+        Some(id) if !id.is_empty() => match sandbox::find_by_id_prefix(&sandbox_store_root(), id) {
+            Ok(Some(record)) => vec![record],
+            Ok(None) | Err(sandbox::LookupError::AmbiguousPrefix(_)) => Vec::new(),
+            Err(sandbox::LookupError::Io(e)) => {
+                return Err(io_error("reading sandbox records", e));
+            }
+        },
+        _ => sandbox::load_all(&sandbox_store_root())
+            .map_err(|e| io_error("reading sandbox records", e))?,
+    };
+
+    Ok(records
+        .into_iter()
+        .filter(|record| {
+            list_filter
+                .as_ref()
+                .is_none_or(|filter| matches_filter(record, filter))
+        })
+        .map(|record| cri::PodSandboxStats {
+            attributes: Some(cri::PodSandboxAttributes {
+                id: record.id.clone(),
+                metadata: Some(metadata_to_proto(&record.metadata)),
+                labels: record.labels,
+                annotations: record.annotations,
+            }),
+            linux: None,
+            windows: None,
+        })
+        .collect())
+}
+
 /// Whether a process with this pid is currently alive (the same
 /// `kill(pid, 0)`-based check `oci_runtime_core::process::alive`
 /// provides, shared with `ociman`'s own status logic).
@@ -1912,27 +1972,54 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         })))
     }
 
+    /// An unknown sandbox is a real `NotFound` (matching real cri-o's
+    /// own `getPodSandboxFromRequest` wrapping, the same rule
+    /// `UpdatePodSandboxResources`/`ReopenContainerLog` already use);
+    /// a real, existing one always gets a real response — see
+    /// [`pod_sandbox_stats_items`]'s own doc comment for exactly what
+    /// it reports and why `linux` is always absent.
     async fn pod_sandbox_stats(
         &self,
-        _request: Request<cri::PodSandboxStatsRequest>,
+        request: Request<cri::PodSandboxStatsRequest>,
     ) -> Result<Response<cri::PodSandboxStatsResponse>, Status> {
-        unimplemented("PodSandboxStats")
+        let id = request.into_inner().pod_sandbox_id;
+        if find_sandbox(&id)?.is_none() {
+            return Err(Status::not_found(format!("could not find pod {id:?}")));
+        }
+        let mut stats = pod_sandbox_stats_items(Some(cri::PodSandboxStatsFilter {
+            id,
+            label_selector: Default::default(),
+        }))?;
+        Ok(Response::new(cri::PodSandboxStatsResponse {
+            stats: stats.pop(),
+        }))
     }
 
+    /// Stats for every sandbox matching the filter — see
+    /// [`pod_sandbox_stats_items`] for the exact filter/absence rules.
     async fn list_pod_sandbox_stats(
         &self,
-        _request: Request<cri::ListPodSandboxStatsRequest>,
+        request: Request<cri::ListPodSandboxStatsRequest>,
     ) -> Result<Response<cri::ListPodSandboxStatsResponse>, Status> {
-        unimplemented("ListPodSandboxStats")
+        let stats = pod_sandbox_stats_items(request.into_inner().filter)?;
+        Ok(Response::new(cri::ListPodSandboxStatsResponse { stats }))
     }
 
     type StreamPodSandboxStatsStream = BoxStream<cri::StreamPodSandboxStatsResponse>;
 
+    /// The `CRIListStreaming` variant of `list_pod_sandbox_stats` —
+    /// the same shared chunking every other streaming list RPC here
+    /// uses (0234).
     async fn stream_pod_sandbox_stats(
         &self,
-        _request: Request<cri::StreamPodSandboxStatsRequest>,
+        request: Request<cri::StreamPodSandboxStatsRequest>,
     ) -> Result<Response<Self::StreamPodSandboxStatsStream>, Status> {
-        unimplemented("StreamPodSandboxStats")
+        let items = pod_sandbox_stats_items(request.into_inner().filter)?;
+        Ok(Response::new(crate::stream::chunked(items, |stats| {
+            cri::StreamPodSandboxStatsResponse {
+                pod_sandbox_stats: stats,
+            }
+        })))
     }
 
     /// A real, unconditional no-op — matching real `cri-o`'s own
