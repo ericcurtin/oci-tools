@@ -66,11 +66,8 @@ Full workspace: `cargo build`/`test --workspace`, `cargo fmt --all
 ## Still ahead
 
 `ociman run`/`create --group-add` (real podman's own actual
-supplementary-group flag, checked directly against `podman run
---help`: string values, name-or-GID resolution, plus a special
-`keep-groups` value) is a real, separately-scoped gap this project
-doesn't have at all yet — a genuinely different, bigger feature than
-this note's own narrow `exec`-time fix, left for its own future
-increment.
+supplementary-group flag) is implemented in `0278`, apart from its own
+`keep-groups` special value, deliberately left for its own future
+increment (needs annotation-driven runtime-level support).
 </content>
 </invoke>

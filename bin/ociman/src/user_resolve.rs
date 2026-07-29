@@ -133,6 +133,25 @@ fn find_passwd_entry(
     Ok(None)
 }
 
+/// Resolve one `ociman run`/`create --group-add` value to a numeric
+/// gid — matching real `podman run --group-add`'s own checked-
+/// directly resolution rule exactly (`github.com/moby/sys/user`'s own
+/// `GetAdditionalGroups`, vendored into real podman): a numeric GID is
+/// used as-is even without a matching `/etc/group` entry; a
+/// non-numeric name must resolve against the container's *own*
+/// `/etc/group`, a clear error if it doesn't.
+pub fn resolve_group_add(rootfs: &Path, group: &str) -> anyhow::Result<u32> {
+    let numeric_gid: Option<u32> = group.parse().ok();
+    match (find_group_gid(rootfs, group, numeric_gid)?, numeric_gid) {
+        (Some(found), _) => Ok(found),
+        (None, Some(gid)) => Ok(gid),
+        (None, None) => anyhow::bail!(
+            "group {group:?} has no matching entry in the container's own /etc/group (and \
+             isn't numeric either, so there's no other way to resolve it)"
+        ),
+    }
+}
+
 /// Find the `/etc/group` row matching `name` (or `numeric_gid`, same
 /// numeric-always-wins rule as [`find_passwd_entry`]) and return its
 /// gid.
@@ -323,5 +342,37 @@ mod tests {
         std::os::unix::fs::symlink("real-passwd", dir.path().join("etc/passwd")).unwrap();
 
         assert_eq!(resolve(dir.path(), "app").unwrap(), (1000, 1000));
+    }
+
+    #[test]
+    fn resolve_group_add_named_group_resolves_via_group_file() {
+        let dir = rootfs_with(None, Some(GROUP));
+        assert_eq!(resolve_group_add(dir.path(), "staff").unwrap(), 50);
+    }
+
+    #[test]
+    fn resolve_group_add_numeric_gid_is_used_as_is_even_without_an_entry() {
+        let dir = rootfs_with(None, None);
+        assert_eq!(resolve_group_add(dir.path(), "12345").unwrap(), 12345);
+    }
+
+    #[test]
+    fn resolve_group_add_numeric_gid_with_a_matching_entry_still_resolves() {
+        let dir = rootfs_with(None, Some(GROUP));
+        assert_eq!(resolve_group_add(dir.path(), "50").unwrap(), 50);
+    }
+
+    #[test]
+    fn resolve_group_add_unknown_name_is_an_error() {
+        let dir = rootfs_with(None, Some(GROUP));
+        let err = resolve_group_add(dir.path(), "nonexistent-group").unwrap_err();
+        assert!(err.to_string().contains("nonexistent-group"), "{err}");
+    }
+
+    #[test]
+    fn resolve_group_add_unknown_name_with_no_group_file_at_all_is_also_an_error() {
+        let dir = rootfs_with(None, None);
+        let err = resolve_group_add(dir.path(), "nonexistent-group").unwrap_err();
+        assert!(err.to_string().contains("nonexistent-group"), "{err}");
     }
 }

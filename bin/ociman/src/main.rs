@@ -495,6 +495,23 @@ struct RunArgs {
     /// `labels` field.
     #[arg(long = "label", value_name = "KEY=VALUE")]
     label: Vec<String>,
+    /// Add an additional supplementary group to the container's own
+    /// primary process: a numeric GID (used as-is even without a
+    /// matching `/etc/group` entry) or a group name (resolved against
+    /// the container's *own* `/etc/group`, a clear error if it isn't
+    /// found there) — matching real `podman run --group-add`'s own
+    /// checked-directly resolution rule exactly
+    /// (`~/git/podman/vendor/github.com/moby/sys/user/user.go`'s own
+    /// `GetAdditionalGroups`). Repeatable; duplicates collapse to one
+    /// real gid, same as real podman. The special `keep-groups` value
+    /// (pass the *host* user's own real supplementary groups through
+    /// unchanged — real podman's own doc says "Currently only
+    /// available with the crun OCI runtime") is a clear, honest "not
+    /// yet" error rather than silently ignored or subtly wrong: it
+    /// needs annotation-driven, runtime-level support this project's
+    /// own `ocirun` has no equivalent mechanism for yet.
+    #[arg(long = "group-add", value_name = "GROUP")]
+    group_add: Vec<String>,
     /// Override the working directory the container's own process
     /// starts in, matching real `docker run -w`/`podman run -w`
     /// exactly. Defaults to the image's own `WORKDIR` config (or
@@ -4177,6 +4194,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             args.workdir.as_deref(),
             entrypoint.as_deref(),
             &volumes,
+            &args.group_add,
         )?;
         // Prepended, not appended: `spec.mounts`' own already-present
         // entries (`/proc`, `/dev`, ...) are all subdirectories of the
@@ -7434,6 +7452,7 @@ fn synthesize_spec(
     workdir: Option<&str>,
     entrypoint: Option<&[String]>,
     volumes: &[ParsedVolume],
+    group_add: &[String],
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -7477,6 +7496,22 @@ fn synthesize_spec(
     });
     process.user.uid = uid;
     process.user.gid = gid;
+    if !group_add.is_empty() {
+        let mut gids = std::collections::BTreeSet::new();
+        for group in group_add {
+            anyhow::ensure!(
+                group != "keep-groups",
+                "--group-add keep-groups is not yet supported (needs annotation-driven, \
+                 runtime-level support this project's own ocirun has no equivalent mechanism \
+                 for yet — real podman's own docs note this is crun-runtime-specific too)"
+            );
+            gids.insert(
+                user_resolve::resolve_group_add(rootfs, group)
+                    .with_context(|| format!("resolving --group-add {group:?}"))?,
+            );
+        }
+        process.user.additional_gids = gids.into_iter().collect();
+    }
     // `Spec::example()`'s own `no_new_privileges: true` is the correct
     // default for `ocirun spec`'s own real-`runc`-spec-compatible
     // template (real `runc spec` also defaults to `noNewPrivileges:

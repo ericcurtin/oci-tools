@@ -518,6 +518,184 @@ fn run_without_read_only_keeps_a_writable_rootfs() {
     );
 }
 
+/// `--group-add` (0278): a numeric GID is used as-is in the real
+/// synthesized spec's own `process.user.additionalGids`, matching
+/// real `podman run --group-add`'s own checked-directly resolution
+/// rule exactly. Multiple values, including duplicates, collapse to
+/// one real gid each, sorted (this project's own `BTreeSet`-backed
+/// dedup, functionally identical to real podman's own `map[int]
+/// struct{}` dedup -- order isn't semantically meaningful either way).
+#[test]
+fn run_group_add_numeric_gids_appear_in_the_real_spec() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/group-add:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/group-add:latest",
+        &[
+            "--group-add",
+            "200",
+            "--group-add",
+            "100",
+            "--group-add",
+            "200",
+            "/bin/sh",
+            "-c",
+            "exit 0",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    let config_path = storage_dir
+        .path()
+        .join("containers")
+        .join(&container_id)
+        .join("config.json");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    assert_eq!(
+        config["process"]["user"]["additionalGids"],
+        serde_json::json!([100, 200]),
+        "duplicates should collapse to one entry each: {config:?}"
+    );
+}
+
+/// A named group resolves against the *container's own* `/etc/group`
+/// -- matching real `podman run --group-add`'s own checked-directly
+/// resolution rule exactly.
+#[test]
+fn run_group_add_named_group_resolves_via_the_containers_own_etc_group() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image_with_files(
+        &store,
+        "ociman-test/group-add-named:latest",
+        &busybox,
+        &["sh"],
+        &[("etc/group", b"staff:x:50:\n")],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/group-add-named:latest",
+        &["--group-add", "staff", "/bin/sh", "-c", "exit 0"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    let config_path = storage_dir
+        .path()
+        .join("containers")
+        .join(&container_id)
+        .join("config.json");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    assert_eq!(
+        config["process"]["user"]["additionalGids"],
+        serde_json::json!([50]),
+        "{config:?}"
+    );
+}
+
+/// A `--group-add` name with no matching entry in the container's own
+/// `/etc/group` is a clear error, matching real `podman run
+/// --group-add`'s own checked-directly rule exactly (a numeric GID
+/// would still succeed even without one -- see the sibling test
+/// above).
+#[test]
+fn run_group_add_unknown_name_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/group-add-unknown:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/group-add-unknown:latest",
+        &[
+            "--group-add",
+            "totally-bogus-group",
+            "/bin/sh",
+            "-c",
+            "exit 0",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("totally-bogus-group"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The special `keep-groups` value is a clear, honest "not yet"
+/// error rather than silently ignored or subtly wrong -- it needs
+/// annotation-driven, runtime-level support this project's own
+/// `ocirun` has no equivalent mechanism for yet.
+#[test]
+fn run_group_add_keep_groups_is_a_clear_not_yet_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/group-add-keep:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/group-add-keep:latest",
+        &["--group-add", "keep-groups", "/bin/sh", "-c", "exit 0"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not yet supported"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `-e`/`--env` both adds a genuinely new variable and overrides an
 /// existing one *in place* (not as a second, shadowed entry) --
 /// matching real `docker run -e`/`podman run -e` exactly. Checked the
