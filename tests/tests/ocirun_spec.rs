@@ -108,3 +108,65 @@ fn spec_accepts_explicit_bundle_directory() {
     assert!(out.status.success(), "ocirun spec --bundle failed: {out:?}");
     assert!(bundle.join("config.json").exists());
 }
+
+/// `ocirun spec -f/--file` (matching real `crun spec -f/--file`
+/// exactly, checked directly against an installed `crun 1.14.1`; real
+/// `runc spec` has no equivalent flag at all): writes to the given
+/// path instead of `config.json`, relative to `--bundle` when both
+/// are given.
+#[test]
+fn spec_file_writes_to_the_given_path_instead_of_config_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_spec(dir.path(), &["--file", "custom-name.json"]);
+    assert!(out.status.success(), "ocirun spec --file failed: {out:?}");
+
+    assert!(!dir.path().join("config.json").exists());
+    let custom_path = dir.path().join("custom-name.json");
+    assert!(custom_path.exists());
+    let raw = std::fs::read_to_string(&custom_path).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    assert_eq!(json["ociVersion"], "1.2.1");
+}
+
+/// A relative `--file` is resolved against `--bundle`, the same way
+/// real `crun`'s own `chdir(bundle)`-then-relative-`fname` sequence
+/// resolves it.
+#[test]
+fn spec_file_is_resolved_relative_to_an_explicit_bundle_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("bundle");
+    std::fs::create_dir(&bundle).unwrap();
+
+    let out = Command::new(bin_path("ocirun"))
+        .args(["spec", "--bundle"])
+        .arg(&bundle)
+        .args(["--file", "nested.json"])
+        .env_remove("OCI_TOOLS_LOG")
+        .output()
+        .expect("failed to spawn ocirun");
+    assert!(out.status.success(), "ocirun spec failed: {out:?}");
+    assert!(bundle.join("nested.json").exists());
+    assert!(!bundle.join("config.json").exists());
+}
+
+/// Unlike the default `config.json` destination (refused outright if
+/// it already exists), an explicit `--file` target is silently
+/// overwritten -- a real, checked-directly `crun` quirk (its own
+/// `access(where, F_OK)` pre-check only runs when no `-f` was given),
+/// verified directly against an installed `crun 1.14.1` before
+/// porting it here.
+#[test]
+fn spec_file_silently_overwrites_an_existing_file_unlike_the_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let custom_path = dir.path().join("custom.json");
+    std::fs::write(&custom_path, b"not a real spec at all").unwrap();
+
+    let out = run_spec(dir.path(), &["--file", "custom.json"]);
+    assert!(
+        out.status.success(),
+        "an explicit --file target should be overwritten, not refused: {out:?}"
+    );
+    let raw = std::fs::read_to_string(&custom_path).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&raw).expect("a real, freshly-written spec");
+    assert_eq!(json["ociVersion"], "1.2.1");
+}

@@ -54,6 +54,21 @@ enum Command {
         /// current directory).
         #[arg(short, long, value_name = "DIR")]
         bundle: Option<PathBuf>,
+        /// Write the spec here instead of `config.json` under the
+        /// bundle directory — matching real `crun spec -f/--file`
+        /// exactly (checked directly against an installed `crun
+        /// 1.14.1`; real `runc spec` has no equivalent flag at all).
+        /// A relative path is resolved against `--bundle`, the same
+        /// way `crun`'s own `chdir(bundle)`-then-relative-`fname`
+        /// sequence resolves it; an absolute path is used verbatim
+        /// either way. Unlike the default `config.json` destination
+        /// (refused outright if it already exists), an explicit
+        /// `--file` target is silently overwritten if it already
+        /// exists — a real, checked-directly crun quirk (its own
+        /// `access(where, F_OK)` pre-check only runs when `fname ==
+        /// NULL`), not an oversight here.
+        #[arg(short, long, value_name = "PATH")]
+        file: Option<PathBuf>,
         /// Generate a configuration for a rootless container.
         #[arg(long)]
         rootless: bool,
@@ -341,7 +356,11 @@ fn main() -> std::process::ExitCode {
 
         match cli.command {
             None => anyhow::bail!("no command given; try `ocirun --help`"),
-            Some(Command::Spec { bundle, rootless }) => cmd_spec(bundle.as_deref(), rootless),
+            Some(Command::Spec {
+                bundle,
+                file,
+                rootless,
+            }) => cmd_spec(bundle.as_deref(), file.as_deref(), rootless),
             Some(Command::State { id }) => cmd_state(&root, &id),
             Some(Command::List { format, quiet }) => cmd_list(&root, &format, quiet),
             Some(Command::Run {
@@ -397,11 +416,18 @@ fn main() -> std::process::ExitCode {
     })
 }
 
-fn cmd_spec(bundle: Option<&Path>, rootless: bool) -> anyhow::Result<()> {
+fn cmd_spec(bundle: Option<&Path>, file: Option<&Path>, rootless: bool) -> anyhow::Result<()> {
     let dir = bundle.unwrap_or_else(|| Path::new("."));
-    let path = dir.join(SPEC_CONFIG);
+    let path = dir.join(file.unwrap_or_else(|| Path::new(SPEC_CONFIG)));
 
-    if path.exists() {
+    // Matches real `crun spec`'s own checked-directly quirk exactly:
+    // the "already exists" refusal only applies to the default
+    // `config.json` destination (`crun`'s own `access(where, F_OK)`
+    // pre-check runs only when no `-f`/`--file` was given) -- an
+    // explicit `--file` target is silently overwritten instead, same
+    // as `crun`'s own unconditional `fopen(where, "w+e")` in that
+    // case.
+    if file.is_none() && path.exists() {
         anyhow::bail!("file {} exists; remove it first", path.display());
     }
 
