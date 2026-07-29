@@ -1317,7 +1317,7 @@ impl ChildSetup {
         let preserve_fds = self.preserve_fds;
         #[allow(unsafe_code)]
         unsafe {
-            command.pre_exec(move || close_fds_ge_than(3 + preserve_fds));
+            command.pre_exec(move || process::close_fds_ge_than(3 + preserve_fds));
         }
         // `exec` only returns (as an `Err`) if it failed; on success the
         // process image is replaced and this line never returns at all.
@@ -1336,25 +1336,6 @@ impl ChildSetup {
 fn fail(code: i32, message: &str) -> ! {
     eprintln!("error: {message}");
     std::process::exit(code);
-}
-
-/// Close every open file descriptor numbered `first_fd` or higher --
-/// see [`ChildSetup::preserve_fds`]'s own doc comment for why. Uses
-/// the `close_range(2)` syscall directly (Linux 5.9+, glibc 2.34+):
-/// this project's own two first-class target distros (CentOS Stream
-/// 10, Ubuntu 26.04) are both comfortably new enough, the same
-/// "assume a modern kernel, no legacy `/proc/self/fd`-iteration
-/// fallback" precedent `user_resolve.rs`'s own `openat2(2)` use
-/// already established. Called from a `pre_exec` closure (see its own
-/// call site), so this must stay allocation-free and async-signal-
-/// safe: a single raw syscall via `libc`, no heap use at all.
-fn close_fds_ge_than(first_fd: u32) -> io::Result<()> {
-    #[allow(unsafe_code)]
-    let ret = unsafe { libc::close_range(first_fd, u32::MAX, 0) };
-    if ret != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// Perform one planned rootfs-setup step for real.

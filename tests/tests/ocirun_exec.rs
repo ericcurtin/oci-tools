@@ -6,7 +6,9 @@
 
 use std::time::Duration;
 
-use oci_tools_tests::{busybox_path, ocirun, ocirun_create, wait_for_status, write_bundle};
+use oci_tools_tests::{
+    bin_path, busybox_path, ocirun, ocirun_create, wait_for_status, write_bundle,
+};
 
 #[test]
 fn exec_joins_the_running_containers_namespaces() {
@@ -399,5 +401,171 @@ fn exec_refuses_a_container_that_is_not_running() {
     ocirun(
         root_dir.path(),
         &["delete", "--force", "exec-not-running-test"],
+    );
+}
+
+/// `ocirun exec --preserve-fds` (0294), the identical real `runc
+/// exec`/`crun exec --preserve-fds` semantics `ocirun run`/`create
+/// --preserve-fds` (`0291`) already established for a container's own
+/// *first* process, now also covering an *additional* one: by
+/// default, every fd above stdio is closed before the exec'd process
+/// ever runs (a real, previously-missing step this project's own
+/// `exec.rs` never performed either, independently of `launch.rs`'s
+/// own identical gap `0291` closed); `--preserve-fds N` keeps exactly
+/// the first `N` of them instead.
+///
+/// Uses a real `pre_exec` closure on the *test's own* spawned `ocirun
+/// exec` subprocess to `dup2` an already-open, real file onto exactly
+/// fd 3 in that one child only -- the same technique (and the same
+/// real POSIX `dup2(fd, fd)`-is-a-no-op-preserving-`FD_CLOEXEC` gotcha
+/// guarded against) `ocirun_run.rs`'s own identical `--preserve-fds`
+/// test already established.
+#[test]
+fn exec_preserve_fds_closes_extra_fds_by_default_but_keeps_them_with_the_flag() {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let create = ocirun_create(root_dir.path(), bundle_dir.path(), "exec-preserve-fds-test");
+    assert!(create.status.success(), "{create:?}");
+    let start = ocirun(root_dir.path(), &["start", "exec-preserve-fds-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-preserve-fds-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let run_with_fd3_open = |extra_args: &[&str]| -> std::process::Output {
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let raw_fd = marker.as_file().as_raw_fd();
+        let mut cmd = std::process::Command::new(bin_path("ocirun"));
+        cmd.arg("--root")
+            .arg(root_dir.path())
+            .arg("exec")
+            .args(extra_args)
+            .args([
+                "exec-preserve-fds-test",
+                "/bin/sh",
+                "-c",
+                "test -e /proc/self/fd/3 && echo fd3-present || echo fd3-absent",
+            ])
+            .env_remove("OCI_TOOLS_LOG");
+        // SAFETY: only calls `dup2(2)`/`fcntl(2)` (both async-signal-
+        // safe, no allocation) in the forked-but-not-yet-exec'd child,
+        // only ever affecting that child's own fd table -- see
+        // `ocirun_run.rs`'s own identical test for exactly why the
+        // `fcntl` call is needed too.
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(raw_fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = cmd.output().expect("failed to spawn ocirun exec");
+        drop(marker);
+        out
+    };
+
+    let without_flag = run_with_fd3_open(&[]);
+    assert!(
+        without_flag.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&without_flag.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&without_flag.stdout).trim(),
+        "fd3-absent",
+        "fd 3 must be closed by default, matching real runc/crun: {without_flag:?}"
+    );
+
+    let with_flag = run_with_fd3_open(&["--preserve-fds", "1"]);
+    assert!(
+        with_flag.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_flag.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&with_flag.stdout).trim(),
+        "fd3-present",
+        "fd 3 must be preserved with --preserve-fds 1: {with_flag:?}"
+    );
+
+    ocirun(
+        root_dir.path(),
+        &["delete", "--force", "exec-preserve-fds-test"],
+    );
+}
+
+/// `--preserve-fds N` on `exec` fails fast, before ever joining the
+/// container's own namespaces at all, if fewer than `N` fds are
+/// actually open starting at fd 3 -- matching real runc's own
+/// identical upfront `Faccessat` check `ocirun run`/`create
+/// --preserve-fds` (`0291`) already established, reused verbatim here
+/// via the same shared `verify_preserve_fds` helper.
+#[test]
+fn exec_preserve_fds_rejects_a_claim_with_no_matching_open_fd() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let create = ocirun_create(
+        root_dir.path(),
+        bundle_dir.path(),
+        "exec-preserve-fds-reject-test",
+    );
+    assert!(create.status.success(), "{create:?}");
+    let start = ocirun(root_dir.path(), &["start", "exec-preserve-fds-reject-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-preserve-fds-reject-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let out = ocirun(
+        root_dir.path(),
+        &[
+            "exec",
+            "--preserve-fds",
+            "5",
+            "exec-preserve-fds-reject-test",
+            "/bin/true",
+        ],
+    );
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is not open in this process"),
+        "{out:?}"
+    );
+
+    ocirun(
+        root_dir.path(),
+        &["delete", "--force", "exec-preserve-fds-reject-test"],
     );
 }

@@ -205,6 +205,11 @@ enum Command {
         /// Repeatable.
         #[arg(short, long = "env")]
         env: Vec<String>,
+        /// Same as `run --preserve-fds` — see its own doc comment.
+        /// Real `runc exec`/`crun exec` both support this identically
+        /// on `exec`, not just `run`/`create` (`docs/design/0294`).
+        #[arg(long = "preserve-fds", default_value_t = 0)]
+        preserve_fds: u32,
         /// Command and arguments to run inside the container.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
@@ -366,6 +371,7 @@ fn main() -> std::process::ExitCode {
                 additional_gids,
                 cwd,
                 env,
+                preserve_fds,
                 args,
             }) => cmd_exec(
                 &root,
@@ -375,6 +381,7 @@ fn main() -> std::process::ExitCode {
                 cwd.as_deref(),
                 &env,
                 &args,
+                preserve_fds,
             ),
             Some(Command::Features) => oci_cli_common::output::print_json(&features::features()),
             Some(Command::Ps {
@@ -1095,6 +1102,7 @@ fn cmd_events(root: &Path, id: &str, stats: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_exec(
     root: &Path,
     id: &str,
@@ -1103,7 +1111,9 @@ fn cmd_exec(
     cwd: Option<&str>,
     extra_env: &[String],
     args: &[String],
+    preserve_fds: u32,
 ) -> anyhow::Result<()> {
+    verify_preserve_fds(preserve_fds)?;
     let store = StateStore::open(root)
         .with_context(|| format!("opening container state root {}", root.display()))?;
     let state = store.load(id)?;
@@ -1167,6 +1177,7 @@ fn cmd_exec(
             .unwrap_or_else(|| process_spec.cwd.clone()),
         env: effective_env,
         args: args.to_vec(),
+        preserve_fds,
     };
 
     // SAFETY: `ocirun`'s own process has not spawned any additional

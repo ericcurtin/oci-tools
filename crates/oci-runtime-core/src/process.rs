@@ -227,6 +227,36 @@ pub fn exit_code_from_wait_status(status: i32) -> i32 {
     }
 }
 
+/// Close every open file descriptor numbered `first_fd` or higher --
+/// the real close-range step every conformant OCI runtime performs
+/// right before a container's own process replaces the caller's via
+/// `execve`, so no fd this project's own internal machinery (or an
+/// inherited-but-forgotten one from *its own* caller) ever leaks in
+/// by accident. Shared by [`crate::launch`] (`run`/`create`) and
+/// [`crate::exec`] (`ocirun exec`) -- both real `runc`/`crun` apply
+/// the identical default (and `--preserve-fds` override) to *both*
+/// their own `run`/`create` and `exec` subcommands (`docs/design/
+/// 0291`, `0294`).
+///
+/// Uses the `close_range(2)` syscall directly (Linux 5.9+, glibc
+/// 2.34+): this project's own two first-class target distros (CentOS
+/// Stream 10, Ubuntu 26.04) are both comfortably new enough, the same
+/// "assume a modern kernel, no legacy `/proc/self/fd`-iteration
+/// fallback" precedent `user_resolve.rs`'s own `openat2(2)` use
+/// already established. Called from a `pre_exec` closure at each call
+/// site (see their own doc comments for exactly why), so this must
+/// stay allocation-free and async-signal-safe: a single raw syscall
+/// via `libc`, no heap use at all.
+pub(crate) fn close_fds_ge_than(first_fd: u32) -> io::Result<()> {
+    // SAFETY: `close_range(2)` with two plain integer bounds and a
+    // `0` flags word -- no pointers involved at all.
+    let ret = unsafe { libc::close_range(first_fd, u32::MAX, 0) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

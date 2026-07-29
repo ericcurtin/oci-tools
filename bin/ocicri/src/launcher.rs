@@ -127,6 +127,9 @@ fn exec_run(args: &[String]) -> anyhow::Result<i32> {
         cwd: process_spec.cwd.clone(),
         env: process_spec.env.clone(),
         args: cmd.to_vec(),
+        // `preserve_fds: 0` -- real CRI's `ExecSyncRequest` has no
+        // equivalent field at all.
+        preserve_fds: 0,
     };
 
     // SAFETY: this process is genuinely single-threaded here -- just

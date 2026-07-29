@@ -45,6 +45,20 @@ pub struct ExecRequest {
     pub env: Vec<String>,
     /// Executable and arguments (exec form; index 0 is the executable).
     pub args: Vec<String>,
+    /// `ocirun exec --preserve-fds N` (0294): the number of extra file
+    /// descriptors, starting at fd 3 (right after stdio), that this
+    /// process's own caller has already arranged to have open and
+    /// wants passed through into the exec'd process untouched --
+    /// matching real `runc exec`/`crun exec --preserve-fds` exactly,
+    /// the same real flag/default `crate::launch::run`/`create`
+    /// already implement (`0291`) for the *first* process a container
+    /// runs; this is its identical counterpart for an *additional*
+    /// one. `0` (every caller except `ocirun`'s own CLI) closes every
+    /// fd above stdio before the exec'd process ever runs, matching
+    /// real runc/crun's own identical default -- the same real,
+    /// previously-missing fd-leak gap `0291` closed for `run`/
+    /// `create` also existed here, independently, until now.
+    pub preserve_fds: u32,
 }
 
 /// Run `request.args` as a new process inside the already-running
@@ -83,6 +97,7 @@ pub unsafe fn exec(pid: i32, request: ExecRequest) -> io::Result<i32> {
         cwd: request.cwd,
         env: request.env,
         args: request.args,
+        preserve_fds: request.preserve_fds,
     };
 
     // SAFETY: forwarded from this function's own contract.
@@ -100,6 +115,7 @@ struct ExecSetup {
     cwd: String,
     env: Vec<String>,
     args: Vec<String>,
+    preserve_fds: u32,
 }
 
 impl ExecSetup {
@@ -161,6 +177,20 @@ impl ExecSetup {
             if let Some((key, value)) = kv.split_once('=') {
                 command.env(key, value);
             }
+        }
+        // Close every fd above stdio (+ any explicitly `--preserve-
+        // fds`d ones), matching real runc/crun's own identical
+        // default -- see `ExecRequest::preserve_fds`'s own doc
+        // comment. A `pre_exec` closure (not a plain call before this)
+        // for the same reason `launch.rs`'s own identical call site
+        // needs one: it must run after `Command`'s own internal stdio
+        // setup, not before (this call site never redirects stdio at
+        // all today, but a bare call here would still be one `Command`
+        // API change away from silently breaking the moment it does).
+        let preserve_fds = self.preserve_fds;
+        #[allow(unsafe_code)]
+        unsafe {
+            command.pre_exec(move || process::close_fds_ge_than(3 + preserve_fds));
         }
         let err = command.exec();
         let code = match err.kind() {

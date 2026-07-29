@@ -7933,6 +7933,10 @@ fn cmd_healthcheck_run(id: &str, ignore_result: bool) -> anyhow::Result<()> {
         cwd: process_spec.cwd.clone(),
         env: process_spec.env.clone(),
         args: test_args,
+        // `preserve_fds: 0` -- `ociman healthcheck run` has no
+        // `--preserve-fds` flag of its own (real `podman healthcheck
+        // run` doesn't either).
+        preserve_fds: 0,
     };
 
     // SAFETY: `ociman`'s own process has not spawned any additional
@@ -9577,6 +9581,10 @@ fn cmd_exec(
             .unwrap_or_else(|| process_spec.cwd.clone()),
         env: effective_env,
         args: args.to_vec(),
+        // `preserve_fds: 0` -- `ociman exec` has no `--preserve-fds`
+        // flag of its own, matching real `podman exec`'s own
+        // identical lack of one (checked directly, 0276).
+        preserve_fds: 0,
     };
 
     // SAFETY: `ociman`'s own process has not spawned any additional
