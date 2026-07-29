@@ -99,13 +99,9 @@ Full workspace: `cargo build`/`test --workspace`, `cargo fmt --all
 
 ## Still ahead
 
-`ociman ps --filter label=`/`label!=` (AND semantics, matching real
-podman's own container-specific behavior confirmed above — a
-deliberately *different* combination rule than `ociman prune --filter
-label=`'s own already-shipped OR semantics, which mirrors a genuinely
-different real upstream function) can now be implemented honestly
-against real container labels. `--label-file <path>` (reading
-additional labels from a file, real podman/docker's own sibling flag
-to `--label`) remains a further, smaller candidate.
+`ociman ps --filter label=`/`label!=` is implemented in `0275`.
+`--label-file <path>` (reading additional labels from a file, real
+podman/docker's own sibling flag to `--label`) remains a further,
+smaller candidate.
 </content>
 </invoke>

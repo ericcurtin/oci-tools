@@ -1160,7 +1160,19 @@ enum Command {
         /// shows a `created` container a plain, filterless `podman
         /// ps` would hide — but `id=`/`name=` do *not* have this same
         /// override effect, still respecting the default running-
-        /// only/`--all` visibility rule on top of matching.
+        /// only/`--all` visibility rule on top of matching. Also
+        /// `label=<key>[=<value>]`/`label!=<key>[=<value>]`, matching
+        /// real `podman ps --filter label=`'s own checked-directly
+        /// container-specific semantics — a deliberately *different*
+        /// combination rule than `ociman prune --filter label=`'s own
+        /// OR semantics: multiple `label=`/`label!=` values here are
+        /// ANDed together (every one must be satisfied), reflecting a
+        /// genuinely different real upstream function for containers
+        /// vs. images (see `docs/design/0274`). Filters against the
+        /// container's own real, effective labels (`ociman run`/
+        /// `create --label`, 0274 — image-inherited plus any
+        /// explicit `--label`), same as `--all`/`id=`/`name=`: an
+        /// ordinary additional constraint, not a visibility override.
         #[arg(short, long = "filter")]
         filter: Vec<String>,
     },
@@ -4960,6 +4972,12 @@ struct PsFilters {
     id: Vec<String>,
     /// `name=<substring>`, OR'd together.
     name: Vec<String>,
+    /// `label=`/`label!=`, ANDed together -- a real, deliberate
+    /// *difference* from `ociman prune --filter label=`'s own OR
+    /// semantics (`0192`), matching real podman's own genuinely
+    /// different container-specific `MatchLabelFilters` (checked
+    /// directly, see `docs/design/0274`'s own research note).
+    labels: Vec<LabelFilter>,
 }
 
 /// Parse `ociman ps`'s own `--filter` values into a [`PsFilters`].
@@ -4988,10 +5006,13 @@ fn parse_ps_filters(filters: &[String]) -> anyhow::Result<PsFilters> {
                 "ociman ps: --filter {f:?} is missing a value"
             );
             parsed.name.push(value.to_string());
+        } else if let Some(result) = try_parse_label_filter("ociman ps", f) {
+            parsed.labels.push(result?);
         } else {
             anyhow::bail!(
                 "ociman ps: --filter {f:?} is not yet supported (only status=<creating|created|\
-                 running|stopped|paused>, id=<prefix>, or name=<substring> are)"
+                 running|stopped|paused>, id=<prefix>, name=<substring>, or label=<key>[=<value>]\
+                 /label!=<key>[=<value>] are)"
             );
         }
     }
@@ -5045,6 +5066,22 @@ fn cmd_ps(all: bool, quiet: bool, json: bool, filter: &[String]) -> anyhow::Resu
                     .map(String::as_str)
                     .unwrap_or("");
                 if !filters.name.iter().any(|want| name.contains(want.as_str())) {
+                    return false;
+                }
+            }
+            // `label=`/`label!=` are ANDed together -- see
+            // `PsFilters::labels`'s own doc comment for exactly why
+            // this differs from `ociman prune --filter label=`'s own
+            // OR semantics. Same visibility-rule treatment as `id=`/
+            // `name=`: an ordinary additional constraint, never an
+            // override of the default running-only/`--all` rule.
+            if !filters.labels.is_empty() {
+                let labels: std::collections::BTreeMap<String, String> = s
+                    .annotations
+                    .get(ANNOTATION_LABELS)
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+                    .unwrap_or_default();
+                if !filters.labels.iter().all(|f| f.matches(&labels)) {
                     return false;
                 }
             }

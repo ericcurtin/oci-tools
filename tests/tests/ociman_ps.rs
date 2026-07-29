@@ -659,7 +659,7 @@ fn ps_filter_with_an_unrecognized_key_or_value_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();
     Store::open(storage_dir.path()).unwrap();
 
-    let bad_key = ociman(storage_dir.path(), &["ps", "--filter", "label=foo"]);
+    let bad_key = ociman(storage_dir.path(), &["ps", "--filter", "ancestor=foo"]);
     assert!(!bad_key.status.success());
     assert!(
         String::from_utf8_lossy(&bad_key.stderr).contains("not yet supported"),
@@ -862,4 +862,146 @@ fn ps_filter_different_keys_are_anded_together() {
         1,
         "{matches_alone:?}"
     );
+}
+
+/// `ociman ps --filter label=`/`label!=` (0275): multiple `label=`
+/// values are ANDed together, a deliberately *different* combination
+/// rule than `ociman prune --filter label=`'s own OR semantics
+/// (`0192`) -- matching real podman's own genuinely different,
+/// container-specific `MatchLabelFilters`, checked directly.
+#[test]
+fn ps_filter_label_multiple_values_are_anded_together() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-filter-label:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let create1 = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--label",
+            "env=prod",
+            "--label",
+            "team=infra",
+            "--name",
+            "label-ps1",
+            "ociman-test/ps-filter-label:latest",
+            "true",
+        ],
+    );
+    assert!(create1.status.success(), "{create1:?}");
+    let create2 = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--label",
+            "env=staging",
+            "--name",
+            "label-ps2",
+            "ociman-test/ps-filter-label:latest",
+            "true",
+        ],
+    );
+    assert!(create2.status.success(), "{create2:?}");
+
+    // Single value: only the matching container.
+    let single = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "label=env=prod", "-q"],
+    );
+    assert!(single.status.success(), "{single:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&single.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "{single:?}"
+    );
+
+    // Two jointly satisfiable values (both true for label-ps1): still
+    // just that one container.
+    let and_match = ociman(
+        storage_dir.path(),
+        &[
+            "ps",
+            "-a",
+            "--filter",
+            "label=env=prod",
+            "--filter",
+            "label=team=infra",
+            "-q",
+        ],
+    );
+    assert!(and_match.status.success(), "{and_match:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&and_match.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "{and_match:?}"
+    );
+
+    // Two jointly unsatisfiable values: nothing (a real AND, not a
+    // silent OR that would otherwise still find label-ps1).
+    let and_miss = ociman(
+        storage_dir.path(),
+        &[
+            "ps",
+            "-a",
+            "--filter",
+            "label=env=prod",
+            "--filter",
+            "label=team=wrong",
+            "-q",
+        ],
+    );
+    assert!(and_miss.status.success(), "{and_miss:?}");
+    assert!(String::from_utf8_lossy(&and_miss.stdout).trim().is_empty());
+
+    // `label!=` negates: everything *except* a container matching.
+    let negated = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "label!=env=prod", "-q"],
+    );
+    assert!(negated.status.success(), "{negated:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&negated.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "{negated:?}"
+    );
+
+    // A bare key (any value) matches both.
+    let bare = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "label=env", "-q"],
+    );
+    assert!(bare.status.success(), "{bare:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&bare.stdout).trim().lines().count(),
+        2,
+        "{bare:?}"
+    );
+
+    // Unlike `status=`, `label=` alone (no `-a`) does not override the
+    // default running-only visibility rule.
+    let no_all = ociman(
+        storage_dir.path(),
+        &["ps", "--filter", "label=env=prod", "-q"],
+    );
+    assert!(no_all.status.success());
+    assert!(String::from_utf8_lossy(&no_all.stdout).trim().is_empty());
 }
