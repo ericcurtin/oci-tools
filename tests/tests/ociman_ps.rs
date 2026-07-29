@@ -1312,3 +1312,122 @@ fn ps_filter_exited_matches_the_containers_own_recorded_exit_code() {
     assert!(no_all.status.success());
     assert!(String::from_utf8_lossy(&no_all.stdout).trim().is_empty());
 }
+
+/// `ociman ps --filter until=` (0289), matching real `podman ps
+/// --filter until=`'s own checked-directly semantics exactly: a
+/// container matches if its own creation time is *strictly* before
+/// the given duration-ago or absolute timestamp (real podman's own
+/// `CreatedTime().Before(until)`), reusing the exact same threshold
+/// computation `ociman prune --filter until=` (`0198`) already
+/// established.
+#[test]
+fn ps_filter_until_matches_containers_created_strictly_before_the_threshold() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-filter-until:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = |name: &str| {
+        let out = ociman(
+            storage_dir.path(),
+            &[
+                "create",
+                "--name",
+                name,
+                "ociman-test/ps-filter-until:latest",
+                "true",
+            ],
+        );
+        assert!(out.status.success(), "{out:?}");
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+    };
+    create("old1");
+    create("old2");
+
+    // A far-future absolute timestamp: every container so far was
+    // created strictly before it.
+    let all_match = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "until=2999-01-01T00:00:00Z", "-q"],
+    );
+    assert!(all_match.status.success(), "{all_match:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&all_match.stdout)
+            .trim()
+            .lines()
+            .count(),
+        2,
+        "{all_match:?}"
+    );
+
+    // A far-past absolute timestamp: nothing created after it
+    // matches.
+    let none_match = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "until=1970-01-01T00:00:00Z", "-q"],
+    );
+    assert!(none_match.status.success(), "{none_match:?}");
+    assert!(
+        String::from_utf8_lossy(&none_match.stdout)
+            .trim()
+            .is_empty(),
+        "{none_match:?}"
+    );
+
+    // A relative duration far enough in the past that it also matches
+    // nothing (both containers were created well within the last
+    // second, not a full day ago).
+    let duration_none = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "until=24h", "-q"],
+    );
+    assert!(duration_none.status.success(), "{duration_none:?}");
+    assert!(
+        String::from_utf8_lossy(&duration_none.stdout)
+            .trim()
+            .is_empty(),
+        "{duration_none:?}"
+    );
+
+    // More than one `until=` value is a clear error, matching real
+    // podman's own identical refusal.
+    let too_many = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "until=24h", "--filter", "until=48h"],
+    );
+    assert!(!too_many.status.success());
+    assert!(
+        String::from_utf8_lossy(&too_many.stderr).contains("more than one until filter"),
+        "{too_many:?}"
+    );
+
+    // A value that's neither a duration nor an RFC3339 timestamp is a
+    // clear error.
+    let bad_value = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "until=not-a-real-value"],
+    );
+    assert!(!bad_value.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad_value.stderr).contains("invalid value for 'until' filter"),
+        "{bad_value:?}"
+    );
+
+    // Unlike `status=`, `until=` alone (no `-a`) doesn't override the
+    // default running-only visibility rule.
+    let no_all = ociman(
+        storage_dir.path(),
+        &["ps", "--filter", "until=2999-01-01T00:00:00Z", "-q"],
+    );
+    assert!(no_all.status.success());
+    assert!(String::from_utf8_lossy(&no_all.stdout).trim().is_empty());
+}

@@ -1250,7 +1250,15 @@ enum Command {
         /// `docs/design/0281`. Also `exited=<code>` — matches a
         /// container with a real, recorded exit code equal to one of
         /// these (never one that hasn't exited at all), matching real
-        /// `podman ps --filter exited=` exactly.
+        /// `podman ps --filter exited=` exactly. Also
+        /// `until=<duration-or-timestamp>` — matches a container
+        /// created strictly before the given duration-ago or absolute
+        /// RFC3339 timestamp, the exact same threshold computation
+        /// `ociman prune --filter until=` (`0198`) already established
+        /// and reused verbatim here; at most one value, matching real
+        /// podman's own identical refusal of more than one (checked
+        /// directly against `~/git/podman/vendor/go.podman.io/common/
+        /// pkg/filters/filters.go`'s own `ComputeUntilTimestamp`).
         #[arg(short, long = "filter")]
         filter: Vec<String>,
     },
@@ -5632,6 +5640,16 @@ struct PsFilters {
     /// real, recorded exit code equal to one of these (never a
     /// container that hasn't exited at all).
     exited: Vec<i32>,
+    /// `until=<duration-or-timestamp>`, parsed into the real
+    /// threshold time itself (`now - duration`, or the absolute
+    /// timestamp verbatim) -- at most one value, matching real
+    /// podman's own identical `ComputeUntilTimestamp` refusal of more
+    /// than one (checked directly against
+    /// `~/git/podman/vendor/go.podman.io/common/pkg/filters/
+    /// filters.go`). A container matches if its own creation time is
+    /// *strictly* before this threshold (real podman's own
+    /// `CreatedTime().Before(until)`, checked directly).
+    until: Option<std::time::SystemTime>,
 }
 
 /// Parse `ociman ps`'s own `--filter` values into a [`PsFilters`].
@@ -5685,12 +5703,29 @@ fn parse_ps_filters(filters: &[String]) -> anyhow::Result<PsFilters> {
                 anyhow::anyhow!("ociman ps: --filter exited={value:?}: invalid exit code")
             })?;
             parsed.exited.push(code);
+        } else if let Some(rest) = f.strip_prefix("until=") {
+            anyhow::ensure!(
+                parsed.until.is_none(),
+                "ociman ps: more than one until filter specified"
+            );
+            let now = std::time::SystemTime::now();
+            let threshold = if let Some(duration) = parse_simple_duration(rest) {
+                now.checked_sub(duration).unwrap_or(std::time::UNIX_EPOCH)
+            } else if let Some(absolute) = oci_spec_types::time::parse_rfc3339_utc(rest) {
+                absolute
+            } else {
+                anyhow::bail!(
+                    "ociman ps: --filter {f:?}: invalid value for 'until' filter (expected a \
+                     duration like \"24h\" or an RFC3339 timestamp)"
+                );
+            };
+            parsed.until = Some(threshold);
         } else {
             anyhow::bail!(
                 "ociman ps: --filter {f:?} is not yet supported (only status=<creating|created|\
                  running|stopped|paused>, id=<prefix>, name=<substring>, label=<key>[=<value>]/\
                  label!=<key>[=<value>], before=<container>, since=<container>, \
-                 ancestor=<image>, or exited=<code> are)"
+                 ancestor=<image>, exited=<code>, or until=<duration-or-timestamp> are)"
             );
         }
     }
@@ -5873,6 +5908,18 @@ fn cmd_ps(all: bool, quiet: bool, json: bool, filter: &[String]) -> anyhow::Resu
                     .get(ANNOTATION_EXIT_CODE)
                     .and_then(|v| v.parse::<i32>().ok());
                 if !exit_code.is_some_and(|ec| filters.exited.contains(&ec)) {
+                    return false;
+                }
+            }
+            // `until=` is an ordinary additional constraint too,
+            // same visibility-rule treatment as everything above --
+            // matches real podman's own strict `CreatedTime().
+            // Before(until)` exactly (checked directly).
+            if let Some(threshold) = filters.until {
+                let Some(created) = oci_spec_types::time::parse_rfc3339_utc(&s.created) else {
+                    return false;
+                };
+                if created >= threshold {
                     return false;
                 }
             }
