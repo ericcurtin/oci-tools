@@ -873,11 +873,19 @@ enum Command {
     /// removes those containers first (killing any still running one,
     /// same as `ociman rm --force`).
     Rmi {
-        /// Image reference, e.g. `ubuntu`, `ubuntu:24.04`, or
-        /// `quay.io/foo/bar@sha256:...` — exactly as it was pulled or
-        /// tagged (matching `ociman inspect`'s own image-reference
-        /// resolution).
-        reference: String,
+        /// Image reference(s), e.g. `ubuntu`, `ubuntu:24.04`, or
+        /// `quay.io/foo/bar@sha256:...` — exactly as pulled or tagged
+        /// (matching `ociman inspect`'s own image-reference
+        /// resolution). Real `podman rmi img1 img2 img3` continues
+        /// past any one image's own failure to resolve/remove,
+        /// reporting every error once every image has had its own
+        /// attempt (checked directly against a real installed
+        /// `podman rmi`) — a genuinely *different* policy than
+        /// `ociman rm`'s own all-or-nothing preflight resolution for
+        /// multiple explicit container IDs (0267): a typo'd image
+        /// name among several valid ones still removes every valid
+        /// one here, rather than aborting the whole call.
+        references: Vec<String>,
         /// Also remove any container still using this image (killing
         /// it first if still running), instead of refusing.
         #[arg(short, long)]
@@ -1846,7 +1854,9 @@ fn main() -> std::process::ExitCode {
                 timestamp,
             ),
             Some(Command::Images { quiet, filter }) => cmd_images(quiet, cli.global.json, &filter),
-            Some(Command::Rmi { reference, force }) => cmd_rmi(&reference, force, cli.global.json),
+            Some(Command::Rmi { references, force }) => {
+                cmd_rmi(&references, force, cli.global.json)
+            }
             Some(Command::Tag { source, target }) => cmd_tag(&source, &target, cli.global.json),
             Some(Command::History { reference }) => cmd_history(&reference, cli.global.json),
             Some(Command::Prune { all, filter }) => cmd_prune(cli.global.json, all, &filter),
@@ -2726,8 +2736,38 @@ fn display_reference(reference: &str) -> &str {
     }
 }
 
-/// Remove an image from local storage — see [`Command::Rmi`]'s own
-/// doc comment for the exact `--force` policy. Matches real `docker
+/// One reference's own full [`rmi_one`] outcome -- every real
+/// reference actually removed from storage (primary first, raw, not
+/// yet display-mapped) plus any dependent containers removed
+/// alongside it (`--force` only).
+struct RmiOutcome {
+    references_removed: Vec<String>,
+    removed_containers: Vec<String>,
+}
+
+impl RmiOutcome {
+    /// The `--json` shape for this one outcome -- see [`RmiResult`]'s
+    /// own doc comment for why `<none>` (never the raw internal
+    /// sentinel) is what an untagged reference serializes as.
+    fn to_result(&self) -> RmiResult {
+        let display_or_none = |r: &str| (!is_untagged_reference(r)).then(|| r.to_string());
+        let (primary, rest) = self
+            .references_removed
+            .split_first()
+            .expect("at least the resolved image's own reference is always present");
+        RmiResult {
+            reference: display_or_none(primary),
+            additional_references_removed: rest.iter().map(|r| display_or_none(r)).collect(),
+            removed_containers: self.removed_containers.clone(),
+        }
+    }
+}
+
+/// Remove one image reference from local storage — the real, full
+/// per-reference `ociman rmi` logic (resolve, sibling-tag ambiguity
+/// gate, dependent-container gate, actual removal), shared by every
+/// reference [`cmd_rmi`] is given. See [`Command::Rmi`]'s own doc
+/// comment for the exact `--force` policy. Matches real `docker
 /// rmi`/`podman rmi`'s own refusal to remove an image a container
 /// still depends on: unlike a plain tag/reference removal, silently
 /// untagging an image out from under an existing container (even a
@@ -2751,9 +2791,13 @@ fn display_reference(reference: &str) -> &str {
 /// docker/podman both only ever untag the one name given that way,
 /// checked directly the same way, regardless of how many sibling tags
 /// exist.
-fn cmd_rmi(reference_str: &str, force: bool, json: bool) -> anyhow::Result<()> {
-    let store = open_store()?;
-    let resolved = resolve_image_by_reference_or_id(&store, reference_str)?
+fn rmi_one(
+    store: &Store,
+    containers: &StateStore,
+    reference_str: &str,
+    force: bool,
+) -> anyhow::Result<RmiOutcome> {
+    let resolved = resolve_image_by_reference_or_id(store, reference_str)?
         .ok_or_else(|| anyhow::anyhow!("{reference_str}: no such image in local storage"))?;
 
     let references_to_remove: Vec<String> = match &resolved {
@@ -2781,7 +2825,6 @@ fn cmd_rmi(reference_str: &str, force: bool, json: bool) -> anyhow::Result<()> {
         }
     };
 
-    let containers = open_container_store()?;
     let dependents: Vec<String> = containers
         .list()
         .context("listing containers")?
@@ -2803,7 +2846,7 @@ fn cmd_rmi(reference_str: &str, force: bool, json: bool) -> anyhow::Result<()> {
             dependents.join(", ")
         );
         for id in &dependents {
-            remove_container(&containers, id, true)
+            remove_container(containers, id, true)
                 .with_context(|| format!("removing dependent container {id} (--force)"))?;
         }
     }
@@ -2814,21 +2857,53 @@ fn cmd_rmi(reference_str: &str, force: bool, json: bool) -> anyhow::Result<()> {
             .with_context(|| format!("removing {reference}"))?;
     }
 
-    let (primary, rest) = references_to_remove
-        .split_first()
-        .expect("at least the resolved image's own reference is always present");
-    if json {
-        let display_or_none = |r: &str| (!is_untagged_reference(r)).then(|| r.to_string());
-        oci_cli_common::output::print_json(&RmiResult {
-            reference: display_or_none(primary),
-            additional_references_removed: rest.iter().map(|r| display_or_none(r)).collect(),
-            removed_containers: dependents,
-        })?;
-    } else {
-        for reference in &references_to_remove {
-            println!("{}", display_reference(reference));
+    Ok(RmiOutcome {
+        references_removed: references_to_remove,
+        removed_containers: dependents,
+    })
+}
+
+/// `ociman rmi <ref1> [ref2...]` — see [`Command::Rmi`]'s own doc
+/// comment for exactly why one reference's own failure never blocks
+/// the others (a real, checked-directly *different* policy than
+/// `ociman rm`'s own all-or-nothing preflight for multiple explicit
+/// container IDs, 0267).
+fn cmd_rmi(references: &[String], force: bool, json: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(!references.is_empty(), "no image reference given");
+    let store = open_store()?;
+    let containers = open_container_store()?;
+
+    let mut outcomes = Vec::with_capacity(references.len());
+    let mut had_error = false;
+    for reference_str in references {
+        match rmi_one(&store, &containers, reference_str, force) {
+            Ok(outcome) => {
+                if !json {
+                    for reference in &outcome.references_removed {
+                        println!("{}", display_reference(reference));
+                    }
+                }
+                outcomes.push(outcome);
+            }
+            Err(e) => {
+                had_error = true;
+                eprintln!("error removing {reference_str}: {e:#}");
+            }
         }
     }
+
+    if json {
+        if references.len() == 1 {
+            if let Some(outcome) = outcomes.first() {
+                oci_cli_common::output::print_json(&outcome.to_result())?;
+            }
+        } else {
+            let results: Vec<RmiResult> = outcomes.iter().map(RmiOutcome::to_result).collect();
+            oci_cli_common::output::print_json(&results)?;
+        }
+    }
+
+    anyhow::ensure!(!had_error, "one or more images failed to be removed");
     Ok(())
 }
 

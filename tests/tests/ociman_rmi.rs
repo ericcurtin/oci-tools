@@ -616,3 +616,180 @@ fn rmi_by_id_shows_none_not_the_raw_sentinel_for_an_untagged_sibling() {
     );
     assert!(store.resolve_image(&sentinel).unwrap().is_none());
 }
+
+/// `ociman rmi ref1 ref2` (0269) removes multiple explicit image
+/// references in one call, matching real `podman rmi ref1 ref2`
+/// exactly.
+#[test]
+fn rmi_accepts_multiple_references_and_removes_them_all() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rmi-multi-a:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/rmi-multi-b:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let rmi = ociman(
+        storage_dir.path(),
+        &[
+            "rmi",
+            "ociman-test/rmi-multi-a:latest",
+            "ociman-test/rmi-multi-b:latest",
+        ],
+    );
+    assert!(
+        rmi.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rmi.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rmi.stdout).trim().lines().count(),
+        2,
+        "{rmi:?}"
+    );
+
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-multi-a:latest")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-multi-b:latest")
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A real, checked-directly *different* policy than `ociman rm`'s own
+/// all-or-nothing preflight (0267): one unresolvable reference among
+/// otherwise-valid ones does *not* block removing the others — real
+/// `podman rmi valid1 bogus valid2` (verified directly) still removes
+/// both `valid1` and `valid2`, only refusing `bogus`.
+#[test]
+fn rmi_with_one_unresolvable_reference_still_removes_the_others() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rmi-multi-bogus-a:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/rmi-multi-bogus-b:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let rmi = ociman(
+        storage_dir.path(),
+        &[
+            "rmi",
+            "ociman-test/rmi-multi-bogus-a:latest",
+            "ociman-test/does-not-exist:latest",
+            "ociman-test/rmi-multi-bogus-b:latest",
+        ],
+    );
+    assert!(
+        !rmi.status.success(),
+        "the one unresolvable reference's own failure should still surface"
+    );
+    assert!(
+        String::from_utf8_lossy(&rmi.stderr).contains("no such image"),
+        "{}",
+        String::from_utf8_lossy(&rmi.stderr)
+    );
+
+    // Both real, valid images are still removed despite the bogus one
+    // in between them -- a genuinely different policy than `ociman
+    // rm`'s own all-or-nothing preflight for multiple container IDs.
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-multi-bogus-a:latest")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/rmi-multi-bogus-b:latest")
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// `ociman --json rmi ref1 ref2` with more than one reference prints a
+/// JSON *array* of results (one per reference), while the single-
+/// reference case (every pre-existing test above) keeps its original,
+/// unwrapped single-object shape unchanged for backward compatibility.
+#[test]
+fn rmi_json_with_multiple_references_prints_an_array() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rmi-multi-json-a:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/rmi-multi-json-b:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let rmi = ociman(
+        storage_dir.path(),
+        &[
+            "--json",
+            "rmi",
+            "ociman-test/rmi-multi-json-a:latest",
+            "ociman-test/rmi-multi-json-b:latest",
+        ],
+    );
+    assert!(
+        rmi.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rmi.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&rmi.stdout).unwrap();
+    let array = view.as_array().expect("a JSON array for multiple refs");
+    assert_eq!(array.len(), 2, "{view:?}");
+    assert_eq!(
+        array[0]["reference"],
+        "docker.io/ociman-test/rmi-multi-json-a:latest"
+    );
+    assert_eq!(
+        array[1]["reference"],
+        "docker.io/ociman-test/rmi-multi-json-b:latest"
+    );
+}

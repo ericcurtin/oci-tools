@@ -83,8 +83,10 @@ Full workspace: `cargo build`/`test --workspace`, `cargo fmt --all
 
 Real podman's own broader `images --filter` set (`reference`,
 `before`/`since`, `id`, `intermediate`, etc.) remains a real,
-similarly-scoped next candidate, as does `ociman rmi` gaining the same
-`--filter`-driven bulk-removal shape `ociman prune`/`images` now both
-share.
+similarly-scoped next candidate. (This note previously speculated
+`ociman rmi` might gain a `--filter`-driven bulk-removal shape too —
+checked directly in `0269`, real `podman rmi` has no `--filter` at
+all, so that idea was retracted there in favor of `rmi`'s own real,
+checked-directly gap: multiple explicit references in one call.)
 </content>
 </invoke>
