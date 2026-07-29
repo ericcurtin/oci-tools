@@ -1190,6 +1190,19 @@ enum Command {
         /// `create --label`, 0274 — image-inherited plus any
         /// explicit `--label`), same as `--all`/`id=`/`name=`: an
         /// ordinary additional constraint, not a visibility override.
+        /// Also `before=<container>`/`since=<container>` — matching
+        /// real `podman ps --filter before=`/`since=`'s own checked-
+        /// directly semantics exactly: `before=X` keeps only
+        /// containers created *strictly earlier* than `X`'s own
+        /// creation time; `since=X` keeps only ones created *strictly
+        /// later*. Multiple values for the same key take the
+        /// *earliest* of all the given reference containers' own
+        /// creation times (matches real podman's own checked-directly
+        /// behavior — a somewhat unusual rule, verified directly
+        /// rather than assumed from source alone). An unresolvable
+        /// reference container is a clear error. Same visibility-rule
+        /// treatment as `id=`/`name=`/`label=`: an ordinary additional
+        /// constraint, not a visibility override.
         #[arg(short, long = "filter")]
         filter: Vec<String>,
     },
@@ -4996,6 +5009,14 @@ struct PsFilters {
     /// different container-specific `MatchLabelFilters` (checked
     /// directly, see `docs/design/0274`'s own research note).
     labels: Vec<LabelFilter>,
+    /// `before=<container>`, each a raw reference/id string (resolved
+    /// once, in `cmd_ps`, since resolving needs the full container
+    /// store) -- multiple values use the *earliest* of their own
+    /// resolved creation times, matching real podman's own checked-
+    /// directly behavior (see `Command::Ps`'s own doc comment).
+    before: Vec<String>,
+    /// `since=<container>`, same shape as [`Self::before`].
+    since: Vec<String>,
 }
 
 /// Parse `ociman ps`'s own `--filter` values into a [`PsFilters`].
@@ -5026,20 +5047,81 @@ fn parse_ps_filters(filters: &[String]) -> anyhow::Result<PsFilters> {
             parsed.name.push(value.to_string());
         } else if let Some(result) = try_parse_label_filter("ociman ps", f) {
             parsed.labels.push(result?);
+        } else if let Some(value) = f.strip_prefix("before=") {
+            anyhow::ensure!(
+                !value.is_empty(),
+                "ociman ps: --filter {f:?} is missing a value"
+            );
+            parsed.before.push(value.to_string());
+        } else if let Some(value) = f.strip_prefix("since=") {
+            anyhow::ensure!(
+                !value.is_empty(),
+                "ociman ps: --filter {f:?} is missing a value"
+            );
+            parsed.since.push(value.to_string());
         } else {
             anyhow::bail!(
                 "ociman ps: --filter {f:?} is not yet supported (only status=<creating|created|\
-                 running|stopped|paused>, id=<prefix>, name=<substring>, or label=<key>[=<value>]\
-                 /label!=<key>[=<value>] are)"
+                 running|stopped|paused>, id=<prefix>, name=<substring>, label=<key>[=<value>]/\
+                 label!=<key>[=<value>], before=<container>, or since=<container> are)"
             );
         }
     }
     Ok(parsed)
 }
 
+/// Resolve `reference` (a container id/`--name`, `before=`/`since=`'s
+/// own value) to its real, recorded creation time -- matching real
+/// podman's own `LookupContainer(filterValue).CreatedTime()`.
+fn resolve_container_created(
+    containers: &StateStore,
+    reference: &str,
+) -> anyhow::Result<std::time::SystemTime> {
+    let id = resolve_container_id(containers, reference)
+        .with_context(|| format!("resolving --filter before=/since= reference {reference:?}"))?;
+    let state = containers.load(&id)?;
+    oci_spec_types::time::parse_rfc3339_utc(&state.created).ok_or_else(|| {
+        anyhow::anyhow!(
+            "container {reference:?}'s own recorded creation time {:?} isn't a valid RFC3339 \
+             timestamp",
+            state.created
+        )
+    })
+}
+
+/// The *earliest* creation time among every reference container in
+/// `references` -- matching real podman's own checked-directly rule
+/// for multiple `before=`/`since=` values (see `Command::Ps`'s own
+/// doc comment for why).
+fn earliest_referenced_creation(
+    containers: &StateStore,
+    references: &[String],
+) -> anyhow::Result<std::time::SystemTime> {
+    references
+        .iter()
+        .map(|r| resolve_container_created(containers, r))
+        .try_fold(None::<std::time::SystemTime>, |earliest, created| {
+            let created = created?;
+            Ok(Some(match earliest {
+                Some(e) if e < created => e,
+                _ => created,
+            }))
+        })
+        .map(|earliest| earliest.expect("references is non-empty when this is called"))
+}
+
 fn cmd_ps(all: bool, quiet: bool, json: bool, filter: &[String]) -> anyhow::Result<()> {
     let filters = parse_ps_filters(filter)?;
     let containers = open_container_store()?;
+    // Resolved once, up front (each reference container needs a real
+    // store lookup) -- not inside the per-container filter closure
+    // below, which must stay infallible.
+    let before_threshold = (!filters.before.is_empty())
+        .then(|| earliest_referenced_creation(&containers, &filters.before))
+        .transpose()?;
+    let since_threshold = (!filters.since.is_empty())
+        .then(|| earliest_referenced_creation(&containers, &filters.since))
+        .transpose()?;
     let mut views: Vec<ContainerView> = containers
         .list()
         .context("listing containers")?
@@ -5100,6 +5182,21 @@ fn cmd_ps(all: bool, quiet: bool, json: bool, filter: &[String]) -> anyhow::Resu
                     .and_then(|raw| serde_json::from_str(raw).ok())
                     .unwrap_or_default();
                 if !filters.labels.iter().all(|f| f.matches(&labels)) {
+                    return false;
+                }
+            }
+            // `before=`/`since=` are ordinary additional constraints
+            // too, same visibility-rule treatment as `id=`/`name=`/
+            // `label=` above -- matching real podman's own strictly-
+            // earlier/strictly-later comparison exactly.
+            if before_threshold.is_some() || since_threshold.is_some() {
+                let Some(created) = oci_spec_types::time::parse_rfc3339_utc(&s.created) else {
+                    return false;
+                };
+                if before_threshold.is_some_and(|t| created >= t) {
+                    return false;
+                }
+                if since_threshold.is_some_and(|t| created <= t) {
                     return false;
                 }
             }

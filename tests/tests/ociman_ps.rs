@@ -1005,3 +1005,107 @@ fn ps_filter_label_multiple_values_are_anded_together() {
     assert!(no_all.status.success());
     assert!(String::from_utf8_lossy(&no_all.stdout).trim().is_empty());
 }
+
+/// `ociman ps --filter before=`/`since=` (0280), matching real `podman
+/// ps --filter before=`/`since=`'s own checked-directly semantics
+/// exactly: `before=X` keeps only containers created strictly earlier
+/// than `X`, `since=X` strictly later. Also checks the real, somewhat
+/// unusual multi-value rule: multiple `before=`/`since=` values use
+/// the *earliest* of all the given reference containers' own creation
+/// times (checked directly against a real installed `podman ps`).
+#[test]
+fn ps_filter_before_and_since_use_the_referenced_containers_own_creation_time() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-filter-before-since:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = |name: &str| {
+        let out = ociman(
+            storage_dir.path(),
+            &[
+                "create",
+                "--name",
+                name,
+                "ociman-test/ps-filter-before-since:latest",
+                "true",
+            ],
+        );
+        assert!(out.status.success(), "{out:?}");
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+    };
+    create("ctr1");
+    create("ctr2");
+    create("ctr3");
+
+    let before = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "before=ctr2", "-q"],
+    );
+    assert!(before.status.success(), "{before:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&before.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "expected only ctr1, created strictly before ctr2: {before:?}"
+    );
+
+    let since = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "since=ctr2", "-q"],
+    );
+    assert!(since.status.success(), "{since:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&since.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "expected only ctr3, created strictly after ctr2: {since:?}"
+    );
+
+    // Multiple `before=` values: the *earliest* of ctr2/ctr3's own
+    // creation times is ctr2's -- same result as `before=ctr2` alone.
+    let before_multi = ociman(
+        storage_dir.path(),
+        &[
+            "ps",
+            "-a",
+            "--filter",
+            "before=ctr2",
+            "--filter",
+            "before=ctr3",
+            "-q",
+        ],
+    );
+    assert!(before_multi.status.success(), "{before_multi:?}");
+    assert_eq!(before_multi.stdout, before.stdout, "{before_multi:?}");
+
+    // An unresolvable reference container is a clear error.
+    let bad_ref = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "before=does-not-exist"],
+    );
+    assert!(!bad_ref.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad_ref.stderr).contains("does not exist"),
+        "{bad_ref:?}"
+    );
+
+    // Unlike `status=`, `before=`/`since=` alone (no `-a`) don't
+    // override the default running-only visibility rule.
+    let no_all = ociman(storage_dir.path(), &["ps", "--filter", "before=ctr2", "-q"]);
+    assert!(no_all.status.success());
+    assert!(String::from_utf8_lossy(&no_all.stdout).trim().is_empty());
+}
