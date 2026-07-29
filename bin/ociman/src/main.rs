@@ -20,6 +20,7 @@ mod rootfs_setup;
 mod user_resolve;
 mod volume;
 
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -1568,20 +1569,28 @@ enum Command {
         #[command(subcommand)]
         command: VolumeCommand,
     },
-    /// A single, one-shot resource-usage sample for a running
-    /// container's own real cgroup — matching real `podman stats
-    /// --no-stream`'s own single-call semantics exactly (see the
-    /// `cmd_stats` doc comment for the one, deliberately narrow gap:
-    /// the real default *continuous* streaming mode isn't implemented
-    /// yet, and is a clear, loud error instead of a silent behavioral
-    /// difference — see `docs/design/0145`).
+    /// A live stream of a running container's own real resource
+    /// usage, matching real `podman stats`'s own default continuous
+    /// mode exactly (0284; `docs/design/0145` originally shipped only
+    /// `--no-stream`'s one-shot sample) — see the `cmd_stats` doc
+    /// comment for exactly how the stream ends.
     Stats {
         /// The container's ID or `--name`.
         id: String,
-        /// Required for now — see the `Stats` variant's own doc
-        /// comment.
+        /// A single, one-shot sample instead of a continuous stream
+        /// — matching real `podman stats --no-stream` exactly.
         #[arg(long)]
         no_stream: bool,
+        /// Seconds between stats reports in the default (streaming)
+        /// mode, matching real `podman stats --interval`'s own
+        /// identical `5`-second default exactly.
+        #[arg(short, long, default_value_t = 5)]
+        interval: u64,
+        /// Disable clearing the screen between reports in the default
+        /// (streaming) mode, matching real `podman stats --no-reset`
+        /// exactly.
+        #[arg(long)]
+        no_reset: bool,
     },
     /// Block until one or more containers stop, then print each one's
     /// own real exit code, one per line, in the order given — matching
@@ -2099,7 +2108,12 @@ fn main() -> std::process::ExitCode {
                 VolumeCommand::Rm { name, force } => cmd_volume_rm(&name, force),
                 VolumeCommand::Prune => cmd_volume_prune(cli.global.json),
             },
-            Some(Command::Stats { id, no_stream }) => cmd_stats(&id, no_stream, cli.global.json),
+            Some(Command::Stats {
+                id,
+                no_stream,
+                interval,
+                no_reset,
+            }) => cmd_stats(&id, no_stream, interval, no_reset, cli.global.json),
             Some(Command::Wait {
                 ids,
                 interval,
@@ -7367,18 +7381,23 @@ struct ContainerStatsView {
 /// a clear, loud error instead of silently behaving differently from
 /// the real command (matches this project's own already-established
 /// "loud error over silently-wrong behavior" convention).
-fn cmd_stats(id: &str, no_stream: bool, json: bool) -> anyhow::Result<()> {
-    if !no_stream {
-        anyhow::bail!(
-            "ociman stats: continuous (streaming) mode isn't implemented yet -- pass --no-stream"
-        );
-    }
-
-    let containers = open_container_store()?;
-    let resolved = resolve_container_id(&containers, id)?;
+/// One real, one-shot resource-usage sample for a running container's
+/// own cgroup — shared by both `ociman stats --no-stream` (a single
+/// call) and the default continuous-streaming mode (0284, a loop
+/// around this same call). Returns `Ok(None)` when the container is
+/// no longer running: a legitimate, honest way to end a stream (see
+/// `cmd_stats`'s own doc comment) rather than an error, since callers
+/// that instead want a hard "must be running" refusal (the
+/// `--no-stream` case) already have the container's own already-
+/// distinguished not-running status to report themselves.
+fn sample_container_stats(
+    containers: &StateStore,
+    id: &str,
+) -> anyhow::Result<Option<ContainerStatsView>> {
+    let resolved = resolve_container_id(containers, id)?;
     let state = containers.load(&resolved)?;
     if state.effective_status() != Status::Running {
-        anyhow::bail!("container {id:?} is not running");
+        return Ok(None);
     }
     let pid = state
         .pid
@@ -7415,7 +7434,7 @@ fn cmd_stats(id: &str, no_stream: bool, json: bool) -> anyhow::Result<()> {
         (mem_usage as f64 / mem_limit as f64) * 100.0
     };
 
-    let view = ContainerStatsView {
+    Ok(Some(ContainerStatsView {
         id: state.id.clone(),
         name: state.annotations.get(ANNOTATION_NAME).cloned(),
         cpu_percent,
@@ -7423,12 +7442,12 @@ fn cmd_stats(id: &str, no_stream: bool, json: bool) -> anyhow::Result<()> {
         mem_limit,
         mem_percent,
         pids,
-    };
+    }))
+}
 
-    if json {
-        oci_cli_common::output::print_json(&view)?;
-        return Ok(());
-    }
+/// `ociman stats`'s own plain-text table, one header/one data row --
+/// shared by `--no-stream` and the streaming loop alike.
+fn print_stats_table(view: &ContainerStatsView) {
     println!(
         "{:<14} {:<20} {:<10} {:<24} {:<8}PIDS",
         "ID", "NAME", "CPU %", "MEM USAGE / LIMIT", "MEM %"
@@ -7446,7 +7465,60 @@ fn cmd_stats(id: &str, no_stream: bool, json: bool) -> anyhow::Result<()> {
         format!("{:.2}%", view.mem_percent),
         view.pids
     );
-    Ok(())
+}
+
+/// A single, one-shot resource-usage sample (`--no-stream`, matching
+/// real `podman stats --no-stream` exactly), or a real, continuous
+/// stream (0284, the real default `podman stats` behavior this
+/// project didn't implement before): redraws the same one-shot
+/// sample every `--interval` seconds (default 5, matching real
+/// podman's own identical default), clearing the screen first when
+/// stdout is a real terminal (checked directly against real podman's
+/// own `common.ClearScreen`'s own identical `IsTerminal` guard) unless
+/// `--no-reset` is given. The stream ends cleanly, not as an error,
+/// the moment the target container is no longer running — the same
+/// honest "nothing to report" reasoning `sample_container_stats`'s
+/// own doc comment gives, here surfacing as a clean exit rather than
+/// a silently-repeating failure. Otherwise runs until interrupted
+/// (e.g. `Ctrl+C`), the same as real `podman stats`'s own default —
+/// no special signal handling needed, matching a plain foreground
+/// loop's already-correct behavior under an unhandled `SIGINT`.
+fn cmd_stats(
+    id: &str,
+    no_stream: bool,
+    interval: u64,
+    no_reset: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+
+    if no_stream {
+        let view = sample_container_stats(&containers, id)?
+            .ok_or_else(|| anyhow::anyhow!("container {id:?} is not running"))?;
+        if json {
+            oci_cli_common::output::print_json(&view)?;
+        } else {
+            print_stats_table(&view);
+        }
+        return Ok(());
+    }
+
+    let is_terminal = std::io::stdout().is_terminal();
+    loop {
+        let Some(view) = sample_container_stats(&containers, id)? else {
+            println!("container {id:?} is no longer running");
+            return Ok(());
+        };
+        if !no_reset && is_terminal {
+            print!("\x1b[2J\x1b[1;1H");
+        }
+        if json {
+            oci_cli_common::output::print_json(&view)?;
+        } else {
+            print_stats_table(&view);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(interval));
+    }
 }
 
 /// A human-readable, decimal-SI byte size (`"65.54kB"`, `"128.5GB"`,

@@ -259,10 +259,73 @@ fn stats_without_no_stream_is_a_clear_error() {
     let out = ociman(storage_dir.path(), &["stats", "does-not-exist"]);
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("no-stream"),
+        String::from_utf8_lossy(&out.stderr).contains("does not exist"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// `ociman stats` (0284, default continuous mode, no `--no-stream`):
+/// streams real samples on a real, short-lived running container,
+/// then ends cleanly (a real success, not an error) the moment the
+/// container itself stops — matching real `podman stats`'s own
+/// default behavior exactly (checked directly against a real
+/// installed `podman stats --help`: `--interval`'s own real `5`
+/// second default, `--no-reset` for disabling the screen-clear).
+/// `--interval 1` here keeps this test itself fast without changing
+/// what's actually being verified.
+#[test]
+fn stats_streams_real_samples_and_ends_cleanly_once_the_container_stops() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stats-stream:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/stats-stream:latest",
+        &["/bin/sleep", "2"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let stats = ociman(
+        storage_dir.path(),
+        &["stats", "--interval", "1", "--no-reset", &id],
+    );
+    assert!(
+        stats.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stats.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&stats.stdout);
+    // At least one real sample was printed (the table header/row this
+    // project's own `--no-stream` mode already established, unchanged
+    // here) before the stream ended.
+    assert!(stdout.contains("CPU %"), "got: {stdout:?}");
+    assert!(
+        stdout.contains("is no longer running"),
+        "the stream should end with a real, honest message once the container stops: {stdout:?}"
+    );
+
+    run.wait().unwrap();
 }
 
 /// `stats` against a container that has already stopped is a clear,
