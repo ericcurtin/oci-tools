@@ -254,3 +254,64 @@ fn healthcheck_run_actually_execs_the_test_and_reports_the_real_result() {
     ociman(storage_dir.path(), &["kill", &id]);
     child.wait().ok();
 }
+
+/// `HealthcheckConfig.timeout` (0308, closing `0172`'s own honestly-
+/// flagged gap): a genuinely hung test is killed once the configured
+/// timeout elapses and reported `unhealthy`, rather than blocking
+/// `ociman healthcheck run` itself for the test's own full duration —
+/// verified by giving the test a real `sleep 30` (30s) but a
+/// `--timeout` an order of magnitude shorter, and asserting the whole
+/// command completes well under that 30s window.
+#[test]
+fn healthcheck_run_kills_a_hung_test_once_its_own_timeout_elapses() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/healthcheck-timeout:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 30".to_string(),
+            ]),
+            healthcheck: Some(HealthcheckConfig {
+                test: vec!["CMD-SHELL".to_string(), "sleep 30; exit 0".to_string()],
+                // 1 second, in nanoseconds -- real Docker/OCI wire
+                // format, matching `HealthcheckConfig::timeout`'s own
+                // doc comment.
+                timeout: 1_000_000_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let mut child = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/healthcheck-timeout:latest",
+        &["-d"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20));
+
+    let before = Instant::now();
+    let result = ociman(storage_dir.path(), &["healthcheck", "run", &id]);
+    let elapsed = before.elapsed();
+    assert!(!result.status.success());
+    assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "unhealthy");
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "should have been killed around the declared 1s timeout, not the test's own full 30s \
+         sleep: took {elapsed:?}"
+    );
+
+    ociman(storage_dir.path(), &["kill", &id]);
+    child.wait().ok();
+}

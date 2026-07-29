@@ -130,6 +130,12 @@ fn exec_run(args: &[String]) -> anyhow::Result<i32> {
         // `preserve_fds: 0` -- real CRI's `ExecSyncRequest` has no
         // equivalent field at all.
         preserve_fds: 0,
+        // This helper's own caller already enforces `ExecSyncRequest.
+        // timeout` at the process-group level (see this function's
+        // own doc comment above, "one negative-pid SIGKILL on
+        // timeout") -- a second, inner deadline here would be
+        // redundant.
+        timeout: None,
     };
 
     // SAFETY: this process is genuinely single-threaded here -- just

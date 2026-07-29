@@ -1204,6 +1204,10 @@ fn cmd_exec(
         env: effective_env,
         args: args.to_vec(),
         preserve_fds,
+        // `ocirun exec` has no `--timeout` flag of its own, matching
+        // real `crun exec`/`runc exec`'s own identical lack of one
+        // (checked directly).
+        timeout: None,
     };
 
     // SAFETY: `ocirun`'s own process has not spawned any additional

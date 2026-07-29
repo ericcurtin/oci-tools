@@ -8380,12 +8380,12 @@ fn healthcheck_exec_args(test: &[String]) -> Option<Vec<String>> {
 /// persisted health-check log/state at all (real podman's own
 /// `processHealthCheckStatus` — a separate, much larger feature: a
 /// real per-container log file, retry-streak tracking, and `--health-
-/// on-failure` actions), no startup-healthcheck distinction (this
+/// on-failure` actions), and no startup-healthcheck distinction (this
 /// project's own `HealthcheckConfig` has no separate startup variant
-/// at all), and — the one real, honestly-flagged gap, not silently
-/// dropped — the configured `Timeout` is not enforced: a genuinely
-/// hung test currently blocks this command itself rather than being
-/// killed and reported `unhealthy` (see `docs/design/0172`).
+/// at all). The configured `Timeout` — `0172`'s own real, honestly-
+/// flagged gap — is enforced now (0308): a genuinely hung test is
+/// killed (`SIGKILL`) once it elapses and reported `unhealthy`, rather
+/// than blocking this command forever.
 fn cmd_healthcheck_run(id: &str, ignore_result: bool) -> anyhow::Result<()> {
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)?;
@@ -8415,13 +8415,27 @@ fn cmd_healthcheck_run(id: &str, ignore_result: bool) -> anyhow::Result<()> {
     let image_config = store
         .image_config(&base_record)
         .with_context(|| format!("reading config for {base_reference}"))?;
-    let test_args = image_config
+    let healthcheck = image_config
         .config
         .as_ref()
-        .and_then(|c| c.healthcheck.as_ref())
-        .and_then(|hc| healthcheck_exec_args(&hc.test));
+        .and_then(|c| c.healthcheck.as_ref());
+    let test_args = healthcheck.and_then(|hc| healthcheck_exec_args(&hc.test));
     let Some(test_args) = test_args else {
         anyhow::bail!("container {id:?} has no healthcheck defined");
+    };
+    // `HealthcheckConfig.timeout` (0308, closing `0172`'s own honestly-
+    // flagged gap): `0` means "not declared" (`ociman build`/real
+    // Docker's own wire format never fills in a default at image-build
+    // time), which this project fills in with real podman's own
+    // documented `DefaultHealthCheckTimeout` (`~/git/podman/libpod/
+    // define/healthchecks.go`) — real podman bakes that same default
+    // into a *container's* own persisted config at `create` time
+    // (`specgen`), which this project has no equivalent persisted-
+    // resolved-healthcheck-config step for yet, so it's applied here
+    // instead, at the one place that actually needs it.
+    let timeout = match healthcheck.map(|hc| hc.timeout) {
+        Some(nanos) if nanos > 0 => std::time::Duration::from_nanos(nanos as u64),
+        _ => std::time::Duration::from_secs(30),
     };
 
     let pid = state
@@ -8455,6 +8469,7 @@ fn cmd_healthcheck_run(id: &str, ignore_result: bool) -> anyhow::Result<()> {
         // `--preserve-fds` flag of its own (real `podman healthcheck
         // run` doesn't either).
         preserve_fds: 0,
+        timeout: Some(timeout),
     };
 
     // SAFETY: `ociman`'s own process has not spawned any additional
@@ -10077,6 +10092,10 @@ fn cmd_exec(
         // flag of its own, matching real `podman exec`'s own
         // identical lack of one (checked directly, 0276).
         preserve_fds: 0,
+        // `ociman exec` has no `--timeout` flag of its own, matching
+        // real `podman exec`'s own identical lack of one (checked
+        // directly).
+        timeout: None,
     };
 
     // SAFETY: `ociman`'s own process has not spawned any additional

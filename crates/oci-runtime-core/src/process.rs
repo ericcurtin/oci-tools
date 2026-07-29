@@ -188,6 +188,33 @@ pub fn wait(pid: i32) -> io::Result<i32> {
     Ok(status)
 }
 
+/// Non-blocking `waitpid(2)` for `pid` (`WNOHANG`, retrying on
+/// `EINTR`): `Some(status)` if it has already exited, `None` if it's
+/// still running. Shared by [`crate::exec`]'s own `--timeout`
+/// enforcement (0308), which polls this in a loop with a real
+/// deadline the same way `hooks::wait_with_timeout` already polls
+/// `std::process::Child::try_wait` for a hook's own `Timeout` — this
+/// is the equivalent primitive for a bare, `fork`ed pid with no
+/// `std::process::Child` handle to poll at all.
+pub fn try_wait(pid: i32) -> io::Result<Option<i32>> {
+    let mut status: i32 = 0;
+    loop {
+        // SAFETY: same as `wait`'s own note, plus `WNOHANG` itself
+        // never blocks: a still-running child reports `0`, not `-1`.
+        let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if ret == 0 {
+            return Ok(None);
+        }
+        if ret > 0 {
+            return Ok(Some(status));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
 /// `kill(2)`: send `signal` to `pid`. A raw syscall (not `rustix::
 /// process::kill_process`, which only accepts its own typed `Signal`
 /// enum) so any numeric signal a caller asks for — including ones with
@@ -336,6 +363,23 @@ mod tests {
         let pid = unsafe { fork(|| exit_with(42)) }.unwrap();
         let status = wait(pid).unwrap();
         assert_eq!(exit_code_from_wait_status(status), 42);
+    }
+
+    #[test]
+    fn try_wait_reports_none_while_a_child_is_still_running_then_its_real_status() {
+        let pid = unsafe {
+            fork(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                exit_with(0);
+            })
+        }
+        .unwrap();
+        assert_eq!(try_wait(pid).unwrap(), None, "the child is still sleeping");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let status = try_wait(pid)
+            .unwrap()
+            .expect("the child should have exited by now");
+        assert_eq!(exit_code_from_wait_status(status), 0);
     }
 
     #[test]

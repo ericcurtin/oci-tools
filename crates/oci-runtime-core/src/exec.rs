@@ -59,14 +59,29 @@ pub struct ExecRequest {
     /// previously-missing fd-leak gap `0291` closed for `run`/
     /// `create` also existed here, independently, until now.
     pub preserve_fds: u32,
+    /// A real deadline for this exec'd process (0308) — `None` (every
+    /// caller except `ociman healthcheck run`) waits forever, matching
+    /// this function's own pre-existing behavior exactly. `Some(d)`
+    /// kills (`SIGKILL`) and reaps the process if it hasn't exited on
+    /// its own within `d`, matching real `docker`/`podman healthcheck
+    /// run`'s own "a hung check counts as unhealthy" semantics: the
+    /// resulting exit code is the same `128 + SIGKILL` a shell would
+    /// report for any other signal-killed process (see
+    /// [`process::exit_code_from_wait_status`]), which every existing
+    /// caller of this function already treats as "nonzero, not
+    /// healthy" with no code changes needed downstream.
+    pub timeout: Option<std::time::Duration>,
 }
 
 /// Run `request.args` as a new process inside the already-running
 /// container whose init process is `pid`, joining `request.namespaces`
 /// and applying `request.user`/`capabilities`/`no_new_privileges`/
 /// `cwd`/`env`. Returns the same exit code the exec'd process would
-/// report to its own shell, or one of `launch`'s own `*_EXIT_CODE`
-/// constants if `oci-tools` itself failed before it ever ran.
+/// report to its own shell, one of `launch`'s own `*_EXIT_CODE`
+/// constants if `oci-tools` itself failed before it ever ran, or (if
+/// `request.timeout` was given and elapsed first) the same `128 +
+/// SIGKILL` code a shell reports for any other signal-killed process
+/// — see [`ExecRequest::timeout`]'s own doc comment.
 ///
 /// # Safety
 ///
@@ -86,7 +101,14 @@ pub unsafe fn exec(pid: i32, request: ExecRequest) -> io::Result<i32> {
     // own doc comment on why joining anything first would make some
     // of these paths unreadable.
     let opened = nsenter::open_all(pid, &request.namespaces)?;
-    let needs_pid_relay = request.namespaces.contains(&NamespaceType::Pid);
+    // A real `timeout` (0308) also needs the inner-fork relay, even
+    // when no PID namespace join is otherwise required: the deadline-
+    // aware wait lives entirely inside `ExecSetup::run`'s own relay
+    // branch (see its doc comment), so that's the one place a timeout
+    // can actually be enforced regardless of which namespaces are
+    // joined.
+    let needs_pid_relay =
+        request.namespaces.contains(&NamespaceType::Pid) || request.timeout.is_some();
 
     let setup = ExecSetup {
         opened,
@@ -98,6 +120,7 @@ pub unsafe fn exec(pid: i32, request: ExecRequest) -> io::Result<i32> {
         env: request.env,
         args: request.args,
         preserve_fds: request.preserve_fds,
+        timeout: request.timeout,
     };
 
     // SAFETY: forwarded from this function's own contract.
@@ -116,14 +139,17 @@ struct ExecSetup {
     env: Vec<String>,
     args: Vec<String>,
     preserve_fds: u32,
+    timeout: Option<std::time::Duration>,
 }
 
 impl ExecSetup {
     /// Join the target container's namespaces, then either `exec`
-    /// directly or — if a PID namespace was joined — fork once more
-    /// first, for the same reason `launch::ChildSetup::run` does: a
-    /// `setns(2)` into a PID namespace never moves the calling process
-    /// into it, only a *subsequent* forked child becomes a member.
+    /// directly or — if a PID namespace was joined (or a `timeout` was
+    /// given, see [`exec`]'s own doc comment for why that also routes
+    /// through here) — fork once more first, for the same reason
+    /// `launch::ChildSetup::run` does: a `setns(2)` into a PID
+    /// namespace never moves the calling process into it, only a
+    /// *subsequent* forked child becomes a member.
     fn run(mut self) -> ! {
         let opened = std::mem::take(&mut self.opened);
         if let Err(e) = nsenter::join_all(opened) {
@@ -134,12 +160,13 @@ impl ExecSetup {
         }
 
         if self.needs_pid_relay {
+            let timeout = self.timeout;
             // SAFETY: this process is still single-threaded (nothing
             // between the last fork and here spawns a thread).
             #[allow(unsafe_code)]
             let inner = unsafe { process::fork(|| self.exec_now()) };
             match inner {
-                Ok(child_pid) => match process::wait(child_pid) {
+                Ok(child_pid) => match wait_with_deadline(child_pid, timeout) {
                     Ok(status) => std::process::exit(process::exit_code_from_wait_status(status)),
                     Err(e) => fail(
                         SETUP_FAILURE_EXIT_CODE,
@@ -199,6 +226,34 @@ impl ExecSetup {
             _ => SETUP_FAILURE_EXIT_CODE,
         };
         fail(code, &format!("exec {}: {err}", self.args[0]));
+    }
+}
+
+/// [`process::wait`], but killing (`SIGKILL`) and reaping `pid` if
+/// `timeout` elapses first (0308) — the same "poll, kill + reap on
+/// deadline" shape `hooks::wait_with_timeout` already established for
+/// a hook's own `Timeout` (via `std::process::Child::try_wait`); this
+/// is its equivalent for a bare, `fork`ed pid, via
+/// [`process::try_wait`]. `None` waits forever, identical to this
+/// function's own pre-existing behavior before `--timeout` existed at
+/// all.
+fn wait_with_deadline(pid: i32, timeout: Option<std::time::Duration>) -> io::Result<i32> {
+    let Some(timeout) = timeout else {
+        return process::wait(pid);
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = process::try_wait(pid)? {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = process::kill(pid, libc::SIGKILL);
+            // The kill above guarantees it exits very soon (if it
+            // hasn't already); a final, ordinary blocking wait reaps
+            // it without needing to poll any further.
+            return process::wait(pid);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
