@@ -801,6 +801,29 @@ enum Command {
         /// site).
         #[arg(long = "add-host", value_name = "HOST:IP")]
         add_host: Vec<String>,
+        /// Set a custom DNS server for every `RUN` step, repeatable —
+        /// matching real `podman build --dns` exactly (checked
+        /// directly against `~/git/podman/vendor/go.podman.io/
+        /// buildah`'s own `CommonBuildOpts.DNSServers`). The special
+        /// value `none` (exactly one, case-insensitive, and no other
+        /// value given alongside it — buildah's own checked-directly
+        /// rule: `len(DNSServers) != 1 || strings.ToLower(...) !=
+        /// "none"`) skips writing `/etc/resolv.conf` for `RUN` steps
+        /// at all, rather than the usual default of a verbatim copy
+        /// of this host's own (`ociman run --dns`'s own identical
+        /// default, `0298`).
+        #[arg(long = "dns", value_name = "IP")]
+        dns: Vec<String>,
+        /// Set a custom DNS search domain for every `RUN` step,
+        /// repeatable — matching real `podman build --dns-search`
+        /// exactly.
+        #[arg(long = "dns-search", value_name = "DOMAIN")]
+        dns_search: Vec<String>,
+        /// Set a custom `resolv.conf` option for every `RUN` step,
+        /// repeatable — matching real `podman build --dns-option`
+        /// exactly.
+        #[arg(long = "dns-option", value_name = "OPTION")]
+        dns_option: Vec<String>,
         /// Fold every layer *this build's own target stage* adds
         /// (however many separate `RUN`/`COPY`/`ADD` instructions
         /// produced them) into exactly one new layer, on top of the
@@ -2172,6 +2195,9 @@ fn main() -> std::process::ExitCode {
                 annotation,
                 pull,
                 add_host,
+                dns,
+                dns_search,
+                dns_option,
                 squash,
                 squash_all,
                 platform,
@@ -2194,6 +2220,9 @@ fn main() -> std::process::ExitCode {
                 &annotation,
                 pull,
                 &add_host,
+                &dns,
+                &dns_search,
+                &dns_option,
                 squash,
                 squash_all,
                 platform.as_deref(),

@@ -699,6 +699,131 @@ fn run_step_has_a_real_resolv_conf_copied_from_the_host() {
     assert_eq!(captured, host_resolv);
 }
 
+/// `ociman build --dns`/`--dns-search`/`--dns-option` (0299) -- a real
+/// `RUN` step sees a `/etc/resolv.conf` synthesized from exactly the
+/// given values instead of the host's own, matching real `podman
+/// build --dns`/`--dns-search`/`--dns-option` exactly.
+#[test]
+fn build_dns_flags_synthesize_a_real_resolv_conf_for_run_steps() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-dns-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-dns-base:latest\n\
+         RUN cat /etc/resolv.conf > /captured-resolv.conf\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--dns",
+            "1.1.1.1",
+            "--dns",
+            "8.8.8.8",
+            "--dns-search",
+            "example.com",
+            "--dns-option",
+            "ndots:5",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-dns-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/build-dns-result:latest",
+            "/bin/cat",
+            "/captured-resolv.conf",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "search example.com\nnameserver 1.1.1.1\nnameserver 8.8.8.8\noptions ndots:5\n"
+    );
+}
+
+/// `ociman build --dns none` (exactly one value, case-insensitive)
+/// skips writing `/etc/resolv.conf` for `RUN` steps entirely, matching
+/// real buildah's own checked-directly rule exactly
+/// (`~/git/podman/vendor/go.podman.io/buildah/run_linux.go`).
+#[test]
+fn build_dns_none_skips_writing_resolv_conf_for_run_steps_entirely() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-dns-none-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-dns-none-base:latest\n\
+         RUN test -e /etc/resolv.conf && echo present || echo absent\n",
+    );
+
+    // The RUN step's own real stdout is only observable via the
+    // build's own live output, not the built image (nothing is
+    // written to a file this time) -- capture the build's own stdout
+    // directly.
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--dns",
+            "none",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-dns-none-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&build.stdout).contains("absent"),
+        "stdout: {}",
+        String::from_utf8_lossy(&build.stdout)
+    );
+}
+
 /// A `RUN` step is a real container's own process -- a nonzero exit
 /// aborts the whole build, matching real `docker build`/`podman
 /// build`, and leaves nothing tagged (same "no partial image" contract
