@@ -926,8 +926,20 @@ enum Command {
         /// version, which uses the earliest for *both* keys — real
         /// podman's own `ps`-side implementation does too, a real,
         /// separate quirk in its own upstream source, not something
-        /// this project invented or miscopied). May be given more
-        /// than once.
+        /// this project invented or miscopied), or `reference=<pattern>`/
+        /// `reference!=<pattern>` — a real shell-glob match (Go's own
+        /// `path.Match` syntax and semantics: `*`/`?`/`[...]`, never
+        /// crossing a `/`) against several real, checked-directly
+        /// candidate forms of each image's own reference (the full
+        /// reference, with/without domain, with/without tag — see
+        /// `reference_filter_candidates`'s own doc comment for the
+        /// exact list), or an immediate match if `<pattern>` itself
+        /// resolves directly to that exact image by tag or real/short
+        /// ID (real podman's own identical shortcut). Multiple
+        /// `reference=` values are OR'd (real podman's own explicit,
+        /// checked-directly exception to its usual per-key-AND rule);
+        /// any `reference!=` match excludes. May be given more than
+        /// once.
         #[arg(short, long = "filter")]
         filter: Vec<String>,
     },
@@ -2987,11 +2999,38 @@ fn cmd_images(quiet: bool, json: bool, filter: &[String]) -> anyhow::Result<()> 
     let since_threshold = (!filters.since.is_empty())
         .then(|| latest_image_creation(&store, &filters.since))
         .transpose()?;
+    let reference_wanted: Vec<ReferenceFilterValue> = filters
+        .reference_wanted
+        .iter()
+        .map(|v| resolve_reference_filter_value(&store, v))
+        .collect::<anyhow::Result<_>>()?;
+    let reference_unwanted: Vec<ReferenceFilterValue> = filters
+        .reference_unwanted
+        .iter()
+        .map(|v| resolve_reference_filter_value(&store, v))
+        .collect::<anyhow::Result<_>>()?;
 
     let mut views = Vec::with_capacity(records.len());
     for record in &records {
         if let Some(dangling) = filters.dangling
             && is_untagged_reference(&record.reference) != dangling
+        {
+            continue;
+        }
+        // `reference!=` excludes on any match; `reference=` (if given
+        // at all) requires at least one match -- matching real
+        // podman's own exact combination rule (see
+        // `ImageFilters::reference_wanted`'s own doc comment).
+        if reference_unwanted
+            .iter()
+            .any(|v| image_matches_reference_filter(v, record))
+        {
+            continue;
+        }
+        if !reference_wanted.is_empty()
+            && !reference_wanted
+                .iter()
+                .any(|v| image_matches_reference_filter(v, record))
         {
             continue;
         }
@@ -3881,6 +3920,18 @@ struct ImageFilters {
     /// after *every* given reference's own creation time, equivalent
     /// to comparing against the *latest* of them.
     since: Vec<String>,
+    /// `reference=<pattern>` -- OR'd together (real podman's own
+    /// `filterReferences`, `~/git/container-libs/common/libimage/
+    /// filters.go`, is an explicit, checked-directly exception to the
+    /// generic per-key-AND rule `before=`/`since=` follow: "reference
+    /// filters is a special case as it does an OR for positive
+    /// matches").
+    reference_wanted: Vec<String>,
+    /// `reference!=<pattern>` -- ANY match excludes, matching real
+    /// podman's own identical combination exactly (`"...and an AND
+    /// logic for negative matches"`): every given `reference!=` value
+    /// must fail to match for an image to survive.
+    reference_unwanted: Vec<String>,
 }
 
 /// Parse `ociman images`'s own `--filter` values into an [`ImageFilters`].
@@ -3911,11 +3962,24 @@ fn parse_image_filters(filters: &[String]) -> anyhow::Result<ImageFilters> {
                 "ociman images: --filter {f:?} is missing a value"
             );
             parsed.since.push(value.to_string());
+        } else if let Some(value) = f.strip_prefix("reference!=") {
+            anyhow::ensure!(
+                !value.is_empty(),
+                "ociman images: --filter {f:?} is missing a value"
+            );
+            parsed.reference_unwanted.push(value.to_string());
+        } else if let Some(value) = f.strip_prefix("reference=") {
+            anyhow::ensure!(
+                !value.is_empty(),
+                "ociman images: --filter {f:?} is missing a value"
+            );
+            parsed.reference_wanted.push(value.to_string());
         } else {
             anyhow::bail!(
                 "ociman images: --filter {f:?} is not yet supported (only \
                  label=<key>[=<value>], label!=<key>[=<value>], dangling=true|false, \
-                 before=<image>, or since=<image>/after=<image> are)"
+                 before=<image>, since=<image>/after=<image>, or \
+                 reference=<pattern>/reference!=<pattern> are)"
             );
         }
     }
@@ -3984,6 +4048,90 @@ fn latest_image_creation(
             }))
         })
         .map(|latest| latest.expect("references is non-empty when this is called"))
+}
+
+/// The real, checked-directly candidate strings `--filter reference=`
+/// glob-matches against for one tagged reference -- a direct port of
+/// real podman's own `imageMatchesReferenceFilter` candidate-building
+/// loop (`~/git/container-libs/common/libimage/filters.go`): the full
+/// reference, the repository path without domain or tag/digest, the
+/// bare name with tag/digest, the full reference without tag/digest,
+/// the repository path with tag/digest, and the bare name without
+/// tag/digest -- e.g. for `docker.io/library/busybox:latest`:
+/// `docker.io/library/busybox:latest`, `library/busybox`,
+/// `busybox:latest`, `docker.io/library/busybox`,
+/// `library/busybox:latest`, `busybox`.
+fn reference_filter_candidates(reference: &Reference) -> Vec<String> {
+    let full = reference.to_string();
+    let repository = reference.repository().to_string();
+    let trimmed = format!("{}/{}", reference.registry(), repository);
+    let tag_or_digest_suffix = full[trimmed.len()..].to_string();
+    let name_with_tag = full.rsplit('/').next().unwrap_or(&full).to_string();
+    let path_with_tag = format!("{repository}{tag_or_digest_suffix}");
+    let name_without_tag = repository
+        .rsplit('/')
+        .next()
+        .unwrap_or(&repository)
+        .to_string();
+    vec![
+        full,
+        repository,
+        name_with_tag,
+        trimmed,
+        path_with_tag,
+        name_without_tag,
+    ]
+}
+
+/// One `--filter reference=`/`reference!=` value, resolved once up
+/// front (in `cmd_images`, not inside the per-image loop) -- `exact_digest`
+/// is `Some` iff the raw value itself directly resolves (by tag or
+/// real/short ID) to a real stored image, matching real podman's own
+/// identical shortcut in `imageMatchesReferenceFilter`: an exact ID or
+/// tag always matches that one specific image outright, never merely
+/// "happens to" via glob semantics (a plain literal value like `redis`
+/// would otherwise need `*redis*`-style wildcards to match via
+/// candidates alone).
+struct ReferenceFilterValue {
+    pattern: String,
+    exact_digest: Option<oci_spec_types::Digest>,
+}
+
+fn resolve_reference_filter_value(
+    store: &Store,
+    value: &str,
+) -> anyhow::Result<ReferenceFilterValue> {
+    let exact_digest = resolve_image_by_reference_or_id(store, value)?
+        .map(|resolved| resolved.record().manifest_digest.clone());
+    Ok(ReferenceFilterValue {
+        pattern: value.to_string(),
+        exact_digest,
+    })
+}
+
+/// Whether `record` matches one already-resolved `--filter
+/// reference=`/`reference!=` value -- see [`ReferenceFilterValue`]'s
+/// own doc comment for the exact-match shortcut, and
+/// [`reference_filter_candidates`] for the glob-match candidate set.
+/// An untagged (dangling) image has no real tag to build candidates
+/// from at all, so only the exact-digest shortcut can ever match it —
+/// matching real podman's own `img.NamesReferences()` returning no
+/// names for one either.
+fn image_matches_reference_filter(value: &ReferenceFilterValue, record: &ImageRecord) -> bool {
+    if value.exact_digest.as_ref() == Some(&record.manifest_digest) {
+        return true;
+    }
+    if is_untagged_reference(&record.reference) {
+        return false;
+    }
+    let Ok(reference) = Reference::parse(&record.reference) else {
+        return false;
+    };
+    reference_filter_candidates(&reference)
+        .iter()
+        .any(|candidate| {
+            oci_spec_types::glob::match_pattern(&value.pattern, candidate).unwrap_or(false)
+        })
 }
 
 fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {

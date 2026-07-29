@@ -1,11 +1,26 @@
-//! Glob pattern matching for `COPY`/`ADD` sources — a direct, function-
-//! for-function translation of Go's own `path/filepath.Match`
+//! Shell-style glob pattern matching — a direct, function-for-function
+//! translation of Go's own `path/filepath.Match`
 //! (`/usr/share/go-1.22/src/path/filepath/match.go` on this development
 //! host, read directly before writing a single line of Rust; not
 //! reverse-engineered from black-box testing or from the one-paragraph
-//! doc comment alone), the exact matcher real BuildKit's own
-//! `copyWithWildcards` (`~/git/moby/daemon/builder/dockerfile/copy.go`)
-//! calls for every Dockerfile `COPY`/`ADD` wildcard source.
+//! doc comment alone).
+//!
+//! Originally written for Dockerfile `COPY`/`ADD` wildcard sources —
+//! the exact matcher real BuildKit's own `copyWithWildcards`
+//! (`~/git/moby/daemon/builder/dockerfile/copy.go`) calls, still
+//! `oci_dockerfile`'s own primary user — moved here (`docs/design/
+//! 0295`) once `ociman images --filter reference=` needed the
+//! identical real `path.Match` semantics real podman's own
+//! `imageMatchesReferenceFilter` uses (`~/git/container-libs/common/
+//! libimage/filters.go`): the same "move a shared primitive out of
+//! one crate's own private code into a crate every real caller already
+//! depends on the moment a second, genuinely unrelated one needs it"
+//! move this project's own `resolve_by_reference_or_id`
+//! (`oci_store`, 0122/0213) and `time` (this same crate, just above)
+//! already went through — a real, verified-zero-behavior-change move
+//! (this module's own test suite, including Go's complete official
+//! `matchTests` table, moved along unmodified and still passes
+//! byte-for-byte identically).
 //!
 //! Every behavior here was independently cross-checked against the
 //! real `go` toolchain installed on this development host (`go1.22.2`)

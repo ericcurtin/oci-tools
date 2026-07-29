@@ -272,17 +272,12 @@ fn images_filter_label_only_lists_images_with_a_matching_label() {
 /// than a silently-ignored no-op (matching `ociman prune`'s own
 /// identical rule for its own unrecognized filters). Real podman's
 /// own further `images --filter` keys (`readonly=`, `intermediate=`,
-/// `containers=`) remain deliberately unimplemented — `reference=` is
-/// used here since it's the next real, checked-directly candidate
-/// noted in `docs/design/0293`'s own "still ahead".
+/// `containers=`) remain deliberately unimplemented.
 #[test]
 fn images_filter_with_an_unrecognized_kind_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();
     Store::open(storage_dir.path()).unwrap();
-    let out = ociman(
-        storage_dir.path(),
-        &["images", "--filter", "reference=some-image"],
-    );
+    let out = ociman(storage_dir.path(), &["images", "--filter", "readonly=true"]);
     assert!(!out.status.success());
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("not yet supported"),
@@ -446,5 +441,166 @@ fn images_filter_before_and_since_use_the_referenced_images_own_creation_time() 
     assert!(
         String::from_utf8_lossy(&bad_ref.stderr).contains("no such image"),
         "{bad_ref:?}"
+    );
+}
+
+/// `ociman images --filter reference=`/`reference!=` (0295), matching
+/// real `podman images --filter reference=`'s own checked-directly
+/// semantics exactly (`~/git/container-libs/common/libimage/
+/// filters.go`'s own `imageMatchesReferenceFilter`): a real shell-glob
+/// match (Go's own `path.Match`) against several candidate forms of
+/// each image's own reference. Uses genuinely distinct images (built
+/// via `ociman build` with different `LABEL`s, the same technique
+/// `images_filter_before_and_since_use_the_referenced_images_own_creation_time`
+/// already established) specifically so the real exact-image-identity
+/// shortcut (matching real podman's own `img.ID()` comparison) never
+/// muddies a glob-matching assertion -- confirmed directly by hand
+/// that three merely re-tagged (same-digest) images all "match" a
+/// filter naming any *one* of their shared tags, a real, faithful
+/// consequence of real podman's own reference-matching algorithm
+/// being keyed on image identity, not tag identity, combined with
+/// this project's own established one-row-per-tag listing convention
+/// (`0263`) -- not something worth obscuring by testing with
+/// same-digest images.
+#[test]
+fn images_filter_reference_glob_matches_and_the_exact_resolve_shortcut() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/reference-filter-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let build = |tag: &str, label: &str| {
+        let context_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            context_dir.path().join("Containerfile"),
+            format!("FROM ociman-test/reference-filter-base:latest\nLABEL step={label}\n"),
+        )
+        .unwrap();
+        let out = ociman(
+            storage_dir.path(),
+            &["build", "-t", tag, context_dir.path().to_str().unwrap()],
+        );
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    build("myrepo/myimage:v1", "one");
+    build("otherimage:latest", "two");
+
+    let list_refs = |args: &[&str]| -> Vec<String> {
+        let out = ociman(storage_dir.path(), args);
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let view: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        view.as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["reference"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // A glob matching only the bare name (no domain, no tag) of one
+    // image's own repository path.
+    let by_name = list_refs(&["--json", "images", "--filter", "reference=*myimage*"]);
+    assert_eq!(
+        by_name,
+        vec!["docker.io/myrepo/myimage:v1".to_string()],
+        "{by_name:?}"
+    );
+
+    // Matches the base image's own bare name candidate exactly.
+    let base = list_refs(&[
+        "--json",
+        "images",
+        "--filter",
+        "reference=reference-filter-base",
+    ]);
+    assert_eq!(
+        base,
+        vec!["docker.io/ociman-test/reference-filter-base:latest".to_string()],
+        "{base:?}"
+    );
+
+    // `reference!=` excludes on any match.
+    let excluded = list_refs(&["--json", "images", "--filter", "reference!=*myimage*"]);
+    assert!(
+        !excluded.contains(&"docker.io/myrepo/myimage:v1".to_string()),
+        "{excluded:?}"
+    );
+    assert!(
+        excluded.contains(&"docker.io/library/otherimage:latest".to_string()),
+        "{excluded:?}"
+    );
+
+    // Multiple `reference=` values are OR'd together (a real,
+    // checked-directly exception to the generic per-key-AND rule
+    // `before=`/`since=` follow).
+    let or_multi = list_refs(&[
+        "--json",
+        "images",
+        "--filter",
+        "reference=*myimage*",
+        "--filter",
+        "reference=*otherimage*",
+    ]);
+    let mut or_multi_sorted = or_multi.clone();
+    or_multi_sorted.sort();
+    assert_eq!(
+        or_multi_sorted,
+        vec![
+            "docker.io/library/otherimage:latest".to_string(),
+            "docker.io/myrepo/myimage:v1".to_string(),
+        ],
+        "{or_multi:?}"
+    );
+
+    // The exact resolve shortcut: an exact, fully-qualified reference
+    // matches that one specific image outright, distinct from every
+    // other real, differently-tagged one (verified here specifically
+    // *because* every image in this test has its own distinct
+    // underlying digest, so this can only be the exact-match
+    // shortcut, not an accidental glob match).
+    let exact = list_refs(&[
+        "--json",
+        "images",
+        "--filter",
+        "reference=docker.io/myrepo/myimage:v1",
+    ]);
+    assert_eq!(
+        exact,
+        vec!["docker.io/myrepo/myimage:v1".to_string()],
+        "{exact:?}"
+    );
+
+    // A pattern matching nothing at all is a real, silent empty
+    // result, never an error (unlike `before=`/`since=`, `reference=`
+    // is a glob filter that never needs to resolve at all).
+    let none = ociman(
+        storage_dir.path(),
+        &[
+            "images",
+            "--filter",
+            "reference=this-matches-nothing-at-all",
+        ],
+    );
+    assert!(none.status.success(), "{none:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&none.stdout).trim(),
+        "no images",
+        "{none:?}"
     );
 }

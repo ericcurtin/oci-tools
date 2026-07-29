@@ -68,7 +68,6 @@ mod dependencies;
 mod dockerignore;
 mod download;
 mod expand_stage;
-mod glob;
 mod instruction;
 mod lexer;
 mod shell_expand;
@@ -82,8 +81,13 @@ pub use dependencies::{resolve_copy_from_dependencies, resolve_dependencies, sta
 pub use dockerignore::{DockerIgnore, parse as parse_dockerignore};
 pub use download::{DownloadError, Downloaded, download};
 pub use expand_stage::{expand_meta_args, expand_stage};
-pub use glob::{BadPattern, contains_wildcards, match_pattern};
+// `glob` moved into `oci_spec_types` (0295) once `ociman images
+// --filter reference=` needed the identical matcher for a genuinely
+// unrelated purpose -- re-exported here unchanged so every existing
+// `oci_dockerfile::{BadPattern, contains_wildcards, match_pattern}`
+// caller keeps working verbatim.
 pub use instruction::{AddFlags, CopyFlags, Instruction, ShellOrExec, parse_onbuild_trigger};
+pub use oci_spec_types::glob::{BadPattern, contains_wildcards, match_pattern};
 pub use shell_expand::expand;
 pub use stage::{Stage, declared_arg_names, find_stage, group_stages};
 

@@ -14,6 +14,11 @@
 //!   dependency (shared by `oci-runtime-core`'s own state file and
 //!   this crate's own [`image::ImageConfig`]/[`image::HistoryEntry`]
 //!   `created` fields)
+//! - [`glob`]: shell-style glob matching, a direct port of Go's own
+//!   `path/filepath.Match` (originally `oci-dockerfile`-private, for
+//!   `COPY`/`ADD` wildcards; moved here once `ociman images --filter
+//!   reference=` needed the identical real `path.Match` semantics
+//!   real podman itself uses)
 //!
 //! Planned:
 //! - distribution-spec: tag lists, error payloads, auth challenge parsing
@@ -25,6 +30,7 @@
 //! there is exactly one definition of each spec structure in the workspace.
 
 pub mod digest;
+pub mod glob;
 pub mod image;
 pub mod reference;
 pub mod runtime;

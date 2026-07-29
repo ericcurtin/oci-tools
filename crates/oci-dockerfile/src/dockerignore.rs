@@ -47,7 +47,7 @@
 //! **Deliberately narrower than real BuildKit** in one specific way:
 //! a pattern segment containing `**` *mixed* with other characters
 //! (`a**b`, rather than a segment that's *exactly* `**`) falls back to
-//! this crate's own [`crate::glob::match_pattern`] for that segment,
+//! [`oci_spec_types::glob::match_pattern`] for that segment,
 //! which collapses consecutive `*`s into an ordinary single-`*`
 //! (never crossing `/`) rather than replicating BuildKit's own
 //! regex-based "any number of path segments, even zero" semantics for
@@ -61,7 +61,7 @@
 //! purely for an edge case this codebase has never seen in a real
 //! Containerfile's own build context.
 
-use crate::glob::{self, BadPattern};
+use oci_spec_types::glob::{self, BadPattern};
 
 /// Read `.dockerignore` file contents into an ordered list of raw
 /// pattern strings, applying exactly `ignorefile.ReadAll`'s own rules:
