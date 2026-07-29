@@ -117,6 +117,23 @@ impl Client {
         }
     }
 
+    /// A fresh, independent [`Client`] carrying the exact same
+    /// credentials and insecure-host set as `self` — its own
+    /// connection pool and (empty, to start) token cache, never
+    /// shared with `self` — for a caller that genuinely wants a
+    /// second, concurrently-usable client talking to the same
+    /// registry the same way (`oci_registry::pull`'s own bounded-
+    /// concurrency blob fetch, `docs/design/0256`; not `Clone` itself
+    /// since sharing this method's own name would misleadingly imply
+    /// the connection pool/token cache come along too, which they
+    /// deliberately do not).
+    pub(crate) fn duplicate_for_worker(&self) -> Self {
+        Client::with_options(
+            self.credentials.clone(),
+            self.insecure_hosts.iter().cloned(),
+        )
+    }
+
     /// Fetch the manifest (or index) `reference` points at.
     pub fn pull_manifest(
         &mut self,
