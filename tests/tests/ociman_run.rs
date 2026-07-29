@@ -986,6 +986,98 @@ fn run_add_host_rejects_the_host_gateway_keyword() {
     );
 }
 
+/// `ociman run` with no `--dns`/`--dns-search`/`--dns-option` at all
+/// (0298): the container's own `/etc/resolv.conf` is a real, verbatim
+/// copy of this host's own — meaningful, not cosmetic, since this
+/// project's own containers already share the host's real network
+/// namespace unmodified, matching real podman's own checked-directly
+/// behavior for that exact case (`~/git/container-libs/common/
+/// libnetwork/resolvconf/resolv.go`'s own `hostNS` branch).
+#[test]
+fn run_without_dns_flags_copies_the_real_hosts_own_resolv_conf_verbatim() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/resolv-default:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm"])
+        .args(["ociman-test/resolv-default:latest"])
+        .args(["/bin/cat", "/etc/resolv.conf"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let container_resolv = String::from_utf8_lossy(&out.stdout);
+    let host_resolv = std::fs::read_to_string("/etc/resolv.conf")
+        .expect("this real dev/CI host should have a real /etc/resolv.conf of its own");
+    assert_eq!(container_resolv, host_resolv);
+}
+
+/// `--dns`/`--dns-search`/`--dns-option` synthesize a real
+/// `/etc/resolv.conf` from exactly the given values instead — real
+/// podman's own "either explicit values or a host copy, never
+/// blended" rule, checked directly.
+#[test]
+fn run_dns_flags_synthesize_a_real_resolv_conf_instead_of_the_hosts_own() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/resolv-explicit:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "--dns",
+            "1.1.1.1",
+            "--dns",
+            "8.8.8.8",
+            "--dns-search",
+            "example.com",
+            "--dns-option",
+            "ndots:5",
+        ])
+        .args(["ociman-test/resolv-explicit:latest"])
+        .args(["/bin/cat", "/etc/resolv.conf"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "search example.com\nnameserver 1.1.1.1\nnameserver 8.8.8.8\noptions ndots:5\n"
+    );
+}
+
 /// `-w`/`--workdir` overrides the image's own default `WORKDIR`,
 /// matching real `docker run -w`/`podman run -w` exactly -- checked
 /// the most direct way available: printing the real, current working

@@ -930,6 +930,18 @@ fn build_stage(
         // running container does.
         oci_runtime_core::etc_hosts::write_etc_hosts(&rootfs_dir, &[], add_host)
             .context("writing /etc/hosts for the build container")?;
+        // A real `/etc/resolv.conf` (0298): unconditionally a verbatim
+        // copy of this host's own (no `--dns`/`--dns-search`/
+        // `--dns-option`-equivalent build flag yet) -- a real `RUN
+        // apt-get update`/`RUN pip install ...`-style step genuinely
+        // needs working DNS resolution to reach a real package
+        // registry, the same real functional need `ociman run`'s own
+        // identical new default serves (see its own doc comment for
+        // why this is meaningful, not cosmetic, given this project's
+        // own containers already share the host's real network
+        // namespace unmodified).
+        oci_runtime_core::resolv_conf::write_resolv_conf(&rootfs_dir, &[], &[], &[])
+            .context("writing /etc/resolv.conf for the build container")?;
 
         Some(dir)
     } else {

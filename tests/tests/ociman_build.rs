@@ -635,6 +635,70 @@ fn run_executes_a_real_command_and_commits_a_real_new_layer() {
     assert_eq!(stdout, "hello\nworld\nBUILT=yes\n");
 }
 
+/// A real `/etc/resolv.conf` (0298) -- unconditionally a verbatim copy
+/// of this host's own -- is present during a `RUN` step, matching
+/// `ociman run`'s own identical new default (real
+/// `apt-get update`/`pip install`-style steps genuinely need working
+/// DNS resolution to reach a real package registry).
+#[test]
+fn run_step_has_a_real_resolv_conf_copied_from_the_host() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/run-resolv-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/run-resolv-base:latest\n\
+         RUN cat /etc/resolv.conf > /captured-resolv.conf\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/run-resolv-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/run-resolv-result:latest",
+            "/bin/cat",
+            "/captured-resolv.conf",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let captured = String::from_utf8_lossy(&run.stdout).into_owned();
+    let host_resolv = std::fs::read_to_string("/etc/resolv.conf")
+        .expect("this real dev/CI host should have a real /etc/resolv.conf of its own");
+    assert_eq!(captured, host_resolv);
+}
+
 /// A `RUN` step is a real container's own process -- a nonzero exit
 /// aborts the whole build, matching real `docker build`/`podman
 /// build`, and leaves nothing tagged (same "no partial image" contract

@@ -486,6 +486,32 @@ struct RunArgs {
     /// without a real network setup of this project's own).
     #[arg(long = "add-host", value_name = "HOST:IP")]
     add_host: Vec<String>,
+    /// Set a custom DNS server, repeatable — matching real `docker
+    /// run --dns`/`podman run --dns` exactly. With none given (this
+    /// project's own default, matching real podman's own checked-
+    /// directly behavior for a container with no private network
+    /// namespace of its own — `~/git/container-libs/common/
+    /// libnetwork/resolvconf/resolv.go`'s own `hostNS` branch), the
+    /// container's own `/etc/resolv.conf` is a real, verbatim copy of
+    /// this host's own; given any of `--dns`/`--dns-search`/
+    /// `--dns-option`, one is synthesized from exactly those values
+    /// instead — real podman's own "either explicit values or a host
+    /// copy, never blended" rule, checked directly (`podman run
+    /// --dns` never combines with the host's own real nameservers).
+    #[arg(long = "dns", value_name = "IP")]
+    dns: Vec<String>,
+    /// Set a custom DNS search domain, repeatable — matching real
+    /// `docker run --dns-search`/`podman run --dns-search` exactly.
+    /// See `--dns`'s own doc comment for the exact default/override
+    /// rule this shares with it.
+    #[arg(long = "dns-search", value_name = "DOMAIN")]
+    dns_search: Vec<String>,
+    /// Set a custom `resolv.conf` option, repeatable — matching real
+    /// `docker run --dns-option`/`podman run --dns-option` exactly.
+    /// See `--dns`'s own doc comment for the exact default/override
+    /// rule this shares with it.
+    #[arg(long = "dns-option", value_name = "OPTION")]
+    dns_option: Vec<String>,
     /// Set a label on the container: `KEY=value`, or bare `KEY` for an
     /// empty value (repeatable) — matching real `docker run --label`/
     /// `podman run --label` exactly. Merges with (rather than
@@ -5050,6 +5076,28 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         }
         oci_runtime_core::etc_hosts::write_etc_hosts(&write_root, &own_names, &args.add_host)
             .context("writing /etc/hosts")?;
+        // A real `/etc/resolv.conf` (0298), matching real podman's own
+        // checked-directly behavior for a container with no private
+        // network namespace of its own (`~/git/container-libs/common/
+        // libnetwork/resolvconf/resolv.go`'s own `hostNS` branch,
+        // which returns the real host's own `/etc/resolv.conf`
+        // contents completely unfiltered whenever the spec has no
+        // `network` namespace at all -- exactly this project's own
+        // case, `Spec::into_rootless` strips it outright): with no
+        // `--dns`/`--dns-search`/`--dns-option` at all, copies the
+        // real host's own file verbatim; otherwise synthesizes one
+        // from the given values, matching real podman's own "either
+        // explicit values or a host copy, never blended" rule (`podman
+        // run --dns` never combines with the host's own real
+        // nameservers). Reuses the exact same primitive `ocicri`
+        // already established for the identical reason (`0297`).
+        oci_runtime_core::resolv_conf::write_resolv_conf(
+            &write_root,
+            &args.dns,
+            &args.dns_search,
+            &args.dns_option,
+        )
+        .context("writing /etc/resolv.conf")?;
 
         // A real, persisted "before" reference for a future `ociman
         // diff` (0149) — captured *after* every layer has been
