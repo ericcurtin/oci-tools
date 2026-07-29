@@ -1754,8 +1754,10 @@ enum Command {
     /// `docker stop`/`podman stop`. A no-op (not an error) on an
     /// already-stopped container.
     Stop {
-        /// The container's ID or `--name`.
-        id: String,
+        /// The container's ID or `--name` — omit when using `--all`.
+        /// Mutually exclusive with `--all`, matching real `podman
+        /// stop`'s own identical rule.
+        id: Option<String>,
         /// Seconds to wait after the initial signal before escalating
         /// to `KILL`. With none given, falls back to the container's
         /// own persisted `run`/`create --stop-timeout` (0301), else
@@ -1774,6 +1776,20 @@ enum Command {
         /// which honor both unless overridden.
         #[arg(short, long)]
         signal: Option<String>,
+        /// Stop every real container instead of the one named on the
+        /// command line — matching real `podman stop --all` exactly
+        /// (checked directly, `~/git/podman/cmd/podman/containers/
+        /// stop.go`, `pkg/domain/infra/abi/containers.go`'s own
+        /// `containerStopImpl`/`getContainers`): every container is
+        /// attempted, an already-`Stopped` one silently tolerated
+        /// (real `ErrCtrStopped`, exactly `stop`'s own existing no-
+        /// `--all` no-op already established), any other genuine
+        /// failure (in particular a paused one — see
+        /// [`stop_container`]'s own doc comment) still surfacing as a
+        /// real, reported error while every other container is still
+        /// attempted regardless (0313).
+        #[arg(short, long)]
+        all: bool,
     },
     /// Send a signal to a running container's own init process — one
     /// immediate send, no grace period, no escalation (unlike `stop`),
@@ -2527,7 +2543,12 @@ fn main() -> std::process::ExitCode {
                 squash,
                 cli.global.json,
             ),
-            Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, signal.as_deref()),
+            Some(Command::Stop {
+                id,
+                time,
+                signal,
+                all,
+            }) => cmd_stop(id.as_deref(), time, signal.as_deref(), all),
             Some(Command::Kill { id, signal, all }) => cmd_kill(id.as_deref(), &signal, all),
             Some(Command::Pause { id }) => cmd_pause(&id),
             Some(Command::Unpause { id }) => cmd_unpause(&id),
@@ -7637,7 +7658,51 @@ fn reset_failed_systemd_scope(container_id: &str, state: &oci_runtime_core::Pers
 /// doc comment for the exact policy): a no-op on one that's already
 /// stopped, matching real `docker stop`/`podman stop`'s own
 /// idempotent behavior rather than erroring on a redundant call.
-fn cmd_stop(id: &str, time_secs: Option<u64>, signal: Option<&str>) -> anyhow::Result<()> {
+///
+/// `--all` (0313) mirrors real `podman stop --all` exactly (checked
+/// directly, and empirically against a real installed binary given a
+/// real mix of running/paused/never-started containers): every
+/// container is attempted; an already-`Stopped` one is silently
+/// tolerated, same as the existing no-`--all` no-op above; every
+/// other failure -- in particular a genuinely `Paused` one, real
+/// podman's own `stopInternal` deliberately refusing to even attempt
+/// it (see [`stop_container`]'s own doc comment) -- still surfaces as
+/// a real, reported error, with every other container still attempted
+/// regardless (matching `kill --all`'s own identical "attempt every
+/// one, report the first real failure at the end" shape, 0312).
+fn cmd_stop(
+    id: Option<&str>,
+    time_secs: Option<u64>,
+    signal: Option<&str>,
+    all: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        id.is_none() || !all,
+        "cannot give both a container ID/name and --all"
+    );
+    if all {
+        let containers = open_container_store()?;
+        let mut first_error = None;
+        for state in containers.list().context("listing containers")? {
+            if state.effective_status() == Status::Stopped {
+                continue;
+            }
+            match stop_container(&state.id, time_secs, signal, true) {
+                Ok(()) => println!("{}", state.id),
+                Err(e) => {
+                    eprintln!("error stopping {}: {e:#}", state.id);
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        return match first_error {
+            Some(e) => Err(e.context("stopping containers")),
+            None => Ok(()),
+        };
+    }
+    let id = id.ok_or_else(|| {
+        anyhow::anyhow!("no container ID/name given (try `ociman stop <ID>` or `--all`)")
+    })?;
     stop_container(id, time_secs, signal, true)?;
     println!("{id}");
     Ok(())
@@ -7757,7 +7822,7 @@ fn stop_container(
     // See `resolve_stop_timeout`'s own doc comment for the exact,
     // full precedence order.
     let time_secs = resolve_stop_timeout(&state, time_secs);
-    if state.effective_status() == Status::Stopped {
+    if state.effective_status() == Status::Stopped || state.pid.is_none() {
         // `effective_status` can report `Stopped` purely because the
         // container's own recorded pid is no longer alive, even while
         // the *raw* status is still `Running`/`Creating` — meaning the
@@ -7770,9 +7835,42 @@ fn stop_container(
         // case let a subsequent `ociman start` begin a brand new
         // launch that the old keeper's own delayed terminal write
         // then silently clobbered moments later.
+        //
+        // `state.pid.is_none()` (a real, previously-latent, pre-
+        // existing bug fixed alongside 0313, unrelated to `--all`
+        // itself but directly surfaced by deciding what `--all`
+        // should do here): `ociman create`'s own deliberately lazy
+        // design never pre-forks any real process at all, unlike real
+        // crun/runc's own two-phase `create`/`start` (`Status::
+        // Created`'s own doc comment describes *that* model, not this
+        // one) -- there is genuinely nothing to signal for a never-
+        // started container, previously a confusing "has no recorded
+        // pid" hard error instead of the same tolerant no-op real
+        // `podman stop`/`podman stop --all` both give it (checked
+        // directly: prints the id, no error, still `Created`
+        // afterward).
         wait_for_keeper_to_finalize(&containers, &resolved);
         return Ok(());
     }
+    // A frozen cgroup *queues* a delivered signal rather than actually
+    // running it until thawed (confirmed directly against real
+    // runc's own `signalInit`, `docs/design/0312`'s own discovered,
+    // at-the-time-deferred gap) -- attempting the signal-then-
+    // escalate dance below against a `Paused` container would
+    // therefore silently hang for this call's own entire grace-plus-
+    // escalation window and then report a false success, the
+    // container never actually having stopped at all. Matches real
+    // podman's own identical real refusal here too (checked directly:
+    // both `podman stop`/`podman restart` on a genuinely paused
+    // container are a real, immediate, `container state improper`
+    // error -- `libpod/container_internal.go`'s own `stopInternal`
+    // deliberately excludes `ContainerStatePaused` from its own
+    // allowed-to-attempt state set), rather than this project's own
+    // previous silent hang-then-false-success.
+    anyhow::ensure!(
+        display_status(&state) != Status::Paused,
+        "container {id:?} is paused; unpause it first"
+    );
     let pid = state
         .pid
         .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
@@ -8169,7 +8267,15 @@ fn cmd_restart(id: &str, time_secs: Option<u64>) -> anyhow::Result<()> {
         false
     };
 
-    stop_container(id, time_secs, None, false)?;
+    // Captured rather than `?`-propagated immediately: the
+    // `ANNOTATION_AUTO_REMOVE` strip above must be restored
+    // regardless of whether the stop itself actually succeeds (e.g.
+    // a genuinely paused container, `stop_container`'s own real
+    // refusal there) -- otherwise a failed restart attempt on a
+    // `--rm` container would silently and permanently drop its own
+    // auto-remove-on-exit behavior, a real state corruption a
+    // *failed* call must never leave behind.
+    let stop_result = stop_container(id, time_secs, None, false);
 
     if had_auto_remove && let Ok(mut state) = containers.load(&resolved) {
         state
@@ -8177,6 +8283,7 @@ fn cmd_restart(id: &str, time_secs: Option<u64>) -> anyhow::Result<()> {
             .insert(ANNOTATION_AUTO_REMOVE.to_string(), "true".to_string());
         containers.write(&state)?;
     }
+    stop_result?;
 
     cmd_start(id, false)?;
 
