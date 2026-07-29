@@ -621,6 +621,101 @@ async fn list_containers_filters_by_sandbox_state_and_labels() {
     assert!(unknown.is_empty(), "{unknown:?}");
 }
 
+/// `StreamContainers` (`CRIListStreaming`, `docs/design/0253`) reports
+/// the exact same items `ListContainers` does — in one message here
+/// (far fewer than real cri-o's own 3000-item chunk size), honoring a
+/// filter identically — and streams zero messages (EOF immediately)
+/// for an empty sandbox, matching real cri-o's own chunking loop
+/// simply never iterating. Completes the `CRIListStreaming` family
+/// `StreamPodSandboxes`/`StreamImages` already started (0234).
+#[tokio::test]
+async fn stream_containers_matches_list_and_streams_nothing_when_empty() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    // Empty sandbox: a real, successful stream with zero messages.
+    let mut empty_stream = client
+        .stream_containers(oci_cri_types::StreamContainersRequest { filter: None })
+        .await
+        .expect("StreamContainers on an empty sandbox should succeed")
+        .into_inner();
+    assert!(
+        empty_stream
+            .message()
+            .await
+            .expect("stream should end cleanly")
+            .is_none(),
+        "an empty sandbox should stream zero messages before EOF"
+    );
+
+    let first = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(container_config("stream-a", 0)),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    let second = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(container_config("stream-b", 0)),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+
+    // Unfiltered: the exact same containers ListContainers reports,
+    // in one message.
+    let listed = client
+        .list_containers(ListContainersRequest { filter: None })
+        .await
+        .unwrap()
+        .into_inner()
+        .containers;
+    let mut stream = client
+        .stream_containers(oci_cri_types::StreamContainersRequest { filter: None })
+        .await
+        .expect("StreamContainers failed")
+        .into_inner();
+    let mut streamed = Vec::new();
+    while let Some(response) = stream.message().await.expect("stream should end cleanly") {
+        streamed.extend(response.containers);
+    }
+    assert_eq!(streamed, listed, "stream and list must report identically");
+    assert_eq!(streamed.len(), 2);
+
+    // A label filter behaves identically to the list RPC's own.
+    let mut filtered_stream = client
+        .stream_containers(oci_cri_types::StreamContainersRequest {
+            filter: Some(ContainerFilter {
+                label_selector: HashMap::from([("app".to_string(), "stream-a".to_string())]),
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("filtered StreamContainers failed")
+        .into_inner();
+    let mut by_label = Vec::new();
+    while let Some(response) = filtered_stream
+        .message()
+        .await
+        .expect("stream should end cleanly")
+    {
+        by_label.extend(response.containers);
+    }
+    assert_eq!(by_label.len(), 1, "{by_label:?}");
+    assert_eq!(by_label[0].id, first);
+    assert_ne!(by_label[0].id, second);
+}
+
 /// `RemovePodSandbox` forcibly removes the sandbox's own containers
 /// too (the proto's own contract, real cri-o's own
 /// `removePodSandbox` loop) — and container records survive a real

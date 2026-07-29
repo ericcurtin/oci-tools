@@ -1429,11 +1429,23 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
 
     type StreamContainersStream = BoxStream<cri::StreamContainersResponse>;
 
+    /// The `CRIListStreaming` variant of `list_containers` — the exact
+    /// same filtered-list computation, streamed in chunks of real
+    /// cri-o's own `streamChunkSize` (see `docs/design/0234`/`0253`
+    /// and `stream.rs`'s own module doc comment — an empty result
+    /// streams zero messages and closes immediately, matching real
+    /// cri-o's own `StreamContainers` exactly), completing the same
+    /// `CRIListStreaming` family `StreamPodSandboxes`/`StreamImages`
+    /// already did.
     async fn stream_containers(
         &self,
-        _request: Request<cri::StreamContainersRequest>,
+        request: Request<cri::StreamContainersRequest>,
     ) -> Result<Response<Self::StreamContainersStream>, Status> {
-        unimplemented("StreamContainers")
+        let containers = container_list_items(request.into_inner().filter)?;
+        Ok(Response::new(crate::stream::chunked(
+            containers,
+            |containers| cri::StreamContainersResponse { containers },
+        )))
     }
 
     /// An unknown (or empty) ID is a real gRPC `NotFound` — real
