@@ -45,6 +45,61 @@ fn ociman_run_detached(
         .expect("failed to spawn ociman run")
 }
 
+/// Same as [`wait_for_container_status`], but matches on a
+/// container's own `--name` rather than its generated id (`ps
+/// --json`'s own `"name"` field, not `"id"`) -- for the `--all` tests
+/// below, which need several containers running at once and so name
+/// each rather than relying on `only_container_id`'s own "exactly one
+/// container" assumption.
+fn wait_for_container_status_by_name(
+    storage_root: &Path,
+    name: &str,
+    want: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = ociman(storage_root, &["ps", "-a", "--json"]);
+        if out.status.success()
+            && let Ok(views) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            && let Some(entry) = views
+                .as_array()
+                .and_then(|a| a.iter().find(|e| e["name"] == name))
+        {
+            let status = entry["status"].as_str().unwrap_or_default().to_string();
+            if status == want || Instant::now() >= deadline {
+                return status;
+            }
+        } else if Instant::now() >= deadline {
+            return String::new();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Same as [`ociman_run_detached`], but with `--name` given *before*
+/// the image -- `RunArgs::args`'s own `trailing_var_arg = true`
+/// captures everything positional after the image into the
+/// container's own command, so `--name` (a real `ociman run` flag,
+/// not part of the container's command) must come first.
+fn ociman_run_detached_named(
+    storage_root: &Path,
+    name: &str,
+    image: &str,
+    container_args: &[&str],
+) -> std::process::Child {
+    Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_root)
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--name", name, image])
+        .args(container_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run")
+}
+
 fn only_container_id(storage_root: &Path, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     loop {
@@ -240,4 +295,142 @@ fn kill_of_a_nonexistent_container_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();
     let out = ociman(storage_dir.path(), &["kill", "does-not-exist"]);
     assert!(!out.status.success());
+}
+
+/// `--all` (0312) matches real `podman kill --all` exactly: every
+/// running container gets signaled, and a container that was `create`d
+/// but never `start`ed (so has no live process to signal at all) is
+/// silently skipped -- no error, nothing printed for it -- rather than
+/// aborting the whole call, checked directly against a real installed
+/// `podman kill --all` in the same situation.
+#[test]
+fn kill_all_kills_every_running_container_and_silently_skips_a_never_started_one() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/kill-all:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run1 = ociman_run_detached_named(
+        storage_dir.path(),
+        "kill-all-run1",
+        "ociman-test/kill-all:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let mut run2 = ociman_run_detached_named(
+        storage_dir.path(),
+        "kill-all-run2",
+        "ociman-test/kill-all:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-all-run1",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-all-run2",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "kill-all-created",
+            "ociman-test/kill-all:latest",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let kill_all = ociman(storage_dir.path(), &["kill", "--all"]);
+    assert!(
+        kill_all.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&kill_all.stderr)
+    );
+
+    run1.wait().unwrap();
+    run2.wait().unwrap();
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-all-run1",
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-all-run2",
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped"
+    );
+    // The never-started container should be completely untouched --
+    // still `created`, not silently transitioned or errored on.
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-all-created",
+            "created",
+            Duration::from_millis(200)
+        ),
+        "created"
+    );
+
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// Real `podman`'s own `--all` and an explicit container ID/name are
+/// mutually exclusive; giving both is a clear, immediate error rather
+/// than silently picking one.
+#[test]
+fn kill_all_with_an_explicit_id_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["kill", "--all", "some-id"]);
+    assert!(!out.status.success());
+}
+
+/// `--all` with nothing running at all is a legitimate, successful
+/// no-op (matches real `podman kill --all` on an empty/all-stopped
+/// container list: exit 0, nothing printed), not an error.
+#[test]
+fn kill_all_with_no_containers_at_all_succeeds_as_a_no_op() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["kill", "--all"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
 }

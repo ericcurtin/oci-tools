@@ -1782,11 +1782,31 @@ enum Command {
     /// container that isn't running (matches real podman: `con.Kill`
     /// on a non-running container returns `ErrCtrStateInvalid`).
     Kill {
-        /// The container's ID or `--name`.
-        id: String,
+        /// The container's ID or `--name` — omit when using `--all`.
+        /// Mutually exclusive with `--all`, matching real `podman
+        /// kill`'s own identical rule (checked directly,
+        /// `~/git/podman/cmd/podman/containers/kill.go`).
+        id: Option<String>,
         /// Signal to send (name or number).
         #[arg(short, long, default_value = "KILL")]
         signal: String,
+        /// Signal every real, currently-running container instead of
+        /// the one named on the command line — matching real `podman
+        /// kill --all` exactly (checked directly, `~/git/podman/pkg/
+        /// domain/infra/abi/containers.go`'s own `ContainerKill`: it
+        /// lists *every* container, running or not, then silently
+        /// skips — no error, nothing printed — any that isn't
+        /// currently running, rather than refusing the whole call;
+        /// unlike `ociman rm --all`, there is no non-running-without-
+        /// `--force` gate here at all to skip *past* — a still-
+        /// stopped container simply has nothing to signal, so it's
+        /// never even attempted). Every other real signal-send
+        /// failure (a genuinely different problem than "just not
+        /// running") is still surfaced as a real error, and every
+        /// other container is still attempted regardless. Real
+        /// `docker kill` has no such flag at all.
+        #[arg(short, long)]
+        all: bool,
     },
     /// Pause all processes in a running container via the real cgroup
     /// v2 freezer — matching real `podman pause` exactly.
@@ -2508,7 +2528,7 @@ fn main() -> std::process::ExitCode {
                 cli.global.json,
             ),
             Some(Command::Stop { id, time, signal }) => cmd_stop(&id, time, signal.as_deref()),
-            Some(Command::Kill { id, signal }) => cmd_kill(&id, &signal),
+            Some(Command::Kill { id, signal, all }) => cmd_kill(id.as_deref(), &signal, all),
             Some(Command::Pause { id }) => cmd_pause(&id),
             Some(Command::Unpause { id }) => cmd_unpause(&id),
             Some(Command::Update {
@@ -8182,8 +8202,70 @@ fn cmd_restart(id: &str, time_secs: Option<u64>) -> anyhow::Result<()> {
 /// silent no-op — `kill`'s entire point is sending a *specific*
 /// signal to a *live* process, so there is nothing sensible to do
 /// once it's already gone.
-fn cmd_kill(id: &str, signal: &str) -> anyhow::Result<()> {
+///
+/// `--all` (0312) is the one real exception to that "not running is a
+/// hard error" rule: real podman's own `ContainerKill` lists *every*
+/// container (not a running-only query) and silently skips — no
+/// error, nothing printed — any that isn't currently live (`Creating`/
+/// `Created`/`Stopped`, i.e. neither `Running` nor `Paused`), rather
+/// than refusing the whole call over it (checked directly,
+/// `~/git/podman/pkg/domain/infra/abi/containers.go` and `libpod/
+/// container_api.go`'s own `Kill`). Every other container is still
+/// attempted regardless of an earlier failure, and a real signal-send
+/// failure (a genuinely different problem than "just not live") still
+/// surfaces as a real error, with every other container still
+/// attempted.
+fn cmd_kill(id: Option<&str>, signal: &str, all: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        id.is_none() || !all,
+        "cannot give both a container ID/name and --all"
+    );
+    let sig = oci_runtime_core::signal::parse(signal)
+        .with_context(|| format!("parsing signal {signal:?}"))?;
     let containers = open_container_store()?;
+
+    if all {
+        let mut first_error = None;
+        for state in containers.list().context("listing containers")? {
+            let status = state.effective_status();
+            if status != Status::Running && status != Status::Paused {
+                // Real podman's own identical "nothing to signal, so
+                // never even attempted" behavior for any container
+                // that isn't genuinely live -- checked directly,
+                // `libpod/container_api.go`'s own `Kill`, which only
+                // ever allows `Running`/`Stopping`/`Paused` (this
+                // project has no separate `Stopping` state) and
+                // rejects every other state (`Creating`/`Created`/
+                // `Stopped`) with `ErrCtrStateInvalid`, the one error
+                // `--all` silently tolerates. Confirmed live against a
+                // real installed podman: `podman kill --all` exits 0
+                // and leaves an untouched `create`d-but-never-`start`
+                // ed container alone, exactly like a stopped one.
+                continue;
+            }
+            let result = state
+                .pid
+                .ok_or_else(|| anyhow::anyhow!("container {:?} has no recorded pid", state.id))
+                .and_then(|pid| {
+                    oci_runtime_core::process::kill(pid, sig).context("sending signal")
+                });
+            match result {
+                Ok(()) => println!("{}", state.id),
+                Err(e) => {
+                    eprintln!("error killing {}: {e:#}", state.id);
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        return match first_error {
+            Some(e) => Err(e.context("killing containers")),
+            None => Ok(()),
+        };
+    }
+
+    let id = id.ok_or_else(|| {
+        anyhow::anyhow!("no container ID/name given (try `ociman kill <ID>` or `--all`)")
+    })?;
     let resolved = resolve_container_id(&containers, id)?;
     let state = containers.load(&resolved)?;
     if state.effective_status() == Status::Stopped {
@@ -8192,9 +8274,6 @@ fn cmd_kill(id: &str, signal: &str) -> anyhow::Result<()> {
     let pid = state
         .pid
         .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
-
-    let sig = oci_runtime_core::signal::parse(signal)
-        .with_context(|| format!("parsing signal {signal:?}"))?;
     oci_runtime_core::process::kill(pid, sig).context("sending signal")?;
 
     println!("{id}");
