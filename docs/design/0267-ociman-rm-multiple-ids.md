@@ -72,7 +72,6 @@ Full workspace: `cargo build`/`test --workspace`, `cargo fmt --all
 
 ## Still ahead
 
-`ociman images --filter` remains a real, similarly-scoped next
-candidate.
+`ociman images --filter` is implemented in `0268`.
 </content>
 </invoke>

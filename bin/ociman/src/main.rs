@@ -851,6 +851,15 @@ enum Command {
         /// identical shape for containers.
         #[arg(short, long)]
         quiet: bool,
+        /// Filter the listed images — matching real `podman images
+        /// --filter`'s own most commonly used filters (its own help
+        /// text's worked example is literally `podman images
+        /// --filter dangling=true`): `label=<key>[=<value>]`,
+        /// `label!=<key>[=<value>]` (OR'd together, same as `ociman
+        /// prune`'s own identical filter), or `dangling=true|false`.
+        /// May be given more than once.
+        #[arg(short, long = "filter")]
+        filter: Vec<String>,
     },
     /// Remove an image from local storage, matching real `docker
     /// rmi`/`podman rmi`. Resolves by tag reference or by a real or
@@ -1836,7 +1845,7 @@ fn main() -> std::process::ExitCode {
                 cli.global.json,
                 timestamp,
             ),
-            Some(Command::Images { quiet }) => cmd_images(quiet, cli.global.json),
+            Some(Command::Images { quiet, filter }) => cmd_images(quiet, cli.global.json, &filter),
             Some(Command::Rmi { reference, force }) => cmd_rmi(&reference, force, cli.global.json),
             Some(Command::Tag { source, target }) => cmd_tag(&source, &target, cli.global.json),
             Some(Command::History { reference }) => cmd_history(&reference, cli.global.json),
@@ -2610,12 +2619,27 @@ fn cmd_info(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_images(quiet: bool, json: bool) -> anyhow::Result<()> {
+fn cmd_images(quiet: bool, json: bool, filter: &[String]) -> anyhow::Result<()> {
     let store = open_store()?;
+    let filters = parse_image_filters(filter)?;
     let records = store.list_images().context("listing local images")?;
 
     let mut views = Vec::with_capacity(records.len());
     for record in &records {
+        if let Some(dangling) = filters.dangling
+            && is_untagged_reference(&record.reference) != dangling
+        {
+            continue;
+        }
+        if !filters.labels.is_empty() {
+            let config = store
+                .image_config(record)
+                .with_context(|| format!("reading config for {}", record.reference))?;
+            let labels = &config.config.unwrap_or_default().labels;
+            if !filters.labels.iter().any(|f| f.matches(labels)) {
+                continue;
+            }
+        }
         let summary = store
             .image_summary(record)
             .with_context(|| format!("reading manifest for {}", record.reference))?;
@@ -3157,25 +3181,54 @@ fn parse_simple_duration(s: &str) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs_f64(total_secs))
 }
 
+/// Parses a `label=<key>[=<value>]` or `label!=<key>[=<value>]`
+/// `--filter` value into a [`LabelFilter`] -- `None` if `f` isn't a
+/// label filter at all (letting the caller try its own other filter
+/// kinds next), `Some(Err(_))` for one that's present but malformed
+/// (e.g. an empty key). Shared by `ociman prune` and `ociman images
+/// --filter` so the two commands' own `label=`/`label!=` semantics
+/// can never silently drift apart from each other.
+fn try_parse_label_filter(command: &str, f: &str) -> Option<anyhow::Result<LabelFilter>> {
+    let (rest, negate) = f
+        .strip_prefix("label!=")
+        .map(|rest| (rest, true))
+        .or_else(|| f.strip_prefix("label=").map(|rest| (rest, false)))?;
+    Some((|| {
+        anyhow::ensure!(
+            !rest.is_empty(),
+            "{command}: --filter {f:?} is missing a label key"
+        );
+        let (key, value) = match rest.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (rest.to_string(), None),
+        };
+        Ok(LabelFilter { key, value, negate })
+    })())
+}
+
+/// Parses a `dangling=true|false` `--filter` value -- `None` if `f`
+/// isn't a dangling filter at all. Shared by `ociman prune` and
+/// `ociman images --filter` for the same reason `try_parse_label_filter`
+/// is.
+fn try_parse_dangling_filter(command: &str, f: &str) -> Option<anyhow::Result<bool>> {
+    let rest = f.strip_prefix("dangling=")?;
+    Some(match rest {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(anyhow::anyhow!(
+            "{command}: --filter {f:?}: invalid value for 'dangling' filter (expected true or \
+             false)"
+        )),
+    })
+}
+
 /// Parse `ociman prune`'s own `--filter` values into a [`PruneFilters`].
 fn parse_prune_filters(filters: &[String]) -> anyhow::Result<PruneFilters> {
     let mut parsed = PruneFilters::default();
     let mut until_values = 0usize;
     for f in filters {
-        if let Some((rest, negate)) = f
-            .strip_prefix("label!=")
-            .map(|rest| (rest, true))
-            .or_else(|| f.strip_prefix("label=").map(|rest| (rest, false)))
-        {
-            anyhow::ensure!(
-                !rest.is_empty(),
-                "ociman prune: --filter {f:?} is missing a label key"
-            );
-            let (key, value) = match rest.split_once('=') {
-                Some((k, v)) => (k.to_string(), Some(v.to_string())),
-                None => (rest.to_string(), None),
-            };
-            parsed.labels.push(LabelFilter { key, value, negate });
+        if let Some(result) = try_parse_label_filter("ociman prune", f) {
+            parsed.labels.push(result?);
         } else if let Some(rest) = f.strip_prefix("until=") {
             until_values += 1;
             anyhow::ensure!(
@@ -3194,15 +3247,8 @@ fn parse_prune_filters(filters: &[String]) -> anyhow::Result<PruneFilters> {
                 );
             };
             parsed.until = Some(threshold);
-        } else if let Some(rest) = f.strip_prefix("dangling=") {
-            let value = match rest {
-                "true" | "1" => true,
-                "false" | "0" => false,
-                _ => anyhow::bail!(
-                    "ociman prune: --filter {f:?}: invalid value for 'dangling' filter \
-                     (expected true or false)"
-                ),
-            };
+        } else if let Some(result) = try_parse_dangling_filter("ociman prune", f) {
+            let value = result?;
             anyhow::ensure!(
                 parsed.dangling.is_none_or(|existing| existing == value),
                 "ociman prune: conflicting dangling filter values specified"
@@ -3213,6 +3259,43 @@ fn parse_prune_filters(filters: &[String]) -> anyhow::Result<PruneFilters> {
                 "ociman prune: --filter {f:?} is not yet supported (only \
                  label=<key>[=<value>], label!=<key>[=<value>], until=<duration-or-timestamp>, \
                  or dangling=true|false are)"
+            );
+        }
+    }
+    Ok(parsed)
+}
+
+/// Every `--filter` value `ociman images` accepts, parsed once up
+/// front -- a narrower set than `ociman prune`'s own `PruneFilters`
+/// (no `until`, which prune-specific semantics don't apply to a plain
+/// listing), matching real `podman images --filter`'s own most
+/// commonly used filters (its own help text's worked example is
+/// literally `podman images --filter dangling=true`).
+#[derive(Default)]
+struct ImageFilters {
+    /// `label=`/`label!=` -- OR'd together, same as `PruneFilters`.
+    labels: Vec<LabelFilter>,
+    /// `dangling=true`/`dangling=false`, if given.
+    dangling: Option<bool>,
+}
+
+/// Parse `ociman images`'s own `--filter` values into an [`ImageFilters`].
+fn parse_image_filters(filters: &[String]) -> anyhow::Result<ImageFilters> {
+    let mut parsed = ImageFilters::default();
+    for f in filters {
+        if let Some(result) = try_parse_label_filter("ociman images", f) {
+            parsed.labels.push(result?);
+        } else if let Some(result) = try_parse_dangling_filter("ociman images", f) {
+            let value = result?;
+            anyhow::ensure!(
+                parsed.dangling.is_none_or(|existing| existing == value),
+                "ociman images: conflicting dangling filter values specified"
+            );
+            parsed.dangling = Some(value);
+        } else {
+            anyhow::bail!(
+                "ociman images: --filter {f:?} is not yet supported (only \
+                 label=<key>[=<value>], label!=<key>[=<value>], or dangling=true|false are)"
             );
         }
     }

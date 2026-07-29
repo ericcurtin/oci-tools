@@ -130,3 +130,158 @@ fn images_quiet_lists_one_line_per_tag_including_two_tags_of_the_same_image() {
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert_eq!(lines[0], lines[1], "{lines:?}");
 }
+
+/// `ociman images --filter dangling=true|false` (0268), matching real
+/// `podman images --filter dangling=true`'s own literal help-text
+/// example: `dangling=true` shows only untagged images, `dangling=
+/// false` shows only tagged ones.
+#[test]
+fn images_filter_dangling_selects_only_untagged_or_only_tagged_images() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/filter-dangling-tagged:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    // A second, untagged image: build on top of the first without a
+    // resulting tag, the same technique `ociman_prune.rs`'s own
+    // dangling tests use.
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/filter-dangling-tagged:latest\nRUN true\n",
+    )
+    .unwrap();
+    let build = ociman(
+        storage_dir.path(),
+        &["build", context_dir.path().to_str().unwrap()],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let dangling_only = ociman(
+        storage_dir.path(),
+        &["images", "-q", "--filter", "dangling=true"],
+    );
+    assert!(dangling_only.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&dangling_only.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "exactly the one untagged image: {dangling_only:?}"
+    );
+
+    let tagged_only = ociman(
+        storage_dir.path(),
+        &["images", "-q", "--filter", "dangling=false"],
+    );
+    assert!(tagged_only.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&tagged_only.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "exactly the one tagged image: {tagged_only:?}"
+    );
+
+    // Sanity: the two filtered sets are actually disjoint digests.
+    assert_ne!(dangling_only.stdout, tagged_only.stdout);
+}
+
+/// `ociman images --filter label=<key>=<value>`, matching real
+/// `podman images --filter label=`'s own semantics -- shared parsing
+/// with `ociman prune --filter label=` (`try_parse_label_filter`),
+/// checked here at the `images` call site instead.
+#[test]
+fn images_filter_label_only_lists_images_with_a_matching_label() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/filter-label-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/filter-label-base:latest\nLABEL env=prod\n",
+    )
+    .unwrap();
+    let build = ociman(
+        storage_dir.path(),
+        &["build", context_dir.path().to_str().unwrap()],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let full_digest = String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    let digest = full_digest.strip_prefix("sha256:").unwrap_or(&full_digest)[..12].to_string();
+
+    // A mismatched value: the labeled image is excluded.
+    let no_match = ociman(
+        storage_dir.path(),
+        &["images", "-q", "--filter", "label=env=staging"],
+    );
+    assert!(no_match.status.success());
+    assert!(
+        !String::from_utf8_lossy(&no_match.stdout).contains(&digest),
+        "a mismatched label value should never match: {no_match:?}"
+    );
+
+    // The exact matching value: only the labeled image is listed.
+    let matched = ociman(
+        storage_dir.path(),
+        &["images", "-q", "--filter", "label=env=prod"],
+    );
+    assert!(matched.status.success());
+    let lines: Vec<String> = String::from_utf8_lossy(&matched.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(lines, vec![digest]);
+}
+
+/// An unrecognized `--filter` value is a clear, immediate error rather
+/// than a silently-ignored no-op (matching `ociman prune`'s own
+/// identical rule for its own unrecognized filters).
+#[test]
+fn images_filter_with_an_unrecognized_kind_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &["images", "--filter", "before=some-image"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not yet supported"),
+        "{out:?}"
+    );
+}
