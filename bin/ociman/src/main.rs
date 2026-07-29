@@ -1579,6 +1579,29 @@ enum Command {
         #[command(subcommand)]
         command: VolumeCommand,
     },
+    /// `podman container`'s own subcommand family — see
+    /// [`ContainerCommand`] for exactly which of its real subcommands
+    /// this covers. Unlike every other container verb (`ps`/`rm`/
+    /// `inspect`/...), which this project only ever exposes as a flat
+    /// top-level command, `exists` genuinely has **no** flat top-level
+    /// alias in real docker/podman either (checked directly: neither
+    /// tool documents a bare `podman exists`) — this family exists
+    /// purely to host that one real, checked-directly-necessary
+    /// subcommand, not to duplicate every flat verb under a second,
+    /// redundant namespace.
+    Container {
+        #[command(subcommand)]
+        command: ContainerCommand,
+    },
+    /// `podman image`'s own subcommand family — see [`ImageCommand`]
+    /// for exactly which of its real subcommands this covers. Same
+    /// rationale as [`Command::Container`]'s own doc comment: `exists`
+    /// has no flat top-level alias in real docker/podman, so this
+    /// family exists solely to host it.
+    Image {
+        #[command(subcommand)]
+        command: ImageCommand,
+    },
     /// A live stream of a running container's own real resource
     /// usage, matching real `podman stats`'s own default continuous
     /// mode exactly (0284; `docs/design/0145` originally shipped only
@@ -1960,6 +1983,56 @@ enum VolumeCommand {
     /// container (running or stopped) — matching real `docker volume
     /// prune`/`podman volume prune`.
     Prune,
+    /// Exit `0` if the named volume exists, `1` otherwise — matching
+    /// real `podman volume exists` exactly (no output either way,
+    /// checked directly against a real installed `podman volume
+    /// exists`; real docker has no equivalent at all).
+    Exists {
+        /// The volume's own name.
+        name: String,
+    },
+}
+
+/// `ociman container`'s own subcommand family (see
+/// [`Command::Container`]'s own doc comment for why this exists at
+/// all despite every other container verb staying flat/top-level).
+#[derive(Debug, clap::Subcommand)]
+enum ContainerCommand {
+    /// Exit `0` if the named (or `--external`, see below) container
+    /// exists, `1` otherwise — matching real `podman container
+    /// exists` exactly (no output either way, checked directly
+    /// against a real installed `podman container exists`; real
+    /// docker has no equivalent at all).
+    Exists {
+        /// The container's ID or `--name`.
+        name: String,
+        /// Real podman's own flag for also checking *external*
+        /// (non-Podman-managed) storage containers — this project has
+        /// no such concept at all (every container this engine ever
+        /// creates is already fully "Podman-managed" in that sense),
+        /// so this is accepted for CLI-compatibility but never changes
+        /// the result: a container this project doesn't know about is
+        /// never found regardless.
+        #[arg(long)]
+        external: bool,
+    },
+}
+
+/// `ociman image`'s own subcommand family (see [`Command::Image`]'s
+/// own doc comment for why this exists at all despite every other
+/// image verb staying flat/top-level).
+#[derive(Debug, clap::Subcommand)]
+enum ImageCommand {
+    /// Exit `0` if the named image exists, `1` otherwise — matching
+    /// real `podman image exists` exactly (no output either way,
+    /// checked directly against a real installed `podman image
+    /// exists`; real docker has no equivalent at all). Resolves by
+    /// tag reference or real/short image ID, the same as every other
+    /// image-by-name command here (`ociman inspect`/`rmi`/`tag`).
+    Exists {
+        /// The image's tag reference or real/short ID.
+        name: String,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -2128,6 +2201,13 @@ fn main() -> std::process::ExitCode {
                 VolumeCommand::Inspect { name } => cmd_volume_inspect(&name, cli.global.json),
                 VolumeCommand::Rm { name, force } => cmd_volume_rm(&name, force),
                 VolumeCommand::Prune => cmd_volume_prune(cli.global.json),
+                VolumeCommand::Exists { name } => cmd_volume_exists(&name),
+            },
+            Some(Command::Container { command }) => match command {
+                ContainerCommand::Exists { name, external: _ } => cmd_container_exists(&name),
+            },
+            Some(Command::Image { command }) => match command {
+                ImageCommand::Exists { name } => cmd_image_exists(&name),
             },
             Some(Command::Stats {
                 id,
@@ -5310,6 +5390,64 @@ fn resolve_container_id(containers: &StateStore, reference: &str) -> anyhow::Res
         [] => anyhow::bail!("container {reference:?} does not exist"),
         _ => anyhow::bail!("multiple containers are named {reference:?} (this should not happen)"),
     }
+}
+
+/// Whether `reference` (a container's own generated id, or its
+/// `--name`) currently identifies a real, stored container —
+/// [`ContainerCommand::Exists`]'s own real underlying check, matching
+/// real `podman container exists`'s own simple boolean semantic
+/// exactly (no output, just an exit code). Shares `resolve_container_
+/// id`'s own two-step id-then-name lookup, but reports `false` for
+/// "not found" instead of a hard error — unlike every other command
+/// here, `exists` (correctly) never treats a missing container as an
+/// error at all.
+fn container_exists(containers: &StateStore, reference: &str) -> anyhow::Result<bool> {
+    match containers.load(reference) {
+        Ok(_) => return Ok(true),
+        Err(oci_runtime_core::StateError::NotFound(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let found = containers
+        .list()
+        .context("listing containers")?
+        .into_iter()
+        .any(|state| state.annotations.get(ANNOTATION_NAME).map(String::as_str) == Some(reference));
+    Ok(found)
+}
+
+/// `ociman container exists` — see [`ContainerCommand::Exists`]'s own
+/// doc comment for the real, checked-directly `--external` no-op
+/// note.
+fn cmd_container_exists(name: &str) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    if !container_exists(&containers, name)? {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `ociman image exists` — resolves the same way every other
+/// image-by-name command here does (`ociman inspect`/`rmi`/`tag`): a
+/// tag reference first, a real or short image ID otherwise.
+fn cmd_image_exists(name: &str) -> anyhow::Result<()> {
+    let store = open_store()?;
+    if resolve_image_by_reference_or_id(&store, name)?.is_none() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `ociman volume exists`.
+fn cmd_volume_exists(name: &str) -> anyhow::Result<()> {
+    let store = open_volume_store()?;
+    if store
+        .get(name)
+        .with_context(|| format!("looking up volume {name:?}"))?
+        .is_none()
+    {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// `docker ps`/`podman ps`-style view of one container record.
