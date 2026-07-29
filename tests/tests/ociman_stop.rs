@@ -361,3 +361,138 @@ fn stop_honors_the_images_declared_stopsignal() {
     );
     ociman(storage_dir.path(), &["rm", &id]);
 }
+
+/// `ociman run --stop-signal` (0300) overrides *both* the default
+/// `TERM` and the image's own declared `STOPSIGNAL` -- checked
+/// directly against real `podman run --stop-signal`/`docker run
+/// --stop-signal`: a `run`/`create`-time override persists on the
+/// container record itself, taking precedence over the image's own
+/// config for every later `stop` given no `--signal` of its own,
+/// exactly matching the same precedence order
+/// `stop_honors_the_images_declared_stopsignal` already exercises one
+/// level up.
+#[test]
+fn run_stop_signal_overrides_the_images_declared_stopsignal() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/run-stop-signal:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig {
+            stop_signal: Some("SIGUSR1".to_string()),
+            ..Default::default()
+        },
+    );
+
+    // Distinct exit codes per signal: whichever trap fires tells us
+    // exactly which signal was delivered. The image declares USR1 as
+    // its own STOPSIGNAL, but --stop-signal USR2 should win instead.
+    let script = "trap 'exit 43' USR1; trap 'exit 62' USR2; while true; do sleep 0.2; done";
+    let mut run = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "-d",
+            "--stop-signal",
+            "SIGUSR2",
+            "ociman-test/run-stop-signal:latest",
+            "/bin/sh",
+            "-c",
+            script,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run");
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    // Inspect reports the effective, persisted-override signal, not
+    // the image's own STOPSIGNAL.
+    let inspect = ociman(storage_dir.path(), &["inspect", &id]);
+    assert!(inspect.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(view["stop_signal"], "SIGUSR2");
+
+    // No --signal at stop time: the persisted --stop-signal override
+    // (USR2) wins over the image's own declared STOPSIGNAL (USR1).
+    let stop = ociman(storage_dir.path(), &["stop", "--time", "60", &id]);
+    assert!(
+        stop.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    run.wait().unwrap();
+    let ps = ociman(storage_dir.path(), &["ps", "-a", "--json"]);
+    let views: serde_json::Value = serde_json::from_slice(&ps.stdout).unwrap();
+    let entry = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == id)
+        .expect("container should be listed")
+        .clone();
+    assert_eq!(entry["status"], "stopped");
+    assert_eq!(
+        entry["exit_code"], 62,
+        "the USR2 trap's own code proves --stop-signal overrode the image's STOPSIGNAL: {entry:?}"
+    );
+    ociman(storage_dir.path(), &["rm", &id]);
+}
+
+/// An invalid `--stop-signal` at `run`/`create` time is a real, clear,
+/// upfront error -- matching real podman's own checked-directly
+/// spec-generation-time validation (see `ANNOTATION_STOP_SIGNAL`'s own
+/// doc comment) -- rather than only surfacing much later at the first
+/// real `stop`. No container is created at all: `ps -a` afterward is
+/// empty.
+#[test]
+fn run_with_an_unparsable_stop_signal_fails_fast_and_creates_nothing() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/bad-stop-signal:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--stop-signal",
+            "NOTASIGNAL",
+            "ociman-test/bad-stop-signal:latest",
+            "/bin/sh",
+        ],
+    );
+    assert!(!create.status.success());
+    assert!(
+        String::from_utf8_lossy(&create.stderr).contains("NOTASIGNAL"),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let ps = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert!(
+        String::from_utf8_lossy(&ps.stdout).trim().is_empty(),
+        "no container should have been created at all"
+    );
+}

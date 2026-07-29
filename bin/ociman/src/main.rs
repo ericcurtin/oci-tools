@@ -74,6 +74,22 @@ const ANNOTATION_NAME: &str = "io.oci-tools.name";
 /// inherited set rather than replacing it outright (also verified
 /// directly).
 const ANNOTATION_LABELS: &str = "io.oci-tools.labels";
+/// A `run`/`create --stop-signal` override, persisted verbatim as the
+/// user gave it (e.g. `SIGUSR1`, `9`) — checked directly against real
+/// `podman run --stop-signal`/`docker run --stop-signal`: this always
+/// wins over the resolved image's own declared `STOPSIGNAL`
+/// ([`stop_signal_from_image`], `0244`) but is itself still overridden
+/// by an explicit `ociman stop --signal`/`ociman restart --signal`
+/// given at that later call (`0300`; see [`resolve_stop_signal`]'s own
+/// doc comment for the exact, full precedence order). Validated
+/// eagerly at `run`/`create` time via `oci_runtime_core::signal::
+/// parse` so a typo'd signal name fails fast rather than only
+/// surfacing much later at the first real `stop`, matching real
+/// podman's own checked-directly behavior (`container-libs`'s own
+/// vendored `pkg/specgen/generate/container.go` calls `signal.
+/// ParseSignalNameOrNumber` right at spec-generation time, before the
+/// container is ever created).
+const ANNOTATION_STOP_SIGNAL: &str = "io.oci-tools.stop-signal";
 /// Present (value always `"true"`) whenever a container's own most
 /// recent launch was given `--rm` — the persisted record `cmd_start`
 /// (0154) needs to correctly auto-remove a container that was
@@ -512,6 +528,22 @@ struct RunArgs {
     /// rule this shares with it.
     #[arg(long = "dns-option", value_name = "OPTION")]
     dns_option: Vec<String>,
+    /// Override the signal a later `ociman stop`/`ociman restart` (with
+    /// no `--signal` of its own) sends first, before ever escalating to
+    /// `KILL` — matching real `docker run --stop-signal`/`podman run
+    /// --stop-signal` exactly (checked directly against an installed
+    /// `podman 4.9.3`/`docker 29.2.1`). Accepts anything `ociman
+    /// stop --signal` itself already does (a bare number, or a name
+    /// with or without its `SIG` prefix, case-insensitive), validated
+    /// eagerly right here so a typo fails this `run`/`create` outright
+    /// instead of only surfacing at the first real `stop` — see
+    /// [`ANNOTATION_STOP_SIGNAL`]'s own doc comment for the exact,
+    /// full precedence order this participates in and why it's
+    /// validated this early. With no `--stop-signal` given, falls back
+    /// to the resolved image's own declared `STOPSIGNAL` (`0244`),
+    /// else `TERM`, exactly as before this flag existed.
+    #[arg(long = "stop-signal", value_name = "SIGNAL")]
+    stop_signal: Option<String>,
     /// Set a label on the container: `KEY=value`, or bare `KEY` for an
     /// empty value (repeatable) — matching real `docker run --label`/
     /// `podman run --label` exactly. Merges with (rather than
@@ -4935,6 +4967,14 @@ struct PreparedContainer {
 /// failure).
 #[allow(clippy::too_many_arguments)]
 fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
+    // Validated eagerly, right here, rather than only at the first
+    // real `stop` -- see `ANNOTATION_STOP_SIGNAL`'s own doc comment
+    // for why this matches real podman's own checked-directly
+    // spec-generation-time validation.
+    if let Some(stop_signal) = &args.stop_signal {
+        oci_runtime_core::signal::parse(stop_signal)
+            .map_err(|e| anyhow::anyhow!("invalid --stop-signal {stop_signal:?}: {e}"))?;
+    }
     let entrypoint = args.entrypoint.as_deref().map(parse_entrypoint);
     let volume_specs = args
         .volume
@@ -5043,6 +5083,9 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             anyhow::bail!("container name {name:?} is already in use by {existing:?}");
         }
         annotations.insert(ANNOTATION_NAME.to_string(), name.to_string());
+    }
+    if let Some(stop_signal) = &args.stop_signal {
+        annotations.insert(ANNOTATION_STOP_SIGNAL.to_string(), stop_signal.clone());
     }
     let (container_id, mut state) = create_container_record(&containers, &annotations)?;
     tracing::debug!(container_id, %reference_display, "preparing container");
@@ -5983,6 +6026,12 @@ struct ContainerInspectView {
     /// honest empty map for a container predating this field's own
     /// existence (no annotation recorded at all yet), never an error.
     labels: std::collections::BTreeMap<String, String>,
+    /// The signal a later `ociman stop`/`ociman restart` (with no
+    /// `--signal` of its own) will actually send first -- see
+    /// [`resolve_stop_signal`]'s own doc comment for the exact, full
+    /// precedence order (`run`/`create --stop-signal` override, else
+    /// the resolved image's own declared `STOPSIGNAL`, else `TERM`).
+    stop_signal: String,
 }
 
 impl ContainerInspectView {
@@ -6019,6 +6068,7 @@ impl ContainerInspectView {
                 .get(ANNOTATION_LABELS)
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default(),
+            stop_signal: resolve_stop_signal(state, None),
         }
     }
 }
@@ -7268,6 +7318,24 @@ fn stop_signal_from_image(state: &oci_runtime_core::PersistedState) -> Option<St
         .filter(|s| !s.is_empty())
 }
 
+/// The full, real `docker stop`/`podman stop` precedence order for
+/// which signal actually gets sent first (before ever escalating to
+/// `KILL`), checked directly: an explicit `--signal` given to *this*
+/// one `stop`/`restart` call always wins; otherwise a `run`/`create
+/// --stop-signal` override persisted at creation time (0300, see
+/// [`ANNOTATION_STOP_SIGNAL`]'s own doc comment); otherwise the
+/// resolved image's own declared `STOPSIGNAL` ([`stop_signal_from_
+/// image`], `0244`); otherwise `TERM`.
+fn resolve_stop_signal(state: &oci_runtime_core::PersistedState, explicit: Option<&str>) -> String {
+    if let Some(explicit) = explicit {
+        return explicit.to_string();
+    }
+    if let Some(persisted) = state.annotations.get(ANNOTATION_STOP_SIGNAL) {
+        return persisted.clone();
+    }
+    stop_signal_from_image(state).unwrap_or_else(|| "TERM".to_string())
+}
+
 /// After a container's own process has genuinely exited, its detached
 /// *keeper* process (the one blocked in `run_and_finalize`, which
 /// forked it) still has its own trailing bookkeeping left to do —
@@ -7334,15 +7402,13 @@ fn stop_container(
         .pid
         .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
 
-    // An explicit `--signal` always wins; otherwise the image's own
-    // declared STOPSIGNAL (0244), else TERM -- matching real
-    // `docker stop`/`podman stop`. A declared-but-unparsable value
+    // See `resolve_stop_signal`'s own doc comment for the exact, full
+    // precedence order. A declared-but-unparsable value (from the
+    // image's own STOPSIGNAL; a persisted `--stop-signal` is already
+    // validated eagerly at `run`/`create` time and can't reach this)
     // falls back to TERM with a warning rather than failing the stop,
     // matching real cri-o's own `StopSignal()` tolerance exactly.
-    let resolved_signal = match signal {
-        Some(explicit) => explicit.to_string(),
-        None => stop_signal_from_image(&state).unwrap_or_else(|| "TERM".to_string()),
-    };
+    let resolved_signal = resolve_stop_signal(&state, signal);
     let sig = match oci_runtime_core::signal::parse(&resolved_signal) {
         Ok(sig) => sig,
         Err(e) if signal.is_none() => {
