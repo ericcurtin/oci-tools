@@ -1207,3 +1207,108 @@ fn ps_filter_ancestor_matches_the_containers_own_image_reference() {
     assert!(no_all.status.success());
     assert!(String::from_utf8_lossy(&no_all.stdout).trim().is_empty());
 }
+
+/// `ociman ps --filter exited=` (0282), matching real `podman ps
+/// --filter exited=` exactly: matches a container with a real,
+/// recorded exit code equal to one of the given values, never one
+/// that hasn't exited at all. Multiple values are OR'd together
+/// (checked directly against a real installed `podman ps`).
+#[test]
+fn ps_filter_exited_matches_the_containers_own_recorded_exit_code() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-filter-exited:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let run_with_exit = |name: &str, code: &str| {
+        let out = ociman(
+            storage_dir.path(),
+            &[
+                "run",
+                "--name",
+                name,
+                "ociman-test/ps-filter-exited:latest",
+                "sh",
+                "-c",
+                &format!("exit {code}"),
+            ],
+        );
+        assert_eq!(out.status.code(), code.parse().ok(), "{out:?}");
+    };
+    run_with_exit("exit0", "0");
+    run_with_exit("exit5", "5");
+    run_with_exit("exit7", "7");
+
+    let single = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "exited=5", "-q"],
+    );
+    assert!(single.status.success(), "{single:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&single.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "{single:?}"
+    );
+
+    let multi = ociman(
+        storage_dir.path(),
+        &[
+            "ps", "-a", "--filter", "exited=5", "--filter", "exited=7", "-q",
+        ],
+    );
+    assert!(multi.status.success(), "{multi:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&multi.stdout)
+            .trim()
+            .lines()
+            .count(),
+        2,
+        "{multi:?}"
+    );
+
+    let zero = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "exited=0", "-q"],
+    );
+    assert!(zero.status.success(), "{zero:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&zero.stdout).trim().lines().count(),
+        1,
+        "{zero:?}"
+    );
+
+    let no_match = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "exited=99", "-q"],
+    );
+    assert!(no_match.status.success());
+    assert!(String::from_utf8_lossy(&no_match.stdout).trim().is_empty());
+
+    let bad_value = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "exited=bogus"],
+    );
+    assert!(!bad_value.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad_value.stderr).contains("invalid exit code"),
+        "{bad_value:?}"
+    );
+
+    // Unlike `status=`, `exited=` alone (no `-a`) doesn't override the
+    // default running-only visibility rule.
+    let no_all = ociman(storage_dir.path(), &["ps", "--filter", "exited=5", "-q"]);
+    assert!(no_all.status.success());
+    assert!(String::from_utf8_lossy(&no_all.stdout).trim().is_empty());
+}

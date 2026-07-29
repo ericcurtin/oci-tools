@@ -1211,7 +1211,10 @@ enum Command {
         /// full manifest-digest match, and real docker/podman's own
         /// broader "or a descendant" image-lineage semantics, are both
         /// real, deliberately deferred candidates — see
-        /// `docs/design/0281`.
+        /// `docs/design/0281`. Also `exited=<code>` — matches a
+        /// container with a real, recorded exit code equal to one of
+        /// these (never one that hasn't exited at all), matching real
+        /// `podman ps --filter exited=` exactly.
         #[arg(short, long = "filter")]
         filter: Vec<String>,
     },
@@ -5030,6 +5033,10 @@ struct PsFilters {
     /// doc comment for the exact, checked-directly (against a real
     /// installed `podman`) matching rule.
     ancestor: Vec<String>,
+    /// `exited=<code>`, OR'd together -- matches a container with a
+    /// real, recorded exit code equal to one of these (never a
+    /// container that hasn't exited at all).
+    exited: Vec<i32>,
 }
 
 /// Parse `ociman ps`'s own `--filter` values into a [`PsFilters`].
@@ -5078,12 +5085,17 @@ fn parse_ps_filters(filters: &[String]) -> anyhow::Result<PsFilters> {
                 "ociman ps: --filter {f:?} is missing a value"
             );
             parsed.ancestor.push(value.to_string());
+        } else if let Some(value) = f.strip_prefix("exited=") {
+            let code: i32 = value.parse().map_err(|_| {
+                anyhow::anyhow!("ociman ps: --filter exited={value:?}: invalid exit code")
+            })?;
+            parsed.exited.push(code);
         } else {
             anyhow::bail!(
                 "ociman ps: --filter {f:?} is not yet supported (only status=<creating|created|\
                  running|stopped|paused>, id=<prefix>, name=<substring>, label=<key>[=<value>]/\
-                 label!=<key>[=<value>], before=<container>, since=<container>, or \
-                 ancestor=<image> are)"
+                 label!=<key>[=<value>], before=<container>, since=<container>, \
+                 ancestor=<image>, or exited=<code> are)"
             );
         }
     }
@@ -5254,6 +5266,18 @@ fn cmd_ps(all: bool, quiet: bool, json: bool, filter: &[String]) -> anyhow::Resu
                     .iter()
                     .any(|want| matches_ancestor_filter(image, want))
                 {
+                    return false;
+                }
+            }
+            // `exited=` is an ordinary additional constraint too --
+            // matches a real, recorded exit code, never a container
+            // that hasn't exited at all.
+            if !filters.exited.is_empty() {
+                let exit_code = s
+                    .annotations
+                    .get(ANNOTATION_EXIT_CODE)
+                    .and_then(|v| v.parse::<i32>().ok());
+                if !exit_code.is_some_and(|ec| filters.exited.contains(&ec)) {
                     return false;
                 }
             }
