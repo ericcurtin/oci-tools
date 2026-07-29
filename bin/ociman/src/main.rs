@@ -90,6 +90,18 @@ const ANNOTATION_LABELS: &str = "io.oci-tools.labels";
 /// ParseSignalNameOrNumber` right at spec-generation time, before the
 /// container is ever created).
 const ANNOTATION_STOP_SIGNAL: &str = "io.oci-tools.stop-signal";
+/// A `run`/`create --stop-timeout` override (seconds, persisted as a
+/// plain decimal string) — checked directly against real `podman run
+/// --stop-timeout`/`docker run --stop-timeout` and their own real
+/// `stop`/`restart --time` CLI-level precedence (`~/git/podman/cmd/
+/// podman/containers/stop.go`/`restart.go`: `cmd.Flag("time").Changed`
+/// gates whether an explicit `--time` even gets passed down at all,
+/// meaning a `stop`/`restart` given no `--time` of its own genuinely
+/// falls back to this persisted per-container value, defaulting to
+/// `10` only when *neither* was ever given — never the other way
+/// around). See [`resolve_stop_timeout`]'s own doc comment for the
+/// exact, full precedence order.
+const ANNOTATION_STOP_TIMEOUT: &str = "io.oci-tools.stop-timeout";
 /// Present (value always `"true"`) whenever a container's own most
 /// recent launch was given `--rm` — the persisted record `cmd_start`
 /// (0154) needs to correctly auto-remove a container that was
@@ -544,6 +556,19 @@ struct RunArgs {
     /// else `TERM`, exactly as before this flag existed.
     #[arg(long = "stop-signal", value_name = "SIGNAL")]
     stop_signal: Option<String>,
+    /// Override the default number of seconds a later `ociman
+    /// stop`/`ociman restart` (with no `--time` of its own) waits
+    /// after the initial signal before escalating to `KILL` —
+    /// matching real `docker run --stop-timeout`/`podman run
+    /// --stop-timeout` exactly (checked directly against an installed
+    /// `podman 4.9.3`/`docker 29.2.1`, and their own real CLI-level
+    /// precedence, `~/git/podman/cmd/podman/containers/stop.go`: an
+    /// explicit `stop --time`/`restart --time` always wins, but with
+    /// none given, this persisted value is used instead of the plain
+    /// `10`-second default). See [`ANNOTATION_STOP_TIMEOUT`]'s own
+    /// doc comment for the exact, full precedence order.
+    #[arg(long = "stop-timeout", value_name = "SECONDS")]
+    stop_timeout: Option<u64>,
     /// Set a label on the container: `KEY=value`, or bare `KEY` for an
     /// empty value (repeatable) — matching real `docker run --label`/
     /// `podman run --label` exactly. Merges with (rather than
@@ -1457,9 +1482,10 @@ enum Command {
         id: String,
         /// Seconds to wait after the initial signal before escalating
         /// to `KILL`, if the container is currently running (same
-        /// meaning as `ociman stop --time`).
-        #[arg(short, long, default_value_t = 10)]
-        time: u64,
+        /// meaning, precedence, and fallback as `ociman stop --time`
+        /// -- see [`resolve_stop_timeout`]'s own doc comment).
+        #[arg(short, long)]
+        time: Option<u64>,
     },
     /// Remove one or more stopped containers' storage — matching real
     /// `podman rm <ID> [ID...]` exactly. Refuses a still-running one
@@ -1636,13 +1662,21 @@ enum Command {
         /// The container's ID or `--name`.
         id: String,
         /// Seconds to wait after the initial signal before escalating
-        /// to `KILL`.
-        #[arg(short, long, default_value_t = 10)]
-        time: u64,
+        /// to `KILL`. With none given, falls back to the container's
+        /// own persisted `run`/`create --stop-timeout` (0301), else
+        /// `10` — matching real `docker stop`/`podman stop`'s own
+        /// checked-directly CLI-level precedence exactly (`~/git/
+        /// podman/cmd/podman/containers/stop.go`: an explicit `--time`
+        /// always wins, but omitting it genuinely falls back to the
+        /// persisted per-container value instead of a plain default).
+        /// See [`resolve_stop_timeout`]'s own doc comment.
+        #[arg(short, long)]
+        time: Option<u64>,
         /// Signal to send initially (name or number). Defaults to the
-        /// image's own declared `STOPSIGNAL` (0244), else `TERM` —
-        /// matching real `docker stop`/`podman stop`, which honor a
-        /// Containerfile's `STOPSIGNAL` unless overridden.
+        /// container's own persisted `run`/`create --stop-signal`
+        /// (0300), else the image's own declared `STOPSIGNAL` (0244),
+        /// else `TERM` — matching real `docker stop`/`podman stop`,
+        /// which honor both unless overridden.
         #[arg(short, long)]
         signal: Option<String>,
     },
@@ -5087,6 +5121,12 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
     if let Some(stop_signal) = &args.stop_signal {
         annotations.insert(ANNOTATION_STOP_SIGNAL.to_string(), stop_signal.clone());
     }
+    if let Some(stop_timeout) = args.stop_timeout {
+        annotations.insert(
+            ANNOTATION_STOP_TIMEOUT.to_string(),
+            stop_timeout.to_string(),
+        );
+    }
     let (container_id, mut state) = create_container_record(&containers, &annotations)?;
     tracing::debug!(container_id, %reference_display, "preparing container");
 
@@ -6032,6 +6072,12 @@ struct ContainerInspectView {
     /// precedence order (`run`/`create --stop-signal` override, else
     /// the resolved image's own declared `STOPSIGNAL`, else `TERM`).
     stop_signal: String,
+    /// The number of seconds a later `ociman stop`/`ociman restart`
+    /// (with no `--time` of its own) will actually wait before
+    /// escalating to `KILL` -- see [`resolve_stop_timeout`]'s own doc
+    /// comment for the exact, full precedence order (`run`/`create
+    /// --stop-timeout` override, else `10`).
+    stop_timeout: u64,
 }
 
 impl ContainerInspectView {
@@ -6069,6 +6115,7 @@ impl ContainerInspectView {
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default(),
             stop_signal: resolve_stop_signal(state, None),
+            stop_timeout: resolve_stop_timeout(state, None),
         }
     }
 }
@@ -7289,7 +7336,7 @@ fn reset_failed_systemd_scope(container_id: &str, state: &oci_runtime_core::Pers
 /// doc comment for the exact policy): a no-op on one that's already
 /// stopped, matching real `docker stop`/`podman stop`'s own
 /// idempotent behavior rather than erroring on a redundant call.
-fn cmd_stop(id: &str, time_secs: u64, signal: Option<&str>) -> anyhow::Result<()> {
+fn cmd_stop(id: &str, time_secs: Option<u64>, signal: Option<&str>) -> anyhow::Result<()> {
     stop_container(id, time_secs, signal, true)?;
     println!("{id}");
     Ok(())
@@ -7336,6 +7383,30 @@ fn resolve_stop_signal(state: &oci_runtime_core::PersistedState, explicit: Optio
     stop_signal_from_image(state).unwrap_or_else(|| "TERM".to_string())
 }
 
+/// The full, real `docker stop`/`podman stop`/`restart --time`
+/// precedence order for how many seconds to wait after the initial
+/// signal before escalating to `KILL`, checked directly (`~/git/
+/// podman/cmd/podman/containers/stop.go`/`restart.go`): an explicit
+/// `--time` given to *this* one `stop`/`restart` call always wins;
+/// otherwise a `run`/`create --stop-timeout` override persisted at
+/// creation time (0301, see [`ANNOTATION_STOP_TIMEOUT`]'s own doc
+/// comment); otherwise `10`, matching real podman's own documented
+/// default exactly. An unparsable persisted value (never actually
+/// reachable in practice — `--stop-timeout`'s own `u64` clap type
+/// already rejects anything but a plain non-negative integer at
+/// `run`/`create` time) falls back to the same `10` rather than
+/// erroring a `stop`/`restart` over it.
+fn resolve_stop_timeout(state: &oci_runtime_core::PersistedState, explicit: Option<u64>) -> u64 {
+    if let Some(explicit) = explicit {
+        return explicit;
+    }
+    state
+        .annotations
+        .get(ANNOTATION_STOP_TIMEOUT)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10)
+}
+
 /// After a container's own process has genuinely exited, its detached
 /// *keeper* process (the one blocked in `run_and_finalize`, which
 /// forked it) still has its own trailing bookkeeping left to do —
@@ -7375,13 +7446,16 @@ fn wait_for_keeper_to_finalize(containers: &StateStore, resolved: &str) {
 /// `cmd_rm`/`cmd_rmi --force`).
 fn stop_container(
     id: &str,
-    time_secs: u64,
+    time_secs: Option<u64>,
     signal: Option<&str>,
     reset_scope: bool,
 ) -> anyhow::Result<()> {
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)?;
     let state = containers.load(&resolved)?;
+    // See `resolve_stop_timeout`'s own doc comment for the exact,
+    // full precedence order.
+    let time_secs = resolve_stop_timeout(&state, time_secs);
     if state.effective_status() == Status::Stopped {
         // `effective_status` can report `Stopped` purely because the
         // container's own recorded pid is no longer alive, even while
@@ -7780,7 +7854,7 @@ fn attach_and_wait_for_exit(containers: &StateStore, resolved: &str) -> anyhow::
 /// has already forked its own new keeper below — at which point this
 /// function itself never forks again, so a background thread spawned
 /// here can no longer corrupt anything.
-fn cmd_restart(id: &str, time_secs: u64) -> anyhow::Result<()> {
+fn cmd_restart(id: &str, time_secs: Option<u64>) -> anyhow::Result<()> {
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)?;
     let old_state = containers.load(&resolved).ok();

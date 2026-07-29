@@ -496,3 +496,151 @@ fn run_with_an_unparsable_stop_signal_fails_fast_and_creates_nothing() {
         "no container should have been created at all"
     );
 }
+
+/// `ociman run --stop-timeout` (0301) is honored when a later `stop`
+/// gives no `--time` of its own -- checked directly against real
+/// `podman run --stop-timeout`/`docker run --stop-timeout` and their
+/// own real CLI-level precedence (`~/git/podman/cmd/podman/
+/// containers/stop.go`: an explicit `--time` always wins, but with
+/// none given, the persisted per-container value is used instead of
+/// the plain `10`-second default). A container that ignores `TERM`
+/// entirely, given a short persisted `--stop-timeout`, must have been
+/// force-killed well before the plain default `10`-second window
+/// would have elapsed -- proving the persisted value, not the
+/// default, actually governed the wait.
+#[test]
+fn run_stop_timeout_is_honored_when_stop_gives_no_explicit_time() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/run-stop-timeout:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "-d",
+            "--stop-timeout",
+            "1",
+            "ociman-test/run-stop-timeout:latest",
+            "/bin/sh",
+            "-c",
+            "trap '' TERM; sleep 300",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run");
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let inspect = ociman(storage_dir.path(), &["inspect", &id]);
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(view["stop_timeout"], 1);
+
+    let before = Instant::now();
+    let stop = ociman(storage_dir.path(), &["stop", &id]);
+    let elapsed = before.elapsed();
+    assert!(
+        stop.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    run.wait().unwrap();
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "should have escalated to KILL around the persisted 1s timeout, not the plain 10s \
+         default: took {elapsed:?}"
+    );
+
+    let ps = ociman(storage_dir.path(), &["ps", "-a", "--json"]);
+    let views: serde_json::Value = serde_json::from_slice(&ps.stdout).unwrap();
+    let entry = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == id)
+        .expect("container should be listed")
+        .clone();
+    assert_eq!(entry["status"], "stopped");
+    assert_eq!(
+        entry["exit_code"], 137,
+        "a real SIGKILL exit code: {entry:?}"
+    );
+    ociman(storage_dir.path(), &["rm", &id]);
+}
+
+/// An explicit `ociman stop --time` still overrides a persisted
+/// `run --stop-timeout`, exactly the same "explicit call-time value
+/// always wins" precedence `run_stop_signal_overrides_the_images_
+/// declared_stopsignal` already exercises for `--signal` -- checked
+/// directly against real podman's own identical rule.
+#[test]
+fn stop_explicit_time_overrides_the_persisted_stop_timeout() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stop-timeout-override:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "-d",
+            "--stop-timeout",
+            "60",
+            "ociman-test/stop-timeout-override:latest",
+            "/bin/sh",
+            "-c",
+            "trap '' TERM; sleep 300",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run");
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let before = Instant::now();
+    let stop = ociman(storage_dir.path(), &["stop", "--time", "1", &id]);
+    let elapsed = before.elapsed();
+    assert!(
+        stop.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    run.wait().unwrap();
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "an explicit --time 1 should override the persisted 60s --stop-timeout: took {elapsed:?}"
+    );
+    ociman(storage_dir.path(), &["rm", &id]);
+}
