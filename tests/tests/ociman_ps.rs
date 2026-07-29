@@ -659,7 +659,7 @@ fn ps_filter_with_an_unrecognized_key_or_value_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();
     Store::open(storage_dir.path()).unwrap();
 
-    let bad_key = ociman(storage_dir.path(), &["ps", "--filter", "ancestor=foo"]);
+    let bad_key = ociman(storage_dir.path(), &["ps", "--filter", "pod=foo"]);
     assert!(!bad_key.status.success());
     assert!(
         String::from_utf8_lossy(&bad_key.stderr).contains("not yet supported"),
@@ -1106,6 +1106,104 @@ fn ps_filter_before_and_since_use_the_referenced_containers_own_creation_time() 
     // Unlike `status=`, `before=`/`since=` alone (no `-a`) don't
     // override the default running-only visibility rule.
     let no_all = ociman(storage_dir.path(), &["ps", "--filter", "before=ctr2", "-q"]);
+    assert!(no_all.status.success());
+    assert!(String::from_utf8_lossy(&no_all.stdout).trim().is_empty());
+}
+
+/// `ociman ps --filter ancestor=` (0281), matching real `podman ps
+/// --filter ancestor=`'s own checked-directly name/tag substring
+/// matching rule for the common case: a real image reference
+/// substring match, and a bare, tagless value also matching a
+/// `:latest`-tagged reference.
+#[test]
+fn ps_filter_ancestor_matches_the_containers_own_image_reference() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-filter-ancestor:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "ancestor-ctr",
+            "ociman-test/ps-filter-ancestor:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    // Full reference.
+    let full = ociman(
+        storage_dir.path(),
+        &[
+            "ps",
+            "-a",
+            "--filter",
+            "ancestor=docker.io/ociman-test/ps-filter-ancestor:latest",
+            "-q",
+        ],
+    );
+    assert!(full.status.success(), "{full:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&full.stdout).trim().lines().count(),
+        1,
+        "{full:?}"
+    );
+
+    // Bare, tagless value: the real tag is `latest`, so this still
+    // matches.
+    let bare = ociman(
+        storage_dir.path(),
+        &[
+            "ps",
+            "-a",
+            "--filter",
+            "ancestor=ociman-test/ps-filter-ancestor",
+            "-q",
+        ],
+    );
+    assert!(bare.status.success(), "{bare:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&bare.stdout).trim().lines().count(),
+        1,
+        "{bare:?}"
+    );
+
+    // Wrong tag: no match.
+    let wrong_tag = ociman(
+        storage_dir.path(),
+        &[
+            "ps",
+            "-a",
+            "--filter",
+            "ancestor=ociman-test/ps-filter-ancestor:v1",
+            "-q",
+        ],
+    );
+    assert!(wrong_tag.status.success(), "{wrong_tag:?}");
+    assert!(String::from_utf8_lossy(&wrong_tag.stdout).trim().is_empty());
+
+    // Unlike `status=`, `ancestor=` alone (no `-a`) doesn't override
+    // the default running-only visibility rule.
+    let no_all = ociman(
+        storage_dir.path(),
+        &[
+            "ps",
+            "--filter",
+            "ancestor=ociman-test/ps-filter-ancestor",
+            "-q",
+        ],
+    );
     assert!(no_all.status.success());
     assert!(String::from_utf8_lossy(&no_all.stdout).trim().is_empty());
 }

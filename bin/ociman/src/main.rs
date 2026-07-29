@@ -1202,7 +1202,16 @@ enum Command {
         /// rather than assumed from source alone). An unresolvable
         /// reference container is a clear error. Same visibility-rule
         /// treatment as `id=`/`name=`/`label=`: an ordinary additional
-        /// constraint, not a visibility override.
+        /// constraint, not a visibility override. Also
+        /// `ancestor=<image>` — matches a container whose own recorded
+        /// image reference contains `<image>` as a substring (a bare,
+        /// tagless value also matches a `:latest`-tagged reference),
+        /// checked directly against a real installed `podman ps
+        /// --filter ancestor=` for the common name/tag case. An exact
+        /// full manifest-digest match, and real docker/podman's own
+        /// broader "or a descendant" image-lineage semantics, are both
+        /// real, deliberately deferred candidates — see
+        /// `docs/design/0281`.
         #[arg(short, long = "filter")]
         filter: Vec<String>,
     },
@@ -5017,6 +5026,10 @@ struct PsFilters {
     before: Vec<String>,
     /// `since=<container>`, same shape as [`Self::before`].
     since: Vec<String>,
+    /// `ancestor=<image>`, OR'd together -- see `Command::Ps`'s own
+    /// doc comment for the exact, checked-directly (against a real
+    /// installed `podman`) matching rule.
+    ancestor: Vec<String>,
 }
 
 /// Parse `ociman ps`'s own `--filter` values into a [`PsFilters`].
@@ -5059,15 +5072,43 @@ fn parse_ps_filters(filters: &[String]) -> anyhow::Result<PsFilters> {
                 "ociman ps: --filter {f:?} is missing a value"
             );
             parsed.since.push(value.to_string());
+        } else if let Some(value) = f.strip_prefix("ancestor=") {
+            anyhow::ensure!(
+                !value.is_empty(),
+                "ociman ps: --filter {f:?} is missing a value"
+            );
+            parsed.ancestor.push(value.to_string());
         } else {
             anyhow::bail!(
                 "ociman ps: --filter {f:?} is not yet supported (only status=<creating|created|\
                  running|stopped|paused>, id=<prefix>, name=<substring>, label=<key>[=<value>]/\
-                 label!=<key>[=<value>], before=<container>, or since=<container> are)"
+                 label!=<key>[=<value>], before=<container>, since=<container>, or \
+                 ancestor=<image> are)"
             );
         }
     }
     Ok(parsed)
+}
+
+/// Whether `image_reference` (a container's own recorded
+/// `ANNOTATION_IMAGE`, e.g. `docker.io/library/busybox:latest`)
+/// matches one `--filter ancestor=` value -- see [`Command::Ps`]'s
+/// own doc comment for exactly which real, checked-directly rule this
+/// implements (name/tag substring matching only; an exact-full-
+/// manifest-digest match, and real docker/podman's own broader
+/// "or a descendant" image-lineage semantics, are both real,
+/// deliberately deferred candidates noted there).
+fn matches_ancestor_filter(image_reference: &str, want: &str) -> bool {
+    if image_reference.contains(want) {
+        return true;
+    }
+    // A bare, tagless value (e.g. `busybox`) matches a `:latest`
+    // reference too -- checked directly against a real installed
+    // `podman ps --filter ancestor=busybox` against a real
+    // `docker.io/library/busybox:latest` container.
+    image_reference
+        .strip_suffix(":latest")
+        .is_some_and(|without_tag| without_tag.contains(want))
 }
 
 /// Resolve `reference` (a container id/`--name`, `before=`/`since=`'s
@@ -5197,6 +5238,22 @@ fn cmd_ps(all: bool, quiet: bool, json: bool, filter: &[String]) -> anyhow::Resu
                     return false;
                 }
                 if since_threshold.is_some_and(|t| created <= t) {
+                    return false;
+                }
+            }
+            // `ancestor=` is an ordinary additional constraint too,
+            // same visibility-rule treatment as everything above.
+            if !filters.ancestor.is_empty() {
+                let image = s
+                    .annotations
+                    .get(ANNOTATION_IMAGE)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if !filters
+                    .ancestor
+                    .iter()
+                    .any(|want| matches_ancestor_filter(image, want))
+                {
                     return false;
                 }
             }
