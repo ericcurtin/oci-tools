@@ -664,6 +664,15 @@ struct RunArgs {
     /// run --pull` with no value), not a silent `always`.
     #[arg(long, value_enum, default_value_t = PullPolicy::Missing)]
     pull: PullPolicy,
+    /// Pull this platform's manifest instead of the host's own when
+    /// `image` needs pulling — see `Command::Pull`'s own identical
+    /// flag for the exact same syntax/semantics (a pure image-
+    /// selection mechanism, no host-match assertion at all: only
+    /// actually running a foreign-architecture binary would fail,
+    /// naturally, at the kernel's own `execve(2)`, this project
+    /// having no cross-architecture emulation of any kind).
+    #[arg(long, value_name = "os/arch[/variant]")]
+    platform: Option<String>,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -683,6 +692,24 @@ enum Command {
         /// local/private development registry commonly needs.
         #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         tls_verify: bool,
+        /// Pull this platform's manifest instead of the host's own
+        /// (`os/arch[/variant]`, e.g. `linux/arm64`) — matching real
+        /// `docker pull --platform`/`podman pull --platform` exactly:
+        /// purely an image-*selection* mechanism (which entry of a
+        /// real multi-platform manifest list to fetch), with no
+        /// requirement that it match the host at all and no
+        /// assertion otherwise — unlike `ociman build --platform`
+        /// (which genuinely executes `RUN` steps using the host's own
+        /// kernel, so a mismatch really is a hard error there), a
+        /// mismatched pull here is completely ordinary; only actually
+        /// *running* a foreign-architecture binary later would fail,
+        /// naturally, at the kernel's own `execve(2)` (this project
+        /// has no cross-architecture emulation of any kind, matching
+        /// real podman/docker without `qemu-user-static`/`binfmt_misc`
+        /// registered either). Defaults to the host's own platform
+        /// when omitted, exactly as before this flag existed.
+        #[arg(long, value_name = "os/arch[/variant]")]
+        platform: Option<String>,
     },
     /// Push an already-stored image back to its own registry/
     /// repository/tag, matching real `docker push`/`podman push`'s
@@ -2278,7 +2305,8 @@ fn main() -> std::process::ExitCode {
             Some(Command::Pull {
                 reference,
                 tls_verify,
-            }) => cmd_pull(&reference, tls_verify, cli.global.json),
+                platform,
+            }) => cmd_pull(&reference, tls_verify, platform.as_deref(), cli.global.json),
             Some(Command::Push {
                 reference,
                 tls_verify,
@@ -2566,11 +2594,20 @@ impl ImageView {
     }
 }
 
-fn cmd_pull(reference_str: &str, tls_verify: bool, json: bool) -> anyhow::Result<()> {
+fn cmd_pull(
+    reference_str: &str,
+    tls_verify: bool,
+    platform: Option<&str>,
+    json: bool,
+) -> anyhow::Result<()> {
     let reference = Reference::parse(reference_str)
         .with_context(|| format!("parsing image reference {reference_str:?}"))?;
+    let platform = platform
+        .map(|p| build::parse_platform_spec("ociman pull", p))
+        .transpose()?
+        .unwrap_or_else(Platform::host);
     let store = open_store()?;
-    let record: ImageRecord = pull_unconditionally(&store, &reference, tls_verify)
+    let record: ImageRecord = pull_unconditionally(&store, &reference, tls_verify, &platform)
         .with_context(|| format!("pulling {reference}"))?;
 
     let summary = store
@@ -5117,6 +5154,12 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         oci_runtime_core::signal::parse(stop_signal)
             .map_err(|e| anyhow::anyhow!("invalid --stop-signal {stop_signal:?}: {e}"))?;
     }
+    let platform = args
+        .platform
+        .as_deref()
+        .map(|p| build::parse_platform_spec("ociman run/create", p))
+        .transpose()?
+        .unwrap_or_else(Platform::host);
     let entrypoint = args.entrypoint.as_deref().map(parse_entrypoint);
     let volume_specs = args
         .volume
@@ -5181,7 +5224,8 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         None => {
             let reference = Reference::parse(&args.image)
                 .with_context(|| format!("parsing image reference {:?}", args.image))?;
-            let record = resolve_or_pull(&store, &reference, args.tls_verify, args.pull)?;
+            let record =
+                resolve_or_pull(&store, &reference, args.tls_verify, args.pull, &platform)?;
             (record, reference.to_string())
         }
     };
@@ -9052,10 +9096,16 @@ fn resolve_or_pull(
     reference: &Reference,
     tls_verify: bool,
     pull_policy: PullPolicy,
+    platform: &Platform,
 ) -> anyhow::Result<ImageRecord> {
-    oci_registry::resolve_or_pull(store, reference, pull_policy.into(), tls_verify, || {
-        pull_unconditionally(store, reference, tls_verify)
-    })
+    oci_registry::resolve_or_pull(
+        store,
+        reference,
+        pull_policy.into(),
+        tls_verify,
+        platform,
+        || pull_unconditionally(store, reference, tls_verify, platform),
+    )
     .map_err(|e| match e {
         oci_registry::PullError::NotFoundLocally { reference } => {
             anyhow::anyhow!("{reference}: no such image in local storage (run `ociman pull` first)")
@@ -9072,9 +9122,10 @@ fn pull_unconditionally(
     store: &Store,
     reference: &Reference,
     tls_verify: bool,
+    platform: &Platform,
 ) -> Result<ImageRecord, oci_registry::PullError> {
     let progress = oci_cli_common::progress::spinner(format!("pulling {}", reference.familiar()));
-    let result = oci_registry::pull_unconditionally(store, reference, tls_verify);
+    let result = oci_registry::pull_unconditionally(store, reference, tls_verify, platform);
     progress.finish_and_clear();
     result
 }

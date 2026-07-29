@@ -363,9 +363,21 @@ fn create_box(image: &str, name: &str, pull: bool) -> anyhow::Result<()> {
     } else {
         oci_registry::PullPolicy::Missing
     };
-    let record = oci_registry::resolve_or_pull(&store, &reference, pull_policy, true, || {
-        oci_registry::pull_unconditionally(&store, &reference, true)
-    })
+    let record = oci_registry::resolve_or_pull(
+        &store,
+        &reference,
+        pull_policy,
+        true,
+        &oci_spec_types::image::Platform::host(),
+        || {
+            oci_registry::pull_unconditionally(
+                &store,
+                &reference,
+                true,
+                &oci_spec_types::image::Platform::host(),
+            )
+        },
+    )
     .with_context(|| format!("resolving {reference}"))?;
 
     let manifest = store

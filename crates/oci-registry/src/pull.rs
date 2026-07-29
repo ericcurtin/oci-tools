@@ -141,9 +141,10 @@ pub fn pull_unconditionally(
     store: &Store,
     reference: &Reference,
     tls_verify: bool,
+    platform: &Platform,
 ) -> Result<ImageRecord, PullError> {
     let mut client = client_for(reference.registry_host(), tls_verify);
-    pull(&mut client, store, reference, &Platform::host())
+    pull(&mut client, store, reference, platform)
 }
 
 /// Look `reference` up in `store`, pulling it according to
@@ -158,12 +159,18 @@ pub fn pull_unconditionally(
 /// directly so a caller that wants its own progress UI around a real
 /// pull (`ociman`'s own spinner, e.g.) can wrap it there; a caller with
 /// no such UI can simply pass `|| pull_unconditionally(store,
-/// reference, tls_verify)` verbatim.
+/// reference, tls_verify, platform)` verbatim.
+///
+/// `platform` (0307) is only ever consulted here for [`PullPolicy::
+/// Newer`]'s own registry digest check — every other policy either
+/// never touches the network at all, or defers entirely to whatever
+/// `pull_now` itself does with it.
 pub fn resolve_or_pull(
     store: &Store,
     reference: &Reference,
     pull_policy: PullPolicy,
     tls_verify: bool,
+    platform: &Platform,
     mut pull_now: impl FnMut() -> Result<ImageRecord, PullError>,
 ) -> Result<ImageRecord, PullError> {
     let local = store.resolve_image(&reference.to_string())?;
@@ -181,12 +188,8 @@ pub fn resolve_or_pull(
                 return pull_now();
             };
             let mut client = client_for(reference.registry_host(), tls_verify);
-            let different = has_different_digest(
-                &mut client,
-                reference,
-                &Platform::host(),
-                &record.manifest_digest,
-            )?;
+            let different =
+                has_different_digest(&mut client, reference, platform, &record.manifest_digest)?;
             if different { pull_now() } else { Ok(record) }
         }
     }
@@ -838,10 +841,17 @@ mod tests {
         store.put_image(&local).unwrap();
 
         let mut pull_now_calls = 0;
-        let record = resolve_or_pull(&store, &reference, PullPolicy::Never, true, || {
-            pull_now_calls += 1;
-            unreachable!("Never must not pull when already present locally")
-        })
+        let record = resolve_or_pull(
+            &store,
+            &reference,
+            PullPolicy::Never,
+            true,
+            &Platform::host(),
+            || {
+                pull_now_calls += 1;
+                unreachable!("Never must not pull when already present locally")
+            },
+        )
         .unwrap();
         assert_eq!(record, local);
         assert_eq!(pull_now_calls, 0);
@@ -853,9 +863,14 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         let reference = Reference::parse("example.com/testrepo:latest").unwrap();
 
-        let err = resolve_or_pull(&store, &reference, PullPolicy::Never, true, || {
-            unreachable!("Never must never pull at all")
-        })
+        let err = resolve_or_pull(
+            &store,
+            &reference,
+            PullPolicy::Never,
+            true,
+            &Platform::host(),
+            || unreachable!("Never must never pull at all"),
+        )
         .unwrap_err();
         assert!(matches!(err, PullError::NotFoundLocally { .. }));
     }
@@ -868,9 +883,14 @@ mod tests {
         let local = fake_record(&reference);
         store.put_image(&local).unwrap();
 
-        let record = resolve_or_pull(&store, &reference, PullPolicy::Missing, true, || {
-            unreachable!("Missing must not pull when already present locally")
-        })
+        let record = resolve_or_pull(
+            &store,
+            &reference,
+            PullPolicy::Missing,
+            true,
+            &Platform::host(),
+            || unreachable!("Missing must not pull when already present locally"),
+        )
         .unwrap();
         assert_eq!(record, local);
     }
@@ -882,10 +902,17 @@ mod tests {
         let reference = Reference::parse("example.com/testrepo:latest").unwrap();
 
         let mut pull_now_calls = 0;
-        let record = resolve_or_pull(&store, &reference, PullPolicy::Missing, true, || {
-            pull_now_calls += 1;
-            Ok(fake_record(&reference))
-        })
+        let record = resolve_or_pull(
+            &store,
+            &reference,
+            PullPolicy::Missing,
+            true,
+            &Platform::host(),
+            || {
+                pull_now_calls += 1;
+                Ok(fake_record(&reference))
+            },
+        )
         .unwrap();
         assert_eq!(record.reference, reference.to_string());
         assert_eq!(pull_now_calls, 1);
@@ -899,10 +926,17 @@ mod tests {
         store.put_image(&fake_record(&reference)).unwrap();
 
         let mut pull_now_calls = 0;
-        resolve_or_pull(&store, &reference, PullPolicy::Always, true, || {
-            pull_now_calls += 1;
-            Ok(fake_record(&reference))
-        })
+        resolve_or_pull(
+            &store,
+            &reference,
+            PullPolicy::Always,
+            true,
+            &Platform::host(),
+            || {
+                pull_now_calls += 1;
+                Ok(fake_record(&reference))
+            },
+        )
         .unwrap();
         assert_eq!(pull_now_calls, 1);
     }

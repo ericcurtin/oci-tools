@@ -199,8 +199,13 @@ fn pull_image_blocking(spec: &str) -> Result<String, Status> {
     let reference = oci_spec_types::Reference::parse(spec)
         .map_err(|e| Status::invalid_argument(format!("parsing image reference {spec:?}: {e}")))?;
     let store = open_store()?;
-    let record = oci_registry::pull_unconditionally(&store, &reference, true)
-        .map_err(|e| Status::unavailable(format!("pulling {reference}: {e}")))?;
+    let record = oci_registry::pull_unconditionally(
+        &store,
+        &reference,
+        true,
+        &oci_spec_types::image::Platform::host(),
+    )
+    .map_err(|e| Status::unavailable(format!("pulling {reference}: {e}")))?;
     Ok(record.manifest_digest.to_string())
 }
 

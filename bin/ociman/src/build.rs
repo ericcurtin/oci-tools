@@ -376,7 +376,7 @@ pub fn cmd_build(
                 // value was parsed but never read anywhere at all) —
                 // see `docs/design/0193`.
                 if let Some(requested) = stage.platform.as_deref().or(platform) {
-                    let requested_platform = parse_platform_spec(requested)?;
+                    let requested_platform = parse_platform_spec("ociman build", requested)?;
                     let host = Platform::host();
                     // `requested_platform` (what the caller asked for)
                     // is the *selection criterion* here, `host` (what
@@ -410,8 +410,13 @@ pub fn cmd_build(
                 let base_reference = Reference::parse(&stage.base_name).with_context(|| {
                     format!("parsing base image reference {:?}", stage.base_name)
                 })?;
-                let base_record =
-                    crate::resolve_or_pull(&store, &base_reference, tls_verify, pull_policy)?;
+                let base_record = crate::resolve_or_pull(
+                    &store,
+                    &base_reference,
+                    tls_verify,
+                    pull_policy,
+                    &Platform::host(),
+                )?;
                 let base_manifest = store
                     .image_manifest(&base_record)
                     .with_context(|| format!("reading manifest for {base_reference}"))?;
@@ -1189,22 +1194,28 @@ fn unused_build_arg_names<'a>(
 /// values real BuildKit also accepts, are deliberately not supported
 /// here — every real Containerfile this project needs to build in
 /// practice already spells out the full `linux/<arch>` form).
-fn parse_platform_spec(value: &str) -> anyhow::Result<Platform> {
+///
+/// Shared by `ociman pull`/`run`/`create --platform` (0307) as well as
+/// `ociman build --platform`/`FROM --platform=` — `command` names
+/// whichever one is actually parsing, for an error message that
+/// points at the right flag rather than always saying "build" even
+/// when it wasn't.
+pub(crate) fn parse_platform_spec(command: &str, value: &str) -> anyhow::Result<Platform> {
     let mut parts = value.split('/');
     let os = parts
         .next()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("ociman build: invalid --platform value {value:?}"))?;
+        .ok_or_else(|| anyhow::anyhow!("{command}: invalid --platform value {value:?}"))?;
     let architecture = parts.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "ociman build: --platform value {value:?} is missing an architecture (expected \
+            "{command}: --platform value {value:?} is missing an architecture (expected \
              os/arch[/variant], e.g. linux/amd64)"
         )
     })?;
     let variant = parts.next().map(str::to_string);
     anyhow::ensure!(
         parts.next().is_none(),
-        "ociman build: invalid --platform value {value:?} (expected os/arch[/variant])"
+        "{command}: invalid --platform value {value:?} (expected os/arch[/variant])"
     );
     Ok(Platform {
         os: os.to_string(),
@@ -2484,7 +2495,13 @@ fn external_image_source_root(
              reference"
         )
     })?;
-    let record = crate::resolve_or_pull(store, &reference, tls_verify, pull_policy)?;
+    let record = crate::resolve_or_pull(
+        store,
+        &reference,
+        tls_verify,
+        pull_policy,
+        &Platform::host(),
+    )?;
     let manifest = store
         .image_manifest(&record)
         .with_context(|| format!("reading manifest for {reference}"))?;
