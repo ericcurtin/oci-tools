@@ -270,18 +270,181 @@ fn images_filter_label_only_lists_images_with_a_matching_label() {
 
 /// An unrecognized `--filter` value is a clear, immediate error rather
 /// than a silently-ignored no-op (matching `ociman prune`'s own
-/// identical rule for its own unrecognized filters).
+/// identical rule for its own unrecognized filters). Real podman's
+/// own further `images --filter` keys (`readonly=`, `intermediate=`,
+/// `containers=`) remain deliberately unimplemented — `reference=` is
+/// used here since it's the next real, checked-directly candidate
+/// noted in `docs/design/0293`'s own "still ahead".
 #[test]
 fn images_filter_with_an_unrecognized_kind_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();
     Store::open(storage_dir.path()).unwrap();
     let out = ociman(
         storage_dir.path(),
-        &["images", "--filter", "before=some-image"],
+        &["images", "--filter", "reference=some-image"],
     );
     assert!(!out.status.success());
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("not yet supported"),
         "{out:?}"
+    );
+}
+
+/// `ociman images --filter before=`/`since=`/`after=` (0293), matching
+/// real `podman images --filter`'s own checked-directly semantics
+/// exactly (`~/git/container-libs/common/libimage/filters.go`): an
+/// image whose own declared creation time is strictly before/after
+/// the named reference image's. Real podman's own generic multi-value
+/// combination rule (every filter under the same key ANDed together)
+/// is mathematically equivalent to comparing against the *earliest*
+/// reference for `before=`, the *latest* for `since=`/`after=` — a
+/// real, checked-directly distinction from `ociman ps --filter
+/// before=`/`since=`'s own different container-creation-time version,
+/// which (matching real podman's own separate `ps`-side quirk) uses
+/// the earliest for *both* keys.
+#[test]
+fn images_filter_before_and_since_use_the_referenced_images_own_creation_time() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/images-filter-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    // Three real, distinct images, spaced apart in real creation time
+    // via `ociman build` (the only way to get a real, non-`None`
+    // top-level `created` field a `seed_image`-only image never has) —
+    // a metadata-only Containerfile (no RUN/COPY) keeps each build
+    // fast.
+    let build = |tag: &str, label: &str| {
+        let context_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            context_dir.path().join("Containerfile"),
+            format!("FROM ociman-test/images-filter-base:latest\nLABEL step={label}\n"),
+        )
+        .unwrap();
+        let out = ociman(
+            storage_dir.path(),
+            &["build", "-t", tag, context_dir.path().to_str().unwrap()],
+        );
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+    };
+    build("img-1:latest", "one");
+    build("img-2:latest", "two");
+    build("img-3:latest", "three");
+
+    let list_refs = |args: &[&str]| -> Vec<String> {
+        let out = ociman(storage_dir.path(), args);
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let view: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        view.as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["reference"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // `before=img-3`: img-1 and img-2 (the base image has no recorded
+    // `created` at all, so it's silently excluded rather than erroring
+    // the whole listing -- matching this project's own established
+    // "absence over fabrication" convention).
+    let before = list_refs(&[
+        "--json",
+        "images",
+        "--filter",
+        "before=docker.io/library/img-3:latest",
+    ]);
+    assert_eq!(
+        before,
+        vec![
+            "docker.io/library/img-1:latest".to_string(),
+            "docker.io/library/img-2:latest".to_string(),
+        ],
+        "{before:?}"
+    );
+
+    // `since=img-1`: img-2 and img-3.
+    let since = list_refs(&[
+        "--json",
+        "images",
+        "--filter",
+        "since=docker.io/library/img-1:latest",
+    ]);
+    assert_eq!(
+        since,
+        vec![
+            "docker.io/library/img-2:latest".to_string(),
+            "docker.io/library/img-3:latest".to_string(),
+        ],
+        "{since:?}"
+    );
+
+    // `after=` is a real, checked-directly synonym for `since=`.
+    let after = list_refs(&[
+        "--json",
+        "images",
+        "--filter",
+        "after=docker.io/library/img-1:latest",
+    ]);
+    assert_eq!(after, since, "{after:?}");
+
+    // Multiple `before=` values: the *earliest* of img-2/img-3's own
+    // creation times is img-2's -- same result as `before=img-2`
+    // alone.
+    let before_multi = list_refs(&[
+        "--json",
+        "images",
+        "--filter",
+        "before=docker.io/library/img-2:latest",
+        "--filter",
+        "before=docker.io/library/img-3:latest",
+    ]);
+    assert_eq!(
+        before_multi,
+        vec!["docker.io/library/img-1:latest".to_string()],
+        "{before_multi:?}"
+    );
+
+    // Multiple `since=` values: the *latest* of img-1/img-2's own
+    // creation times is img-2's -- same result as `since=img-2` alone.
+    let since_multi = list_refs(&[
+        "--json",
+        "images",
+        "--filter",
+        "since=docker.io/library/img-1:latest",
+        "--filter",
+        "since=docker.io/library/img-2:latest",
+    ]);
+    assert_eq!(
+        since_multi,
+        vec!["docker.io/library/img-3:latest".to_string()],
+        "{since_multi:?}"
+    );
+
+    // An unresolvable reference image is a clear error.
+    let bad_ref = ociman(
+        storage_dir.path(),
+        &["images", "--filter", "before=does-not-exist:latest"],
+    );
+    assert!(!bad_ref.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad_ref.stderr).contains("no such image"),
+        "{bad_ref:?}"
     );
 }

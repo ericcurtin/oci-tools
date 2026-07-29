@@ -910,8 +910,24 @@ enum Command {
         /// text's worked example is literally `podman images
         /// --filter dangling=true`): `label=<key>[=<value>]`,
         /// `label!=<key>[=<value>]` (OR'd together, same as `ociman
-        /// prune`'s own identical filter), or `dangling=true|false`.
-        /// May be given more than once.
+        /// prune`'s own identical filter), `dangling=true|false`, or
+        /// `before=<image>`/`since=<image>`/`after=<image>` (`since`/
+        /// `after` are real podman's own checked-directly synonyms
+        /// for the identical filter) — matches an image whose own
+        /// declared creation time is strictly before/after the named
+        /// image's. Multiple values for the same key are ANDed
+        /// together, matching real podman's own generic multi-value
+        /// combination rule exactly (`~/git/container-libs/common/
+        /// libimage/filters.go`'s own `applyFilters`) — mathematically
+        /// equivalent to comparing against the *earliest* of them for
+        /// `before=`, the *latest* for `since=`/`after=` (a real,
+        /// checked-directly distinction from `ociman ps --filter
+        /// before=`/`since=`'s own different container-creation-time
+        /// version, which uses the earliest for *both* keys — real
+        /// podman's own `ps`-side implementation does too, a real,
+        /// separate quirk in its own upstream source, not something
+        /// this project invented or miscopied). May be given more
+        /// than once.
         #[arg(short, long = "filter")]
         filter: Vec<String>,
     },
@@ -2961,6 +2977,17 @@ fn cmd_images(quiet: bool, json: bool, filter: &[String]) -> anyhow::Result<()> 
     let filters = parse_image_filters(filter)?;
     let records = store.list_images().context("listing local images")?;
 
+    // Resolved once, up front (each reference image needs a real
+    // store lookup) -- not inside the per-image filter loop below,
+    // matching `cmd_ps`'s own identical `before_threshold`/
+    // `since_threshold` precomputation (0280).
+    let before_threshold = (!filters.before.is_empty())
+        .then(|| earliest_image_creation(&store, &filters.before))
+        .transpose()?;
+    let since_threshold = (!filters.since.is_empty())
+        .then(|| latest_image_creation(&store, &filters.since))
+        .transpose()?;
+
     let mut views = Vec::with_capacity(records.len());
     for record in &records {
         if let Some(dangling) = filters.dangling
@@ -2968,13 +2995,33 @@ fn cmd_images(quiet: bool, json: bool, filter: &[String]) -> anyhow::Result<()> 
         {
             continue;
         }
-        if !filters.labels.is_empty() {
+        let needs_config =
+            !filters.labels.is_empty() || before_threshold.is_some() || since_threshold.is_some();
+        if needs_config {
             let config = store
                 .image_config(record)
                 .with_context(|| format!("reading config for {}", record.reference))?;
-            let labels = &config.config.unwrap_or_default().labels;
-            if !filters.labels.iter().any(|f| f.matches(labels)) {
-                continue;
+            if !filters.labels.is_empty() {
+                let empty_labels = std::collections::BTreeMap::new();
+                let labels = config.config.as_ref().map_or(&empty_labels, |c| &c.labels);
+                if !filters.labels.iter().any(|f| f.matches(labels)) {
+                    continue;
+                }
+            }
+            if before_threshold.is_some() || since_threshold.is_some() {
+                let Some(created) = config
+                    .created
+                    .as_deref()
+                    .and_then(oci_spec_types::time::parse_rfc3339_utc)
+                else {
+                    continue;
+                };
+                if before_threshold.is_some_and(|t| created >= t) {
+                    continue;
+                }
+                if since_threshold.is_some_and(|t| created <= t) {
+                    continue;
+                }
             }
         }
         let summary = store
@@ -3819,6 +3866,21 @@ struct ImageFilters {
     labels: Vec<LabelFilter>,
     /// `dangling=true`/`dangling=false`, if given.
     dangling: Option<bool>,
+    /// `before=<image>`, each a raw reference/id string (resolved
+    /// once, in `cmd_images`, since resolving needs the full store) --
+    /// matches an image whose own declared creation time is strictly
+    /// before *every* given reference image's own (real podman's own
+    /// `applyFilters`, `~/git/container-libs/common/libimage/
+    /// filters.go`, ANDs multiple values under the same key
+    /// together — mathematically equivalent to comparing against the
+    /// *earliest* of them, the one that's hardest to satisfy).
+    before: Vec<String>,
+    /// `since=<image>`/`after=<image>` (real podman's own checked-
+    /// directly synonyms for the identical filter, `case "after",
+    /// "since":`) -- the mirror image of [`Self::before`]: strictly
+    /// after *every* given reference's own creation time, equivalent
+    /// to comparing against the *latest* of them.
+    since: Vec<String>,
 }
 
 /// Parse `ociman images`'s own `--filter` values into an [`ImageFilters`].
@@ -3834,14 +3896,94 @@ fn parse_image_filters(filters: &[String]) -> anyhow::Result<ImageFilters> {
                 "ociman images: conflicting dangling filter values specified"
             );
             parsed.dangling = Some(value);
+        } else if let Some(value) = f.strip_prefix("before=") {
+            anyhow::ensure!(
+                !value.is_empty(),
+                "ociman images: --filter {f:?} is missing a value"
+            );
+            parsed.before.push(value.to_string());
+        } else if let Some(value) = f
+            .strip_prefix("since=")
+            .or_else(|| f.strip_prefix("after="))
+        {
+            anyhow::ensure!(
+                !value.is_empty(),
+                "ociman images: --filter {f:?} is missing a value"
+            );
+            parsed.since.push(value.to_string());
         } else {
             anyhow::bail!(
                 "ociman images: --filter {f:?} is not yet supported (only \
-                 label=<key>[=<value>], label!=<key>[=<value>], or dangling=true|false are)"
+                 label=<key>[=<value>], label!=<key>[=<value>], dangling=true|false, \
+                 before=<image>, or since=<image>/after=<image> are)"
             );
         }
     }
     Ok(parsed)
+}
+
+/// Resolve `reference` (an image tag/ID, `images --filter before=`/
+/// `since=`/`after=`'s own value) to its real, declared creation time
+/// -- matching real podman's own `r.time(key, value)`
+/// (`LookupImage(value).Created()`).
+fn resolve_image_created(store: &Store, reference: &str) -> anyhow::Result<std::time::SystemTime> {
+    let resolved = resolve_image_by_reference_or_id(store, reference)?.ok_or_else(|| {
+        anyhow::anyhow!("--filter before=/since=/after=: {reference}: no such image")
+    })?;
+    let config = store
+        .image_config(resolved.record())
+        .with_context(|| format!("reading config for {reference}"))?;
+    let created = config
+        .created
+        .ok_or_else(|| anyhow::anyhow!("image {reference:?} has no recorded creation time"))?;
+    oci_spec_types::time::parse_rfc3339_utc(&created).ok_or_else(|| {
+        anyhow::anyhow!(
+            "image {reference:?}'s own recorded creation time {created:?} isn't a valid RFC3339 \
+             timestamp"
+        )
+    })
+}
+
+/// The *earliest* creation time among every reference image in
+/// `references` -- see [`ImageFilters::before`]'s own doc comment for
+/// why "earliest" is the mathematically correct AND-composition of
+/// multiple `before=` values, not merely a convention borrowed from
+/// `ociman ps --filter before=`.
+fn earliest_image_creation(
+    store: &Store,
+    references: &[String],
+) -> anyhow::Result<std::time::SystemTime> {
+    references
+        .iter()
+        .map(|r| resolve_image_created(store, r))
+        .try_fold(None::<std::time::SystemTime>, |earliest, created| {
+            let created = created?;
+            Ok(Some(match earliest {
+                Some(e) if e < created => e,
+                _ => created,
+            }))
+        })
+        .map(|earliest| earliest.expect("references is non-empty when this is called"))
+}
+
+/// The *latest* creation time among every reference image in
+/// `references` -- the mirror image of [`earliest_image_creation`],
+/// for `since=`/`after=`'s own correct AND-composition.
+fn latest_image_creation(
+    store: &Store,
+    references: &[String],
+) -> anyhow::Result<std::time::SystemTime> {
+    references
+        .iter()
+        .map(|r| resolve_image_created(store, r))
+        .try_fold(None::<std::time::SystemTime>, |latest, created| {
+            let created = created?;
+            Ok(Some(match latest {
+                Some(l) if l > created => l,
+                _ => created,
+            }))
+        })
+        .map(|latest| latest.expect("references is non-empty when this is called"))
 }
 
 fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
