@@ -57,6 +57,22 @@ const ANNOTATION_EXIT_CODE: &str = "io.oci-tools.exit-code";
 /// [`resolve_container_id`] for how this makes a name usable anywhere
 /// an id is, matching real `docker`/`podman`).
 const ANNOTATION_NAME: &str = "io.oci-tools.name";
+/// The container's own real, effective labels (the resolved image's
+/// own `Config.Labels`, with `run`/`create --label` entries merged in
+/// on top) — a single JSON-encoded `BTreeMap<String, String>`, rather
+/// than one annotation per label key, since this project's own
+/// `annotations` map already has real, established keys of its own
+/// (`ANNOTATION_IMAGE`/`ANNOTATION_NAME`/...) that a namespaced-per-
+/// label-key scheme risks colliding with. Matches real `podman
+/// inspect`'s own checked-directly behavior: a container with no
+/// explicit `--label` still reports its base image's own labels via
+/// `Config.Labels` (verified directly: a real `podman create` with no
+/// `--label` at all against an image with its own real `LABEL`
+/// showed that label in `podman inspect`'s own output), and an
+/// explicit `--label` *adds* to (or overrides a same key in) that
+/// inherited set rather than replacing it outright (also verified
+/// directly).
+const ANNOTATION_LABELS: &str = "io.oci-tools.labels";
 /// Present (value always `"true"`) whenever a container's own most
 /// recent launch was given `--rm` — the persisted record `cmd_start`
 /// (0154) needs to correctly auto-remove a container that was
@@ -469,6 +485,16 @@ struct RunArgs {
     /// without a real network setup of this project's own).
     #[arg(long = "add-host", value_name = "HOST:IP")]
     add_host: Vec<String>,
+    /// Set a label on the container: `KEY=value`, or bare `KEY` for an
+    /// empty value (repeatable) — matching real `docker run --label`/
+    /// `podman run --label` exactly. Merges with (rather than
+    /// replacing) the resolved image's own inherited `Config.Labels`,
+    /// a same-key `--label` overriding the image's own value —
+    /// checked directly against a real installed `podman create
+    /// --label`/`podman inspect`. Visible via `ociman inspect`'s own
+    /// `labels` field.
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    label: Vec<String>,
     /// Override the working directory the container's own process
     /// starts in, matching real `docker run -w`/`podman run -w`
     /// exactly. Defaults to the image's own `WORKDIR` config (or
@@ -4008,6 +4034,21 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
     // actually has, resolvable back through `store.resolve_image`
     // identically either way.
     annotations.insert(ANNOTATION_IMAGE.to_string(), record.reference.clone());
+    // The image's own inherited labels, with `--label` merged in on
+    // top (a same-key `--label` overriding the image's own value) --
+    // see `ANNOTATION_LABELS`'s own doc comment for the real,
+    // checked-directly semantics this matches. Stored even when
+    // empty (a real, honest `{}`), so `ociman inspect`'s own reader
+    // never has to guess whether an absent annotation means "no
+    // labels" or "never recorded at all".
+    let mut labels = config.config.clone().unwrap_or_default().labels;
+    for (key, value) in build::parse_key_value_pairs(&args.label) {
+        labels.insert(key, value);
+    }
+    annotations.insert(
+        ANNOTATION_LABELS.to_string(),
+        serde_json::to_string(&labels).expect("a string-keyed/valued map always serializes"),
+    );
     if let Some(name) = &args.name {
         validate_container_name(name)?;
         if let Ok(existing) = resolve_container_id(&containers, name) {
@@ -4859,6 +4900,12 @@ struct ContainerInspectView {
     bundle: String,
     rootfs: String,
     exit_code: Option<i32>,
+    /// The container's own real, effective labels -- see
+    /// [`ANNOTATION_LABELS`]'s own doc comment for the exact real
+    /// semantics (image-inherited, `--label` merged on top). A real,
+    /// honest empty map for a container predating this field's own
+    /// existence (no annotation recorded at all yet), never an error.
+    labels: std::collections::BTreeMap<String, String>,
 }
 
 impl ContainerInspectView {
@@ -4890,6 +4937,11 @@ impl ContainerInspectView {
                 .annotations
                 .get(ANNOTATION_EXIT_CODE)
                 .and_then(|s| s.parse().ok()),
+            labels: state
+                .annotations
+                .get(ANNOTATION_LABELS)
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default(),
         }
     }
 }

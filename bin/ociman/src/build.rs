@@ -1254,7 +1254,7 @@ fn read_build_arg_file(path: &Path) -> anyhow::Result<Vec<String>> {
 /// directly, exactly the same — only what the resulting pairs get
 /// applied *to* differs (`ImageConfig.config.labels` vs. the built
 /// manifest's own top-level `annotations`).
-fn parse_key_value_pairs(values: &[String]) -> Vec<(String, String)> {
+pub(crate) fn parse_key_value_pairs(values: &[String]) -> Vec<(String, String)> {
     let mut resolved: Vec<(String, String)> = Vec::new();
     let mut index_of: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for value in values {

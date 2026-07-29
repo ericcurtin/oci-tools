@@ -256,3 +256,113 @@ fn inspect_by_id_is_not_ambiguous_when_multiple_tags_share_the_same_digest() {
         String::from_utf8_lossy(&inspect.stderr)
     );
 }
+
+/// `ociman run`/`create --label` (0274): a container with no explicit
+/// `--label` still shows its base image's own real `LABEL`s via
+/// `ociman inspect`'s own `labels` field, matching real `podman
+/// create`/`podman inspect`'s checked-directly behavior exactly.
+#[test]
+fn inspect_shows_the_image_own_inherited_labels_with_no_explicit_label_flag() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert("image.label".to_string(), "fromimage".to_string());
+    seed_image(
+        &store,
+        "ociman-test/label-inherit:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            labels,
+            ..Default::default()
+        },
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "label-inherit-ctr",
+            "ociman-test/label-inherit:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let inspect = ociman(storage_dir.path(), &["inspect", "label-inherit-ctr"]);
+    assert!(
+        inspect.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(
+        view["labels"],
+        serde_json::json!({"image.label": "fromimage"}),
+        "{view:?}"
+    );
+}
+
+/// `--label KEY=VALUE`/bare `KEY` merges with (rather than replacing)
+/// the image's own inherited labels, a same-key `--label` overriding
+/// the image's own value — matching real `podman create --label`'s
+/// own checked-directly behavior exactly.
+#[test]
+fn create_label_merges_with_and_overrides_the_image_own_inherited_labels() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert("image.label".to_string(), "fromimage".to_string());
+    labels.insert("shared.key".to_string(), "fromimage".to_string());
+    seed_image(
+        &store,
+        "ociman-test/label-merge:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            labels,
+            ..Default::default()
+        },
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "label-merge-ctr",
+            "--label",
+            "own.label=fromcli",
+            "--label",
+            "barekey",
+            "--label",
+            "shared.key=fromcli",
+            "ociman-test/label-merge:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let inspect = ociman(storage_dir.path(), &["inspect", "label-merge-ctr"]);
+    assert!(inspect.status.success(), "{inspect:?}");
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(
+        view["labels"],
+        serde_json::json!({
+            "image.label": "fromimage",
+            "shared.key": "fromcli",
+            "own.label": "fromcli",
+            "barekey": "",
+        }),
+        "{view:?}"
+    );
+}

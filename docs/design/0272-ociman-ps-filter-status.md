@@ -93,10 +93,15 @@ Full workspace: `cargo build`/`test --workspace`, `cargo fmt --all
 `ociman ps --filter name=`/`id=` is implemented in `0273` (resolved
 the substring-vs-regex-dependency question without a new dependency:
 real docker/podman's own regex search is behaviorally a substring
-search for any ordinary, non-regex filter value). `label=`/`label!=`
-(needs more direct verification of the still-not-fully-understood real
-multi-value semantics found above), and the rest of real podman's own
-larger `ps --filter` family (`ancestor`, `before`/`since`, `pod`,
-`network`, ...) remain real, separately-scoped next candidates.
+search for any ordinary, non-regex filter value). `label=`/`label!=`'s
+own "still-not-fully-understood real multi-value semantics" turned out
+to be test contamination, not a real anomaly — redone from a clean
+slate, it cleanly AND's (`0274`'s own research note) — but implementing
+it honestly first needed container-level labels to exist at all
+(`ociman run`/`create --label`, closed in `0274`), so the filter itself
+is left for a follow-up increment now that there's something real to
+filter on. The rest of real podman's own larger `ps --filter` family
+(`ancestor`, `before`/`since`, `pod`, `network`, ...) remain real,
+separately-scoped next candidates.
 </content>
 </invoke>
