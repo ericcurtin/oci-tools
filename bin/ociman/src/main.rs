@@ -1593,14 +1593,33 @@ enum Command {
         /// list an explicit `ID`/`--name` argument already builds
         /// (resolved, and only then removed, exactly the same way).
         /// Mutually exclusive with `--all`, matching real podman's own
-        /// identical rule. Unlike real podman (whose own missing-file
-        /// tolerance is gated behind a separate `--ignore` flag this
-        /// project doesn't have yet), a cidfile that can't be read at
-        /// all is always a clear, immediate error here — the natural,
-        /// honest behavior for a flag with no `--ignore` counterpart
-        /// yet, not a silent divergence.
+        /// identical rule. Unlike real podman's own `--ignore`-gated
+        /// tolerance for a missing cidfile itself, a cidfile that
+        /// can't be read at all is always a clear, immediate error
+        /// here regardless of `--ignore` (0310's own deliberately
+        /// narrow scope, kept even now that `--ignore` exists —
+        /// `--ignore` here only ever widens what an *id* tolerates,
+        /// matching real podman's own checked-directly narrow gate,
+        /// see [`Self::Rm`]'s own `ignore` field doc comment).
         #[arg(long = "cidfile", value_name = "FILE")]
         cidfile: Vec<PathBuf>,
+        /// Don't error if a given `ID`/`--name` doesn't resolve to any
+        /// real container at all — matching real `podman rm --ignore`
+        /// exactly (checked directly against an installed `podman
+        /// 4.9.3`, both its own source, `~/git/podman/pkg/domain/
+        /// infra/abi/containers.go`'s own `ContainerRm`, and live
+        /// behavior): real podman's own gate is this narrow specific
+        /// case only — a still-running container refused without
+        /// `--force` is still a hard error even with `--ignore`
+        /// (verified directly: identical error, identical exit code,
+        /// with or without the flag) — matched here identically:
+        /// `--ignore` only ever silences "this id doesn't resolve to
+        /// anything at all," nothing else. `--force` implies
+        /// `--ignore` too (matching real podman's own checked-directly
+        /// behavior, and this project's own already-established
+        /// `ociman rmi --force`-implies-`--ignore` convention).
+        #[arg(short, long)]
+        ignore: bool,
     },
     /// Copy files/directories between the local filesystem and a
     /// container (running or stopped), or between two containers —
@@ -2461,7 +2480,8 @@ fn main() -> std::process::ExitCode {
                 force,
                 all,
                 cidfile,
-            }) => cmd_rm(&ids, force, all, &cidfile),
+                ignore,
+            }) => cmd_rm(&ids, force, all, &cidfile, ignore),
             Some(Command::Cp {
                 src,
                 dest,
@@ -6747,11 +6767,21 @@ fn cmd_ps(
 /// difference from `--all`'s own "keep going past a per-container
 /// failure" policy, which still applies once a name/ID has actually
 /// resolved to something real).
-fn cmd_rm(ids: &[String], force: bool, all: bool, cidfiles: &[PathBuf]) -> anyhow::Result<()> {
+fn cmd_rm(
+    ids: &[String],
+    force: bool,
+    all: bool,
+    cidfiles: &[PathBuf],
+    ignore: bool,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         cidfiles.is_empty() || !all,
         "--all and --cidfile cannot be used together"
     );
+    // Matches real `podman rm --force`'s own checked-directly
+    // behavior exactly: forcing implies ignoring too, the same
+    // convention `ociman rmi --force` already established.
+    let ignore = ignore || force;
     // Real podman's own exact semantics (`~/git/podman/cmd/podman/
     // containers/rm.go`): the file's own first line only
     // (`strings.Cut(content, "\n")`), merged into the same target list
@@ -6775,13 +6805,30 @@ fn cmd_rm(ids: &[String], force: bool, all: bool, cidfiles: &[PathBuf]) -> anyho
             // Resolve every given identifier first: an unresolvable
             // one aborts before anything at all is removed (checked
             // directly against a real `podman rm id1 nonexistent
-            // id2`: neither `id1` nor `id2` gets removed either).
+            // id2`: neither `id1` nor `id2` gets removed either) --
+            // unless `--ignore` is given, in which case real podman's
+            // own narrow gate (checked directly: only ever "doesn't
+            // resolve to anything at all," never a running-without-
+            // `--force` refusal or any other failure kind) drops that
+            // one id from what gets removed instead of aborting the
+            // whole call. `resolve_container_id` itself doesn't
+            // distinguish "genuinely doesn't exist" from a defensive-
+            // only ambiguous-name case that container-name uniqueness
+            // (enforced at creation time) already makes unreachable in
+            // practice, so any resolve failure is tolerated here --
+            // narrower in theory than real podman's own two-specific-
+            // error-class gate, identical to it in every real,
+            // reachable case.
+            let mut targets = Vec::with_capacity(ids.len());
             for id in ids {
-                resolve_container_id(&containers, id)
-                    .with_context(|| format!("resolving {id:?}"))?;
+                match resolve_container_id(&containers, id) {
+                    Ok(_) => targets.push(id.clone()),
+                    Err(_) if ignore => continue,
+                    Err(e) => return Err(e).with_context(|| format!("resolving {id:?}")),
+                }
             }
             let mut first_error = None;
-            for id in ids {
+            for id in &targets {
                 if let Err(e) = remove_container(&containers, id, force) {
                     eprintln!("error removing {id}: {e:#}");
                     first_error.get_or_insert(e);

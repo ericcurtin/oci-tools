@@ -1746,10 +1746,13 @@ fn rm_all_and_cidfile_together_is_a_clear_error() {
 }
 
 /// A `--cidfile` that can't be read at all (missing file) is a clear,
-/// immediate error -- this project has no `--ignore` flag on `ociman
-/// rm` yet to tolerate it (unlike real podman's own `--ignore`-gated
-/// tolerance for exactly this case), so the honest behavior here is a
-/// hard failure, not a silent skip.
+/// immediate error regardless of `--ignore` (0310's own deliberately
+/// narrow scope, kept even now that `--ignore` exists — see
+/// `rm_ignore_still_errors_on_an_unreadable_cidfile` below for the
+/// direct proof `--ignore` doesn't widen to this case too): unlike
+/// real podman's own `--ignore`-gated tolerance for exactly this
+/// case, the honest behavior here is a hard failure, not a silent
+/// skip.
 #[test]
 fn rm_cidfile_of_a_missing_file_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();
@@ -1757,6 +1760,166 @@ fn rm_cidfile_of_a_missing_file_is_a_clear_error() {
     let out = ociman(
         storage_dir.path(),
         &["rm", "--cidfile", "/no/such/cidfile-path.txt"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("reading --cidfile"),
+        "{out:?}"
+    );
+}
+
+/// `ociman rm --ignore` (0311), matching real `podman rm --ignore`
+/// exactly (checked directly against an installed `podman 4.9.3`,
+/// both its own source and live behavior): an id that doesn't resolve
+/// to any real container at all is silently skipped instead of
+/// erroring the whole call.
+#[test]
+fn rm_ignore_silently_skips_an_id_that_does_not_resolve_at_all() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let out = ociman(
+        storage_dir.path(),
+        &["rm", "--ignore", "nonexistent-container-xyz"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+}
+
+/// `--ignore` merged with a real, resolvable container in the same
+/// call: the real one is still removed normally, only the
+/// unresolvable one is dropped -- proving `--ignore` doesn't turn the
+/// whole call into a no-op, just skips what can't resolve.
+#[test]
+fn rm_ignore_still_removes_a_real_container_alongside_an_unresolvable_one() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rm-ignore:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "rm-ignore-real",
+            "ociman-test/rm-ignore:latest",
+            "true",
+        ],
+    );
+    assert!(run.status.success());
+
+    let rm = ociman(
+        storage_dir.path(),
+        &[
+            "rm",
+            "--ignore",
+            "rm-ignore-real",
+            "nonexistent-container-xyz",
+        ],
+    );
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&rm.stdout).trim(), "rm-ignore-real");
+
+    let ps_after = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert!(String::from_utf8_lossy(&ps_after.stdout).trim().is_empty());
+}
+
+/// `--force` alone (no explicit `--ignore`) also tolerates an
+/// unresolvable id -- matching real podman's own checked-directly
+/// "forcing implies ignoring too" behavior, the same convention
+/// `ociman rmi --force` already established.
+#[test]
+fn rm_force_alone_also_implies_ignore() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let out = ociman(
+        storage_dir.path(),
+        &["rm", "--force", "nonexistent-container-xyz"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `--ignore`'s own real, checked-directly narrow gate: it only ever
+/// tolerates "doesn't resolve to anything at all," never a
+/// still-running-without-`--force` refusal -- matching real podman's
+/// own identical behavior, verified directly against an installed
+/// `podman 4.9.3` (an identical hard error, with or without
+/// `--ignore`, for a running container without `--force`). Uses the
+/// same bare "created" (never-run) record technique
+/// `rm_without_force_refuses_to_remove_a_container_still_marked_running`
+/// already established -- this only needs a record whose
+/// `effective_status` isn't `Stopped` yet, not a real long-lived
+/// process.
+#[test]
+fn rm_ignore_does_not_tolerate_a_non_stopped_container_without_force() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let containers_root = storage_dir.path().join("containers");
+    let containers = oci_runtime_core::StateStore::open(&containers_root).unwrap();
+    containers
+        .create(
+            "still-creating-ignore",
+            Path::new("/bundle"),
+            Path::new("/bundle/rootfs"),
+            Default::default(),
+        )
+        .unwrap();
+
+    let rm = ociman(
+        storage_dir.path(),
+        &["rm", "--ignore", "still-creating-ignore"],
+    );
+    assert!(
+        !rm.status.success(),
+        "--ignore should not tolerate a non-stopped-without-force refusal"
+    );
+
+    let forced = ociman(
+        storage_dir.path(),
+        &["rm", "--force", "still-creating-ignore"],
+    );
+    assert!(
+        forced.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+}
+
+/// `--ignore` never widens `--cidfile`'s own separate "the file itself
+/// can't be read" case (0310's own deliberately narrow scope): a
+/// missing cidfile is still a hard, immediate error even with
+/// `--ignore` given.
+#[test]
+fn rm_ignore_still_errors_on_an_unreadable_cidfile() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &["rm", "--ignore", "--cidfile", "/no/such/cidfile-path.txt"],
     );
     assert!(!out.status.success());
     assert!(
