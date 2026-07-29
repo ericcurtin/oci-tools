@@ -1044,8 +1044,15 @@ enum Command {
         /// ID (real podman's own identical shortcut). Multiple
         /// `reference=` values are OR'd (real podman's own explicit,
         /// checked-directly exception to its usual per-key-AND rule);
-        /// any `reference!=` match excludes. May be given more than
-        /// once.
+        /// any `reference!=` match excludes; or `containers=true|
+        /// false` — whether any real container (running or stopped)
+        /// currently uses the image, matched by its own underlying
+        /// identity (manifest digest), not one exact tag string,
+        /// matching real podman's own `filterContainers` exactly.
+        /// Real podman's own third value, `containers=external`, is a
+        /// clear, honest error instead — this project has no
+        /// external/non-managed container concept to check against.
+        /// May be given more than once.
         #[arg(short, long = "filter")]
         filter: Vec<String>,
     },
@@ -3170,11 +3177,24 @@ fn cmd_images(quiet: bool, json: bool, filter: &[String]) -> anyhow::Result<()> 
         .iter()
         .map(|v| resolve_reference_filter_value(&store, v))
         .collect::<anyhow::Result<_>>()?;
+    let in_use_digests = filters
+        .containers
+        .is_some()
+        .then(|| images_in_use_digests(&store, &open_container_store()?))
+        .transpose()?;
 
     let mut views = Vec::with_capacity(records.len());
     for record in &records {
         if let Some(dangling) = filters.dangling
             && is_untagged_reference(&record.reference) != dangling
+        {
+            continue;
+        }
+        if let Some(wanted) = filters.containers
+            && in_use_digests
+                .as_ref()
+                .is_some_and(|d| d.contains(&record.manifest_digest))
+                != wanted
         {
             continue;
         }
@@ -4093,6 +4113,72 @@ struct ImageFilters {
     /// logic for negative matches"`): every given `reference!=` value
     /// must fail to match for an image to survive.
     reference_unwanted: Vec<String>,
+    /// `containers=true`/`containers=false`, if given -- whether any
+    /// real container (running or stopped) currently uses the image,
+    /// matching real podman's own `filterContainers` exactly
+    /// (`~/git/container-libs/common/libimage/filters.go`): matched
+    /// by the image's own underlying identity (manifest digest), not
+    /// one exact tag string, the same "matched by digest, not string"
+    /// rule `ociman prune`'s own `in_use_digests` computation already
+    /// established. Real podman's own third value, `containers=
+    /// external`, needs an "external (non-podman-managed) container"
+    /// concept this project has none of at all -- a clear, honest
+    /// error instead of silently accepting it, matching this
+    /// project's own "no fabricated behavior" convention.
+    containers: Option<bool>,
+}
+
+/// Every real image (identified by manifest digest, not one exact
+/// reference string) currently used by *any* real container, running
+/// or stopped -- shared by `ociman prune` (dependency-safety check),
+/// `ociman system df` (its own `active`/reclaimable split), and
+/// `ociman images --filter containers=` (this function's own third
+/// caller, `0303`), rather than each computing this identical
+/// container-store scan independently. Matched by digest rather than
+/// the container's own literal `ANNOTATION_IMAGE` string so that two
+/// tags pointing at the same real image (`ociman tag`'s own whole
+/// point) both count as "in use" if a container uses *either* one.
+fn images_in_use_digests(
+    store: &Store,
+    containers: &StateStore,
+) -> anyhow::Result<std::collections::HashSet<oci_spec_types::Digest>> {
+    let mut in_use = std::collections::HashSet::new();
+    for state in containers.list().context("listing containers")? {
+        if let Some(image_ref) = state.annotations.get(ANNOTATION_IMAGE)
+            && let Some(record) = store
+                .resolve_image(image_ref)
+                .context("resolving a container's own image reference")?
+        {
+            in_use.insert(record.manifest_digest);
+        }
+    }
+    Ok(in_use)
+}
+
+/// Parses a `containers=true|false` `--filter` value -- `None` if `f`
+/// isn't a `containers=` filter at all. Unlike [`try_parse_dangling_
+/// filter`], this matches real podman's own strictly narrower value
+/// rule exactly (`~/git/container-libs/common/libimage/filters.go`'s
+/// own `(*Runtime).containers`): only the literal strings `"true"`/
+/// `"false"` (no `"1"`/`"0"` shorthand, no case variants -- a real,
+/// checked-directly *different*, stricter rule than `dangling=`'s own
+/// `strconv.ParseBool`-backed one), or `"external"`, given a clear,
+/// honest error rather than silently accepted (see [`ImageFilters::
+/// containers`]'s own doc comment for why).
+fn try_parse_containers_filter(f: &str) -> Option<anyhow::Result<bool>> {
+    let rest = f.strip_prefix("containers=")?;
+    Some(match rest {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        "external" => Err(anyhow::anyhow!(
+            "ociman images: --filter {f:?}: 'external' is not supported (this project has no \
+             external/non-managed container concept); use containers=true or containers=false"
+        )),
+        _ => Err(anyhow::anyhow!(
+            "ociman images: --filter {f:?}: invalid value for 'containers' filter (expected \
+             true or false)"
+        )),
+    })
 }
 
 /// Parse `ociman images`'s own `--filter` values into an [`ImageFilters`].
@@ -4135,12 +4221,19 @@ fn parse_image_filters(filters: &[String]) -> anyhow::Result<ImageFilters> {
                 "ociman images: --filter {f:?} is missing a value"
             );
             parsed.reference_wanted.push(value.to_string());
+        } else if let Some(result) = try_parse_containers_filter(f) {
+            let value = result?;
+            anyhow::ensure!(
+                parsed.containers.is_none_or(|existing| existing == value),
+                "ociman images: conflicting containers filter values specified"
+            );
+            parsed.containers = Some(value);
         } else {
             anyhow::bail!(
                 "ociman images: --filter {f:?} is not yet supported (only \
                  label=<key>[=<value>], label!=<key>[=<value>], dangling=true|false, \
-                 before=<image>, since=<image>/after=<image>, or \
-                 reference=<pattern>/reference!=<pattern> are)"
+                 before=<image>, since=<image>/after=<image>, \
+                 reference=<pattern>/reference!=<pattern>, or containers=true|false are)"
             );
         }
     }
@@ -4323,22 +4416,7 @@ fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
     // actually reclaim them.
     let dangling_only = filters.dangling.unwrap_or(!all);
     let containers = open_container_store()?;
-    // Matched by the underlying manifest digest, not the exact
-    // reference string a container happened to be started with: two
-    // tags pointing at the same image (`ociman tag`'s own whole
-    // point) must both count as "in use" if a container uses *either*
-    // one, the same real image either way.
-    let mut in_use_digests: std::collections::HashSet<oci_spec_types::Digest> =
-        std::collections::HashSet::new();
-    for state in containers.list().context("listing containers")? {
-        if let Some(image_ref) = state.annotations.get(ANNOTATION_IMAGE)
-            && let Some(record) = store
-                .resolve_image(image_ref)
-                .context("resolving a container's own image reference")?
-        {
-            in_use_digests.insert(record.manifest_digest);
-        }
-    }
+    let in_use_digests = images_in_use_digests(&store, &containers)?;
     let mut images_removed = Vec::new();
     for record in store.list_images().context("listing images")? {
         if in_use_digests.contains(&record.manifest_digest) {
@@ -4568,17 +4646,7 @@ fn cmd_system_df(json: bool, verbose: bool) -> anyhow::Result<()> {
         return cmd_system_df_verbose(&store, &containers, &volume_store, json);
     }
 
-    let mut in_use_digests: std::collections::HashSet<oci_spec_types::Digest> =
-        std::collections::HashSet::new();
-    for state in containers.list().context("listing containers")? {
-        if let Some(image_ref) = state.annotations.get(ANNOTATION_IMAGE)
-            && let Some(record) = store
-                .resolve_image(image_ref)
-                .context("resolving a container's own image reference")?
-        {
-            in_use_digests.insert(record.manifest_digest);
-        }
-    }
+    let in_use_digests = images_in_use_digests(&store, &containers)?;
 
     let mut images = SystemDfRow {
         total: 0,

@@ -604,3 +604,106 @@ fn images_filter_reference_glob_matches_and_the_exact_resolve_shortcut() {
         "{none:?}"
     );
 }
+
+/// `ociman images --filter containers=true|false` (0303), matching
+/// real `podman images --filter containers=` exactly
+/// (`~/git/container-libs/common/libimage/filters.go`'s own
+/// `filterContainers`): whether any real container (running or
+/// stopped) currently uses the image, matched by its own underlying
+/// identity (manifest digest, via a real created container's
+/// `ociman create`), not one exact tag string.
+#[test]
+fn images_filter_containers_selects_images_with_or_without_a_real_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    // Distinct `Cmd`s so each image gets a genuinely different
+    // manifest digest -- otherwise both references would resolve to
+    // the exact same real image, which should (correctly) show up as
+    // "in use" for either tag.
+    seed_image(
+        &store,
+        "ociman-test/has-container:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec!["sh".to_string()]),
+            ..Default::default()
+        },
+    );
+    seed_image(
+        &store,
+        "ociman-test/no-container:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec!["sh".to_string(), "-c".to_string(), "true".to_string()]),
+            ..Default::default()
+        },
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/has-container:latest", "true"],
+    );
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let with_container = ociman(
+        storage_dir.path(),
+        &["images", "--filter", "containers=true"],
+    );
+    assert!(with_container.status.success());
+    let stdout = String::from_utf8_lossy(&with_container.stdout);
+    assert!(stdout.contains("has-container"), "{stdout}");
+    assert!(!stdout.contains("no-container"), "{stdout}");
+
+    let without_container = ociman(
+        storage_dir.path(),
+        &["images", "--filter", "containers=false"],
+    );
+    assert!(without_container.status.success());
+    let stdout = String::from_utf8_lossy(&without_container.stdout);
+    assert!(!stdout.contains("has-container"), "{stdout}");
+    assert!(stdout.contains("no-container"), "{stdout}");
+}
+
+/// An invalid `containers=` value is a real, clear error, matching
+/// real podman's own checked-directly rule exactly: unlike
+/// `dangling=`, only the literal strings `true`/`false` are accepted
+/// (no `1`/`0` shorthand) — `external` gets its own, more specific
+/// error naming this project's lack of an external-container concept
+/// rather than the generic "invalid value" one.
+#[test]
+fn images_filter_containers_rejects_an_invalid_value() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let bogus = ociman(
+        storage_dir.path(),
+        &["images", "--filter", "containers=bogus"],
+    );
+    assert!(!bogus.status.success());
+    assert!(
+        String::from_utf8_lossy(&bogus.stderr).contains("invalid value"),
+        "{}",
+        String::from_utf8_lossy(&bogus.stderr)
+    );
+
+    let external = ociman(
+        storage_dir.path(),
+        &["images", "--filter", "containers=external"],
+    );
+    assert!(!external.status.success());
+    assert!(
+        String::from_utf8_lossy(&external.stderr).contains("not supported"),
+        "{}",
+        String::from_utf8_lossy(&external.stderr)
+    );
+}
