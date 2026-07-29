@@ -223,7 +223,7 @@ fn exec_refuses_a_container_that_has_already_stopped() {
 }
 
 #[test]
-fn exec_cwd_and_env_flags_override_the_defaults() {
+fn exec_workdir_and_env_flags_override_the_defaults() {
     let Some(busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");
         return;
@@ -257,7 +257,7 @@ fn exec_cwd_and_env_flags_override_the_defaults() {
         storage_dir.path(),
         &[
             "exec",
-            "--cwd",
+            "--workdir",
             "/bin",
             "--env",
             "EXEC_TEST_VAR=exec-test-value",
@@ -276,12 +276,60 @@ fn exec_cwd_and_env_flags_override_the_defaults() {
     assert_eq!(
         stdout.lines().next(),
         Some("/bin"),
-        "--cwd should override the default cwd (\"/\"): got {stdout:?}"
+        "--workdir should override the default cwd (\"/\"): got {stdout:?}"
     );
     assert!(stdout.contains("exec-test-value"), "got: {stdout:?}");
     assert!(
         stdout.contains("got:/bin"),
         "the container's own base PATH should still be set (appended to, not replaced): {stdout:?}"
+    );
+
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "--force", &id]);
+}
+
+/// The short `-w` form (matching real `podman exec -w` exactly, not
+/// just its long `--workdir` spelling) works identically.
+#[test]
+fn exec_workdir_short_flag_overrides_the_default() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/exec-workdir-short:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/exec-workdir-short:latest",
+        &["/bin/sh", "-c", "sleep 5"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let exec = ociman(
+        storage_dir.path(),
+        &["exec", "-w", "/bin", &id, "/bin/sh", "-c", "pwd"],
+    );
+    assert!(
+        exec.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&exec.stdout).trim(),
+        "/bin",
+        "the short -w flag should behave identically to --workdir"
     );
 
     run.wait().unwrap();

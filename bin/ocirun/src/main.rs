@@ -220,6 +220,34 @@ enum Command {
         /// The container's ID.
         id: String,
     },
+    /// Display a running container's real cgroup stats, matching real
+    /// `runc events --stats`'s own one-shot mode exactly (checked
+    /// directly, field for field, against `~/git/runc/events.go`/
+    /// `types/events.go`): a single `{"type":"stats","id":...,
+    /// "data":{...}}` line to stdout, real `cpu.usage.total`/
+    /// `memory.usage.{usage,limit}`/`pids.current` — the same shared
+    /// `oci_runtime_core::cgroups` readers `ociman stats`/`ocicri`'s
+    /// own `ContainerStats` already use, so this is composition, not
+    /// new engineering. Deliberately a narrower subset of real runc's
+    /// own much larger `Stats` struct (which also reports cpuset,
+    /// blkio, hugetlb, Intel RDT, PSI, and per-interface network
+    /// counters this project has no readers for at all) — an honest,
+    /// smaller-but-real report rather than a byte-for-byte port,
+    /// matching this project's own established "narrower but never
+    /// fabricated" convention (e.g. `ociman info`). The periodic
+    /// (no `--stats`, every `--interval`) OOM-notify mode real `runc
+    /// events` also has is a clear, honest "not yet" error rather than
+    /// a half-implemented approximation.
+    Events {
+        /// The container's ID.
+        id: String,
+        /// Display the container's stats once, then exit — the only
+        /// mode this project implements yet (see this command's own
+        /// doc comment for why the periodic/OOM-notify default is a
+        /// clear error instead).
+        #[arg(long)]
+        stats: bool,
+    },
 }
 
 /// Parse a `runc exec --user`-style `<uid>[:<gid>]` string: `uid` is
@@ -293,6 +321,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Update { id, resources }) => cmd_update(&root, &id, &resources),
             Some(Command::Pause { id }) => cmd_pause(&root, &id),
             Some(Command::Resume { id }) => cmd_resume(&root, &id),
+            Some(Command::Events { id, stats }) => cmd_events(&root, &id, stats),
         }
     })
 }
@@ -821,6 +850,114 @@ fn cmd_resume(root: &Path, id: &str) -> anyhow::Result<()> {
     let cgroup_dir = resolve_cgroup_dir(root, id)?;
     oci_runtime_core::cgroups::set_frozen(&cgroup_dir, false)
         .with_context(|| format!("thawing {}", cgroup_dir.display()))
+}
+
+/// Real runc's own top-level `events` JSON envelope
+/// (`~/git/runc/types/events.go`'s own `Event`), field for field.
+#[derive(Debug, serde::Serialize)]
+struct EventsEvent {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    id: String,
+    data: EventsStats,
+}
+
+/// A deliberately narrower subset of real runc's own much larger
+/// `types.Stats` (`cpuset`/`blkio`/`hugetlb`/`intel_rdt`/
+/// `network_interfaces` all have no reader anywhere in this project —
+/// see [`Command::Events`]'s own doc comment) — but every field this
+/// *does* report matches real runc's own field names and units
+/// exactly, checked directly against `~/git/runc/vendor/github.com/
+/// opencontainers/cgroups/fs2/{cpu,memory}.go`'s own real cgroup-v2
+/// collection code, not guessed from the struct's own field names
+/// alone: `cpu.usage.total` is `cpu.stat`'s `usage_usec * 1000`
+/// (nanoseconds); `memory.usage.usage` is the *raw* `memory.current`
+/// (real runc's own `getMemoryDataV2`, deliberately not the
+/// working-set-adjusted value `ociman stats`'s own, differently-
+/// purposed display uses); `memory.usage.limit` is `memory.max`
+/// (`u64::MAX` when unset, matching real runc's own identical
+/// cgroup-v2 sentinel mapping); `pids.current` is `pids.current`.
+#[derive(Debug, serde::Serialize)]
+struct EventsStats {
+    cpu: EventsCpu,
+    memory: EventsMemory,
+    pids: EventsPids,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct EventsCpu {
+    usage: EventsCpuUsage,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct EventsCpuUsage {
+    total: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct EventsMemory {
+    usage: EventsMemoryEntry,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct EventsMemoryEntry {
+    usage: u64,
+    limit: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct EventsPids {
+    current: u64,
+}
+
+/// `ocirun events --stats <id>` — see [`Command::Events`]'s own doc
+/// comment for exactly what this reports and why. The periodic
+/// (no `--stats`) mode real `runc events` also has is a clear,
+/// honest "not yet" error instead of a half-implemented
+/// approximation, the same shape `ociman stats`'s own "pass
+/// --no-stream" error already established for the identical reason.
+fn cmd_events(root: &Path, id: &str, stats: bool) -> anyhow::Result<()> {
+    if !stats {
+        anyhow::bail!(
+            "ocirun events: periodic/OOM-notify mode isn't implemented yet -- pass --stats \
+             for a one-shot report"
+        );
+    }
+    let store = StateStore::open(root)
+        .with_context(|| format!("opening container state root {}", root.display()))?;
+    let state = store.load(id)?;
+    if state.effective_status() == Status::Stopped {
+        anyhow::bail!("container with id {id} is not running");
+    }
+    let cgroup_dir = resolve_cgroup_dir(root, id)?;
+
+    let cpu_total = oci_runtime_core::cgroups::cpu_usage_nanos(&cgroup_dir)
+        .with_context(|| format!("reading cpu usage for container {id:?}"))?;
+    let mem_usage = oci_runtime_core::cgroups::memory_current_bytes(&cgroup_dir)
+        .with_context(|| format!("reading memory usage for container {id:?}"))?;
+    let mem_limit = oci_runtime_core::cgroups::memory_limit_bytes(&cgroup_dir)
+        .with_context(|| format!("reading memory limit for container {id:?}"))?;
+    let pids = oci_runtime_core::cgroups::pids_current(&cgroup_dir)
+        .with_context(|| format!("reading pid count for container {id:?}"))?;
+
+    let event = EventsEvent {
+        kind: "stats",
+        id: id.to_string(),
+        data: EventsStats {
+            cpu: EventsCpu {
+                usage: EventsCpuUsage { total: cpu_total },
+            },
+            memory: EventsMemory {
+                usage: EventsMemoryEntry {
+                    usage: mem_usage,
+                    limit: mem_limit,
+                },
+            },
+            pids: EventsPids { current: pids },
+        },
+    };
+    println!("{}", serde_json::to_string(&event)?);
+    Ok(())
 }
 
 fn cmd_exec(

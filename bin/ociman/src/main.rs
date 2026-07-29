@@ -472,8 +472,9 @@ struct RunArgs {
     /// Override the working directory the container's own process
     /// starts in, matching real `docker run -w`/`podman run -w`
     /// exactly. Defaults to the image's own `WORKDIR` config (or
-    /// `/` if the image sets none), same as `ociman exec --cwd`'s
-    /// own analogous override for an already-running container.
+    /// `/` if the image sets none), same as `ociman exec -w`/
+    /// `--workdir`'s own analogous override for an already-running
+    /// container.
     #[arg(short = 'w', long = "workdir")]
     workdir: Option<String>,
     /// Override the image's own `ENTRYPOINT`, matching real
@@ -1447,9 +1448,13 @@ enum Command {
         /// numeric-only `ocirun exec --user`.
         #[arg(short, long)]
         user: Option<String>,
-        /// Current working directory inside the container.
-        #[arg(long)]
-        cwd: Option<String>,
+        /// Current working directory inside the container, matching
+        /// real `podman exec -w`/`--workdir` exactly (this flag was
+        /// briefly named `--cwd` here; renamed to match real podman's
+        /// own actual flag rather than diverging from it for no
+        /// reason).
+        #[arg(short = 'w', long = "workdir")]
+        workdir: Option<String>,
         /// Set an additional environment variable, `KEY=value`, or
         /// pull one from `ociman`'s own process environment by bare
         /// name (`KEY`, dropped entirely if unset there) — matching
@@ -1860,10 +1865,10 @@ fn main() -> std::process::ExitCode {
             Some(Command::Exec {
                 id,
                 user,
-                cwd,
+                workdir,
                 env,
                 args,
-            }) => cmd_exec(&id, user.as_deref(), cwd.as_deref(), &env, &args),
+            }) => cmd_exec(&id, user.as_deref(), workdir.as_deref(), &env, &args),
             Some(Command::Logs { id, follow, tail }) => cmd_logs(&id, follow, tail),
             Some(Command::Save {
                 reference,
@@ -7518,7 +7523,7 @@ fn cmd_exec(
     // The exec'd process joins the *same* namespaces and capability
     // set the container's own init process was given, read back from
     // its own bundle — user/cwd/env default the same way, but
-    // `--user`/`--cwd`/`--env` (matching real `podman exec`'s own
+    // `--user`/`-w`/`--workdir`/`--env` (matching real `podman exec`'s own
     // flags) can override them per invocation.
     let bundle = oci_runtime_core::Bundle::load(Path::new(&state.bundle))
         .with_context(|| format!("loading bundle from {}", state.bundle))?;
