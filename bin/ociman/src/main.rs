@@ -1834,6 +1834,30 @@ enum Command {
         /// `ociman rmi --force`-implies-`--ignore` convention).
         #[arg(short, long)]
         ignore: bool,
+        /// Seconds to wait for a still-running container to stop
+        /// gracefully before killing it, instead of an immediate,
+        /// unmaskable `KILL` — matching real `podman rm -t`/`--time`
+        /// exactly (checked directly, `~/git/podman/cmd/podman/
+        /// containers/rm.go`): requires `--force` too (a real,
+        /// immediate error otherwise, matching real podman's own
+        /// identical, checked-directly `"--force option must be
+        /// specified to use the --time option"` restriction).
+        ///
+        /// **A deliberate divergence from real podman's own default,
+        /// not an oversight**: real podman's own `rm --force` alone
+        /// (no `--time` at all) still does this same graceful-then-
+        /// kill sequence, using the container's own resolved default
+        /// timeout (10 seconds unless overridden) — this project's
+        /// own `ociman rm --force` alone stays exactly as fast as it
+        /// already was (an immediate `KILL`, no grace period at all),
+        /// matching this project's own explicit "beat on destroy
+        /// time" goal rather than faithfully reproducing real
+        /// podman's own slower default; `-t`/`--time`'s own real
+        /// escalation sequence (reusing [`stop_container`], the exact
+        /// same one `ociman stop`/`restart` already use) is opt-in,
+        /// only ever reached when this flag is actually given.
+        #[arg(short = 't', long = "time")]
+        time: Option<u64>,
     },
     /// Copy files/directories between the local filesystem and a
     /// container (running or stopped), or between two containers —
@@ -2951,7 +2975,8 @@ fn main() -> std::process::ExitCode {
                 all,
                 cidfile,
                 ignore,
-            }) => cmd_rm(&ids, force, all, &cidfile, ignore),
+                time,
+            }) => cmd_rm(&ids, force, all, &cidfile, ignore, time),
             Some(Command::Cp {
                 src,
                 dest,
@@ -4103,7 +4128,12 @@ fn rmi_one(
             dependents.join(", ")
         );
         for id in &dependents {
-            remove_container(containers, id, true)
+            // `ociman rmi` has no `--time` flag of its own (matching
+            // real `podman rmi`'s own identical lack of one), so this
+            // cascade always uses the fast, immediate-`KILL` default
+            // (see `Command::Rm::time`'s own doc comment for why
+            // that's this project's own deliberate default).
+            remove_container(containers, id, true, None)
                 .with_context(|| format!("removing dependent container {id} (--force)"))?;
         }
     }
@@ -7663,7 +7693,16 @@ fn cmd_rm(
     all: bool,
     cidfiles: &[PathBuf],
     ignore: bool,
+    time_secs: Option<u64>,
 ) -> anyhow::Result<()> {
+    // Matches real `podman rm`'s own identical, checked-directly
+    // restriction exactly (`~/git/podman/cmd/podman/containers/
+    // rm.go`'s own `if cmd.Flag("time").Changed { if !rmOptions.Force
+    // { return errors.New(...) } }`).
+    anyhow::ensure!(
+        time_secs.is_none() || force,
+        "--force option must be specified to use the --time option"
+    );
     anyhow::ensure!(
         cidfiles.is_empty() || !all,
         "--all and --cidfile cannot be used together"
@@ -7742,7 +7781,7 @@ fn cmd_rm(
             }
             let mut first_error = None;
             for id in &targets {
-                if let Err(e) = remove_container(&containers, id, force) {
+                if let Err(e) = remove_container(&containers, id, force, time_secs) {
                     eprintln!("error removing {id}: {e:#}");
                     first_error.get_or_insert(e);
                     continue;
@@ -7757,7 +7796,7 @@ fn cmd_rm(
         (true, true) => {
             let mut first_error = None;
             for state in containers.list().context("listing containers")? {
-                if let Err(e) = remove_container(&containers, &state.id, force) {
+                if let Err(e) = remove_container(&containers, &state.id, force, time_secs) {
                     eprintln!("error removing {}: {e:#}", state.id);
                     first_error.get_or_insert(e);
                     continue;
@@ -8479,7 +8518,12 @@ fn apply_change_instruction(
 /// own machine-readable stdout output would produce invalid JSON,
 /// same reasoning as `warn_on_unused_build_args`'s own stderr-only
 /// convention in `build.rs`.
-fn remove_container(containers: &StateStore, id: &str, force: bool) -> anyhow::Result<()> {
+fn remove_container(
+    containers: &StateStore,
+    id: &str,
+    force: bool,
+    time_secs: Option<u64>,
+) -> anyhow::Result<()> {
     let resolved = resolve_container_id(containers, id)?;
     let state = containers.load(&resolved)?;
     let status = state.effective_status();
@@ -8487,9 +8531,25 @@ fn remove_container(containers: &StateStore, id: &str, force: bool) -> anyhow::R
     if !force && status != Status::Stopped {
         anyhow::bail!("cannot remove container {id:?} that is not stopped: {status}");
     }
-    if let Some(pid) = state.pid
+    if let Some(time_secs) = time_secs {
+        // `-t`/`--time` explicitly given (see `Command::Rm::time`'s
+        // own doc comment for why this is opt-in, not this project's
+        // own default): a real, graceful stop-then-kill escalation,
+        // matching real `podman rm --force --time` exactly. Reuses
+        // `stop_container` verbatim -- the exact same primitive
+        // `ociman stop`/`restart` already use, rather than a second,
+        // cruder reimplementation of the identical sequence.
+        if status != Status::Stopped {
+            stop_container(id, Some(time_secs), None, true)?;
+        }
+    } else if let Some(pid) = state.pid
         && status != Status::Stopped
     {
+        // No `--time` given: this project's own established, fast
+        // default -- an immediate, unmaskable `KILL`, no grace period
+        // at all (a deliberate divergence from real podman's own
+        // slower default of gracefully stopping first even under a
+        // bare `--force`, see `Command::Rm::time`'s own doc comment).
         let sigkill = oci_runtime_core::signal::parse("KILL").expect("KILL is always valid");
         let _ = oci_runtime_core::process::kill(pid, sigkill);
         for _ in 0..50 {

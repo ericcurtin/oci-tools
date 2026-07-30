@@ -5,7 +5,8 @@
 //! real seeded image, no registry access needed).
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use oci_spec_types::image::ContainerConfig;
 use oci_store::Store;
@@ -19,6 +20,65 @@ fn ociman(storage_root: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .expect("failed to spawn ociman")
+}
+
+/// Same technique `ociman_stop.rs`'s own identical helper already
+/// established, needed here too for the new `rm --force --time`
+/// tests, which (unlike every other `rm` test in this file) need a
+/// real, still-running, signal-trappable container.
+fn ociman_run_detached(
+    storage_root: &Path,
+    image: &str,
+    container_args: &[&str],
+) -> std::process::Child {
+    Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_root)
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", image])
+        .args(container_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run")
+}
+
+fn only_container_id(storage_root: &Path, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = ociman(storage_root, &["ps", "-a", "-q"]);
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !id.is_empty() || Instant::now() >= deadline {
+            return id;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_container_status(
+    storage_root: &Path,
+    id: &str,
+    want: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = ociman(storage_root, &["ps", "-a", "--json"]);
+        if out.status.success()
+            && let Ok(views) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            && let Some(entry) = views
+                .as_array()
+                .and_then(|a| a.iter().find(|e| e["id"] == id))
+        {
+            let status = entry["status"].as_str().unwrap_or_default().to_string();
+            if status == want || Instant::now() >= deadline {
+                return status;
+            }
+        } else if Instant::now() >= deadline {
+            return String::new();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -533,6 +593,152 @@ fn rm_all_without_force_skips_a_non_stopped_container_but_still_removes_the_rest
     assert!(String::from_utf8_lossy(&ps_final.stdout).trim().is_empty());
 }
 
+/// `-t`/`--time` (0355) without `--force` is a real, immediate error,
+/// matching real `podman rm -t`/`--time`'s own identical, checked-
+/// directly restriction exactly (`~/git/podman/cmd/podman/containers/
+/// rm.go`).
+#[test]
+fn rm_time_without_force_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &["rm", "--time", "5", "does-not-matter"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--force option must be specified"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `rm --force --time` (0355) genuinely gives a still-running
+/// container a real chance to exit gracefully first, rather than an
+/// immediate, unmaskable `KILL` -- matching real `podman rm --force
+/// --time` exactly. Same real TERM-trap technique `ociman_stop.rs`'s
+/// own `stop_lets_a_signal_handling_container_exit_gracefully` test
+/// already established, reused here since this is the exact same
+/// underlying `stop_container` escalation, just reached through `rm`
+/// instead of `stop`.
+#[test]
+fn rm_force_time_lets_a_signal_handling_container_exit_gracefully() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rm-force-time-graceful:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/rm-force-time-graceful:latest",
+        &[
+            "/bin/sh",
+            "-c",
+            "trap 'exit 0' TERM; while true; do sleep 0.2; done",
+        ],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    // Same generous grace window `ociman_stop.rs`'s own identical
+    // test uses, for the same reason: what matters is *whether* the
+    // trap runs at all, not exactly how many milliseconds it takes
+    // under real, possibly-loaded-host scheduling.
+    let rm = ociman(storage_dir.path(), &["rm", "--force", "--time", "60", &id]);
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+
+    run.wait().unwrap();
+    // `rm`'s own whole point: the container's own record is genuinely
+    // gone afterward, not just stopped -- distinct from `ociman
+    // stop`'s own identical graceful escalation, which only stops it.
+    let ps_after = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert!(
+        String::from_utf8_lossy(&ps_after.stdout).trim().is_empty(),
+        "the container should be fully removed, not merely stopped: {ps_after:?}"
+    );
+}
+
+/// A real, deliberate divergence from real podman's own default,
+/// verified directly rather than merely documented: `rm --force`
+/// *alone* (no `--time` given at all) still uses this project's own
+/// fast, immediate `KILL`, never the graceful-then-kill escalation
+/// `--time` opts into. `rm`'s own whole point removes the container's
+/// persisted record, so the exit-code-based technique the tests above
+/// use (checking a TERM trap's own effect) can't observe anything
+/// afterward -- a real, ignores-`TERM`-outright container (the same
+/// `docs/design/0017` finding `ociman_kill.rs`'s own tests already
+/// rely on) run under a generous, real `--time`-sized deadline is the
+/// most direct substitute: if this project's own default `rm --force`
+/// genuinely still waited out a grace period the way real podman's
+/// own default does, this would time out; completing well within it
+/// proves no such wait happens at all.
+#[test]
+fn rm_force_without_time_completes_fast_with_no_grace_period_at_all() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rm-force-no-time:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/rm-force-no-time:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let start = Instant::now();
+    let rm = ociman(storage_dir.path(), &["rm", "--force", &id]);
+    let elapsed = start.elapsed();
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "rm --force alone (no --time) must complete fast, with no real grace period at all -- \
+         took {elapsed:?}"
+    );
+
+    run.wait().unwrap();
+    let ps_after = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert!(
+        String::from_utf8_lossy(&ps_after.stdout).trim().is_empty(),
+        "{ps_after:?}"
+    );
+}
+
 /// `ociman ps --filter status=created` (0272), given *without* `-a`,
 /// still shows a `created` (never-started) container — real `podman
 /// ps --filter status=` (checked directly) overrides the default
@@ -1041,7 +1247,7 @@ fn ps_filter_before_and_since_use_the_referenced_containers_own_creation_time() 
             ],
         );
         assert!(out.status.success(), "{out:?}");
-        std::thread::sleep(std::time::Duration::from_millis(1200));
+        std::thread::sleep(Duration::from_millis(1200));
     };
     create("ctr1");
     create("ctr2");
@@ -1348,7 +1554,7 @@ fn ps_filter_until_matches_containers_created_strictly_before_the_threshold() {
             ],
         );
         assert!(out.status.success(), "{out:?}");
-        std::thread::sleep(std::time::Duration::from_millis(1200));
+        std::thread::sleep(Duration::from_millis(1200));
     };
     create("old1");
     create("old2");
@@ -1466,7 +1672,7 @@ fn ps_last_overrides_visibility_and_keeps_only_the_n_most_recently_created() {
             ],
         );
         assert!(out.status.success(), "{out:?}");
-        std::thread::sleep(std::time::Duration::from_millis(1200));
+        std::thread::sleep(Duration::from_millis(1200));
     };
     create("last1");
     create("last2");
