@@ -1894,17 +1894,49 @@ enum Command {
         #[arg(short, long)]
         all: bool,
     },
-    /// Pause all processes in a running container via the real cgroup
-    /// v2 freezer — matching real `podman pause` exactly.
+    /// Pause all processes in one or more running containers via the
+    /// real cgroup v2 freezer — matching real `podman pause` exactly,
+    /// including its own real `CONTAINER [CONTAINER...]`/`--all`/
+    /// `--cidfile` support (0320) and its own checked-directly state
+    /// requirements: a real, reported error on a container that's
+    /// already paused, or that isn't running at all — real `podman
+    /// pause`'s own single, shared `ErrCtrStateInvalid` for both
+    /// cases, tolerated (silently skipped) only under `--all`. Real
+    /// podman has no `--ignore` for `pause`/`unpause` at all (unlike
+    /// `rm`/`stop`).
     Pause {
-        /// The container's ID or `--name`.
-        id: String,
+        /// The container ID(s)/`--name`(s) — omit when using `--all`.
+        ids: Vec<String>,
+        /// Pause every real, currently-running container instead of
+        /// the one(s) named on the command line — matching real
+        /// `podman pause --all` exactly.
+        #[arg(short, long)]
+        all: bool,
+        /// Read a container ID from `FILE` (repeatable) — matching
+        /// real `podman pause --cidfile` exactly. Mutually exclusive
+        /// with `--all`.
+        #[arg(long = "cidfile", value_name = "FILE")]
+        cidfile: Vec<PathBuf>,
     },
-    /// Unpause a container previously frozen by `pause` — matching
-    /// real `podman unpause` exactly.
+    /// Unpause one or more containers previously frozen by `pause` —
+    /// matching real `podman unpause` exactly, including its own real
+    /// `CONTAINER [CONTAINER...]`/`--all`/`--cidfile` support (0320)
+    /// and its own checked-directly requirement that the container
+    /// actually be paused (a real, reported error otherwise, tolerated
+    /// only under `--all`).
     Unpause {
-        /// The container's ID or `--name`.
-        id: String,
+        /// The container ID(s)/`--name`(s) — omit when using `--all`.
+        ids: Vec<String>,
+        /// Unpause every real, currently-paused container instead of
+        /// the one(s) named on the command line — matching real
+        /// `podman unpause --all` exactly.
+        #[arg(short, long)]
+        all: bool,
+        /// Read a container ID from `FILE` (repeatable) — matching
+        /// real `podman unpause --cidfile` exactly. Mutually exclusive
+        /// with `--all`.
+        #[arg(long = "cidfile", value_name = "FILE")]
+        cidfile: Vec<PathBuf>,
     },
     /// Update a running container's real cgroup resource limits in
     /// place — matching real `podman update` for exactly the same
@@ -2627,8 +2659,8 @@ fn main() -> std::process::ExitCode {
                 ignore,
             }) => cmd_stop(&ids, time, signal.as_deref(), all, &cidfile, ignore),
             Some(Command::Kill { ids, signal, all }) => cmd_kill(&ids, &signal, all),
-            Some(Command::Pause { id }) => cmd_pause(&id),
-            Some(Command::Unpause { id }) => cmd_unpause(&id),
+            Some(Command::Pause { ids, all, cidfile }) => cmd_pause(&ids, all, &cidfile),
+            Some(Command::Unpause { ids, all, cidfile }) => cmd_unpause(&ids, all, &cidfile),
             Some(Command::Update {
                 id,
                 memory,
@@ -8970,36 +9002,184 @@ fn cmd_top(id: &str, ps_args: &[String]) -> anyhow::Result<()> {
     oci_runtime_core::cgroups::print_ps_table(&pids, ps_args).context("printing ps table")
 }
 
-/// Pause every process in a running container via the real cgroup v2
-/// freezer — matching real `podman pause` exactly, including its own
-/// checked-directly requirement that the container actually be
-/// `running` first (confirmed directly: real `podman pause` on a
-/// merely `created` container errors, unlike real `runc pause`'s own
-/// more permissive `Created`-or-`Running` check — see `ocirun pause`'s
-/// own doc comment for that one). Prints `id` back, matching real
-/// `podman pause`'s own output exactly.
-fn cmd_pause(id: &str) -> anyhow::Result<()> {
-    let cgroup_dir = resolve_running_container_cgroup(id)?;
-    oci_runtime_core::cgroups::set_frozen(&cgroup_dir, true)
-        .with_context(|| format!("pausing container {id:?}"))?;
-    println!("{id}");
-    Ok(())
+/// `ociman pause` — see [`Command::Pause`]'s own doc comment for the
+/// full `--all`/`--cidfile`/multi-target shape (0320). Delegates the
+/// actual per-container logic to [`pause_or_unpause_one`].
+fn cmd_pause(ids: &[String], all: bool, cidfiles: &[PathBuf]) -> anyhow::Result<()> {
+    cmd_pause_or_unpause(ids, all, cidfiles, true)
 }
 
-/// Unpause a container previously frozen by `pause` — matching real
-/// `podman unpause`'s own core effect. Real `podman unpause` requires
-/// the container to be tracked as specifically `paused`; this project
-/// has no separate `Paused` status of its own yet (see `ocirun
-/// resume`'s own doc comment for why), so this instead requires
-/// `running` — already covers the "was already paused, cgroup-wise"
-/// case, since thawing an already-thawed cgroup is itself a harmless,
-/// idempotent no-op at the kernel level. Prints `id` back, matching
-/// real `podman unpause`'s own output exactly.
-fn cmd_unpause(id: &str) -> anyhow::Result<()> {
-    let cgroup_dir = resolve_running_container_cgroup(id)?;
-    oci_runtime_core::cgroups::set_frozen(&cgroup_dir, false)
-        .with_context(|| format!("unpausing container {id:?}"))?;
-    println!("{id}");
+/// `ociman unpause` — see [`Command::Unpause`]'s own doc comment for
+/// the full `--all`/`--cidfile`/multi-target shape (0320). Delegates
+/// the actual per-container logic to [`pause_or_unpause_one`].
+fn cmd_unpause(ids: &[String], all: bool, cidfiles: &[PathBuf]) -> anyhow::Result<()> {
+    cmd_pause_or_unpause(ids, all, cidfiles, false)
+}
+
+/// Shared `pause`/`unpause` implementation (0320): `freeze` selects
+/// which of the two this call actually is. Real podman's own
+/// `pause.go`/`unpause.go` are otherwise near-identical (same flags,
+/// same `getContainers`-based multi-target/`--all`/`--cidfile`
+/// resolution, same "attempt every one, report the first real failure
+/// at the end" policy for a multi-id call, same "silently skip a
+/// container in the wrong state" tolerance *only* under `--all`) —
+/// matched here by one shared function parameterized on `freeze`
+/// rather than two near-duplicate ones, this project's own "share as
+/// much Rust code as possible" pillar.
+fn cmd_pause_or_unpause(
+    ids: &[String],
+    all: bool,
+    cidfiles: &[PathBuf],
+    freeze: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        cidfiles.is_empty() || !all,
+        "--all and --cidfile cannot be used together"
+    );
+    // Real podman's own exact semantics (`~/git/podman/cmd/podman/
+    // containers/pause.go`/`unpause.go`): the file's own first line
+    // only, merged into the same target list an explicit `ID`/`--name`
+    // argument already builds. No `--ignore` exists for either real
+    // command at all (unlike `rm`/`stop`), so an unreadable cidfile is
+    // always a hard error.
+    let mut ids: Vec<String> = ids.to_vec();
+    for path in cidfiles {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --cidfile {}", path.display()))?;
+        ids.push(content.split('\n').next().unwrap_or("").to_string());
+    }
+
+    anyhow::ensure!(
+        ids.is_empty() || !all,
+        "cannot give both a container ID/name and --all"
+    );
+
+    let verb = if freeze { "pausing" } else { "unpausing" };
+    let containers = open_container_store()?;
+
+    if all {
+        // The one state a container may legitimately be in for this
+        // operation to actually do anything -- checked directly,
+        // real podman's own `Pause`/`Unpause` both fold "already in
+        // that state" and "not eligible at all" into the identical
+        // `ErrCtrStateInvalid`, tolerated (silently skipped, nothing
+        // printed) only under `--all`.
+        let eligible = if freeze {
+            Status::Running
+        } else {
+            Status::Paused
+        };
+        let mut first_error = None;
+        for state in containers.list().context("listing containers")? {
+            if display_status(&state) != eligible {
+                continue;
+            }
+            if let Err(e) = pause_or_unpause_one(&containers, &state.id, &state.id, freeze) {
+                eprintln!("error {verb} {}: {e:#}", state.id);
+                first_error.get_or_insert(e);
+            }
+        }
+        return match first_error {
+            Some(e) => Err(e.context(format!("{verb} containers"))),
+            None => Ok(()),
+        };
+    }
+
+    anyhow::ensure!(
+        !ids.is_empty(),
+        "no container ID/name given (try `ociman {} <ID>` or `--all`)",
+        if freeze { "pause" } else { "unpause" }
+    );
+
+    // The overwhelmingly common case -- exactly one target -- keeps
+    // the original, simplest possible path.
+    if let [id] = ids.as_slice() {
+        let resolved = resolve_container_id(&containers, id)?;
+        pause_or_unpause_one(&containers, &resolved, id, freeze)?;
+        return Ok(());
+    }
+
+    // Two or more explicit targets: resolve every one first, aborting
+    // the whole call before touching anything if any of them don't
+    // exist at all -- matching real podman's own identical two-phase
+    // behavior (checked directly, `getContainers`'s own `default`
+    // case). Once every id has resolved, though, each one is still
+    // genuinely attempted regardless of an earlier one's own failure.
+    let mut resolved_ids = Vec::with_capacity(ids.len());
+    for id in &ids {
+        resolved_ids.push(resolve_container_id(&containers, id)?);
+    }
+
+    let mut first_error = None;
+    for (raw_id, resolved) in ids.iter().zip(resolved_ids.iter()) {
+        if let Err(e) = pause_or_unpause_one(&containers, resolved, raw_id, freeze) {
+            eprintln!("error {verb} {raw_id}: {e:#}");
+            first_error.get_or_insert(e);
+        }
+    }
+    match first_error {
+        Some(e) => Err(e.context(format!("{verb} containers"))),
+        None => Ok(()),
+    }
+}
+
+/// The actual single-container pause/unpause logic: a real, reported
+/// error on a container that's already in the target state, or that
+/// isn't eligible at all (checked directly against real podman's own
+/// `Pause`/`Unpause`, `~/git/podman/libpod/container_api.go`) — a
+/// genuine correctness fix alongside 0320's own `--all`/`--cidfile`/
+/// multi-target work: this project's own `pause`/`unpause` previously
+/// only ever checked `effective_status() == Running` (never
+/// distinguishing a genuinely already-*paused* container, since
+/// `effective_status` itself never reports `Paused` at all -- it's
+/// deliberately never persisted, see `Status::Paused`'s own doc
+/// comment), so a double-`pause`/double-`unpause` silently "succeeded"
+/// (freezing an already-frozen, or thawing an already-thawed, cgroup
+/// is a harmless no-op at the kernel level) instead of the real,
+/// reported error real podman gives in both cases -- confirmed live,
+/// before this fix: `podman pause`/`unpause` on an already-paused/
+/// already-unpaused container are both a real, immediate error (exit
+/// `125`), not a silent success.
+fn pause_or_unpause_one(
+    containers: &StateStore,
+    resolved: &str,
+    raw_id: &str,
+    freeze: bool,
+) -> anyhow::Result<()> {
+    let state = containers.load(resolved)?;
+    // The same real, computed-from-the-live-cgroup-freezer status
+    // `ps`/`inspect` already show (`display_status`) -- the only way
+    // to actually distinguish "genuinely paused" from "genuinely
+    // running" at all, since the persisted status alone never can.
+    let status = display_status(&state);
+    if freeze {
+        anyhow::ensure!(
+            status != Status::Paused,
+            "container {raw_id:?} is already paused"
+        );
+        anyhow::ensure!(
+            status == Status::Running,
+            "container {raw_id:?} is not running"
+        );
+    } else {
+        anyhow::ensure!(
+            status == Status::Paused,
+            "container {raw_id:?} is not paused"
+        );
+    }
+    let pid = state
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("container {raw_id:?} has no recorded pid"))?;
+    let cgroup_dir =
+        oci_runtime_core::cgroups::cgroup_dir_for_running_pid(Path::new("/sys/fs/cgroup"), pid)
+            .with_context(|| format!("resolving cgroup for container {raw_id:?}"))?;
+    oci_runtime_core::cgroups::set_frozen(&cgroup_dir, freeze).with_context(|| {
+        format!(
+            "{} container {raw_id:?}",
+            if freeze { "pausing" } else { "unpausing" }
+        )
+    })?;
+    println!("{raw_id}");
     Ok(())
 }
 

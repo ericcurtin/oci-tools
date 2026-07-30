@@ -79,6 +79,58 @@ fn wait_for_container_status(
     }
 }
 
+/// Same as [`wait_for_container_status`], but matches on a
+/// container's own `--name` rather than its generated id -- for the
+/// `--all`/multi-target tests below, which need several containers
+/// running at once.
+fn wait_for_container_status_by_name(
+    storage_root: &Path,
+    name: &str,
+    want: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = ociman(storage_root, &["ps", "-a", "--json"]);
+        if out.status.success()
+            && let Ok(views) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            && let Some(entry) = views
+                .as_array()
+                .and_then(|a| a.iter().find(|e| e["name"] == name))
+        {
+            let status = entry["status"].as_str().unwrap_or_default().to_string();
+            if status == want || Instant::now() >= deadline {
+                return status;
+            }
+        } else if Instant::now() >= deadline {
+            return String::new();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Same as [`ociman_run_detached`], but with `--name` given *before*
+/// the image -- `RunArgs::args`'s own `trailing_var_arg = true`
+/// captures everything positional after the image into the
+/// container's own command, so `--name` must come first.
+fn ociman_run_detached_named(
+    storage_root: &Path,
+    name: &str,
+    image: &str,
+    container_args: &[&str],
+) -> std::process::Child {
+    Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_root)
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--name", name, image])
+        .args(container_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run")
+}
+
 /// The `status` field from `ociman inspect <id> --json`, asserting
 /// the command itself succeeded.
 fn inspect_status(storage_root: &Path, id: &str) -> String {
@@ -310,4 +362,503 @@ fn pause_and_unpause_on_an_unknown_container_are_clear_errors() {
     assert!(!pause.status.success());
     let unpause = ociman(storage_dir.path(), &["unpause", "does-not-exist"]);
     assert!(!unpause.status.success());
+}
+
+/// A second `pause` on an already-paused container, or a second
+/// `unpause` on an already-running (never/no-longer paused) one, are
+/// both real, immediate errors (0320) — matching real `podman pause`/
+/// `unpause` exactly (checked directly against a real installed
+/// binary): both are a real, reported `ErrCtrStateInvalid`-equivalent
+/// error, not a silent success the way this project's own
+/// implementation used to give it before this note (freezing an
+/// already-frozen, or thawing an already-thawed, cgroup being a
+/// harmless no-op at the kernel level is not the same thing as this
+/// command's own contract, which real podman's own error makes clear
+/// it should not silently tolerate).
+#[test]
+fn double_pause_and_double_unpause_are_real_errors() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/double-pause:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/double-pause:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let pause = ociman(storage_dir.path(), &["pause", &id]);
+    assert!(
+        pause.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pause.stderr)
+    );
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "paused", Duration::from_secs(5)),
+        "paused"
+    );
+
+    let double_pause = ociman(storage_dir.path(), &["pause", &id]);
+    assert!(
+        !double_pause.status.success(),
+        "pausing an already-paused container must be a real error"
+    );
+
+    let unpause = ociman(storage_dir.path(), &["unpause", &id]);
+    assert!(
+        unpause.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unpause.stderr)
+    );
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(5)),
+        "running"
+    );
+
+    let double_unpause = ociman(storage_dir.path(), &["unpause", &id]);
+    assert!(
+        !double_unpause.status.success(),
+        "unpausing an already-running container must be a real error"
+    );
+
+    ociman(storage_dir.path(), &["stop", "--time", "0", &id]);
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", &id]);
+}
+
+/// `--all` (0320) matches real `podman pause --all`/`podman unpause
+/// --all` exactly (checked directly, and empirically against a real
+/// installed binary given a real mix of running/paused/never-started
+/// containers): `pause --all` pauses every genuinely running
+/// container and silently skips both an already-paused one and a
+/// never-started one; `unpause --all` unpauses every genuinely paused
+/// one and silently skips everything else.
+#[test]
+fn pause_all_and_unpause_all_skip_containers_in_the_wrong_state() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/pause-all:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run1 = ociman_run_detached_named(
+        storage_dir.path(),
+        "pause-all-run1",
+        "ociman-test/pause-all:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let mut run2 = ociman_run_detached_named(
+        storage_dir.path(),
+        "pause-all-run2",
+        "ociman-test/pause-all:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-all-run1",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-all-run2",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    // Already paused before the `--all` call.
+    let pause_run2 = ociman(storage_dir.path(), &["pause", "pause-all-run2"]);
+    assert!(pause_run2.status.success());
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-all-run2",
+            "paused",
+            Duration::from_secs(5)
+        ),
+        "paused"
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "pause-all-created",
+            "ociman-test/pause-all:latest",
+            "true",
+        ],
+    );
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let pause_all = ociman(storage_dir.path(), &["pause", "--all"]);
+    assert!(
+        pause_all.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&pause_all.stderr)
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-all-run1",
+            "paused",
+            Duration::from_secs(5)
+        ),
+        "paused",
+        "the genuinely running container should have been paused by --all"
+    );
+    // Still just paused, untouched by this second call.
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-all-run2",
+            "paused",
+            Duration::from_millis(200)
+        ),
+        "paused"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-all-created",
+            "created",
+            Duration::from_millis(200)
+        ),
+        "created",
+        "a never-started container must be left completely untouched by pause --all"
+    );
+
+    let unpause_all = ociman(storage_dir.path(), &["unpause", "--all"]);
+    assert!(
+        unpause_all.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&unpause_all.stderr)
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-all-run1",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-all-run2",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-all-created",
+            "created",
+            Duration::from_millis(200)
+        ),
+        "created"
+    );
+
+    ociman(storage_dir.path(), &["stop", "--time", "0", "-a"]);
+    run1.wait().unwrap();
+    run2.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// Real `podman pause`/`unpause`'s own `--cidfile` and `--all` are
+/// mutually exclusive, matching `rm`/`stop`/`restart`'s own identical
+/// rule.
+#[test]
+fn pause_all_and_cidfile_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let cidfile = storage_dir.path().join("cid.txt");
+    std::fs::write(&cidfile, "some-id").unwrap();
+    let pause = ociman(
+        storage_dir.path(),
+        &["pause", "--all", "--cidfile", cidfile.to_str().unwrap()],
+    );
+    assert!(!pause.status.success());
+    let unpause = ociman(
+        storage_dir.path(),
+        &["unpause", "--all", "--cidfile", cidfile.to_str().unwrap()],
+    );
+    assert!(!unpause.status.success());
+}
+
+/// `--cidfile` (0320) matches real `podman pause --cidfile`/`podman
+/// unpause --cidfile` exactly: the file's own first line only,
+/// trailing content ignored, merged into the same target list an
+/// explicit `ID`/`--name` argument already builds -- same technique
+/// `ociman_ps.rs`'s own established cidfile tests use.
+#[test]
+fn pause_and_unpause_cidfile_read_the_container_id_from_a_file() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/pause-cidfile:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached_named(
+        storage_dir.path(),
+        "pause-cidfile-target",
+        "ociman-test/pause-cidfile:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-cidfile-target",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let cidfile = storage_dir.path().join("cid.txt");
+    std::fs::write(&cidfile, "pause-cidfile-target\ngarbage second line").unwrap();
+
+    let pause = ociman(
+        storage_dir.path(),
+        &["pause", "--cidfile", cidfile.to_str().unwrap()],
+    );
+    assert!(
+        pause.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pause.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&pause.stdout).trim(),
+        "pause-cidfile-target"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-cidfile-target",
+            "paused",
+            Duration::from_secs(5)
+        ),
+        "paused"
+    );
+
+    let unpause = ociman(
+        storage_dir.path(),
+        &["unpause", "--cidfile", cidfile.to_str().unwrap()],
+    );
+    assert!(
+        unpause.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unpause.stderr)
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-cidfile-target",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    ociman(storage_dir.path(), &["stop", "--time", "0", "-a"]);
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// Multiple explicit ids (0320, a real, previously-unsupported gap:
+/// `ociman pause`/`unpause` only ever accepted exactly one target
+/// before this) each get paused/unpaused; an unresolvable id among
+/// several aborts the whole call before touching any of them,
+/// matching real podman's own identical two-phase behavior (checked
+/// directly, `getContainers`'s own `default` case).
+#[test]
+fn pause_and_unpause_with_multiple_explicit_ids() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/pause-multi:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run1 = ociman_run_detached_named(
+        storage_dir.path(),
+        "pause-multi-run1",
+        "ociman-test/pause-multi:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let mut run2 = ociman_run_detached_named(
+        storage_dir.path(),
+        "pause-multi-run2",
+        "ociman-test/pause-multi:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-multi-run1",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-multi-run2",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    // Unresolvable third target: the whole call should abort before
+    // touching either real container at all.
+    let bad = ociman(
+        storage_dir.path(),
+        &[
+            "pause",
+            "pause-multi-run1",
+            "pause-multi-run2",
+            "pause-multi-nope",
+        ],
+    );
+    assert!(!bad.status.success());
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-multi-run1",
+            "running",
+            Duration::from_millis(200)
+        ),
+        "running",
+        "must be completely untouched by the aborted call"
+    );
+
+    let pause = ociman(
+        storage_dir.path(),
+        &["pause", "pause-multi-run1", "pause-multi-run2"],
+    );
+    assert!(
+        pause.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pause.stderr)
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-multi-run1",
+            "paused",
+            Duration::from_secs(5)
+        ),
+        "paused"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-multi-run2",
+            "paused",
+            Duration::from_secs(5)
+        ),
+        "paused"
+    );
+
+    let unpause = ociman(
+        storage_dir.path(),
+        &["unpause", "pause-multi-run1", "pause-multi-run2"],
+    );
+    assert!(
+        unpause.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unpause.stderr)
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-multi-run1",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-multi-run2",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    ociman(storage_dir.path(), &["stop", "--time", "0", "-a"]);
+    run1.wait().unwrap();
+    run2.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
 }
