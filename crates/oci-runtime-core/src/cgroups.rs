@@ -393,6 +393,48 @@ pub fn is_frozen(cgroup_dir: &Path) -> io::Result<bool> {
     Ok(content.trim() == "1")
 }
 
+/// Send `signal` to `pid`, then — if `pid`'s own real, current cgroup
+/// (discovered via [`cgroup_dir_for_running_pid`], the same technique
+/// `ociman`'s own `display_status`/`cmd_top` already use) is currently
+/// frozen — thaw it so the signal actually takes effect.
+///
+/// A frozen cgroup's own freezer *queues* a delivered signal rather
+/// than running it at all until thawed (confirmed directly against
+/// real runc's own `signalInit`, `~/git/runc/libcontainer/
+/// container_linux.go`: "For cgroup v1, killing a process in a frozen
+/// cgroup does nothing until it's thawed. Only thaw the cgroup for
+/// SIGKILL." — generalized here to *any* signal, not just `SIGKILL`,
+/// since a frozen cgroup's own freezer queues every signal completely
+/// identically, not just that one; real crun's own `libcrun_kill_
+/// linux`, `~/git/crun/src/libcrun/linux.c`, never thaws at all, for
+/// any signal — checked directly, neither reference runtime actually
+/// gets this right in general). Without this, `kill`ing a genuinely
+/// paused container reports success (the signal really was sent)
+/// while silently doing nothing at all — a real, previously-
+/// discovered gap (`docs/design/0312`) confirmed live: real `podman
+/// kill` on a paused container genuinely reports it `Exited (137)`
+/// afterward, not a silent no-op, which this project's own `kill`
+/// must match too (and does, for every signal, not just `SIGKILL`).
+///
+/// Best-effort at resolving the cgroup itself (matching `display_
+/// status`'s own identical tolerance): a pid whose cgroup can't be
+/// found at all (already exited between the signal and this check,
+/// e.g.) is simply left alone rather than turning an already-sent
+/// signal into a reported failure over a check that was only ever a
+/// bonus in the first place. A *found*, and genuinely frozen, cgroup
+/// that then fails to actually thaw, though, is a real error: the
+/// entire point of this function succeeding is that the signal
+/// actually took effect, and it provably didn't in that case.
+pub fn kill_thawing_if_paused(cgroup_root: &Path, pid: i32, signal: i32) -> io::Result<()> {
+    crate::process::kill(pid, signal)?;
+    if let Ok(cgroup_dir) = cgroup_dir_for_running_pid(cgroup_root, pid)
+        && is_frozen(&cgroup_dir).unwrap_or(false)
+    {
+        set_frozen(&cgroup_dir, false)?;
+    }
+    Ok(())
+}
+
 /// Poll `cgroup_dir`'s own `cgroup.events` file (`interval` between
 /// attempts, up to `max_attempts` of them) until it reports a real
 /// `frozen 1` line, matching runc's own `waitFrozen` exactly (down to

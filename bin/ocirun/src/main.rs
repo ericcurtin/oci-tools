@@ -773,7 +773,25 @@ fn cmd_kill(root: &Path, id: &str, signal: Option<&str>, all: bool) -> anyhow::R
     if all {
         return kill_all(root, id, signal);
     }
-    oci_runtime_core::process::kill(pid, signal).context("sending signal")?;
+    // `kill_thawing_if_paused`, not a plain `process::kill` (0319,
+    // closing a real gap `docs/design/0312` first found): a genuinely
+    // paused container's own frozen cgroup *queues* a sent signal
+    // rather than actually delivering it until thawed, so a plain
+    // signal send would otherwise report success while silently doing
+    // nothing at all to a paused target. Checked directly against both
+    // real reference runtimes' own source rather than assumed: real
+    // runc's own `signalInit` (`~/git/runc/libcontainer/
+    // container_linux.go`) only thaws after `SIGKILL` specifically,
+    // never any other signal; real crun's own `libcrun_kill_linux`
+    // (`~/git/crun/src/libcrun/linux.c`) never thaws at all, for any
+    // signal -- neither reference runtime actually gets this right in
+    // general. This project's own version deliberately generalizes to
+    // *every* signal (a frozen cgroup's own freezer queues any of them
+    // completely identically, not just `SIGKILL`), a genuine
+    // improvement over both real tools, not merely matching one of
+    // them.
+    oci_runtime_core::cgroups::kill_thawing_if_paused(Path::new("/sys/fs/cgroup"), pid, signal)
+        .context("sending signal")?;
     Ok(())
 }
 

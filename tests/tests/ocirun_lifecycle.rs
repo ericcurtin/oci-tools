@@ -776,6 +776,122 @@ fn pause_freezes_and_resume_thaws_a_real_running_containers_own_cpu_usage() {
     );
 }
 
+/// `ocirun kill` against a *still-paused* (not first resumed) real
+/// container (0319, closing `0312`'s own discovered gap): a genuinely
+/// frozen cgroup *queues* a sent signal rather than delivering it at
+/// all until thawed, so a plain `kill(2)` alone would report success
+/// while the container silently stays alive and paused forever.
+/// `ocirun kill` must thaw it as part of delivering the signal, not
+/// require a separate `resume` first. Same real delegated-cgroup
+/// carrier-scope setup as the pause/resume test above.
+#[test]
+fn kill_on_a_still_paused_container_actually_terminates_it() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_scope_available() {
+        eprintln!(
+            "skipping: no reachable `systemd --user` session (systemd-run --user --scope failed)"
+        );
+        return;
+    }
+
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(
+        bundle_dir.path(),
+        &busybox,
+        &["/bin/sh", "-c", "i=0; while true; do i=$((i+1)); done"],
+    );
+
+    let config_path = bundle_dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    let uid = rustix::process::getuid().as_raw();
+    let target = format!(
+        "/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/ocirun-killpause-test-{}",
+        std::process::id()
+    );
+    config["linux"]["cgroupsPath"] = serde_json::json!(target);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let carrier_unit = format!("ocirun-killpause-test-carrier-{}.scope", std::process::id());
+    let create = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--slice=app.slice",
+            &format!("--unit={carrier_unit}"),
+            "--",
+        ])
+        .arg(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args(["create", "killpause-test", "--bundle"])
+        .arg(bundle_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .expect("failed to spawn systemd-run");
+    assert!(
+        create.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let start = ocirun(root_dir.path(), &["start", "killpause-test"]);
+    assert!(
+        start.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert_eq!(state_status(root_dir.path(), "killpause-test"), "running");
+
+    let pause = ocirun(root_dir.path(), &["pause", "killpause-test"]);
+    assert!(
+        pause.status.success(),
+        "pause failed: {}",
+        String::from_utf8_lossy(&pause.stderr)
+    );
+    assert_eq!(
+        state_status(root_dir.path(), "killpause-test"),
+        "paused",
+        "must genuinely be paused before killing it -- otherwise this test proves nothing"
+    );
+
+    // No `resume` here at all -- the whole point is that `kill` itself
+    // must make the signal actually take effect on a still-frozen
+    // container.
+    let kill = ocirun(root_dir.path(), &["kill", "killpause-test", "KILL"]);
+    assert!(
+        kill.status.success(),
+        "{}",
+        String::from_utf8_lossy(&kill.stderr)
+    );
+
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "killpause-test",
+            "stopped",
+            Duration::from_secs(5)
+        ),
+        "stopped",
+        "kill on a still-paused container must actually terminate it, not silently leave it \
+         alive and frozen forever"
+    );
+
+    let delete = ocirun(root_dir.path(), &["delete", "killpause-test"]);
+    assert!(
+        delete.status.success(),
+        "delete failed: {}",
+        String::from_utf8_lossy(&delete.stderr)
+    );
+}
+
 /// `pause`/`resume` against a container that has already stopped is a
 /// clear, real error, not a silent no-op or a confusing raw I/O
 /// failure — matching real `runc pause`/`resume`'s own "not running"

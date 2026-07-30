@@ -597,3 +597,101 @@ fn kill_with_one_nonexistent_id_among_several_aborts_before_signaling_any() {
     run1.wait().unwrap();
     ociman(storage_dir.path(), &["rm", "-a", "-f"]);
 }
+
+/// Same real, reachable-`systemd --user`-session probe
+/// `ociman_pause.rs`'s own tests use.
+fn systemd_user_session_available() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-system-running"])
+        .output()
+        .is_ok_and(|out| !out.stdout.is_empty())
+}
+
+/// `ociman kill` against a *still-paused* (not first unpaused) real
+/// container (0319, closing `0312`'s own discovered gap): a genuinely
+/// frozen cgroup *queues* a sent signal rather than delivering it at
+/// all until thawed, so a plain signal send alone would report
+/// success while the container silently stays alive and paused
+/// forever. `ociman kill` must thaw it as part of delivering the
+/// signal, not require a separate `unpause` first -- checked directly
+/// against a real installed podman, which genuinely does this too
+/// (`podman kill` on a paused container reports `Exited (137)`
+/// afterward, not a silent no-op).
+#[test]
+fn kill_on_a_still_paused_container_actually_terminates_it() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/kill-pause:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached_named(
+        storage_dir.path(),
+        "kill-pause-target",
+        "ociman-test/kill-pause:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-pause-target",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let pause = ociman(storage_dir.path(), &["pause", "kill-pause-target"]);
+    assert!(
+        pause.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&pause.stderr)
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-pause-target",
+            "paused",
+            Duration::from_secs(5)
+        ),
+        "paused",
+        "must genuinely be paused before killing it -- otherwise this test proves nothing"
+    );
+
+    // No `unpause` here at all -- the whole point is that `kill`
+    // itself must make the signal actually take effect on a
+    // still-frozen container.
+    let kill = ociman(storage_dir.path(), &["kill", "kill-pause-target"]);
+    assert!(
+        kill.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&kill.stderr)
+    );
+
+    run.wait().unwrap();
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-pause-target",
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped",
+        "kill on a still-paused container must actually terminate it, not silently leave it \
+         alive and frozen forever"
+    );
+
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}

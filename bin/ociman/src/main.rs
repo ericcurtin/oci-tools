@@ -8706,18 +8706,9 @@ fn cmd_kill(ids: &[String], signal: &str, all: bool) -> anyhow::Result<()> {
                 // ed container alone, exactly like a stopped one.
                 continue;
             }
-            let result = state
-                .pid
-                .ok_or_else(|| anyhow::anyhow!("container {:?} has no recorded pid", state.id))
-                .and_then(|pid| {
-                    oci_runtime_core::process::kill(pid, sig).context("sending signal")
-                });
-            match result {
-                Ok(()) => println!("{}", state.id),
-                Err(e) => {
-                    eprintln!("error killing {}: {e:#}", state.id);
-                    first_error.get_or_insert(e);
-                }
+            if let Err(e) = kill_one(&containers, &state.id, &state.id, sig) {
+                eprintln!("error killing {}: {e:#}", state.id);
+                first_error.get_or_insert(e);
             }
         }
         return match first_error {
@@ -8764,10 +8755,20 @@ fn cmd_kill(ids: &[String], signal: &str, all: bool) -> anyhow::Result<()> {
 
 /// The actual single-container kill logic (a container that isn't
 /// running is a real, surfaced error, see [`cmd_kill`]'s own doc
-/// comment) — factored out so both the single- and multi-target paths
-/// above share it, printing `raw_id` (the original given string, not
-/// `resolved`) on success to match this command's own existing
-/// single-target convention.
+/// comment) — factored out so the single-target, multi-target, and
+/// `--all` paths all share it, printing `raw_id` (the original given
+/// string, not `resolved`) on success to match this command's own
+/// existing single-target convention.
+///
+/// Uses [`oci_runtime_core::cgroups::kill_thawing_if_paused`] rather
+/// than a plain `process::kill` (0319, closing `0312`'s own
+/// discovered gap): a genuinely paused container's own frozen cgroup
+/// *queues* a sent signal rather than actually delivering it until
+/// thawed, so a plain signal send previously reported success while
+/// silently doing nothing at all to a paused target — confirmed live
+/// against a real installed podman that this project's own `kill`
+/// must match: `podman kill` on a paused container genuinely reports
+/// it `Exited (137)` afterward, not a silent no-op.
 fn kill_one(containers: &StateStore, resolved: &str, raw_id: &str, sig: i32) -> anyhow::Result<()> {
     let state = containers.load(resolved)?;
     if state.effective_status() == Status::Stopped {
@@ -8776,7 +8777,8 @@ fn kill_one(containers: &StateStore, resolved: &str, raw_id: &str, sig: i32) -> 
     let pid = state
         .pid
         .ok_or_else(|| anyhow::anyhow!("container {raw_id:?} has no recorded pid"))?;
-    oci_runtime_core::process::kill(pid, sig).context("sending signal")?;
+    oci_runtime_core::cgroups::kill_thawing_if_paused(Path::new("/sys/fs/cgroup"), pid, sig)
+        .context("sending signal")?;
     println!("{raw_id}");
     Ok(())
 }
