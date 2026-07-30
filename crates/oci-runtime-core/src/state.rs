@@ -108,6 +108,29 @@ pub struct PersistedState {
     pub rootfs: String,
     /// RFC 3339 UTC creation timestamp.
     pub created: String,
+    /// RFC 3339 UTC timestamp of this container's own most recent
+    /// real start (overwritten on every subsequent `start`, matching
+    /// real podman's own identical `StartedTime` field — checked
+    /// directly, `~/git/podman/libpod/runtime_ctr.go`'s own
+    /// unconditional `ctr.state.StartedTime = time.Now()`, not just
+    /// set once at the very first start). `None` for a container that
+    /// has never actually started at all yet (still `Creating`/
+    /// `Created`), or one recorded by a version of this project
+    /// predating this field (`#[serde(default)]`, the same forward-
+    /// compatible-record convention `owner`'s own doc comment already
+    /// established).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// RFC 3339 UTC timestamp of the moment this container's own
+    /// process was last observed to have exited (real podman's own
+    /// `FinishedTime`, `~/git/podman/libpod/runtime_ctr.go`) — set
+    /// alongside the same real reap moment `ociman`'s own
+    /// `run_and_finalize` already records `ANNOTATION_EXIT_CODE` at,
+    /// the one real place a container's own process is actually
+    /// waited on. `None` for a container that has never stopped at
+    /// all (or that predates this field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
     /// Annotations copied from `config.json`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub annotations: BTreeMap<String, String>,
@@ -384,6 +407,8 @@ impl StateStore {
             bundle: bundle.to_string_lossy().into_owned(),
             rootfs: rootfs.to_string_lossy().into_owned(),
             created: format_rfc3339_utc(SystemTime::now()),
+            started_at: None,
+            finished_at: None,
             annotations,
             owner: current_user_name(),
         };
@@ -532,6 +557,8 @@ mod tests {
         assert_eq!(created.status, Status::Creating);
         assert_eq!(created.pid, None);
         assert_eq!(created.oci_version, OCI_VERSION);
+        assert_eq!(created.started_at, None);
+        assert_eq!(created.finished_at, None);
 
         let loaded = store.load("c1").unwrap();
         assert_eq!(loaded, created);

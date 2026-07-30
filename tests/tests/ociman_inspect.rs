@@ -743,3 +743,135 @@ fn inspect_mounts_reports_bind_mounts_and_named_volumes_but_omits_the_field_when
     let plain_view: serde_json::Value = serde_json::from_slice(&plain_inspect.stdout).unwrap();
     assert!(plain_view.get("mounts").is_none(), "{plain_view:?}");
 }
+
+/// `ociman inspect`'s own `started_at`/`finished_at` fields
+/// (`docs/design/0370`): both absent for a container that has never
+/// actually started at all yet (`ociman create`, no `start`).
+#[test]
+fn inspect_started_at_and_finished_at_are_absent_for_a_never_started_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-started-never:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/inspect-started-never:latest", "true"],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+    let view: serde_json::Value =
+        serde_json::from_slice(&ociman(storage_dir.path(), &["inspect", &id, "--json"]).stdout)
+            .unwrap();
+    assert!(view.get("started_at").is_none(), "{view:?}");
+    assert!(view.get("finished_at").is_none(), "{view:?}");
+}
+
+/// Both fields are set once a container has actually run to
+/// completion, `finished_at` never earlier than `started_at` (RFC3339
+/// strings sort lexically the same as chronologically).
+#[test]
+fn inspect_started_at_and_finished_at_are_set_after_a_container_runs_to_completion() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-started-ran:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/inspect-started-ran:latest", "true"],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let id = only_container_id(storage_dir.path());
+    assert!(!id.is_empty());
+
+    let view: serde_json::Value =
+        serde_json::from_slice(&ociman(storage_dir.path(), &["inspect", &id, "--json"]).stdout)
+            .unwrap();
+    let started_at = view["started_at"]
+        .as_str()
+        .expect("started_at should be set");
+    let finished_at = view["finished_at"]
+        .as_str()
+        .expect("finished_at should be set");
+    assert!(
+        finished_at >= started_at,
+        "finished_at {finished_at:?} should be at or after started_at {started_at:?}"
+    );
+}
+
+/// `ociman restart` overwrites `started_at` to the new start's own
+/// time, matching real podman's own identical `StartedTime`
+/// unconditional-overwrite behavior (checked directly, `~/git/podman/
+/// libpod/runtime_ctr.go`) -- not just set once at the very first
+/// start.
+#[test]
+fn inspect_restart_overwrites_started_at() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-restart-started:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/inspect-restart-started:latest", "true"],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let id = only_container_id(storage_dir.path());
+    assert!(!id.is_empty());
+
+    let first_view: serde_json::Value =
+        serde_json::from_slice(&ociman(storage_dir.path(), &["inspect", &id, "--json"]).stdout)
+            .unwrap();
+    let first_started_at = first_view["started_at"]
+        .as_str()
+        .expect("started_at should be set")
+        .to_string();
+
+    // `format_rfc3339_utc`'s own second-level precision (matching
+    // real runc's `state.json`, see its own doc comment) needs a
+    // real, full second of separation to reliably observe a
+    // different value here.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let restart = ociman(storage_dir.path(), &["restart", &id]);
+    assert!(restart.status.success(), "{restart:?}");
+
+    let second_view: serde_json::Value =
+        serde_json::from_slice(&ociman(storage_dir.path(), &["inspect", &id, "--json"]).stdout)
+            .unwrap();
+    let second_started_at = second_view["started_at"]
+        .as_str()
+        .expect("started_at should still be set")
+        .to_string();
+    assert!(
+        second_started_at > first_started_at,
+        "restart should overwrite started_at with a later value: {first_started_at:?} -> \
+         {second_started_at:?}"
+    );
+}

@@ -7013,6 +7013,10 @@ fn run_and_finalize(
     let record_running = |pid: i32| {
         state.status = Status::Running;
         state.pid = Some(pid);
+        // Overwritten on every real start, matching real podman's own
+        // identical `StartedTime` (see `PersistedState::started_at`'s
+        // own doc comment) -- surfaced via `ociman inspect`.
+        state.started_at = Some(format_rfc3339_utc(std::time::SystemTime::now()));
         let _ = containers.write(&state);
     };
 
@@ -7088,6 +7092,13 @@ fn run_and_finalize(
     // scope-teardown time (see `docs/design/0096`).
     reset_failed_systemd_scope(container_id, &state);
 
+    // The one real moment this container's own process is actually
+    // reaped -- also where `PersistedState::finished_at` gets set
+    // (real podman's own identical `FinishedTime`, see its own doc
+    // comment), computed once so both branches below record the exact
+    // same instant.
+    let finished_at = format_rfc3339_utc(std::time::SystemTime::now());
+
     if rm {
         let fresh = containers.load(container_id).ok();
         let still_wants_auto_remove = fresh
@@ -7103,6 +7114,7 @@ fn run_and_finalize(
             // silently undoing `cmd_restart`'s own suppression).
             fresh_state.status = Status::Stopped;
             fresh_state.pid = state.pid;
+            fresh_state.finished_at = Some(finished_at);
             fresh_state
                 .annotations
                 .insert(ANNOTATION_EXIT_CODE.to_string(), exit_code.to_string());
@@ -7112,6 +7124,7 @@ fn run_and_finalize(
         // (e.g. a concurrent `rm -f`) -- nothing left to write to.
     } else {
         state.status = Status::Stopped;
+        state.finished_at = Some(finished_at);
         state
             .annotations
             .insert(ANNOTATION_EXIT_CODE.to_string(), exit_code.to_string());
@@ -7550,6 +7563,20 @@ struct ContainerInspectView {
     command: String,
     status: String,
     created: String,
+    /// The container's own most recent real start time, matching real
+    /// podman's own `StartedTime` in spirit (see
+    /// [`oci_runtime_core::PersistedState::started_at`]'s own doc
+    /// comment) -- `None` for one that has never actually started at
+    /// all yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
+    /// The moment this container's own process was last observed to
+    /// have exited, matching real podman's own `FinishedTime` in
+    /// spirit (see [`oci_runtime_core::PersistedState::finished_at`]'s
+    /// own doc comment) -- `None` for one that has never stopped at
+    /// all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finished_at: Option<String>,
     /// `0` once stopped (never omitted here, unlike [`Self::name`]) —
     /// matches `PersistedState::to_view`'s own established convention
     /// for the same field.
@@ -7674,6 +7701,8 @@ impl ContainerInspectView {
                 .unwrap_or_default(),
             status: status.to_string(),
             created: state.created.clone(),
+            started_at: state.started_at.clone(),
+            finished_at: state.finished_at.clone(),
             pid: if status == Status::Stopped {
                 0
             } else {
