@@ -316,6 +316,88 @@ enum Command {
         #[arg(long = "extra-flags", value_name = "FLAGS", allow_hyphen_values = true)]
         extra_flags: Option<String>,
     },
+    /// Generate (or `--delete`) a real, standalone desktop launcher
+    /// for entering a whole box — matching real `distrobox generate-
+    /// entry` exactly (checked directly, `~/git/distrobox/pkg/
+    /// commands/generate_entry.go`): distinct from `export --app`,
+    /// which exports one specific application *inside* a box; this
+    /// generates a launcher for the box itself (`Exec=ocibox enter
+    /// <name>`), plus a right-click "Remove" desktop action
+    /// (`Exec=ocibox rm <name>`, needing no `--force` at all — this
+    /// project's own `rm` never prompts in the first place). Written
+    /// to the same `$HOME/.local/share/applications` directory
+    /// `export --app` already defaults to, under real distrobox's own
+    /// identical `<name>.desktop` filename convention (checked
+    /// directly, `getEntryFilePath`) — no `--export-path` flag at all,
+    /// matching real `distrobox generate-entry`'s own identical lack
+    /// of one for this specific command.
+    ///
+    /// Real distrobox's own `--icon` default is the literal string
+    /// `"auto"`: a per-distro logo, detected from the box's own image
+    /// name and downloaded over the network the first time, cached
+    /// locally after that (`resolveIcon`/`downloadIconFile`). This
+    /// project deliberately doesn't reproduce that — a real, honestly-
+    /// deferred network dependency this narrower first slice doesn't
+    /// need — and falls back to a fixed, standard freedesktop icon
+    /// name every icon theme already provides (`utilities-terminal`)
+    /// instead of either the network-fetched per-distro logo or real
+    /// distrobox's own separately-installed, non-standard fallback
+    /// icon asset (`terminal-distrobox-icon`, a file this project
+    /// never installs, so referencing its name here would only ever
+    /// resolve to a real, missing icon). `--icon`, when given, always
+    /// overrides this with the exact value given, matching real
+    /// distrobox's own identical "anything other than empty/`auto`
+    /// passes straight through" rule.
+    ///
+    /// Also a real, deliberate divergence from real `distrobox
+    /// generate-entry`'s own hardcoded `"my-distrobox"` fallback name
+    /// when neither `NAME` nor `--all` is given at all (`~/git/
+    /// distrobox/pkg/commands/generate_entry.go`'s own `default:`
+    /// branch in `resolveTargets` — a real, checked-directly quirk
+    /// that generates an entry for a box that might not even exist,
+    /// with no existence check at all in that one code path):
+    /// `ocibox create` itself has never had an implicit default name
+    /// of its own, and this command doesn't invent one either — a
+    /// clear, immediate error instead, the same "no invented magic
+    /// default names" stance this project already takes everywhere
+    /// else.
+    ///
+    /// `--delete` never checks for any kind of "is this really an
+    /// `ocibox`-generated entry" marker at all — a real, checked-
+    /// directly *asymmetry* with `export --app --delete`'s own more
+    /// cautious marker check: real distrobox's own `deleteEntry` for
+    /// *this* command has no such check either (`os.Remove` on the
+    /// bare `<name>.desktop` path, unconditionally, tolerating it
+    /// simply not existing), so this project matches that command's
+    /// own real, independently-checked behavior rather than assuming
+    /// one uniform safety convention across every export-adjacent
+    /// command in the whole tool.
+    GenerateEntry {
+        /// The box's own name — required unless `--all` is given (see
+        /// this command's own doc comment for why there is no
+        /// implicit fallback name).
+        name: Option<String>,
+        /// Generate (or `--delete`) an entry for every existing box,
+        /// matching real `distrobox generate-entry --all`/`-a`
+        /// exactly; `NAME`, if also given, is ignored (matching real
+        /// distrobox's own identical priority — the same convention
+        /// `ocibox rm --all` already established for itself).
+        #[arg(long, short = 'a')]
+        all: bool,
+        /// Remove a previously generated entry instead of creating
+        /// one, matching real `distrobox generate-entry --delete`/
+        /// `-d` exactly.
+        #[arg(long, short = 'd')]
+        delete: bool,
+        /// Override the generated entry's own `Icon=` value —
+        /// matching real `distrobox generate-entry --icon`/`-i`
+        /// exactly for any *explicit* value; see this command's own
+        /// doc comment for the real, deliberate divergence when not
+        /// given at all (this project's own default, no network
+        /// fetch).
+        #[arg(long, short = 'i', value_name = "ICON")]
+        icon: Option<String>,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -369,6 +451,12 @@ fn main() -> std::process::ExitCode {
                     extra_flags: extra_flags.as_deref(),
                 },
             ),
+            Some(Command::GenerateEntry {
+                name,
+                all,
+                delete,
+                icon,
+            }) => cmd_generate_entry(name.as_deref(), all, delete, icon.as_deref()),
             None => anyhow::bail!(
                 "no subcommand given (try `ocibox create --image ... --name ...`); \
                  the rest of milestone 7 (`stop`/...) arrives later"
@@ -1801,6 +1889,107 @@ fn cmd_export_app(
         "{app} from {box_name} exported successfully in {}",
         export_dir.display()
     );
+    Ok(())
+}
+
+/// A small, purely-informational identifying comment written into
+/// every entry this command generates — real distrobox's own
+/// identical template has no equivalent at all (see
+/// [`Command::GenerateEntry`]'s own doc comment for why this is fine:
+/// `--delete` never actually checks for it, matching real distrobox's
+/// own identical unconditional-`os.Remove` behavior for this specific
+/// command).
+const GENERATE_ENTRY_MARKER: &str = "ocibox_generate_entry";
+
+/// This project's own default `Icon=` value for a generated entry
+/// when `--icon` isn't given at all — see [`Command::GenerateEntry`]'s
+/// own doc comment for exactly why this isn't real distrobox's own
+/// `"auto"` per-distro network-fetched logo, nor its own separately-
+/// installed `terminal-distrobox-icon` fallback asset (a file this
+/// project never installs): a standard freedesktop icon name every
+/// icon theme already provides.
+const GENERATE_ENTRY_DEFAULT_ICON: &str = "utilities-terminal";
+
+/// The real, on-host path a generated entry for `name` lives at —
+/// matching real `distrobox generate-entry`'s own identical
+/// `<name>.desktop` filename convention exactly (`getEntryFilePath`),
+/// under the same `$HOME/.local/share/applications` directory
+/// `export --app` already defaults to.
+fn generate_entry_file_path(name: &str) -> anyhow::Result<PathBuf> {
+    Ok(default_app_export_path()?.join(format!("{name}.desktop")))
+}
+
+/// `ocibox generate-entry` — see [`Command::GenerateEntry`]'s own doc
+/// comment for the exact real semantics and deliberate divergences
+/// this ports.
+fn cmd_generate_entry(
+    name: Option<&str>,
+    all: bool,
+    delete: bool,
+    icon: Option<&str>,
+) -> anyhow::Result<()> {
+    let targets: Vec<String> = if all {
+        list_boxes()?.into_iter().map(|r| r.name).collect()
+    } else {
+        let name = name.ok_or_else(|| {
+            anyhow::anyhow!(
+                "either NAME or --all must be given (see `ocibox generate-entry --help`)"
+            )
+        })?;
+        validate_box_name(name)?;
+        if !delete {
+            anyhow::ensure!(
+                boxes_root().join(name).is_dir(),
+                "cannot find box {name:?}, please create it first"
+            );
+        }
+        vec![name.to_string()]
+    };
+
+    for name in &targets {
+        let entry_path = generate_entry_file_path(name)?;
+        if delete {
+            match std::fs::remove_file(&entry_path) {
+                Ok(()) => println!("{name}.desktop removed successfully"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("removing {}", entry_path.display()));
+                }
+            }
+            continue;
+        }
+
+        std::fs::create_dir_all(entry_path.parent().expect("has a parent, just joined one"))
+            .with_context(|| format!("creating {}", entry_path.display()))?;
+        let icon = icon.unwrap_or(GENERATE_ENTRY_DEFAULT_ICON);
+        let content = format!(
+            "# {GENERATE_ENTRY_MARKER}\n\
+             # box: {name}\n\
+             [Desktop Entry]\n\
+             Name={name}\n\
+             GenericName=Terminal entering {name}\n\
+             Comment=Terminal entering {name}\n\
+             Categories=System;Utility;\n\
+             Exec=ocibox enter {name}\n\
+             Icon={icon}\n\
+             Keywords=ocibox;\n\
+             NoDisplay=false\n\
+             Terminal=true\n\
+             TryExec=ocibox\n\
+             Type=Application\n\
+             Actions=Remove;\n\
+             \n\
+             [Desktop Action Remove]\n\
+             Name=Remove {name} from system\n\
+             Exec=ocibox rm {name}\n"
+        );
+        std::fs::write(&entry_path, content)
+            .with_context(|| format!("writing {}", entry_path.display()))?;
+        println!(
+            "{name}.desktop successfully created in {}",
+            entry_path.display()
+        );
+    }
     Ok(())
 }
 
