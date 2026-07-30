@@ -1,13 +1,14 @@
-//! `ocibox export --bin` integration tests (`docs/design/0252`):
-//! exercises the actual built `ocibox` binary writing (and removing)
-//! a real wrapper script that routes an exported binary's own
-//! invocations through `ocibox enter` — checked directly against real
-//! `distrobox export --bin`'s own actual shell implementation
-//! (`~/git/distrobox/internal/inside-distrobox/assets/distrobox-export`),
-//! deliberately scoped to just the binary-export half (see
-//! `Command::Export`'s own doc comment for exactly why not `--app`
-//! yet, and how the explicit `--box` flag here diverges from real
-//! `distrobox export`'s own "detect which box I'm running in" model).
+//! `ocibox export --bin`/`--app` integration tests (`docs/design/
+//! 0252`, `0322`): exercises the actual built `ocibox` binary writing
+//! (and removing) a real wrapper script/`.desktop` launcher that
+//! routes an exported binary/application's own invocations through
+//! `ocibox enter` — checked directly against real `distrobox
+//! export`'s own actual shell implementation (`~/git/distrobox/
+//! internal/inside-distrobox/assets/distrobox-export`), deliberately
+//! without `--app`'s own icon-copying half (see `Command::Export`'s
+//! own doc comment for exactly why not, and how the explicit `--box`
+//! flag here diverges from real `distrobox export`'s own "detect
+//! which box I'm running in" model).
 
 use std::path::Path;
 use std::process::Command;
@@ -291,5 +292,292 @@ fn export_rejects_a_non_absolute_bin_path() {
         String::from_utf8_lossy(&out.stderr).contains("absolute path"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Writes a real `.desktop` file into a box's own rootfs, matching
+/// what a real installed application would leave behind.
+fn write_desktop_file(storage_dir: &tempfile::TempDir, box_name: &str, contents: &str) {
+    let dir = storage_dir
+        .path()
+        .join("boxes")
+        .join(box_name)
+        .join("rootfs/usr/share/applications");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("myapp.desktop"), contents).unwrap();
+}
+
+const SAMPLE_DESKTOP_FILE: &str = "[Desktop Entry]\nType=Application\nName=My App\n\
+Exec=/usr/bin/myapp --flag\nTryExec=/usr/bin/myapp\nIcon=myapp-icon\n";
+
+/// `export --app` (0322) writes a rewritten `.desktop` launcher whose
+/// own `Exec=` routes through `ocibox enter`, strips `TryExec=`
+/// entirely (it would check for the host's own binary, not the
+/// box's), and leaves `Icon=` completely untouched (icon handling is
+/// a real, separate, deferred increment — see `Command::Export`'s own
+/// doc comment) — matching real `distrobox export --app`'s own core
+/// `Exec=`-rewriting mechanism, checked directly against
+/// `~/git/distrobox`'s own real shell implementation.
+#[test]
+fn export_app_writes_a_rewritten_desktop_file() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(&storage_dir, "testbox", SAMPLE_DESKTOP_FILE);
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&export.stdout).contains("exported successfully"),
+        "{}",
+        String::from_utf8_lossy(&export.stdout)
+    );
+
+    let dest = export_dir.path().join("testbox-myapp.desktop");
+    assert!(dest.is_file(), "launcher should exist at {dest:?}");
+    let contents = std::fs::read_to_string(&dest).unwrap();
+    assert!(contents.contains("ocibox_app_export"), "{contents:?}");
+    assert!(
+        contents.contains("Exec=ocibox enter testbox -- /usr/bin/myapp --flag"),
+        "{contents:?}"
+    );
+    assert!(
+        !contents.contains("TryExec="),
+        "TryExec should be stripped entirely: {contents:?}"
+    );
+    assert!(
+        contents.contains("Icon=myapp-icon"),
+        "Icon= should be left completely untouched: {contents:?}"
+    );
+    assert!(contents.contains("Name=My App"), "{contents:?}");
+}
+
+/// `export --app` also accepts an absolute path (inside the box's own
+/// rootfs) to a `.desktop` file directly, matching real `distrobox
+/// export --app`'s own identical either/or interpretation.
+#[test]
+fn export_app_accepts_an_explicit_desktop_file_path() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(&storage_dir, "testbox", SAMPLE_DESKTOP_FILE);
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "/usr/share/applications/myapp.desktop",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert!(export_dir.path().join("testbox-myapp.desktop").is_file());
+}
+
+/// `export --app --delete` removes a previously-exported launcher,
+/// refusing a foreign file with no marker comment -- the same
+/// marker/safety-check convention `--bin --delete` already
+/// established.
+#[test]
+fn export_app_delete_removes_the_launcher_and_refuses_a_foreign_file() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(&storage_dir, "testbox", SAMPLE_DESKTOP_FILE);
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(export.status.success());
+    let dest = export_dir.path().join("testbox-myapp.desktop");
+    assert!(dest.is_file());
+
+    // A foreign file at the exact same destination our own search
+    // would resolve to (no marker comment) is refused, matching real
+    // `distrobox export --delete`'s own identical safety check.
+    std::fs::write(&dest, "[Desktop Entry]\nName=Not exported\n").unwrap();
+    let refuse = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+            "--delete",
+        ],
+    );
+    assert!(!refuse.status.success());
+    assert!(
+        String::from_utf8_lossy(&refuse.stderr).contains("not an ocibox-exported application"),
+        "{}",
+        String::from_utf8_lossy(&refuse.stderr)
+    );
+    assert!(dest.is_file(), "the foreign file must survive untouched");
+
+    // Re-export for real, then delete it for real.
+    let reexport = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(reexport.status.success());
+
+    let delete = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+            "--delete",
+        ],
+    );
+    assert!(
+        delete.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&delete.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&delete.stdout).contains("removed successfully"),
+        "{}",
+        String::from_utf8_lossy(&delete.stdout)
+    );
+    assert!(!dest.exists(), "the launcher should really be gone now");
+}
+
+/// `export --app` of a name with no matching `.desktop` file is a
+/// clear error, matching real `distrobox export --app`'s own
+/// identical "cannot find any desktop files" rejection.
+#[test]
+fn export_app_of_an_unknown_app_is_a_clear_error() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let out = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "NoSuchApp",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot find any desktop files"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `export` requires exactly one of `--app`/`--bin`, matching real
+/// `distrobox export`'s own identical "choose only one action" rule.
+#[test]
+fn export_requires_exactly_one_of_app_or_bin() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let neither = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(!neither.status.success());
+    assert!(
+        String::from_utf8_lossy(&neither.stderr).contains("either --app or --bin is required"),
+        "{}",
+        String::from_utf8_lossy(&neither.stderr)
+    );
+
+    let both = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "someapp",
+            "--bin",
+            "/bin/echo",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(!both.status.success());
+    assert!(
+        String::from_utf8_lossy(&both.stderr).contains("choose only one"),
+        "{}",
+        String::from_utf8_lossy(&both.stderr)
     );
 }

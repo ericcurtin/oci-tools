@@ -196,13 +196,22 @@ enum Command {
         /// if empty.
         command: Vec<String>,
     },
-    /// Export a binary from inside a box onto the host as a small
-    /// wrapper script, matching real `distrobox export --bin`'s own
-    /// binary-export mode (checked directly against `~/git/distrobox`'s
-    /// own real shell implementation, `internal/inside-distrobox/
-    /// assets/distrobox-export`) — deliberately not yet `--app`
-    /// desktop-entry export, a materially bigger feature needing
-    /// desktop-file/icon handling this project has none of yet.
+    /// Export a binary or graphical application from inside a box onto
+    /// the host — matching real `distrobox export`'s own `--bin`/
+    /// `--app` modes (checked directly against `~/git/distrobox`'s own
+    /// real shell implementation, `internal/inside-distrobox/assets/
+    /// distrobox-export`). `--app` (0322) writes a rewritten `.desktop`
+    /// launcher whose `Exec=` routes through `ocibox enter`, matching
+    /// real `distrobox export --app`'s own core mechanism exactly, but
+    /// deliberately without its own icon-copying half yet (a
+    /// genuinely separate, larger increment — this project has no
+    /// icon-file/`XDG_DATA_DIRS`-search machinery of any kind yet); an
+    /// exported app's own `Icon=` line is therefore left exactly as
+    /// the box's own `.desktop` file already had it, which may not
+    /// resolve to a real file on the host (an honestly-documented,
+    /// narrower-than-real-distrobox gap, the same "narrow first slice"
+    /// reasoning this project already applies elsewhere, not a silent
+    /// behavior change).
     ///
     /// Real `distrobox export` is meant to be run *from inside* the
     /// container, detecting which box it's running in via its own
@@ -214,27 +223,35 @@ enum Command {
     /// to route the wrapper's own invocations through: a real,
     /// honestly-documented divergence, not a silent behavior change.
     Export {
-        /// The box whose rootfs `--bin` lives in, and that the
-        /// generated wrapper routes through (`--box`).
+        /// The box whose rootfs `--bin`/`--app` lives in, and that the
+        /// generated wrapper/launcher routes through (`--box`).
         #[arg(long = "box", value_name = "NAME")]
         box_name: String,
+        /// Name of the application to export, or an absolute path
+        /// (inside the box's own rootfs) to its own `.desktop` file
+        /// directly (`--app`/`-a`, matching real `distrobox export`'s
+        /// own identical flag and its own identical either/or
+        /// interpretation). Mutually exclusive with `--bin`.
+        #[arg(long = "app", short = 'a', value_name = "NAME_OR_PATH")]
+        app: Option<String>,
         /// Absolute path (inside the box's own rootfs) of the binary
         /// to export (`--bin`/`-b`, matching real `distrobox export`'s
-        /// own identical flag).
+        /// own identical flag). Mutually exclusive with `--app`.
         #[arg(long = "bin", short = 'b', value_name = "PATH")]
-        bin: String,
-        /// Directory to write the generated wrapper script into
-        /// (`--export-path`), matching real `distrobox export`'s own
-        /// identical option; defaults to `$HOME/.local/bin`, the real
-        /// tool's own documented default for binary exports.
+        bin: Option<String>,
+        /// Directory to write the generated wrapper script/launcher
+        /// into (`--export-path`), matching real `distrobox export`'s
+        /// own identical option; defaults to `$HOME/.local/bin` for
+        /// `--bin`, `$HOME/.local/share/applications` for `--app` —
+        /// both real, documented, per-mode defaults.
         #[arg(long = "export-path", value_name = "DIR")]
         export_path: Option<PathBuf>,
-        /// Remove a previously exported wrapper instead of creating
-        /// one (`--delete`/`-d`, matching real `distrobox export`'s
-        /// own identical flag) — refuses a destination that isn't
-        /// actually an `ocibox`-generated wrapper, the same real
-        /// safety check (a `distrobox_binary` marker comment) real
-        /// `distrobox export --delete` itself does.
+        /// Remove a previously exported wrapper/launcher instead of
+        /// creating one (`--delete`/`-d`, matching real `distrobox
+        /// export`'s own identical flag) — refuses a destination that
+        /// isn't actually an `ocibox`-generated export, the same real
+        /// safety check (a marker comment) real `distrobox export
+        /// --delete` itself does.
         #[arg(long, short = 'd')]
         delete: bool,
     },
@@ -264,10 +281,17 @@ fn main() -> std::process::ExitCode {
             }) => cmd_ephemeral(&image, pull, &command),
             Some(Command::Export {
                 box_name,
+                app,
                 bin,
                 export_path,
                 delete,
-            }) => cmd_export(&box_name, &bin, export_path.as_deref(), delete),
+            }) => cmd_export(
+                &box_name,
+                app.as_deref(),
+                bin.as_deref(),
+                export_path.as_deref(),
+                delete,
+            ),
             None => anyhow::bail!(
                 "no subcommand given (try `ocibox create --image ... --name ...`); \
                  the rest of milestone 7 (`stop`/...) arrives later"
@@ -856,9 +880,9 @@ fn cmd_ephemeral(image: &str, pull: bool, command: &[String]) -> anyhow::Result<
     }
 }
 
-/// The comment line every wrapper [`cmd_export`] writes carries, and
-/// the one [`cmd_export`]'s own `--delete` checks for before ever
-/// removing a file — matching real `distrobox export`'s own identical
+/// The comment line every wrapper [`cmd_export_bin`] writes carries,
+/// and the one its own `--delete` checks for before ever removing a
+/// file — matching real `distrobox export`'s own identical
 /// `distrobox_binary` marker/safety-check pair (`internal/inside-
 /// distrobox/assets/distrobox-export`'s own `generate_script`/
 /// `export_binary`), just namespaced to this project's own binary
@@ -866,12 +890,52 @@ fn cmd_ephemeral(image: &str, pull: bool, command: &[String]) -> anyhow::Result<
 /// export (or vice versa) by mistake.
 const EXPORT_MARKER: &str = "ocibox_binary";
 
+/// The comment line every generated `.desktop` launcher
+/// [`cmd_export_app`] writes carries, and the one its own `--delete`
+/// checks for before ever removing a file — the exact same
+/// marker/safety-check convention [`EXPORT_MARKER`] already
+/// establishes for `--bin`, just for `--app` instead. A `#`-prefixed
+/// line is a real, valid comment anywhere in a `.desktop` file per the
+/// freedesktop Desktop Entry Specification, safely ignored by every
+/// real parser regardless of where it appears.
+const APP_EXPORT_MARKER: &str = "ocibox_app_export";
+
 /// `$HOME/.local/bin`, real `distrobox export --bin`'s own documented
 /// default destination when `--export-path` isn't given.
 fn default_export_path() -> anyhow::Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| anyhow::anyhow!("--export-path was not given and $HOME is not set"))?;
     Ok(PathBuf::from(home).join(".local/bin"))
+}
+
+/// `$HOME/.local/share/applications`, real `distrobox export --app`'s
+/// own documented default destination when `--export-path` isn't
+/// given — a real, separate default from `--bin`'s own.
+fn default_app_export_path() -> anyhow::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| anyhow::anyhow!("--export-path was not given and $HOME is not set"))?;
+    Ok(PathBuf::from(home).join(".local/share/applications"))
+}
+
+/// `ocibox export --box <NAME> --app <NAME_OR_PATH>` / `--bin <PATH>`
+/// — see [`Command::Export`]'s own doc comment for the exact scope of
+/// each. Exactly one of `app`/`bin` is required, matching real
+/// `distrobox export`'s own identical "choose only one action" rule
+/// (checked directly, `distrobox-export`'s own `if [ -n
+/// "${exported_app}" ] && [ -n "${exported_bin}" ]` guard).
+fn cmd_export(
+    box_name: &str,
+    app: Option<&str>,
+    bin: Option<&str>,
+    export_path: Option<&Path>,
+    delete: bool,
+) -> anyhow::Result<()> {
+    match (app, bin) {
+        (Some(_), Some(_)) => anyhow::bail!("choose only one of --app or --bin"),
+        (None, None) => anyhow::bail!("either --app or --bin is required"),
+        (Some(app), None) => cmd_export_app(box_name, app, export_path, delete),
+        (None, Some(bin)) => cmd_export_bin(box_name, bin, export_path, delete),
+    }
 }
 
 /// `ocibox export --box <NAME> --bin <PATH>`: writes a small wrapper
@@ -882,7 +946,7 @@ fn default_export_path() -> anyhow::Result<PathBuf> {
 /// destination file that isn't actually one of this project's own
 /// exported wrappers (real `distrobox export --delete`'s own identical
 /// safety check, checked directly).
-fn cmd_export(
+fn cmd_export_bin(
     box_name: &str,
     bin: &str,
     export_path: Option<&Path>,
@@ -961,6 +1025,190 @@ fn cmd_export(
 
     println!(
         "{bin} from {box_name} exported successfully in {}",
+        export_dir.display()
+    );
+    Ok(())
+}
+
+/// The two canonical `.desktop`-file directories real `distrobox-
+/// export`'s own `export_application` searches when `$XDG_DATA_DIRS`
+/// isn't set (checked directly — the common case here, since `ocibox`
+/// runs from the *host*, never with the box's own env, so there is no
+/// real `$XDG_DATA_DIRS` to consult in the first place). Real
+/// distrobox also searches a Flatpak-exports directory and the user's
+/// own `$HOME/.local/share/applications`; deliberately not searched
+/// here — an app installed only via Flatpak or a per-user desktop
+/// file inside the box is a real, narrower-than-real-distrobox gap
+/// for this first slice, not a silent behavior change.
+const DESKTOP_FILE_SEARCH_DIRS: &[&str] =
+    &["usr/share/applications", "usr/local/share/applications"];
+
+/// Resolve `app` (an application name to search for, or an absolute
+/// path — inside the box's own rootfs — to a `.desktop` file
+/// directly) to every real, matching `.desktop` file, matching real
+/// `distrobox-export`'s own `export_application` resolution exactly:
+/// an explicit path is used as-is if it exists; otherwise every
+/// [`DESKTOP_FILE_SEARCH_DIRS`] entry is scanned for a `.desktop` file
+/// whose `Exec=`/`Name=` line contains `app`, skipping any that
+/// already routes through `ocibox enter` (an already-exported app,
+/// matching real distrobox's own identical "skip already-exported"
+/// `grep -L` filter). Sorted for a deterministic result across calls.
+fn find_desktop_files(rootfs: &Path, app: &str) -> anyhow::Result<Vec<PathBuf>> {
+    if let Some(rest) = app.strip_prefix('/') {
+        let candidate = rootfs.join(rest);
+        if candidate.is_file() {
+            return Ok(vec![candidate]);
+        }
+    }
+
+    let mut matches = Vec::new();
+    for dir in DESKTOP_FILE_SEARCH_DIRS {
+        let dir = rootfs.join(dir);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry
+                .with_context(|| format!("reading {}", dir.display()))?
+                .path();
+            if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let already_exported = content
+                .lines()
+                .any(|l| l.starts_with("Exec=") && l.contains("ocibox enter"));
+            if already_exported {
+                continue;
+            }
+            let matches_app = content
+                .lines()
+                .any(|l| (l.starts_with("Exec=") || l.starts_with("Name=")) && l.contains(app));
+            if matches_app {
+                matches.push(path);
+            }
+        }
+    }
+    matches.sort();
+    Ok(matches)
+}
+
+/// Rewrite one real `.desktop` file's own content for export: prefix
+/// its own `Exec=` line with `ocibox enter <box_name> --` (matching
+/// real `distrobox-export`'s own identical `sed "s|^Exec=\(.*\)|
+/// Exec=${container_command_prefix}\1|g"`, just without its own
+/// extra `--extra-flags`/`--enter-flags` support, out of scope here);
+/// drops any `TryExec=` line entirely (it would check for the
+/// *host's* own binary, not the box's, so real distrobox drops it
+/// too — checked directly). `Icon=` is left completely untouched —
+/// see [`Command::Export`]'s own doc comment for why icon handling
+/// itself is a real, separate, deferred increment.
+fn rewrite_desktop_file(content: &str, box_name: &str) -> String {
+    let mut out = format!("# {APP_EXPORT_MARKER}\n# box: {box_name}\n");
+    for line in content.lines() {
+        if line.starts_with("TryExec=") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Exec=") {
+            out.push_str(&format!("Exec=ocibox enter {box_name} -- {rest}\n"));
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// The real, on-host filename a `.desktop` file exported from
+/// `box_name` is written under — matching real `distrobox-export`'s
+/// own identical `${container_name}-$(basename ${desktop_file})`
+/// naming convention exactly, so exports from two different boxes of
+/// an app with the same launcher filename never collide.
+fn exported_desktop_file_name(box_name: &str, src: &Path) -> anyhow::Result<String> {
+    let base = src
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{}: no file name", src.display()))?
+        .to_string_lossy();
+    Ok(format!("{box_name}-{base}"))
+}
+
+/// `ocibox export --box <NAME> --app <NAME_OR_PATH>`: finds every
+/// real, matching `.desktop` file inside the box's own rootfs (see
+/// [`find_desktop_files`]) and writes a rewritten copy of each at
+/// `--export-path` (or [`default_app_export_path`]) whose own
+/// `Exec=` routes through `ocibox enter <box_name>` — see
+/// [`Command::Export`]'s own doc comment for exactly how this scopes
+/// down real `distrobox export --app` and why (no icon handling yet).
+/// `--delete` reverses it: re-resolves the same matching `.desktop`
+/// file(s) and removes whichever of their own real, corresponding
+/// exported copies actually exist, refusing to touch anything that
+/// isn't actually one of this project's own exported launchers (the
+/// same marker/safety-check convention `--bin` already established).
+fn cmd_export_app(
+    box_name: &str,
+    app: &str,
+    export_path: Option<&Path>,
+    delete: bool,
+) -> anyhow::Result<()> {
+    validate_box_name(box_name)?;
+    let box_dir = boxes_root().join(box_name);
+    anyhow::ensure!(box_dir.is_dir(), "{box_name}: no such box");
+    let rootfs = box_dir.join("rootfs");
+
+    let export_dir = match export_path {
+        Some(dir) => dir.to_path_buf(),
+        None => default_app_export_path()?,
+    };
+
+    let desktop_files = find_desktop_files(&rootfs, app)?;
+    anyhow::ensure!(
+        !desktop_files.is_empty(),
+        "cannot find any desktop files for {app:?} inside box {box_name:?}"
+    );
+
+    if delete {
+        let mut removed_any = false;
+        for src in &desktop_files {
+            let dest_name = exported_desktop_file_name(box_name, src)?;
+            let dest_file = export_dir.join(&dest_name);
+            if !dest_file.is_file() {
+                continue;
+            }
+            let existing = std::fs::read_to_string(&dest_file)
+                .with_context(|| format!("reading {}", dest_file.display()))?;
+            anyhow::ensure!(
+                existing.contains(APP_EXPORT_MARKER),
+                "{}: not an ocibox-exported application",
+                dest_file.display()
+            );
+            std::fs::remove_file(&dest_file)
+                .with_context(|| format!("removing {}", dest_file.display()))?;
+            println!(
+                "{dest_name} removed successfully from {}",
+                export_dir.display()
+            );
+            removed_any = true;
+        }
+        anyhow::ensure!(removed_any, "{app}: not exported from box {box_name:?}");
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&export_dir)
+        .with_context(|| format!("creating {}", export_dir.display()))?;
+    for src in &desktop_files {
+        let content =
+            std::fs::read_to_string(src).with_context(|| format!("reading {}", src.display()))?;
+        let rewritten = rewrite_desktop_file(&content, box_name);
+        let dest_name = exported_desktop_file_name(box_name, src)?;
+        let dest_file = export_dir.join(&dest_name);
+        std::fs::write(&dest_file, rewritten)
+            .with_context(|| format!("writing {}", dest_file.display()))?;
+    }
+
+    println!(
+        "{app} from {box_name} exported successfully in {}",
         export_dir.display()
     );
     Ok(())
