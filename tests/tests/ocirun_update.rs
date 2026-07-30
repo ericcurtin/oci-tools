@@ -207,6 +207,118 @@ fn update_ad_hoc_memory_and_pids_limit_flags_write_the_real_cgroup() {
     cleanup(root_dir.path(), "adhoc-memory-pids-test", &cgroup_dir);
 }
 
+/// `ocirun update`'s own ad-hoc CPU-bandwidth flags (0356) --
+/// `--cpu-share`/`--cpu-period`/`--cpu-quota`/`--cpu-burst`, matching
+/// real `runc update`/`crun update`'s own identical flags exactly --
+/// write the exact same real `cpu.weight`/`cpu.max`/`cpu.max.burst`
+/// cgroup files `oci_runtime_core::cgroups::plan_cpu` already writes
+/// for a `--resources` JSON blob with the same fields, reached here
+/// through the CLI flags instead.
+#[test]
+fn update_ad_hoc_cpu_bandwidth_flags_write_the_real_cgroup() {
+    let Some((bundle_dir, root_dir, cgroup_dir)) =
+        create_and_start_with_real_cgroup("adhoc-cpu-bandwidth-test")
+    else {
+        return;
+    };
+    let _ = &bundle_dir;
+
+    let update = ocirun(
+        root_dir.path(),
+        &[
+            "update",
+            "adhoc-cpu-bandwidth-test",
+            "--cpu-share",
+            "1024",
+            "--cpu-period",
+            "100000",
+            "--cpu-quota",
+            "50000",
+            "--cpu-burst",
+            "20000",
+        ],
+    );
+    assert!(
+        update.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+
+    // `--cpu-share 1024` (real docker/podman/runc's own default CPU
+    // shares value) converts to exactly `cpu.weight=100` (the cgroup
+    // v2 default too) -- the same already-tested conversion
+    // `oci_runtime_core::cgroups`'s own unit tests already establish
+    // for this exact input.
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("cpu.weight"))
+            .unwrap()
+            .trim(),
+        "100"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("cpu.max"))
+            .unwrap()
+            .trim(),
+        "50000 100000",
+        "cpu.max is \"<quota> <period>\", matching real cgroup v2 syntax"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("cpu.max.burst"))
+            .unwrap()
+            .trim(),
+        "20000"
+    );
+
+    cleanup(root_dir.path(), "adhoc-cpu-bandwidth-test", &cgroup_dir);
+}
+
+/// `--cpu-rt-period`/`--cpu-rt-runtime` (0356) are accepted without
+/// error, matching real `runc update`/`crun update`'s own identical
+/// flags -- but genuinely write nothing to any real cgroup file at
+/// all on a cgroup-v2-only host like this project's own (cgroup v2
+/// has no realtime-scheduling controller), the same honest "accepted
+/// on parse, never acted on" status both real reference runtimes
+/// themselves have here too. Checked directly: every other real
+/// cgroup file this container's own subtree already has stays
+/// completely untouched.
+#[test]
+fn update_cpu_rt_flags_are_accepted_but_write_nothing_to_any_real_cgroup_file() {
+    let Some((bundle_dir, root_dir, cgroup_dir)) =
+        create_and_start_with_real_cgroup("adhoc-cpu-rt-test")
+    else {
+        return;
+    };
+    let _ = &bundle_dir;
+
+    let before = std::fs::read_to_string(cgroup_dir.join("cpu.max")).unwrap();
+
+    let update = ocirun(
+        root_dir.path(),
+        &[
+            "update",
+            "adhoc-cpu-rt-test",
+            "--cpu-rt-period",
+            "1000000",
+            "--cpu-rt-runtime",
+            "950000",
+        ],
+    );
+    assert!(
+        update.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("cpu.max")).unwrap(),
+        before,
+        "cpu.max must stay completely untouched -- --cpu-rt-period/--cpu-rt-runtime have no \
+         real cgroup v2 effect at all"
+    );
+
+    cleanup(root_dir.path(), "adhoc-cpu-rt-test", &cgroup_dir);
+}
+
 /// A real, checked-directly upstream quirk (`~/git/runc/update.go`'s
 /// own doc comment: *"if data is to be read from a file or the
 /// standard input, all other options are ignored"*): `--resources`

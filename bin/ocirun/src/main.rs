@@ -272,20 +272,30 @@ enum Command {
     },
     /// Update a running container's real cgroup resource limits in
     /// place — matching real `runc update`'s own `--resources`/`-r`
-    /// JSON-file mode, *and* (0353) a first slice of its own many
-    /// individual ad-hoc flags — `--memory`/`--memory-swap`/
-    /// `--pids-limit`/`--cpuset-cpus`/`--cpuset-mems`, the exact same
-    /// set real `crun update` also supports (checked directly,
-    /// `~/git/crun/src/update.c`) — closing a real, previously-
+    /// JSON-file mode, *and* (0353, 0356) an ever-growing slice of its
+    /// own many individual ad-hoc flags — closing a real, previously-
     /// documented-but-never-revisited gap from this project's own
     /// milestone-3 design note (`docs/design/0099`: "a deliberate,
-    /// documented scope limit, not attempted here"). Real runc's own
-    /// remaining, still-unimplemented ad-hoc flags
-    /// (`--blkio-weight`/`--cpu-period`/`--cpu-quota`/`--cpu-share`/
-    /// `--cpu-rt-period`/`--cpu-rt-runtime`/`--cpu-idle`/
-    /// `--kernel-memory`/`--kernel-memory-tcp`, plus real runc's own
-    /// Intel RDT-only `--l3-cache-schema`/`--mem-bw-schema`) remain a
-    /// separate, still-deferred candidate.
+    /// documented scope limit, not attempted here"). `--memory`/
+    /// `--memory-swap`/`--pids-limit`/`--cpuset-cpus`/`--cpuset-mems`
+    /// (0353) plus, now, every remaining CPU-bandwidth flag that maps
+    /// directly onto an [`oci_spec_types::runtime::LinuxCpu`] field
+    /// this project's own `plan_cpu` already knows how to apply:
+    /// `--cpu-period`/`--cpu-quota`/`--cpu-share`/`--cpu-burst`/
+    /// `--cpu-rt-period`/`--cpu-rt-runtime` (0356) — the same set real
+    /// `crun update` also supports (checked directly, `~/git/crun/
+    /// src/update.c`), except `--cpu-burst`, a real runc-only
+    /// addition crun genuinely has no equivalent of at all. Real
+    /// runc's own remaining, still-unimplemented ad-hoc flags
+    /// (`--blkio-weight`, needing a whole new cgroup v1-to-v2
+    /// `io.weight` translation this project doesn't have yet;
+    /// `--cpu-idle`, needing a new `LinuxCpu` field and a new
+    /// `cpu.idle` cgroup write neither of which exist yet; `--kernel-
+    /// memory`/`--kernel-memory-tcp`, both real runc's own explicitly
+    /// `Hidden`/"obsoleted; do not use"; plus real runc's own Intel
+    /// RDT-only `--l3-cache-schema`/`--mem-bw-schema`) remain a
+    /// separate, still-deferred candidate — each genuinely needing new
+    /// underlying plumbing, unlike this note's own flags.
     Update {
         /// The container's ID.
         id: String,
@@ -343,6 +353,52 @@ enum Command {
         /// update --cpuset-mems`/`crun update --cpuset-mems` exactly.
         #[arg(long = "cpuset-mems")]
         cpuset_mems: Option<String>,
+        /// CPU shares (relative weight vs. other cgroups), matching
+        /// real `runc update --cpu-share`/`crun update --cpu-share`
+        /// exactly: a plain, non-negative integer, translated to the
+        /// real cgroup v2 `cpu.weight` file
+        /// (`oci_runtime_core::cgroups::convert_cpu_shares_to_weight`,
+        /// the exact same conversion `--cpus`'s own quota/period math
+        /// doesn't touch at all — a genuinely different cgroup
+        /// property).
+        #[arg(long = "cpu-share")]
+        cpu_share: Option<u64>,
+        /// CPU CFS hardcap period, in microseconds, matching real
+        /// `runc update --cpu-period`/`crun update --cpu-period`
+        /// exactly — combined with `--cpu-quota` into the real cgroup
+        /// v2 `cpu.max` file (`oci_runtime_core::cgroups::plan_cpu`).
+        #[arg(long = "cpu-period")]
+        cpu_period: Option<u64>,
+        /// CPU CFS hardcap quota (allowed CPU time per `--cpu-
+        /// period`), in microseconds, matching real `runc update
+        /// --cpu-quota`/`crun update --cpu-quota` exactly.
+        #[arg(long = "cpu-quota", allow_hyphen_values = true)]
+        cpu_quota: Option<i64>,
+        /// CPU CFS hardcap burst limit (extra accumulated CPU time
+        /// allowed for one burst within a period), in microseconds,
+        /// matching real `runc update --cpu-burst` exactly — real
+        /// `crun update` has no equivalent flag of its own at all
+        /// (checked directly, `~/git/crun/src/update.c`).
+        #[arg(long = "cpu-burst")]
+        cpu_burst: Option<u64>,
+        /// Realtime-scheduling period, in microseconds, matching real
+        /// `runc update --cpu-rt-period`/`crun update --cpu-rt-
+        /// period` exactly. Accepted and stored, matching both real
+        /// reference runtimes' own identical CLI surface, but a real,
+        /// honest no-op at cgroup-application time on a cgroup-v2-only
+        /// host like this project's own (`oci_spec_types::runtime::
+        /// LinuxCpu::realtime_period`'s own doc comment: cgroup v2 has
+        /// no realtime-scheduling controller at all) — the same
+        /// "accepted on parse, never acted on" status real runc/crun
+        /// themselves have here too.
+        #[arg(long = "cpu-rt-period")]
+        cpu_rt_period: Option<u64>,
+        /// Realtime-scheduling runtime, in microseconds, matching real
+        /// `runc update --cpu-rt-runtime`/`crun update --cpu-rt-
+        /// runtime` exactly. Same real, honest cgroup-v2 no-op status
+        /// as `--cpu-rt-period` above.
+        #[arg(long = "cpu-rt-runtime", allow_hyphen_values = true)]
+        cpu_rt_runtime: Option<i64>,
     },
     /// Freeze every process in a running container via the real
     /// cgroup v2 freezer (`cgroup.freeze`) — matching real `runc
@@ -499,15 +555,29 @@ fn main() -> std::process::ExitCode {
                 pids_limit,
                 cpuset_cpus,
                 cpuset_mems,
+                cpu_share,
+                cpu_period,
+                cpu_quota,
+                cpu_burst,
+                cpu_rt_period,
+                cpu_rt_runtime,
             }) => cmd_update(
                 &root,
                 &id,
                 resources.as_deref(),
-                memory.as_deref(),
-                memory_swap.as_deref(),
-                pids_limit,
-                cpuset_cpus.as_deref(),
-                cpuset_mems.as_deref(),
+                &UpdateFlags {
+                    memory: memory.as_deref(),
+                    memory_swap: memory_swap.as_deref(),
+                    pids_limit,
+                    cpuset_cpus: cpuset_cpus.as_deref(),
+                    cpuset_mems: cpuset_mems.as_deref(),
+                    cpu_share,
+                    cpu_period,
+                    cpu_quota,
+                    cpu_burst,
+                    cpu_rt_period,
+                    cpu_rt_runtime,
+                },
             ),
             Some(Command::Pause { id }) => cmd_pause(&root, &id),
             Some(Command::Resume { id }) => cmd_resume(&root, &id),
@@ -1136,6 +1206,26 @@ fn parse_memory_swap_limit(value: &str) -> anyhow::Result<i64> {
     parse_memory_limit(value)
 }
 
+/// `ocirun update`'s own ad-hoc flags, bundled into one struct once
+/// `0356` grew the original five (`0353`) to eleven -- purely a
+/// call-site/parameter-list ergonomics change, not a behavior one:
+/// every field here is still exactly one `Command::Update` CLI flag,
+/// unpacked the same way [`resources_from_flags`] already did before.
+#[derive(Default)]
+struct UpdateFlags<'a> {
+    memory: Option<&'a str>,
+    memory_swap: Option<&'a str>,
+    pids_limit: Option<i64>,
+    cpuset_cpus: Option<&'a str>,
+    cpuset_mems: Option<&'a str>,
+    cpu_share: Option<u64>,
+    cpu_period: Option<u64>,
+    cpu_quota: Option<i64>,
+    cpu_burst: Option<u64>,
+    cpu_rt_period: Option<u64>,
+    cpu_rt_runtime: Option<i64>,
+}
+
 /// Build a [`oci_spec_types::runtime::LinuxResources`] from this
 /// command's own ad-hoc flags -- only ever called when `--resources`
 /// was *not* given (see [`Command::Update::resources`]'s own doc
@@ -1145,51 +1235,55 @@ fn parse_memory_swap_limit(value: &str) -> anyhow::Result<i64> {
 /// every one of these ad-hoc flags' own real upstream "only ever
 /// change what's actually given" convention (the same one the
 /// JSON-file mode's own doc comment already establishes).
-#[allow(clippy::too_many_arguments)]
 fn resources_from_flags(
-    memory: Option<&str>,
-    memory_swap: Option<&str>,
-    pids_limit: Option<i64>,
-    cpuset_cpus: Option<&str>,
-    cpuset_mems: Option<&str>,
+    flags: &UpdateFlags<'_>,
 ) -> anyhow::Result<oci_spec_types::runtime::LinuxResources> {
     let mut resources = oci_spec_types::runtime::LinuxResources::default();
-    if memory.is_some() || memory_swap.is_some() {
+    if flags.memory.is_some() || flags.memory_swap.is_some() {
         let mut mem = oci_spec_types::runtime::LinuxMemory::default();
-        if let Some(memory) = memory {
+        if let Some(memory) = flags.memory {
             mem.limit = Some(parse_memory_limit(memory)?);
         }
-        if let Some(memory_swap) = memory_swap {
+        if let Some(memory_swap) = flags.memory_swap {
             mem.swap = Some(parse_memory_swap_limit(memory_swap)?);
         }
         resources.memory = Some(mem);
     }
-    if let Some(limit) = pids_limit {
+    if let Some(limit) = flags.pids_limit {
         resources.pids = Some(oci_spec_types::runtime::LinuxPids { limit: Some(limit) });
     }
-    if cpuset_cpus.is_some() || cpuset_mems.is_some() {
+    let needs_cpu = flags.cpuset_cpus.is_some()
+        || flags.cpuset_mems.is_some()
+        || flags.cpu_share.is_some()
+        || flags.cpu_period.is_some()
+        || flags.cpu_quota.is_some()
+        || flags.cpu_burst.is_some()
+        || flags.cpu_rt_period.is_some()
+        || flags.cpu_rt_runtime.is_some();
+    if needs_cpu {
         let mut cpu = oci_spec_types::runtime::LinuxCpu::default();
-        if let Some(cpuset_cpus) = cpuset_cpus {
+        if let Some(cpuset_cpus) = flags.cpuset_cpus {
             cpu.cpus = cpuset_cpus.to_string();
         }
-        if let Some(cpuset_mems) = cpuset_mems {
+        if let Some(cpuset_mems) = flags.cpuset_mems {
             cpu.mems = cpuset_mems.to_string();
         }
+        cpu.shares = flags.cpu_share;
+        cpu.period = flags.cpu_period;
+        cpu.quota = flags.cpu_quota;
+        cpu.burst = flags.cpu_burst;
+        cpu.realtime_period = flags.cpu_rt_period;
+        cpu.realtime_runtime = flags.cpu_rt_runtime;
         resources.cpu = Some(cpu);
     }
     Ok(resources)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_update(
     root: &Path,
     id: &str,
     resources_path: Option<&Path>,
-    memory: Option<&str>,
-    memory_swap: Option<&str>,
-    pids_limit: Option<i64>,
-    cpuset_cpus: Option<&str>,
-    cpuset_mems: Option<&str>,
+    flags: &UpdateFlags<'_>,
 ) -> anyhow::Result<()> {
     let cgroup_dir = resolve_cgroup_dir(root, id)?;
 
@@ -1202,7 +1296,7 @@ fn cmd_update(
             serde_json::from_reader(file)
                 .with_context(|| format!("parsing {} as JSON", path.display()))?
         }
-        None => resources_from_flags(memory, memory_swap, pids_limit, cpuset_cpus, cpuset_mems)?,
+        None => resources_from_flags(flags)?,
     };
 
     let writes = oci_runtime_core::cgroups::plan_resources(&resources);
@@ -1497,7 +1591,7 @@ mod tests {
 
     #[test]
     fn resources_from_flags_with_nothing_given_is_a_real_empty_default() {
-        let resources = resources_from_flags(None, None, None, None, None).unwrap();
+        let resources = resources_from_flags(&UpdateFlags::default()).unwrap();
         assert_eq!(
             resources,
             oci_spec_types::runtime::LinuxResources::default()
@@ -1506,7 +1600,12 @@ mod tests {
 
     #[test]
     fn resources_from_flags_builds_memory_and_swap_together() {
-        let resources = resources_from_flags(Some("100m"), Some("200m"), None, None, None).unwrap();
+        let resources = resources_from_flags(&UpdateFlags {
+            memory: Some("100m"),
+            memory_swap: Some("200m"),
+            ..Default::default()
+        })
+        .unwrap();
         let mem = resources.memory.unwrap();
         assert_eq!(mem.limit, Some(100 * 1024 * 1024));
         assert_eq!(mem.swap, Some(200 * 1024 * 1024));
@@ -1514,7 +1613,11 @@ mod tests {
 
     #[test]
     fn resources_from_flags_builds_pids_limit_alone() {
-        let resources = resources_from_flags(None, None, Some(50), None, None).unwrap();
+        let resources = resources_from_flags(&UpdateFlags {
+            pids_limit: Some(50),
+            ..Default::default()
+        })
+        .unwrap();
         assert_eq!(resources.pids.unwrap().limit, Some(50));
         assert!(resources.memory.is_none());
         assert!(resources.cpu.is_none());
@@ -1522,14 +1625,46 @@ mod tests {
 
     #[test]
     fn resources_from_flags_builds_cpuset_cpus_and_mems_together() {
-        let resources = resources_from_flags(None, None, None, Some("0-1"), Some("0")).unwrap();
+        let resources = resources_from_flags(&UpdateFlags {
+            cpuset_cpus: Some("0-1"),
+            cpuset_mems: Some("0"),
+            ..Default::default()
+        })
+        .unwrap();
         let cpu = resources.cpu.unwrap();
         assert_eq!(cpu.cpus, "0-1");
         assert_eq!(cpu.mems, "0");
     }
 
     #[test]
+    fn resources_from_flags_builds_every_cpu_bandwidth_field_together() {
+        let resources = resources_from_flags(&UpdateFlags {
+            cpu_share: Some(512),
+            cpu_period: Some(100_000),
+            cpu_quota: Some(50_000),
+            cpu_burst: Some(1_000),
+            cpu_rt_period: Some(1_000_000),
+            cpu_rt_runtime: Some(950_000),
+            ..Default::default()
+        })
+        .unwrap();
+        let cpu = resources.cpu.unwrap();
+        assert_eq!(cpu.shares, Some(512));
+        assert_eq!(cpu.period, Some(100_000));
+        assert_eq!(cpu.quota, Some(50_000));
+        assert_eq!(cpu.burst, Some(1_000));
+        assert_eq!(cpu.realtime_period, Some(1_000_000));
+        assert_eq!(cpu.realtime_runtime, Some(950_000));
+    }
+
+    #[test]
     fn resources_from_flags_propagates_a_real_parse_error() {
-        assert!(resources_from_flags(Some("not-a-number"), None, None, None, None).is_err());
+        assert!(
+            resources_from_flags(&UpdateFlags {
+                memory: Some("not-a-number"),
+                ..Default::default()
+            })
+            .is_err()
+        );
     }
 }
