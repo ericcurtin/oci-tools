@@ -347,9 +347,10 @@ pub struct LinuxIdMapping {
 /// cgroup resource limits.
 ///
 /// **Scope shipped so far**: `devices` (the only field `ocirun spec`'s
-/// default output sets), `memory`, `cpu`, `pids`. Block-IO/huge-page/
-/// network/RDMA limits are not modeled yet — no oci-tools feature
-/// exercises them.
+/// default output sets), `memory`, `cpu`, `pids`, `blockIO` (`weight`
+/// only, `0366`). Per-device block-IO weight/throttling, huge-page,
+/// network, and RDMA limits are not modeled yet — no oci-tools
+/// feature exercises them.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LinuxResources {
     /// Device cgroup allow/deny rules, evaluated in order (a later rule
@@ -365,6 +366,27 @@ pub struct LinuxResources {
     /// Process-count (pids) limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pids: Option<LinuxPids>,
+    /// Block I/O (blkio) limits — the real spec's own field name is
+    /// `blockIO` (capital I/O, not plain camelCase), hence the
+    /// explicit `rename` below rather than relying on any struct-wide
+    /// `rename_all` rule.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "blockIO")]
+    pub block_io: Option<LinuxBlockIo>,
+}
+
+/// `blockIO` cgroup limits — see [`LinuxResources`]'s own doc comment
+/// for exactly which sub-field is modeled so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LinuxBlockIo {
+    /// Relative block IO weight (real spec's own documented range:
+    /// 10-1000, the cgroup v1 convention) — converted to cgroup v2's
+    /// `io.weight` (range 1-10000) when the BFQ IO scheduler isn't
+    /// active, or written directly to `io.bfq.weight` (same raw
+    /// range, no conversion) when it is — see `oci_runtime_core::
+    /// cgroups`'s own doc comment for the exact real, checked-
+    /// directly logic this ports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u16>,
 }
 
 /// `memory` cgroup resource limits. All fields are in bytes unless noted
@@ -629,6 +651,7 @@ impl Spec {
                     memory: None,
                     cpu: None,
                     pids: None,
+                    block_io: None,
                 }),
                 cgroups_path: None,
                 seccomp: None,

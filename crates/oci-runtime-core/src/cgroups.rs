@@ -59,7 +59,30 @@ pub fn plan_resources(resources: &LinuxResources) -> Vec<CgroupWrite> {
             writes.push(("pids.max", s));
         }
     }
+    if let Some(block_io) = &resources.block_io {
+        plan_blkio(block_io, &mut writes);
+    }
     writes
+}
+
+/// `blockIO.weight` (`0366`) — always planned as an `io.bfq.weight`
+/// write with the real spec's own raw, cgroup-v1-range value (10-
+/// 1000), *not* the converted `io.weight` value: whether the BFQ IO
+/// scheduler is actually active (making `io.bfq.weight` the real file
+/// to write) can only be known at [`apply`] time, by actually trying
+/// it against a real cgroup directory — the same real, checked-
+/// directly two-step [`apply`]'s own doc comment describes (matches
+/// real crun's own identical "try `io.bfq.weight` first, fall back to
+/// `io.weight` with the linear conversion only on a real `ENOENT`"
+/// logic, `~/git/crun/src/libcrun/cgroup-resources.c`'s own
+/// `write_blkio_resources`, simpler than real runc's own extra
+/// read-back heuristic for the identical real effect).
+fn plan_blkio(block_io: &oci_spec_types::runtime::LinuxBlockIo, writes: &mut Vec<CgroupWrite>) {
+    if let Some(weight) = block_io.weight
+        && weight != 0
+    {
+        writes.push(("io.bfq.weight", weight.to_string()));
+    }
 }
 
 fn plan_memory(memory: &oci_spec_types::runtime::LinuxMemory, writes: &mut Vec<CgroupWrite>) {
@@ -260,11 +283,57 @@ pub(crate) fn convert_cpu_shares_to_weight(shares: u64) -> u64 {
 /// (production: a real cgroup v2 directory; tests: a plain directory
 /// standing in for one — writing plain text files needs no special
 /// privilege, only the real cgroupfs mount enforces the semantics).
+///
+/// One real, deliberate special case: [`plan_blkio`]'s own
+/// `"io.bfq.weight"` entry always carries the real spec's own raw,
+/// unconverted value, since whether the BFQ IO scheduler is actually
+/// active on this cgroup (the only condition under which that file
+/// even exists) can only be known here, by actually trying it — a
+/// real `ENOENT` falls back to `"io.weight"` with the real, documented
+/// linear conversion from cgroup v1's `[10-1000]` range to cgroup v2's
+/// `[1-10000]` range (matches real runc's own `ConvertBlkIOToIOWeightValue`/
+/// crun's own identical fallback formula exactly: `y = 1 + (x - 10) *
+/// 9999 / 990`).
 pub fn apply(cgroup_dir: &Path, writes: &[CgroupWrite]) -> io::Result<()> {
     for (filename, content) in writes {
+        if *filename == "io.bfq.weight" {
+            match std::fs::write(cgroup_dir.join(filename), content) {
+                Ok(()) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    let v1_weight: u64 = content.parse().map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "internal error: non-numeric io.bfq.weight content {content:?}"
+                            ),
+                        )
+                    })?;
+                    let v2_weight = convert_blkio_weight_to_io_weight(v1_weight);
+                    std::fs::write(cgroup_dir.join("io.weight"), v2_weight.to_string())?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
         std::fs::write(cgroup_dir.join(filename), content)?;
     }
     Ok(())
+}
+
+/// Converts a cgroup v1 `blkio.weight`-range value (documented
+/// 10-1000) linearly to cgroup v2's `io.weight` range (1-10000) —
+/// matches real runc's own `ConvertBlkIOToIOWeightValue`/crun's own
+/// identical fallback formula exactly: `y = 1 + (x - 10) * 9999 /
+/// 990`. `saturating_sub` rather than a hard range check, matching
+/// this module's own general "pure translation, no CLI-input
+/// validation" convention elsewhere (e.g. [`num_to_cgroup_str`]) — a
+/// value below the documented minimum still produces *some* sane,
+/// in-range result rather than panicking on the subtraction.
+pub(crate) fn convert_blkio_weight_to_io_weight(weight: u64) -> u64 {
+    if weight == 0 {
+        return 0;
+    }
+    1 + weight.saturating_sub(10) * 9999 / 990
 }
 
 /// Resolve `linux.cgroupsPath` to an actual directory under
@@ -1096,6 +1165,82 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("pids.max")).unwrap(),
             "max"
+        );
+    }
+
+    #[test]
+    fn plan_blkio_carries_the_raw_v1_range_weight_unconverted() {
+        let resources = LinuxResources {
+            block_io: Some(oci_spec_types::runtime::LinuxBlockIo { weight: Some(500) }),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_resources(&resources),
+            vec![("io.bfq.weight", "500".to_string())]
+        );
+    }
+
+    #[test]
+    fn plan_blkio_skips_a_zero_weight() {
+        let resources = LinuxResources {
+            block_io: Some(oci_spec_types::runtime::LinuxBlockIo { weight: Some(0) }),
+            ..Default::default()
+        };
+        assert_eq!(plan_resources(&resources), vec![]);
+    }
+
+    #[test]
+    fn convert_blkio_weight_to_io_weight_matches_the_real_documented_formula() {
+        // The real spec's own documented range endpoints, matching
+        // real runc's own `ConvertBlkIOToIOWeightValue`/crun's own
+        // identical formula exactly: `y = 1 + (x - 10) * 9999 / 990`.
+        assert_eq!(convert_blkio_weight_to_io_weight(10), 1);
+        assert_eq!(convert_blkio_weight_to_io_weight(1000), 10_000);
+        assert_eq!(convert_blkio_weight_to_io_weight(500), 4950);
+        assert_eq!(convert_blkio_weight_to_io_weight(0), 0);
+    }
+
+    #[test]
+    fn apply_writes_the_raw_value_to_io_bfq_weight_when_it_succeeds() {
+        // A plain, real directory (standing in for a real cgroup that
+        // does expose `io.bfq.weight`, matching this module's own
+        // established test convention): a plain, ordinary file write
+        // here always succeeds, the same as a real cgroup with BFQ
+        // active would.
+        let dir = tempfile::tempdir().unwrap();
+        let writes = vec![("io.bfq.weight", "500".to_string())];
+        apply(dir.path(), &writes).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("io.bfq.weight")).unwrap(),
+            "500",
+            "the real spec's own raw value, never converted, when io.bfq.weight itself succeeds"
+        );
+        assert!(!dir.path().join("io.weight").exists());
+    }
+
+    #[test]
+    fn apply_falls_back_to_io_weight_with_the_converted_value_when_io_bfq_weight_is_absent() {
+        // A broken symlink (pointing at a path whose own parent
+        // directory doesn't exist either) is this test's own way of
+        // simulating "this cgroup doesn't actually expose io.bfq.
+        // weight at all" using only a plain directory: opening it for
+        // writing genuinely fails with a real `ENOENT`, the exact
+        // same error a real cgroup without the BFQ scheduler active
+        // gives for the same file.
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            "/nonexistent-oci-tools-test-dir/target",
+            dir.path().join("io.bfq.weight"),
+        )
+        .unwrap();
+
+        let writes = vec![("io.bfq.weight", "500".to_string())];
+        apply(dir.path(), &writes).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("io.weight")).unwrap(),
+            convert_blkio_weight_to_io_weight(500).to_string(),
+            "falls back to io.weight with the real, documented linear conversion"
         );
     }
 

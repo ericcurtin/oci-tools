@@ -444,6 +444,21 @@ enum Command {
         /// as `--cpu-rt-period` above.
         #[arg(long = "cpu-rt-runtime", allow_hyphen_values = true)]
         cpu_rt_runtime: Option<i64>,
+        /// Relative block IO weight (real spec's own documented
+        /// range 10-1000, the cgroup v1 convention — passed straight
+        /// through with no range validation, matching real `runc
+        /// update --blkio-weight`/`crun update --blkio-weight`
+        /// exactly: both are a bare, unchecked cast). Written to the
+        /// real cgroup v2 `io.bfq.weight` file when the BFQ IO
+        /// scheduler is active on this cgroup (the raw value, no
+        /// conversion needed), or `io.weight` with the real,
+        /// documented linear conversion to its own `[1-10000]` range
+        /// otherwise (`oci_runtime_core::cgroups::plan_resources`/
+        /// `apply` — see their own doc comments for the exact real,
+        /// checked-directly two-step logic this ports from both
+        /// reference runtimes).
+        #[arg(long = "blkio-weight")]
+        blkio_weight: Option<u16>,
     },
     /// Freeze every process in a running container via the real
     /// cgroup v2 freezer (`cgroup.freeze`) — matching real `runc
@@ -610,6 +625,7 @@ fn main() -> std::process::ExitCode {
                 cpu_burst,
                 cpu_rt_period,
                 cpu_rt_runtime,
+                blkio_weight,
             }) => cmd_update(
                 &root,
                 &id,
@@ -626,6 +642,7 @@ fn main() -> std::process::ExitCode {
                     cpu_burst,
                     cpu_rt_period,
                     cpu_rt_runtime,
+                    blkio_weight,
                 },
             ),
             Some(Command::Pause { id }) => cmd_pause(&root, &id),
@@ -1273,6 +1290,7 @@ struct UpdateFlags<'a> {
     cpu_burst: Option<u64>,
     cpu_rt_period: Option<u64>,
     cpu_rt_runtime: Option<i64>,
+    blkio_weight: Option<u16>,
 }
 
 /// Build a [`oci_spec_types::runtime::LinuxResources`] from this
@@ -1324,6 +1342,11 @@ fn resources_from_flags(
         cpu.realtime_period = flags.cpu_rt_period;
         cpu.realtime_runtime = flags.cpu_rt_runtime;
         resources.cpu = Some(cpu);
+    }
+    if let Some(weight) = flags.blkio_weight {
+        resources.block_io = Some(oci_spec_types::runtime::LinuxBlockIo {
+            weight: Some(weight),
+        });
     }
     Ok(resources)
 }
@@ -1748,6 +1771,16 @@ mod tests {
         assert_eq!(cpu.burst, Some(1_000));
         assert_eq!(cpu.realtime_period, Some(1_000_000));
         assert_eq!(cpu.realtime_runtime, Some(950_000));
+    }
+
+    #[test]
+    fn resources_from_flags_builds_blkio_weight_alone() {
+        let resources = resources_from_flags(&UpdateFlags {
+            blkio_weight: Some(500),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(resources.block_io.unwrap().weight, Some(500));
     }
 
     #[test]
