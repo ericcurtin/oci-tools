@@ -279,6 +279,10 @@ fn run(args: &[String]) -> anyhow::Result<()> {
             // from kubelet for a container's own init process; real
             // `cri-o` has no equivalent concept at this layer either.
             0,
+            // `no_pivot: false` -- same reasoning, `--no-pivot` too is
+            // a `runc`/`crun`-level escape hatch this layer has no
+            // equivalent of.
+            false,
             |pid| {
                 let _ = write_atomic(&dir_for_pid, PID_FILENAME, pid.to_string().as_bytes());
             },

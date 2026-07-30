@@ -30,4 +30,4 @@ pub mod syscalls;
 
 pub use loop_device::{AttachOptions, attach, detach, wait_until_detached};
 pub use options::{ParsedMountOptions, known_option_names, parse_mount_options};
-pub use syscalls::{MountPlan, mount, pivot_root, unmount, unmount_detach};
+pub use syscalls::{MountPlan, mount, move_mount, pivot_root, unmount, unmount_detach};

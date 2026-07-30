@@ -134,6 +134,19 @@ enum Command {
         /// every container, regardless of this flag ever existing).
         #[arg(long = "preserve-fds", default_value_t = 0)]
         preserve_fds: u32,
+        /// Use a `chroot`-style root swap instead of `pivot_root(2)`
+        /// — matching real `runc run`/`crun run --no-pivot` exactly
+        /// (checked directly: real crun's own simpler `move_root`
+        /// path is what this project's own implementation matches,
+        /// deliberately narrower than real runc's own additional
+        /// host-mountinfo-scanning hardening step, which this project
+        /// has no mountinfo parser to implement). Both reference
+        /// runtimes document this as an escape hatch for exceptional
+        /// circumstances only (e.g. a nested container with no fresh
+        /// mount namespace of its own to `pivot_root` within) — not
+        /// something an ordinary invocation needs.
+        #[arg(long = "no-pivot")]
+        no_pivot: bool,
     },
     /// Create a container: set up namespaces/mounts/cgroups and leave
     /// its process blocked, waiting for `start`. Returns once setup
@@ -152,6 +165,9 @@ enum Command {
         /// Same as `run --preserve-fds` — see its own doc comment.
         #[arg(long = "preserve-fds", default_value_t = 0)]
         preserve_fds: u32,
+        /// Same as `run --no-pivot` — see its own doc comment.
+        #[arg(long = "no-pivot")]
+        no_pivot: bool,
     },
     /// Start a previously `create`d container's process running.
     Start {
@@ -368,18 +384,27 @@ fn main() -> std::process::ExitCode {
                 bundle,
                 pid_file,
                 preserve_fds,
-            }) => cmd_run(&id, bundle.as_deref(), pid_file.as_deref(), preserve_fds),
+                no_pivot,
+            }) => cmd_run(
+                &id,
+                bundle.as_deref(),
+                pid_file.as_deref(),
+                preserve_fds,
+                no_pivot,
+            ),
             Some(Command::Create {
                 id,
                 bundle,
                 pid_file,
                 preserve_fds,
+                no_pivot,
             }) => cmd_create(
                 &root,
                 &id,
                 bundle.as_deref(),
                 pid_file.as_deref(),
                 preserve_fds,
+                no_pivot,
             ),
             Some(Command::Start { id }) => cmd_start(&root, &id),
             Some(Command::Kill { id, signal, all }) => cmd_kill(&root, &id, signal.as_deref(), all),
@@ -537,6 +562,7 @@ fn cmd_run(
     bundle: Option<&Path>,
     pid_file: Option<&Path>,
     preserve_fds: u32,
+    no_pivot: bool,
 ) -> anyhow::Result<()> {
     let dir = bundle.unwrap_or_else(|| Path::new("."));
     tracing::debug!(container_id = id, bundle = %dir.display(), "run starting");
@@ -578,6 +604,7 @@ fn cmd_run(
             // real `runc run`/`crun run` exactly (0196).
             false,
             preserve_fds,
+            no_pivot,
             |pid| {
                 if let Some(path) = pid_file {
                     write_pid_file(path, pid);
@@ -600,6 +627,7 @@ fn cmd_create(
     bundle: Option<&Path>,
     pid_file: Option<&Path>,
     preserve_fds: u32,
+    no_pivot: bool,
 ) -> anyhow::Result<()> {
     let dir = bundle.unwrap_or_else(|| Path::new("."));
     tracing::debug!(container_id = id, bundle = %dir.display(), "create starting");
@@ -623,7 +651,14 @@ fn cmd_create(
         // threads by this point, same as `run`'s own safety note.
         #[allow(unsafe_code)]
         let pid = unsafe {
-            oci_runtime_core::launch::create(id, &loaded, &rootfs, &fifo_path, preserve_fds)
+            oci_runtime_core::launch::create(
+                id,
+                &loaded,
+                &rootfs,
+                &fifo_path,
+                preserve_fds,
+                no_pivot,
+            )
         }
         .context("creating container")?;
         Ok(pid)

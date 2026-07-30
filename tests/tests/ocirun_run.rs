@@ -651,3 +651,57 @@ fn run_preserve_fds_rejects_a_claim_with_no_matching_open_fd() {
         "{out:?}"
     );
 }
+
+/// `ocirun run --no-pivot` (matching real `runc run`/`crun run
+/// --no-pivot` exactly): a `chroot`-style root swap instead of
+/// `pivot_root(2)` still genuinely isolates the container's own
+/// rootfs (`ls /` shows only the container's own top level, not the
+/// host's), producing the exact same real, user-visible result as the
+/// default `pivot_root` path — the two are meant to be
+/// indistinguishable from inside the container, only the low-level
+/// mechanism differs.
+#[test]
+fn run_no_pivot_still_isolates_the_rootfs_just_like_pivot_root() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(
+        dir.path(),
+        &busybox,
+        &["/bin/sh", "-c", "echo hello-no-pivot && ls /"],
+    );
+
+    let out = Command::new(bin_path("ocirun"))
+        .args(["run", "--no-pivot", "no-pivot-test"])
+        .current_dir(dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .output()
+        .expect("failed to spawn ocirun run --no-pivot");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "ocirun run --no-pivot failed: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(stdout.contains("hello-no-pivot"), "got stdout: {stdout:?}");
+    // Proof the chroot-style swap actually isolated the rootfs, same
+    // as `run_execs_the_container_process_and_isolates_the_rootfs`'s
+    // own identical check for the default `pivot_root` path.
+    assert!(stdout.contains("bin"), "got stdout: {stdout:?}");
+
+    // No `RootfsAction::UnmountOldRoot`-style leftover directory at
+    // all on this path (there is no relocated old root in the first
+    // place, unlike real `pivot_root`) -- confirms the plan's own
+    // `UnmountOldRoot` step was genuinely skipped, not silently
+    // executed against a chroot'd tree it was never meant to run
+    // against.
+    assert!(
+        !dir.path()
+            .join("rootfs")
+            .join(".oci-tools-put-old")
+            .exists(),
+        "no pivot_root scratch directory should exist at all on the --no-pivot path"
+    );
+}

@@ -772,7 +772,9 @@ fn enter_and_get_exit_code(name: &str, command: &[String]) -> anyhow::Result<i32
     let exit_code = unsafe {
         // `preserve_fds: 0` -- `ocibox` has no `--preserve-fds` flag of
         // its own (real `distrobox` has no equivalent either).
-        oci_runtime_core::launch::run(name, &bundle, &validated_rootfs, false, false, 0)
+        // `no_pivot: false` -- `ocibox enter` has no `--no-pivot` flag
+        // of its own either (real `distrobox` has no equivalent).
+        oci_runtime_core::launch::run(name, &bundle, &validated_rootfs, false, false, 0, false)
     }
     .with_context(|| format!("running inside box {name}"))?;
     Ok(exit_code)

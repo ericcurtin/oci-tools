@@ -1752,10 +1752,18 @@ fn run_instruction(
     // completely ordinary build is the one final digest line.
     #[allow(unsafe_code)]
     let exit_code = unsafe {
-        // `preserve_fds: 0` -- `ociman build`'s own `RUN` steps have no
-        // equivalent flag (real `docker build`/`podman build` don't
-        // either).
-        oci_runtime_core::launch::run("ociman-build", &bundle, &validated_rootfs, true, quiet, 0)
+        // `preserve_fds: 0`/`no_pivot: false` -- `ociman build`'s own
+        // `RUN` steps have no equivalent flags (real `docker build`/
+        // `podman build` don't either).
+        oci_runtime_core::launch::run(
+            "ociman-build",
+            &bundle,
+            &validated_rootfs,
+            true,
+            quiet,
+            0,
+            false,
+        )
     }
     .with_context(|| format!("running RUN {command_text}"))?;
     anyhow::ensure!(

@@ -1071,3 +1071,72 @@ fn kill_all_signals_the_real_pid_and_leaves_the_cgroup_unfrozen() {
 
     ocirun(root_dir.path(), &["delete", "kill-all-test"]);
 }
+
+/// `ocirun create --no-pivot` (matching real `runc create`/`crun
+/// create --no-pivot`): the container really starts running (reaches
+/// `running` after a real `start`, same as any other `create`d
+/// container), proving the `chroot`-style root swap
+/// (`ocirun_run.rs`'s own `run_no_pivot_still_isolates_the_rootfs_
+/// just_like_pivot_root` already checks the actual rootfs isolation)
+/// works identically through `create`'s own separate call site into
+/// the same shared `ChildSetup`/`mount_pivot_and_exec` machinery
+/// `run --no-pivot` uses.
+#[test]
+fn create_no_pivot_reaches_running_after_start() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let create = Command::new(bin_path("ocirun"))
+        .arg("--root")
+        .arg(root_dir.path())
+        .args(["create", "create-no-pivot-test", "--bundle"])
+        .arg(bundle_dir.path())
+        .args(["--no-pivot"])
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .expect("failed to spawn ocirun create --no-pivot");
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert_eq!(
+        state_status(root_dir.path(), "create-no-pivot-test"),
+        "created"
+    );
+
+    let start = ocirun(root_dir.path(), &["start", "create-no-pivot-test"]);
+    assert!(
+        start.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "create-no-pivot-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    // Cleanup.
+    let kill = ocirun(root_dir.path(), &["kill", "create-no-pivot-test", "KILL"]);
+    assert!(kill.status.success());
+    wait_for_status(
+        root_dir.path(),
+        "create-no-pivot-test",
+        "stopped",
+        Duration::from_secs(5),
+    );
+    ocirun(root_dir.path(), &["delete", "create-no-pivot-test"]);
+}

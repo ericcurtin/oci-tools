@@ -144,6 +144,17 @@ pub fn pivot_root(new_root: &Path, put_old: &Path) -> io::Result<()> {
     rustix::process::pivot_root(new_root, put_old).map_err(io::Error::from)
 }
 
+/// `mount(source, target, NULL, MS_MOVE, NULL)`: relocate an existing
+/// mount at `source` to `target`, with no other flags — the one real
+/// [`MountPlan::Move`] shape this crate's own [`mount`] dispatches to,
+/// exposed directly here too for a caller (`ocirun run --no-pivot`'s
+/// own `chroot`-style root swap, matching real `runc`/`crun
+/// --no-pivot` exactly) that has no OCI mount options list of its own
+/// to parse into a [`ParsedMountOptions`] in the first place.
+pub fn move_mount(source: &Path, target: &Path) -> io::Result<()> {
+    rustix::mount::mount_move(source, target).map_err(io::Error::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

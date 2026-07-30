@@ -93,6 +93,7 @@ pub unsafe fn run(
     close_stdin: bool,
     discard_output: bool,
     preserve_fds: u32,
+    no_pivot: bool,
 ) -> io::Result<i32> {
     // SAFETY: forwarded from this function's own contract.
     unsafe {
@@ -105,6 +106,7 @@ pub unsafe fn run(
             close_stdin,
             discard_output,
             preserve_fds,
+            no_pivot,
             |_pid| {},
         )
     }
@@ -197,6 +199,9 @@ pub enum CgroupSetup {
 /// `log_path` is given, that always wins (checked first below) and
 /// `discard_output` is simply never consulted.
 ///
+/// `no_pivot`: see [`ChildSetup::no_pivot`]'s own doc comment. `false`
+/// for every caller except `ocirun`'s own CLI.
+///
 /// # Safety
 ///
 /// Same contract as [`run`].
@@ -211,10 +216,12 @@ pub unsafe fn run_reporting_pid(
     close_stdin: bool,
     discard_output: bool,
     preserve_fds: u32,
+    no_pivot: bool,
     on_pid: impl FnOnce(i32),
 ) -> io::Result<i32> {
     let mut child_setup = build_child_setup(bundle, rootfs, id)?;
     child_setup.preserve_fds = preserve_fds;
+    child_setup.no_pivot = no_pivot;
     if close_stdin {
         child_setup.stdin_fd = Some(
             std::fs::File::open("/dev/null")
@@ -647,9 +654,11 @@ pub unsafe fn create(
     rootfs: &Path,
     exec_fifo_path: &Path,
     preserve_fds: u32,
+    no_pivot: bool,
 ) -> io::Result<i32> {
     let mut child_setup = build_child_setup(bundle, rootfs, id)?;
     child_setup.preserve_fds = preserve_fds;
+    child_setup.no_pivot = no_pivot;
     let (read_fd, write_fd) =
         rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)?;
     child_setup.exec_fifo = Some(exec_fifo_path.to_path_buf());
@@ -824,6 +833,7 @@ fn build_child_setup(bundle: &Bundle, rootfs: &Path, id: &str) -> io::Result<Chi
         env: process_spec.env.clone(),
         cwd: process_spec.cwd.clone(),
         preserve_fds: 0,
+        no_pivot: false,
     })
 }
 
@@ -977,6 +987,19 @@ struct ChildSetup {
     /// happened to have open (beyond stdio) would have leaked straight
     /// into the container's exec'd process regardless of this flag.
     preserve_fds: u32,
+    /// `ocirun run/create --no-pivot` (matching real `runc`/`crun
+    /// --no-pivot` exactly): use a `chroot`-style root swap
+    /// ([`chroot_style_root_swap`]) instead of `pivot_root(2)` for the
+    /// planned `RootfsAction::PivotRoot`/`RootfsAction::
+    /// UnmountOldRoot` steps. `false` (the default for every caller
+    /// except `ocirun`'s own CLI) uses real `pivot_root` unchanged,
+    /// matching this project's own previous, sole behavior exactly —
+    /// both reference runtimes gate this behind an explicit "don't use
+    /// this except in exceptional circumstances" warning (a nested
+    /// container with no fresh mount namespace of its own to
+    /// `pivot_root` within is the real, narrow case it exists for), so
+    /// it's opt-in here too.
+    no_pivot: bool,
 }
 
 impl ChildSetup {
@@ -1192,6 +1215,24 @@ impl ChildSetup {
             {
                 self.run_container_hooks(&ctx.create_container, "creating", "createContainer");
             }
+            // `--no-pivot` (see `Self::no_pivot`'s own doc comment):
+            // divert the planned `pivot_root(2)` to a `chroot`-style
+            // swap instead, and skip `UnmountOldRoot` entirely — there
+            // is no relocated old root to unmount at all on this path,
+            // unlike real `pivot_root`, since `chroot` never relocates
+            // anything in the first place.
+            if self.no_pivot {
+                match action {
+                    RootfsAction::PivotRoot { new_root, .. } => {
+                        if let Err(e) = chroot_style_root_swap(new_root) {
+                            fail(SETUP_FAILURE_EXIT_CODE, &format!("{action:?}: {e}"));
+                        }
+                        continue;
+                    }
+                    RootfsAction::UnmountOldRoot { .. } => continue,
+                    _ => {}
+                }
+            }
             if let Err(e) = execute_rootfs_action(action) {
                 fail(SETUP_FAILURE_EXIT_CODE, &format!("{action:?}: {e}"));
             }
@@ -1336,6 +1377,84 @@ impl ChildSetup {
 fn fail(code: i32, message: &str) -> ! {
     eprintln!("error: {message}");
     std::process::exit(code);
+}
+
+/// The `--no-pivot` alternative to `pivot_root(2)`: `chroot`-based root
+/// swap, matching real crun's own exact `move_root`
+/// (`~/git/crun/src/libcrun/linux.c`) step for step — `chdir(new_root)`,
+/// [`unmount_or_hide`] the *host's* own still-reachable (this process
+/// hasn't `chroot`'d yet) absolute `/sys`/`/proc`, `mount(new_root, "/",
+/// MS_MOVE)`, `chroot(".")`, `chdir("/")`. Unlike `pivot_root`, there is
+/// no relocated "old root" to unmount afterward at all — `chroot`
+/// itself never relocates anything, it only changes which directory
+/// `/` refers to — so the caller (`Self::mount_pivot_and_exec`) simply
+/// skips the corresponding `RootfsAction::UnmountOldRoot` step outright
+/// on this path rather than calling anything here for it.
+///
+/// The `/sys`/`/proc` unmount-or-hide step specifically closes the same
+/// real "a mount from outside the new root is still reachable from
+/// inside it" hazard `pivot_root`'s own relocate-then-unmount step
+/// already closes for *every* mount — without it, a process could
+/// still reach the host's own real `/sys`/`/proc` (as they stood right
+/// before this call) via a relative path escape after `chroot` alone,
+/// since plain `chroot(2)` (unlike `pivot_root`) never detaches
+/// anything from the process's own mount namespace.
+///
+/// Deliberately narrower than real runc's own `--no-pivot`
+/// (`~/git/runc/libcontainer/rootfs_linux.go`'s own `msMoveRoot`):
+/// runc additionally scans `/proc/self/mountinfo` for every full host
+/// mount under `/proc`/`/sys` and slave-remounts/masks each one
+/// individually, a broader hardening step this project has no
+/// mountinfo parser to implement at all — matching real crun's own
+/// simpler, narrower path instead is a real, documented divergence,
+/// not an oversight (the same "pick the simpler of two reference
+/// implementations, say so" precedent already established elsewhere,
+/// e.g. `docs/design/0327`'s own `Icon=` rewrite quirk). `--no-pivot`
+/// is already a real, explicit "don't use this except in exceptional
+/// circumstances" escape hatch in both reference runtimes; this
+/// project's own narrower version is consistent with that same
+/// caution, and the default (`pivot_root`) path is completely
+/// unaffected either way.
+fn chroot_style_root_swap(new_root: &Path) -> io::Result<()> {
+    std::env::set_current_dir(new_root)?;
+    unmount_or_hide(Path::new("/sys"))?;
+    unmount_or_hide(Path::new("/proc"))?;
+    // `"."`, not `new_root` itself again: `new_root` may well be a
+    // *relative* path (e.g. a bundle resolved against a relative `
+    // --bundle`/the current directory) — real, found directly by this
+    // change's own first test run, not a theoretical concern. Reusing
+    // it verbatim here (matching crun's own C code's own literal
+    // `mount(rootfs, "/", ...)` after its own `chdir(rootfs)`, which
+    // only ever works because crun's own caller always resolves
+    // `rootfs` to an absolute path first) would instead resolve
+    // relative to the directory this `set_current_dir` just moved
+    // *into* (i.e. `new_root` all over again, doubled), pointing at
+    // a path that doesn't exist at all. `"."` unambiguously refers to
+    // "wherever we just `chdir`'d to" regardless of whether the
+    // original `new_root` string was itself relative or absolute.
+    oci_mount::move_mount(Path::new("."), Path::new("/"))?;
+    rustix::process::chroot(".").map_err(io::Error::from)?;
+    std::env::set_current_dir("/")
+}
+
+/// Unmount `target` (lazily, `MNT_DETACH`), falling back to hiding it
+/// under an empty (`size=0k`) `tmpfs` if the kernel refuses with
+/// `EINVAL` (a locked mount, matching real crun's own exact
+/// `umount_or_hide` fallback, `~/git/crun/src/libcrun/linux.c`) — see
+/// [`chroot_style_root_swap`]'s own doc comment for why this step
+/// exists at all.
+fn unmount_or_hide(target: &Path) -> io::Result<()> {
+    match oci_mount::unmount_detach(target) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+            let parsed = oci_mount::ParsedMountOptions {
+                data: "size=0k".to_string(),
+                ..Default::default()
+            };
+            oci_mount::mount(Some("tmpfs"), target, Some("tmpfs"), &parsed)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Perform one planned rootfs-setup step for real.

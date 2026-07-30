@@ -620,7 +620,8 @@ fn provision_vm(rootfs: &Path, name: &str) -> anyhow::Result<()> {
         #[allow(unsafe_code)]
         let exit_code = unsafe {
             // `preserve_fds: 0` -- `ocivmm` has no `--preserve-fds`
-            // flag of its own.
+            // flag of its own. `no_pivot: false` -- `ocivmm` has no
+            // `--no-pivot` flag either.
             oci_runtime_core::launch::run(
                 &format!("ocivmm-provision-{name}"),
                 &bundle,
@@ -628,6 +629,7 @@ fn provision_vm(rootfs: &Path, name: &str) -> anyhow::Result<()> {
                 true,
                 false,
                 0,
+                false,
             )
         }
         .context("running the provisioning container")?;

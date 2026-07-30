@@ -6241,6 +6241,10 @@ fn run_and_finalize(
             // concept for specialized orchestrators, not a container-
             // engine-level one).
             0,
+            // `no_pivot: false` -- same reasoning, `--no-pivot` too is
+            // a `runc`/`crun`-level escape hatch neither `docker run`/
+            // `podman run` expose.
+            false,
             record_running,
         )
     }
