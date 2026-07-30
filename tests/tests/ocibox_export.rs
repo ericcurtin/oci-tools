@@ -926,3 +926,182 @@ fn export_app_delete_also_removes_the_copied_icon() {
         "the copied icon should really be gone now"
     );
 }
+
+/// `--export-label` (0328) not given at all defaults to appending
+/// `" (on <box_name>)"` to the exported `.desktop` file's own `Name=`
+/// line -- matching real `distrobox export`'s own identical, checked-
+/// directly default exactly.
+#[test]
+fn export_app_default_label_appends_on_box_name() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(&storage_dir, "testbox", SAMPLE_DESKTOP_FILE);
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let contents =
+        std::fs::read_to_string(export_dir.path().join("testbox-myapp.desktop")).unwrap();
+    assert!(
+        contents.lines().any(|l| l == "Name=My App (on testbox)"),
+        "{contents:?}"
+    );
+}
+
+/// `--export-label none` disables the label entirely -- `Name=` stays
+/// exactly as it already was, no default `(on <box_name>)` appended.
+#[test]
+fn export_app_export_label_none_disables_the_label() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(&storage_dir, "testbox", SAMPLE_DESKTOP_FILE);
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+            "--export-label",
+            "none",
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let contents =
+        std::fs::read_to_string(export_dir.path().join("testbox-myapp.desktop")).unwrap();
+    assert!(contents.lines().any(|l| l == "Name=My App"), "{contents:?}");
+}
+
+/// A real, explicit `--export-label` value is appended verbatim (with
+/// a leading space), overriding the default `(on <box_name>)` label
+/// entirely.
+#[test]
+fn export_app_custom_export_label_is_appended_verbatim() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(&storage_dir, "testbox", SAMPLE_DESKTOP_FILE);
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+            "--export-label",
+            "[work]",
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let contents =
+        std::fs::read_to_string(export_dir.path().join("testbox-myapp.desktop")).unwrap();
+    assert!(
+        contents.lines().any(|l| l == "Name=My App [work]"),
+        "{contents:?}"
+    );
+}
+
+/// The label is only ever appended to a line that genuinely *starts*
+/// with `Name` (covering both the bare `Name=` key and a localized
+/// `Name[xx]=` one) -- a deliberate, documented narrowing of real
+/// distrobox's own cruder, unanchored `sed "s|Name.*|&${label}|g"`,
+/// which would also (mis)match a `GenericName=`/`Comment=` line merely
+/// *containing* the substring "Name" anywhere in its own value.
+#[test]
+fn export_app_label_only_touches_lines_starting_with_name() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(
+        &storage_dir,
+        "testbox",
+        "[Desktop Entry]\nType=Application\nName=My App\nGenericName=Editor\n\
+         Comment=Has a Name mentioned here\nExec=/usr/bin/myapp --flag\n",
+    );
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let contents =
+        std::fs::read_to_string(export_dir.path().join("testbox-myapp.desktop")).unwrap();
+    assert!(
+        contents.lines().any(|l| l == "Name=My App (on testbox)"),
+        "{contents:?}"
+    );
+    assert!(
+        contents.lines().any(|l| l == "GenericName=Editor"),
+        "GenericName= must be left untouched: {contents:?}"
+    );
+    assert!(
+        contents
+            .lines()
+            .any(|l| l == "Comment=Has a Name mentioned here"),
+        "a Comment= merely containing the substring \"Name\" must be left untouched: {contents:?}"
+    );
+}

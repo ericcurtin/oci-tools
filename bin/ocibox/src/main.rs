@@ -202,16 +202,9 @@ enum Command {
     /// real shell implementation, `internal/inside-distrobox/assets/
     /// distrobox-export`). `--app` (0322) writes a rewritten `.desktop`
     /// launcher whose `Exec=` routes through `ocibox enter`, matching
-    /// real `distrobox export --app`'s own core mechanism exactly, but
-    /// deliberately without its own icon-copying half yet (a
-    /// genuinely separate, larger increment — this project has no
-    /// icon-file/`XDG_DATA_DIRS`-search machinery of any kind yet); an
-    /// exported app's own `Icon=` line is therefore left exactly as
-    /// the box's own `.desktop` file already had it, which may not
-    /// resolve to a real file on the host (an honestly-documented,
-    /// narrower-than-real-distrobox gap, the same "narrow first slice"
-    /// reasoning this project already applies elsewhere, not a silent
-    /// behavior change).
+    /// real `distrobox export --app`'s own core mechanism exactly,
+    /// including its own real icon search/copy/`Icon=`-rewrite
+    /// (`0327`) and `--export-label` (`0328`).
     ///
     /// Real `distrobox export` is meant to be run *from inside* the
     /// container, detecting which box it's running in via its own
@@ -254,6 +247,21 @@ enum Command {
         /// --delete` itself does.
         #[arg(long, short = 'd')]
         delete: bool,
+        /// Label appended to an exported application's own `Name=`
+        /// line (`--export-label`, matching real `distrobox export
+        /// -el`'s own identical flag and default exactly — this
+        /// project's own established convention here doesn't
+        /// replicate real distrobox's own multi-character short-flag
+        /// aliases, matching `--export-path`'s own pre-existing lack
+        /// of a `-ep` alias too): defaults to `" (on <box_name>)"`
+        /// when not given at all; the literal value `none` disables
+        /// the label entirely; any other value is appended verbatim
+        /// (with a leading space). Only ever affects `--app` (real
+        /// distrobox's own `--bin` export never reads it either,
+        /// since only a `.desktop` file has a `Name=` line to append
+        /// to).
+        #[arg(long = "export-label", value_name = "LABEL")]
+        export_label: Option<String>,
     },
 }
 
@@ -285,12 +293,14 @@ fn main() -> std::process::ExitCode {
                 bin,
                 export_path,
                 delete,
+                export_label,
             }) => cmd_export(
                 &box_name,
                 app.as_deref(),
                 bin.as_deref(),
                 export_path.as_deref(),
                 delete,
+                export_label.as_deref(),
             ),
             None => anyhow::bail!(
                 "no subcommand given (try `ocibox create --image ... --name ...`); \
@@ -934,11 +944,12 @@ fn cmd_export(
     bin: Option<&str>,
     export_path: Option<&Path>,
     delete: bool,
+    export_label: Option<&str>,
 ) -> anyhow::Result<()> {
     match (app, bin) {
         (Some(_), Some(_)) => anyhow::bail!("choose only one of --app or --bin"),
         (None, None) => anyhow::bail!("either --app or --bin is required"),
-        (Some(app), None) => cmd_export_app(box_name, app, export_path, delete),
+        (Some(app), None) => cmd_export_app(box_name, app, export_path, delete, export_label),
         (None, Some(bin)) => cmd_export_bin(box_name, bin, export_path, delete),
     }
 }
@@ -1282,6 +1293,7 @@ fn rewrite_desktop_file(
     box_name: &str,
     icon_rewrite: Option<&str>,
     home: &Path,
+    label: &str,
 ) -> String {
     let mut out = format!("# {APP_EXPORT_MARKER}\n# box: {box_name}\n");
     for line in content.lines() {
@@ -1304,6 +1316,23 @@ fn rewrite_desktop_file(
                 home.display(),
                 rest.replace("pixmaps", "icons")
             ));
+            continue;
+        }
+        // A real, deliberate narrowing of real distrobox's own
+        // `sed "s|Name.*|&${label}|g"`: that unanchored pattern also
+        // matches (and appends the label to) any line merely
+        // *containing* the substring "Name" anywhere at all --
+        // including `GenericName=`/`Comment=` lines that happen to
+        // mention "Name" in their own value -- a real, crude quirk
+        // this project deliberately doesn't replicate, appending the
+        // label only to a line that actually *starts* with `Name`
+        // (covering both the bare `Name=` key and a localized
+        // `Name[xx]=` one, exactly like real distrobox's own intent,
+        // just without its own over-matching side effect).
+        if line.starts_with("Name") && !label.is_empty() {
+            out.push_str(line);
+            out.push_str(label);
+            out.push('\n');
             continue;
         }
         out.push_str(line);
@@ -1336,6 +1365,20 @@ fn desktop_file_icon_value(content: &str) -> Option<&str> {
         .filter(|v| !v.is_empty())
 }
 
+/// Resolve `--export-label`'s own real, checked-directly three-way
+/// default rule (`~/git/distrobox/internal/inside-distrobox/assets/
+/// distrobox-export:297-304`): not given at all -> `" (on
+/// <box_name>)"`; the literal value `"none"` -> no label at all
+/// (empty string); any other value -> itself, with a leading space so
+/// the exported `.desktop` file reads `NAME LABEL`, not `NAMELABEL`.
+fn resolve_export_label(export_label: Option<&str>, box_name: &str) -> String {
+    match export_label {
+        None => format!(" (on {box_name})"),
+        Some("none") => String::new(),
+        Some(label) => format!(" {label}"),
+    }
+}
+
 /// `ocibox export --box <NAME> --app <NAME_OR_PATH>`: finds every
 /// real, matching `.desktop` file inside the box's own rootfs (see
 /// [`find_desktop_files`]), copies its own icon(s) to the real host
@@ -1358,12 +1401,14 @@ fn cmd_export_app(
     app: &str,
     export_path: Option<&Path>,
     delete: bool,
+    export_label: Option<&str>,
 ) -> anyhow::Result<()> {
     validate_box_name(box_name)?;
     let box_dir = boxes_root().join(box_name);
     anyhow::ensure!(box_dir.is_dir(), "{box_name}: no such box");
     let rootfs = box_dir.join("rootfs");
     let home = home_dir()?;
+    let label = resolve_export_label(export_label, box_name);
 
     let export_dir = match export_path {
         Some(dir) => dir.to_path_buf(),
@@ -1437,7 +1482,8 @@ fn cmd_export_app(
             }
         }
 
-        let rewritten = rewrite_desktop_file(&content, box_name, icon_rewrite.as_deref(), &home);
+        let rewritten =
+            rewrite_desktop_file(&content, box_name, icon_rewrite.as_deref(), &home, &label);
         let dest_name = exported_desktop_file_name(box_name, src)?;
         let dest_file = export_dir.join(&dest_name);
         std::fs::write(&dest_file, rewritten)
