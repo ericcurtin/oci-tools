@@ -1286,6 +1286,7 @@ dependencies = [
  "oci-mount",
  "oci-runtime-core",
  "oci-spec-types",
+ "rustix",
  "serde",
  "serde_json",
  "tracing",

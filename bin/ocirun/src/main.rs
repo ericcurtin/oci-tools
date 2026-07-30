@@ -171,6 +171,28 @@ enum Command {
         /// `ocirun delete` is needed to actually clean it up.
         #[arg(long)]
         keep: bool,
+        /// Detach: start the container and return immediately instead
+        /// of blocking in the foreground until it exits — matching
+        /// real `runc run -d`/`crun run --detach` exactly (checked
+        /// directly: real runc's own `runner.run` shares one
+        /// implementation between plain `run` and `-d`, gated by a
+        /// single `detach` boolean that skips the final wait-for-exit
+        /// step; real crun's own `libcrun_container_run` forks a
+        /// genuine child and returns as soon as *it* reports the
+        /// container is under way, never waiting for the container's
+        /// own command to actually finish). Deliberately distinct from
+        /// the separate `create`/`start` two-phase lifecycle: unlike
+        /// `create`, a detached `run` never gates the container's own
+        /// command behind an exec-fifo — it starts running
+        /// immediately, exactly like a foreground `run`, just without
+        /// this invocation blocking on its exit. This invocation
+        /// prints nothing on success (matching real `runc run -d`'s
+        /// own silence, not `ociman run -d`'s own id-printing
+        /// convention — `ocirun` is the lower-level, runc-CLI-
+        /// compatible layer). `--pid-file`/`--keep` both still apply,
+        /// running inside the detached process instead of this one.
+        #[arg(short = 'd', long)]
+        detach: bool,
     },
     /// Create a container: set up namespaces/mounts/cgroups and leave
     /// its process blocked, waiting for `start`. Returns once setup
@@ -584,6 +606,7 @@ fn main() -> std::process::ExitCode {
                 preserve_fds,
                 no_pivot,
                 keep,
+                detach,
             }) => cmd_run(
                 &root,
                 &id,
@@ -592,6 +615,7 @@ fn main() -> std::process::ExitCode {
                 preserve_fds,
                 no_pivot,
                 keep,
+                detach,
             ),
             Some(Command::Create {
                 id,
@@ -809,12 +833,13 @@ fn cmd_run(
     preserve_fds: u32,
     no_pivot: bool,
     keep: bool,
+    detach: bool,
 ) -> anyhow::Result<()> {
-    let dir = bundle.unwrap_or_else(|| Path::new("."));
+    let dir = bundle.unwrap_or_else(|| Path::new(".")).to_path_buf();
     tracing::debug!(container_id = id, bundle = %dir.display(), "run starting");
     verify_preserve_fds(preserve_fds)?;
 
-    let bundle = oci_runtime_core::Bundle::load(dir)
+    let bundle = oci_runtime_core::Bundle::load(&dir)
         .with_context(|| format!("loading bundle from {}", dir.display()))?;
     let rootfs =
         oci_runtime_core::validate::validate(&bundle).context("config.json failed validation")?;
@@ -824,29 +849,158 @@ fn cmd_run(
     // `runc create` (and, internally, real `runc run` too) already
     // uses, so a concurrent `ocirun state`/`list`/`exec`/`kill`
     // against this same id sees something real while this invocation
-    // is still blocked in the foreground below.
+    // is still blocked in the foreground below (or, for `--detach`,
+    // while the detached process below is still running).
     let store = StateStore::open(root)
         .with_context(|| format!("opening container state root {}", root.display()))?;
     let annotations = bundle.spec.annotations.clone();
-    let mut state = store.create(id, dir, &rootfs, annotations)?;
+    let state = store.create(id, &dir, &rootfs, annotations)?;
 
+    if detach {
+        // A fresh, owned copy of everything the forked keeper needs —
+        // `bundle`/`rootfs`/`state` are moved into the closure below
+        // (the parent never touches them again); `id_owned` is a
+        // separate owned copy so this function's own `id: &str`
+        // parameter is still available afterward, for the wait call
+        // below.
+        let id_owned = id.to_string();
+        let root_owned = root.to_path_buf();
+        let pid_file_owned = pid_file.map(Path::to_path_buf);
+
+        // SAFETY: `ocirun`'s own process has not spawned any
+        // additional threads by this point (argument parsing and log
+        // initialization don't spawn any), so this `fork` is sound —
+        // see its own safety note for the requirement this satisfies.
+        // The forked child is a fresh, single-threaded process
+        // regardless, so the *second*, inner `run_and_finalize` fork
+        // (inside `launch::run_reporting_pid`) is sound too.
+        #[allow(unsafe_code)]
+        let keeper_pid = unsafe {
+            oci_runtime_core::process::fork(move || {
+                // Detach from the controlling terminal/session
+                // entirely (matching real crun's own `detach_process`/
+                // `setsid`, and `ociman run -d`'s own identical
+                // choice, `docs/design/0098`) — a plain `setsid()`,
+                // not crun's own additional second `fork()` (which
+                // guarantees the detached process can never become a
+                // session leader again); a real, minor, documented
+                // divergence, not assumed equivalent.
+                let _ = rustix::process::setsid();
+                if let Ok(devnull) = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("/dev/null")
+                {
+                    // `ocirun run` has no `--interactive` concept of
+                    // its own at all (`Command::Run`'s own doc
+                    // comment) — stdin, not just stdout/stderr, is
+                    // always silenced here, unlike `ociman`'s own
+                    // keeper (which conditionally leaves stdin open
+                    // for a later `-i` attach that has no `ocirun`
+                    // equivalent to begin with).
+                    let _ = rustix::stdio::dup2_stdin(&devnull);
+                    let _ = rustix::stdio::dup2_stdout(&devnull);
+                    let _ = rustix::stdio::dup2_stderr(&devnull);
+                }
+                // A fresh `StateStore` handle for this fresh process,
+                // matching `ociman`'s own keeper (0098) — cheap, and
+                // avoids relying on the parent's own handle surviving
+                // across the fork in any fork-unsafe way.
+                let Ok(store) = StateStore::open(&root_owned) else {
+                    std::process::exit(oci_runtime_core::launch::SETUP_FAILURE_EXIT_CODE);
+                };
+                let code = match run_and_finalize(
+                    &id_owned,
+                    &bundle,
+                    &rootfs,
+                    &store,
+                    state,
+                    pid_file_owned.as_deref(),
+                    preserve_fds,
+                    no_pivot,
+                    keep,
+                ) {
+                    Ok(code) => code,
+                    Err(_) => oci_runtime_core::launch::SETUP_FAILURE_EXIT_CODE,
+                };
+                std::process::exit(code);
+            })
+        }
+        .context("detaching container")?;
+
+        wait_for_detached_run_to_start(&store, id, keeper_pid)?;
+        return Ok(());
+    }
+
+    let exit_code = run_and_finalize(
+        id,
+        &bundle,
+        &rootfs,
+        &store,
+        state,
+        pid_file,
+        preserve_fds,
+        no_pivot,
+        keep,
+    )?;
+
+    // The container's own exit code becomes ours, matching runc/crun's
+    // `run`: exit code 0 must mean "the container's process exited 0",
+    // not merely "ocirun didn't error", so this bypasses
+    // oci_cli_common::run_main's usual Ok(())-means-success mapping.
+    std::process::exit(exit_code);
+}
+
+/// Run `bundle`'s already-fully-prepared container to completion
+/// (`launch::run_reporting_pid`), then finalize its own persisted
+/// state exactly once the real exit code is known — shared, unchanged
+/// logic between the foreground and `--detach`ed `ocirun run` paths
+/// (mirroring `ociman`'s own identically-shaped `run_and_finalize`,
+/// `docs/design/0098`).
+///
+/// Matching real `runc run`'s own checked-directly default
+/// (`~/git/runc/utils_linux.go`'s own `shouldDestroy`/`runner.
+/// destroy`): removes the container's own state once it's done,
+/// whether the container actually ran (any exit code) or the launch
+/// itself failed partway through — unless `keep` was given, matching
+/// real `runc run --keep`/`crun run --keep` exactly (`Command::Run::
+/// keep`'s own doc comment). No separate "write Stopped" step is
+/// needed for the `keep` case: `state` was last written `Running`
+/// with the container's own real pid inside the callback below, and
+/// `effective_status` already re-derives `Stopped` lazily from that
+/// pid no longer being alive the next time anything queries it — the
+/// same "process death is the only signal that matters" convention
+/// this whole state store already established, not a new one invented
+/// here.
+#[allow(clippy::too_many_arguments)]
+fn run_and_finalize(
+    id: &str,
+    bundle: &oci_runtime_core::Bundle,
+    rootfs: &Path,
+    store: &StateStore,
+    mut state: oci_runtime_core::PersistedState,
+    pid_file: Option<&Path>,
+    preserve_fds: u32,
+    no_pivot: bool,
+    keep: bool,
+) -> anyhow::Result<i32> {
     // `launch::run` itself is just `run_reporting_pid` with a no-op
     // callback (see its own doc comment) — called directly here
     // instead so `--pid-file`'s own callback has somewhere to hook in,
     // without this binary needing to duplicate `run`'s own choice of
     // `CgroupSetup::FromSpec`/no log path.
     //
-    // SAFETY: `ocirun`'s own process has not spawned any additional
-    // threads by this point (argument parsing and log initialization
-    // don't spawn any), so the fork `launch::run_reporting_pid`
-    // performs is sound — see its own safety note for the requirement
-    // this satisfies.
+    // SAFETY: forwarded from this function's own two call sites (see
+    // each one's own safety comment): `ocirun`'s own foreground
+    // process hasn't spawned any threads by this point, and a fresh
+    // `fork(2)` child (the detached path) is always single-threaded
+    // regardless of its parent.
     #[allow(unsafe_code)]
     let result = unsafe {
         oci_runtime_core::launch::run_reporting_pid(
             id,
-            &bundle,
-            &rootfs,
+            bundle,
+            rootfs,
             None,
             oci_runtime_core::launch::CgroupSetup::FromSpec,
             // `close_stdin: false` — matching real `runc run`/`crun
@@ -878,32 +1032,69 @@ fn cmd_run(
     }
     .context("running container");
 
-    // Matching real `runc run`'s own checked-directly default
-    // (`~/git/runc/utils_linux.go`'s own `shouldDestroy`/`runner.
-    // destroy`): a plain, foreground `ocirun run` removes its own
-    // state once it's done, whether the container actually ran (any
-    // exit code) or the launch itself failed partway through — unless
-    // `--keep` was given, matching real `runc run --keep`/`crun run
-    // --keep` exactly (`Command::Run::keep`'s own doc comment). No
-    // separate "write Stopped" step is needed for the `--keep` case:
-    // `state` was last written `Running` with the container's own
-    // real pid inside the callback above, and `effective_status`
-    // already re-derives `Stopped` lazily from that pid no longer
-    // being alive the next time anything queries it — the same
-    // "process death is the only signal that matters" convention this
-    // whole state store already established, not a new one invented
-    // here.
     if !keep {
         let _ = store.remove(id);
     }
 
-    let exit_code = result?;
+    result
+}
 
-    // The container's own exit code becomes ours, matching runc/crun's
-    // `run`: exit code 0 must mean "the container's process exited 0",
-    // not merely "ocirun didn't error", so this bypasses
-    // oci_cli_common::run_main's usual Ok(())-means-success mapping.
-    std::process::exit(exit_code);
+/// Block until a detached `ocirun run -d`'s own keeper process (the
+/// backgrounded fork `cmd_run`'s own `detach` branch just created) has
+/// gotten far enough to report a real, running pid (or has already
+/// finished entirely, for a container whose own command exits almost
+/// immediately) — or report why it never did. Polls the same
+/// persisted state file every other subcommand already reads, rather
+/// than any new IPC of its own — mirroring `ociman`'s own identically
+/// -shaped `wait_for_detached_container_to_start` (`docs/design/
+/// 0098`/`0189`) exactly, including its own real, previously-hit race:
+/// a container whose own command exits almost instantly can run to
+/// completion and have its entire record already gone (unless `keep`)
+/// by the time this function's very first poll runs at all —
+/// indistinguishable, from the state store alone, from a genuine
+/// setup failure (which also removes the record). The one remaining
+/// signal that can tell them apart: the keeper's own real exit code (0
+/// for success, [`oci_runtime_core::launch::SETUP_FAILURE_EXIT_CODE`]
+/// for a genuine failure), reaped here via a real, blocking `waitpid`.
+fn wait_for_detached_run_to_start(
+    store: &StateStore,
+    id: &str,
+    keeper_pid: i32,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match store.load(id) {
+            Ok(state) if state.status != Status::Creating => return Ok(()),
+            Ok(_) => {}
+            Err(oci_runtime_core::StateError::NotFound(_)) => {
+                // The keeper is either still running (in which case
+                // this blocks briefly until it isn't) or has already
+                // exited and is sitting as a zombie (in which case
+                // this returns immediately) — nothing else ever reaps
+                // this specific child, so this can't observe a stale
+                // exit code left over from an unrelated process.
+                let status = oci_runtime_core::process::wait(keeper_pid)?;
+                let code = oci_runtime_core::exit_code_from_wait_status(status);
+                if code == 0 {
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "container {id:?} failed to start (its own detached setup failed, exit \
+                     code {code})"
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
+        if !oci_runtime_core::process::alive(keeper_pid) {
+            anyhow::bail!(
+                "container {id:?} failed to start (its own detached process exited unexpectedly)"
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for container {id:?} to start");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn cmd_create(

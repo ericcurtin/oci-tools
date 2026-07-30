@@ -977,3 +977,123 @@ fn run_without_keep_removes_the_state_entirely() {
     assert!(!state.status.success(), "{state:?}");
     let _ = root_dir;
 }
+
+/// `ocirun run --detach`/`-d` (real runc's/crun's own detach flag,
+/// mirroring `ociman run -d`'s own already-shipped keeper-process
+/// pattern, `docs/design/0098`) returns almost immediately -- long
+/// before a `sleep 30`'d container's own real command finishes -- and
+/// leaves it genuinely running, queryable via a concurrent `ocirun
+/// state`, exactly as if this had been a foreground `run` a separate
+/// invocation happened to observe mid-flight. Also confirms real
+/// runc's own checked-directly silence on success (unlike `ociman run
+/// -d`'s own id-printing convention): nothing at all is printed to
+/// stdout.
+#[test]
+fn run_detach_returns_immediately_with_the_container_still_running() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let started = std::time::Instant::now();
+    let out = Command::new(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args(["run", "--detach", "run-detach-test", "--bundle"])
+        .arg(bundle_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .output()
+        .expect("failed to spawn ocirun run --detach");
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a detached run must return long before the container's own \
+         30-second sleep finishes, took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "real `runc run -d` prints nothing at all on success, unlike `ociman run -d`'s own \
+         id-printing convention: {out:?}"
+    );
+
+    assert_eq!(
+        state_status(root_dir.path(), "run-detach-test"),
+        "running",
+        "the detached container must already be genuinely running by the time the \
+         original invocation returns"
+    );
+
+    let kill = ocirun(root_dir.path(), &["kill", "run-detach-test", "KILL"]);
+    assert!(kill.status.success(), "{kill:?}");
+    assert_eq!(
+        wait_for_status_tolerating_not_yet_created(
+            root_dir.path(),
+            "run-detach-test",
+            "does-not-exist",
+            Duration::from_secs(5),
+        ),
+        "does-not-exist",
+        "without --keep, the detached container's own state must be removed once it exits, \
+         same as a foreground run"
+    );
+}
+
+/// `ocirun run --detach --keep` combined: the container's own state
+/// survives after it exits (queryable, `stopped`), exactly like a
+/// foreground `--keep`'d run, just reached asynchronously instead.
+#[test]
+fn run_detach_keep_leaves_a_stopped_state_behind_for_a_later_delete() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "exit 9"]);
+
+    let out = Command::new(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args([
+            "run",
+            "--detach",
+            "--keep",
+            "run-detach-keep-test",
+            "--bundle",
+        ])
+        .arg(bundle_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .output()
+        .expect("failed to spawn ocirun run --detach --keep");
+    assert!(out.status.success(), "{out:?}");
+
+    // The container's own command (`exit 9`) may not have actually
+    // finished by the moment the detaching invocation above returns
+    // (it only waits for `Creating` to clear, not for real exit) --
+    // poll for `stopped` rather than asserting it immediately.
+    assert_eq!(
+        wait_for_status_tolerating_not_yet_created(
+            root_dir.path(),
+            "run-detach-keep-test",
+            "stopped",
+            Duration::from_secs(5),
+        ),
+        "stopped",
+        "a --keep'd detached container's own state must still be queryable once it exits"
+    );
+
+    let delete = ocirun(root_dir.path(), &["delete", "run-detach-keep-test"]);
+    assert!(delete.status.success(), "{delete:?}");
+    let state = Command::new(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args(["state", "run-detach-keep-test"])
+        .env_remove("OCI_TOOLS_LOG")
+        .output()
+        .expect("failed to spawn ocirun state");
+    assert!(!state.status.success(), "{state:?}");
+}

@@ -17,6 +17,7 @@ oci-cli-common.workspace = true
 oci-mount.workspace = true
 oci-runtime-core.workspace = true
 oci-spec-types.workspace = true
+rustix = { workspace = true, features = ["process", "stdio"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
