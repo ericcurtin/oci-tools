@@ -1041,3 +1041,278 @@ fn restart_all_reports_a_real_error_for_a_paused_container_but_still_restarts_th
     ociman(storage_dir.path(), &["stop", "--time", "0", "-a"]);
     ociman(storage_dir.path(), &["rm", "-a", "-f"]);
 }
+
+/// `--cidfile` (0316) matches real `podman restart --cidfile` exactly:
+/// the file's own first line only, trailing content ignored, merged
+/// into the same target list an explicit `ID`/`--name` argument
+/// already builds -- same technique `ociman_ps.rs`'s own
+/// `rm_cidfile_reads_the_container_id_from_a_file_and_ignores_
+/// trailing_content` already established (a plain file holding the
+/// container's own name is a faithful stand-in for whatever a real
+/// `run --cidfile` would have produced, without needing to actually
+/// run one first).
+#[test]
+fn restart_cidfile_reads_the_container_id_from_a_file_and_ignores_trailing_content() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/restart-cidfile:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "-d",
+            "--name",
+            "restart-cidfile-target",
+            "ociman-test/restart-cidfile:latest",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            "restart-cidfile-target",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+    let first_pid = inspect_json(storage_dir.path(), "restart-cidfile-target")["pid"]
+        .as_i64()
+        .expect("running container should report a real pid");
+
+    let cidfile = storage_dir.path().join("cid.txt");
+    std::fs::write(&cidfile, "restart-cidfile-target\ngarbage second line").unwrap();
+
+    let restart = ociman(
+        storage_dir.path(),
+        &[
+            "restart",
+            "--time",
+            "1",
+            "--cidfile",
+            cidfile.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        restart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&restart.stdout).trim(),
+        id,
+        "restart prints the resolved id, not the raw name/cidfile-sourced input given"
+    );
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            "restart-cidfile-target",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+    let second_pid = inspect_json(storage_dir.path(), "restart-cidfile-target")["pid"]
+        .as_i64()
+        .expect("running container should report a real pid");
+    assert_ne!(
+        first_pid, second_pid,
+        "restart should have replaced the process"
+    );
+
+    ociman(storage_dir.path(), &["stop", "--time", "0", "-a"]);
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// Real `podman restart`'s own `--cidfile` and `--all` are mutually
+/// exclusive, matching `rm`'s own identical rule.
+#[test]
+fn restart_all_and_cidfile_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let cidfile = storage_dir.path().join("cid.txt");
+    std::fs::write(&cidfile, "some-id").unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &["restart", "--all", "--cidfile", cidfile.to_str().unwrap()],
+    );
+    assert!(!out.status.success());
+}
+
+/// A cidfile that can't be read at all is always a hard error --
+/// real `podman restart` has no `--ignore` flag at all (unlike `rm`/
+/// `stop`), so there is nothing to tolerate it with.
+#[test]
+fn restart_cidfile_that_cannot_be_read_is_a_hard_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &["restart", "--cidfile", "/does/not/exist/at/all"],
+    );
+    assert!(!out.status.success());
+}
+
+/// Multiple explicit ids (0316, a real, previously-unsupported gap:
+/// `ociman restart` only ever accepted exactly one target before
+/// this) resolve every one *first* -- an unresolvable one aborts the
+/// whole call before restarting anything at all, matching real
+/// podman's own identical two-phase behavior exactly (checked
+/// directly, `getContainers`'s own `default` case).
+#[test]
+fn restart_with_multiple_explicit_ids_resolves_all_before_restarting_any() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/restart-multi:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    for name in ["restart-multi-1", "restart-multi-2"] {
+        let run = ociman(
+            storage_dir.path(),
+            &[
+                "run",
+                "-d",
+                "--name",
+                name,
+                "ociman-test/restart-multi:latest",
+                "/bin/sh",
+                "-c",
+                "sleep 30",
+            ],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(
+            wait_for_status(storage_dir.path(), name, "running", Duration::from_secs(20)),
+            "running"
+        );
+    }
+
+    // A nonexistent third target: the whole call should abort before
+    // touching either real container at all.
+    let first_pid = inspect_json(storage_dir.path(), "restart-multi-1")["pid"]
+        .as_i64()
+        .expect("running container should report a real pid");
+    let second_pid = inspect_json(storage_dir.path(), "restart-multi-2")["pid"]
+        .as_i64()
+        .expect("running container should report a real pid");
+
+    let bad = ociman(
+        storage_dir.path(),
+        &[
+            "restart",
+            "restart-multi-1",
+            "restart-multi-2",
+            "restart-multi-does-not-exist",
+        ],
+    );
+    assert!(
+        !bad.status.success(),
+        "an unresolvable id among several should abort the whole call"
+    );
+    assert_eq!(
+        inspect_json(storage_dir.path(), "restart-multi-1")["pid"]
+            .as_i64()
+            .unwrap(),
+        first_pid,
+        "restart-multi-1 must be completely untouched by the aborted call"
+    );
+    assert_eq!(
+        inspect_json(storage_dir.path(), "restart-multi-2")["pid"]
+            .as_i64()
+            .unwrap(),
+        second_pid,
+        "restart-multi-2 must be completely untouched by the aborted call"
+    );
+
+    // Now with only the two real targets: both should genuinely
+    // restart.
+    let good = ociman(
+        storage_dir.path(),
+        &[
+            "restart",
+            "--time",
+            "1",
+            "restart-multi-1",
+            "restart-multi-2",
+        ],
+    );
+    assert!(
+        good.status.success(),
+        "{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            "restart-multi-1",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            "restart-multi-2",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+    assert_ne!(
+        inspect_json(storage_dir.path(), "restart-multi-1")["pid"]
+            .as_i64()
+            .unwrap(),
+        first_pid
+    );
+    assert_ne!(
+        inspect_json(storage_dir.path(), "restart-multi-2")["pid"]
+            .as_i64()
+            .unwrap(),
+        second_pid
+    );
+
+    ociman(storage_dir.path(), &["stop", "--time", "0", "-a"]);
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}

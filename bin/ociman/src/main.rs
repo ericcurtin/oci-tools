@@ -1535,18 +1535,27 @@ enum Command {
     /// exactly. A no-op-then-start for an already-stopped container
     /// (nothing to stop first).
     Restart {
-        /// The container's ID or `--name` — omit when using `--all`.
-        /// Mutually exclusive with `--all`, matching real `podman
-        /// restart`'s own identical rule.
-        id: Option<String>,
+        /// The container ID(s)/`--name`(s) — omit when using `--all`.
+        /// Real `podman restart id1 id2` (checked directly,
+        /// `~/git/podman/pkg/domain/infra/abi/containers.go`'s own
+        /// `getContainers` default case) resolves *every* given
+        /// identifier first: an unresolvable one aborts the whole call
+        /// before anything is restarted, the same convention `ociman
+        /// rm`'s own multi-target resolve loop already established.
+        /// Once every given id has resolved, though, each one is still
+        /// genuinely attempted regardless of an earlier one's own
+        /// restart failure (0316) — matching real podman's own
+        /// identical "resolve eagerly, then attempt every one
+        /// tolerantly" two-phase behavior exactly.
+        ids: Vec<String>,
         /// Seconds to wait after the initial signal before escalating
         /// to `KILL`, if the container is currently running (same
         /// meaning, precedence, and fallback as `ociman stop --time`
         /// -- see [`resolve_stop_timeout`]'s own doc comment).
         #[arg(short, long)]
         time: Option<u64>,
-        /// Restart every real container instead of the one named on
-        /// the command line — matching real `podman restart --all`
+        /// Restart every real container instead of the one(s) named
+        /// on the command line — matching real `podman restart --all`
         /// exactly (checked directly, `~/git/podman/cmd/podman/
         /// containers/restart.go`, `pkg/domain/infra/abi/
         /// containers.go`'s own `ContainerRestart`/`getContainers`):
@@ -1557,6 +1566,17 @@ enum Command {
         /// genuinely paused container (0315).
         #[arg(short, long)]
         all: bool,
+        /// Read a container ID from `FILE` (repeatable) — matching
+        /// real `podman restart --cidfile` exactly (checked directly,
+        /// `~/git/podman/cmd/podman/containers/restart.go`): the
+        /// file's own first line only, merged into the same target
+        /// list an explicit `ID`/`--name` argument already builds.
+        /// Mutually exclusive with `--all`. Real `podman restart` has
+        /// no `--ignore` flag at all (unlike `rm`/`stop`) — a cidfile
+        /// that can't be read is always a hard error here, matching
+        /// that real, checked-directly absence exactly (0316).
+        #[arg(long = "cidfile", value_name = "FILE")]
+        cidfile: Vec<PathBuf>,
     },
     /// Remove one or more stopped containers' storage — matching real
     /// `podman rm <ID> [ID...]` exactly. Refuses a still-running one
@@ -2524,7 +2544,12 @@ fn main() -> std::process::ExitCode {
             ),
             Some(Command::Start { id, attach }) => cmd_start(&id, attach),
             Some(Command::Attach { id }) => cmd_attach(&id),
-            Some(Command::Restart { id, time, all }) => cmd_restart(id.as_deref(), time, all),
+            Some(Command::Restart {
+                ids,
+                time,
+                all,
+                cidfile,
+            }) => cmd_restart(&ids, time, all, &cidfile),
             Some(Command::Rm {
                 ids,
                 force,
@@ -8303,40 +8328,107 @@ fn attach_and_wait_for_exit(containers: &StateStore, resolved: &str) -> anyhow::
 /// "defer the background thread until no more forking can possibly
 /// happen in this process" reasoning, just widened from "the rest of
 /// this one call" to "the rest of this whole `--all` sweep".
-fn cmd_restart(id: Option<&str>, time_secs: Option<u64>, all: bool) -> anyhow::Result<()> {
+fn cmd_restart(
+    ids: &[String],
+    time_secs: Option<u64>,
+    all: bool,
+    cidfiles: &[PathBuf],
+) -> anyhow::Result<()> {
     anyhow::ensure!(
-        id.is_none() || !all,
+        cidfiles.is_empty() || !all,
+        "--all and --cidfile cannot be used together"
+    );
+    // Real podman's own exact semantics (`~/git/podman/cmd/podman/
+    // containers/restart.go`): the file's own first line only, merged
+    // into the same target list an explicit `ID`/`--name` argument
+    // already builds -- no distinction after this point. No
+    // `--ignore` exists for real `restart` at all, so an unreadable
+    // cidfile is always a hard error, unlike `rm`/`stop`'s own
+    // tolerant option.
+    let mut ids: Vec<String> = ids.to_vec();
+    for path in cidfiles {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --cidfile {}", path.display()))?;
+        ids.push(content.split('\n').next().unwrap_or("").to_string());
+    }
+
+    anyhow::ensure!(
+        ids.is_empty() || !all,
         "cannot give both a container ID/name and --all"
     );
+
     if all {
         let containers = open_container_store()?;
-        let mut first_error = None;
-        let mut deferred_scope_resets = Vec::new();
-        for state in containers.list().context("listing containers")? {
-            match restart_one(&state.id, time_secs, true) {
-                Ok(deferred) => deferred_scope_resets.extend(deferred),
-                Err(e) => {
-                    eprintln!("error restarting {}: {e:#}", state.id);
-                    first_error.get_or_insert(e);
-                }
+        let targets: Vec<String> = containers
+            .list()
+            .context("listing containers")?
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        return restart_many(&targets, time_secs);
+    }
+
+    anyhow::ensure!(
+        !ids.is_empty(),
+        "no container ID/name given (try `ociman restart <ID>` or `--all`)"
+    );
+
+    // The overwhelmingly common case -- exactly one target, no
+    // `--all`/`--cidfile` -- keeps the original, simplest possible
+    // path: no deferred-scope-reset bookkeeping is needed at all when
+    // there is no second container's own `fork()` this process could
+    // ever race against.
+    if let [id] = ids.as_slice() {
+        restart_one(id, time_secs, false)?;
+        return Ok(());
+    }
+
+    // Two or more explicit targets: resolve every one first, aborting
+    // the whole call before restarting anything if any of them don't
+    // exist at all -- matching real podman's own identical two-phase
+    // behavior for a plain multi-id `restart` (checked directly,
+    // `getContainers`'s own `default` case: a `LookupContainer`
+    // failure on any one name aborts immediately, before ever
+    // attempting `RestartWithTimeout` on any of them).
+    let containers = open_container_store()?;
+    let mut resolved_ids = Vec::with_capacity(ids.len());
+    for id in &ids {
+        resolved_ids.push(resolve_container_id(&containers, id)?);
+    }
+    restart_many(&resolved_ids, time_secs)
+}
+
+/// Restart every one of `ids` (already-resolved), attempting every
+/// one regardless of an earlier failure and reporting the first real
+/// error at the end — shared by both `--all` and an explicit multi-id/
+/// `--cidfile` call (0316), both of which need the identical
+/// deferred-scope-reset handling `cmd_restart`'s own `--all` doc
+/// comment (0315) already explains: more than one real restart in the
+/// same process means more than one `fork()`, and [`restart_one`]'s
+/// own old-scope cleanup thread must never still be alive for the
+/// *next* one.
+fn restart_many(ids: &[String], time_secs: Option<u64>) -> anyhow::Result<()> {
+    let mut first_error = None;
+    let mut deferred_scope_resets = Vec::new();
+    for id in ids {
+        match restart_one(id, time_secs, true) {
+            Ok(deferred) => deferred_scope_resets.extend(deferred),
+            Err(e) => {
+                eprintln!("error restarting {id}: {e:#}");
+                first_error.get_or_insert(e);
             }
         }
-        // Only now, with every container's own `fork()` already done,
-        // is it safe to let these background threads run -- see this
-        // function's own doc comment above.
-        for (resolved, old_state) in deferred_scope_resets {
-            reset_failed_systemd_scope(&resolved, &old_state);
-        }
-        return match first_error {
-            Some(e) => Err(e.context("restarting containers")),
-            None => Ok(()),
-        };
     }
-    let id = id.ok_or_else(|| {
-        anyhow::anyhow!("no container ID/name given (try `ociman restart <ID>` or `--all`)")
-    })?;
-    restart_one(id, time_secs, false)?;
-    Ok(())
+    // Only now, with every container's own `fork()` already done, is
+    // it safe to let these background threads run -- see
+    // `cmd_restart`'s own `--all` doc comment (0315) for why.
+    for (resolved, old_state) in deferred_scope_resets {
+        reset_failed_systemd_scope(&resolved, &old_state);
+    }
+    match first_error {
+        Some(e) => Err(e.context("restarting containers")),
+        None => Ok(()),
+    }
 }
 
 /// The actual single-container restart logic, factored out of
