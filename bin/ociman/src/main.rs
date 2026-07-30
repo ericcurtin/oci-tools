@@ -8070,25 +8070,30 @@ fn stop_container(
         wait_for_keeper_to_finalize(&containers, &resolved);
         return Ok(());
     }
-    // A frozen cgroup *queues* a delivered signal rather than actually
-    // running it until thawed (confirmed directly against real
-    // runc's own `signalInit`, `docs/design/0312`'s own discovered,
-    // at-the-time-deferred gap) -- attempting the signal-then-
-    // escalate dance below against a `Paused` container would
-    // therefore silently hang for this call's own entire grace-plus-
-    // escalation window and then report a false success, the
-    // container never actually having stopped at all. Matches real
-    // podman's own identical real refusal here too (checked directly:
-    // both `podman stop`/`podman restart` on a genuinely paused
-    // container are a real, immediate, `container state improper`
-    // error -- `libpod/container_internal.go`'s own `stopInternal`
-    // deliberately excludes `ContainerStatePaused` from its own
-    // allowed-to-attempt state set), rather than this project's own
-    // previous silent hang-then-false-success.
-    anyhow::ensure!(
-        display_status(&state) != Status::Paused,
-        "container {id:?} is paused; unpause it first"
-    );
+    // Unlike real podman's own `stop`/`restart` (`libpod/container_
+    // internal.go`'s own `stopInternal` deliberately excludes
+    // `ContainerStatePaused` from its own allowed-to-attempt state set
+    // entirely, refusing outright rather than ever attempting it —
+    // checked directly, and empirically: both `podman stop`/`podman
+    // restart` on a genuinely paused container are a real, immediate
+    // `container state improper` error), this project's own `stop`
+    // (and, since `cmd_restart` shares this same function unchanged,
+    // `restart` too) *does* genuinely succeed against a paused
+    // container (0324, closing the single most-repeated "still ahead"
+    // item across six consecutive design notes, 0313/0315-0320): every
+    // signal send below goes through [`oci_runtime_core::cgroups::
+    // kill_thawing_if_paused`] (the same real primitive `kill` itself
+    // already uses, 0319) rather than a plain `process::kill`, so the
+    // container's own cgroup is thawed the moment the very first
+    // signal is actually sent — before this fix, this project's own
+    // stop used to silently hang for the *entire* grace-plus-
+    // escalation window against a still-frozen cgroup (a signal a
+    // frozen cgroup's own freezer only ever *queues*, never delivers,
+    // until thawed) and then falsely report success, the container
+    // never having actually stopped at all; that silent-false-success
+    // bug is what this fix genuinely closes, not merely a cosmetic
+    // improvement over real podman's own equally real, immediate
+    // refusal.
     let pid = state
         .pid
         .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
@@ -8114,7 +8119,8 @@ fn stop_container(
             return Err(e).with_context(|| format!("parsing signal {resolved_signal:?}"));
         }
     };
-    let _ = oci_runtime_core::process::kill(pid, sig);
+    let _ =
+        oci_runtime_core::cgroups::kill_thawing_if_paused(Path::new("/sys/fs/cgroup"), pid, sig);
 
     // Re-send the same signal a few more times, early on — a real,
     // genuinely observed race (not hypothetical: see `docs/design/
@@ -8150,7 +8156,11 @@ fn stop_container(
                 }
                 return Ok(());
             }
-            let _ = oci_runtime_core::process::kill(pid, sig);
+            let _ = oci_runtime_core::cgroups::kill_thawing_if_paused(
+                Path::new("/sys/fs/cgroup"),
+                pid,
+                sig,
+            );
         }
     }
 
@@ -8173,7 +8183,11 @@ fn stop_container(
     // `ocirun kill`'s own SIGTERM-is-ignorable-by-a-pid-namespace-init
     // finding (0017) already established elsewhere in this project.
     let sigkill = oci_runtime_core::signal::parse("KILL").expect("KILL is always valid");
-    let _ = oci_runtime_core::process::kill(pid, sigkill);
+    let _ = oci_runtime_core::cgroups::kill_thawing_if_paused(
+        Path::new("/sys/fs/cgroup"),
+        pid,
+        sigkill,
+    );
     for _ in 0..50 {
         if !oci_runtime_core::process::alive(pid) {
             break;

@@ -837,20 +837,21 @@ fn stop_all_with_no_containers_at_all_succeeds_as_a_no_op() {
     assert!(out.stdout.is_empty());
 }
 
-/// A real, previously-latent bug closed alongside 0313 (unrelated to
-/// `--all` itself, but directly surfaced by deciding what `--all`
-/// should do with a genuinely paused container): `stop`/`restart` on
-/// a paused container must be a real, immediate error (matching real
-/// podman's own identical refusal, checked directly: both `podman
-/// stop`/`podman restart` on a paused container are a real error, not
-/// a silent no-op), never the previous silent hang-through-the-full-
-/// timeout-then-false-success this project used to give it -- a
-/// frozen cgroup queues rather than delivers a signal until thawed
-/// (`docs/design/0312`'s own discovered, at-the-time-deferred gap),
-/// so blindly attempting the signal-then-escalate dance against one
-/// would have looked like it worked while doing nothing at all.
+/// `stop` on a genuinely paused container now really works (0324,
+/// closing the single most-repeated "still ahead" item across six
+/// consecutive design notes, 0313/0315-0320): unlike real podman's
+/// own `stop`/`restart`, which both deliberately refuse a paused
+/// container outright (`libpod/container_internal.go`'s own
+/// `stopInternal` excludes `ContainerStatePaused` from its own
+/// allowed-to-attempt state set entirely — checked directly, and
+/// confirmed empirically: both real `podman stop`/`podman restart` on
+/// a paused container are a real, immediate error), this project's
+/// own `stop` genuinely thaws the container as part of delivering its
+/// first signal (the same real primitive `kill` itself already uses,
+/// 0319) and then proceeds exactly as it would for any other running
+/// container — no `unpause` step required first.
 #[test]
-fn stop_and_restart_on_a_paused_container_are_a_real_immediate_error() {
+fn stop_on_a_paused_container_genuinely_thaws_and_stops_it() {
     let Some(busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");
         return;
@@ -883,44 +884,105 @@ fn stop_and_restart_on_a_paused_container_are_a_real_immediate_error() {
         "stderr: {}",
         String::from_utf8_lossy(&pause.stderr)
     );
-
-    let before = Instant::now();
-    let stop = ociman(storage_dir.path(), &["stop", "--time", "1", &id]);
-    let elapsed = before.elapsed();
-    assert!(
-        !stop.status.success(),
-        "stop on a paused container must be a real error, not a silent success"
-    );
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "must fail immediately, not hang through the grace/escalation window: took {elapsed:?}"
-    );
-
-    let restart = ociman(storage_dir.path(), &["restart", "--time", "1", &id]);
-    assert!(
-        !restart.status.success(),
-        "restart on a paused container must be a real error, not a silent success"
-    );
-
-    // Still genuinely paused -- neither the failed `stop` nor the
-    // failed `restart` should have touched it at all.
     assert_eq!(
-        wait_for_container_status(
-            storage_dir.path(),
-            &id,
-            "paused",
-            Duration::from_millis(200)
-        ),
+        wait_for_container_status(storage_dir.path(), &id, "paused", Duration::from_secs(5)),
         "paused"
     );
 
-    let unpause = ociman(storage_dir.path(), &["unpause", &id]);
-    assert!(unpause.status.success());
-    let real_stop = ociman(storage_dir.path(), &["stop", "--time", "1", &id]);
-    assert!(real_stop.status.success());
+    // No `unpause` here at all -- `stop` itself must make the signal
+    // actually take effect on a still-frozen container.
+    let stop = ociman(storage_dir.path(), &["stop", "--time", "1", &id]);
+    assert!(
+        stop.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+
     run.wait().unwrap();
-    wait_for_container_status(storage_dir.path(), &id, "stopped", Duration::from_secs(20));
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "stopped", Duration::from_secs(20)),
+        "stopped",
+        "stop on a paused container must actually terminate it, not silently leave it alive \
+         and frozen forever"
+    );
+
     ociman(storage_dir.path(), &["rm", &id]);
+}
+
+/// `restart` on a genuinely paused container also now really works
+/// (0324): `cmd_restart` shares `stop_container` unchanged, so this
+/// fix applies to both with no `restart`-specific code at all.
+#[test]
+fn restart_on_a_paused_container_genuinely_thaws_and_restarts_it() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/restart-paused:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "-d",
+            "ociman-test/restart-paused:latest",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+    let first_pid = ociman(storage_dir.path(), &["inspect", &id, "--json"]);
+    let first_pid: serde_json::Value = serde_json::from_slice(&first_pid.stdout).unwrap();
+    let first_pid = first_pid["pid"].as_i64().expect("a real pid");
+
+    let pause = ociman(storage_dir.path(), &["pause", &id]);
+    assert!(pause.status.success());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "paused", Duration::from_secs(5)),
+        "paused"
+    );
+
+    // No `unpause` here at all either.
+    let restart = ociman(storage_dir.path(), &["restart", "--time", "1", &id]);
+    assert!(
+        restart.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running",
+        "restart on a paused container must leave it genuinely running again"
+    );
+    let second_pid = ociman(storage_dir.path(), &["inspect", &id, "--json"]);
+    let second_pid: serde_json::Value = serde_json::from_slice(&second_pid.stdout).unwrap();
+    let second_pid = second_pid["pid"].as_i64().expect("a real pid");
+    assert_ne!(
+        first_pid, second_pid,
+        "restart should have replaced the container's own process with a new one"
+    );
+
+    ociman(storage_dir.path(), &["stop", "--time", "0", &id]);
+    ociman(storage_dir.path(), &["rm", "-f", &id]);
 }
 
 /// Multiple explicit ids (0318, a real, previously-unsupported gap:

@@ -933,13 +933,16 @@ fn restart_all_with_an_explicit_id_is_a_clear_error() {
     assert!(!out.status.success());
 }
 
-/// A genuinely paused container is a real, reported error under
-/// `--all` too (matching real podman's own identical refusal,
-/// `ociman_stop.rs`'s own `stop_and_restart_on_a_paused_container_
-/// are_a_real_immediate_error` for the single-target case) -- every
-/// other container is still attempted regardless.
+/// A genuinely paused container in the mix is now genuinely restarted
+/// by `--all` too (0324, closing the most-repeated "still ahead" item
+/// across six consecutive design notes) -- `cmd_restart` shares
+/// `stop_container` unchanged, so the same real thaw-then-signal fix
+/// `ociman_stop.rs`'s own `stop_on_a_paused_container_genuinely_
+/// thaws_and_stops_it`/`restart_on_a_paused_container_genuinely_
+/// thaws_and_restarts_it` cover for the single-target case applies
+/// here too, with no `--all`-specific code of its own.
 #[test]
-fn restart_all_reports_a_real_error_for_a_paused_container_but_still_restarts_the_rest() {
+fn restart_all_genuinely_restarts_a_paused_container_too() {
     let Some(busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");
         return;
@@ -1005,39 +1008,62 @@ fn restart_all_reports_a_real_error_for_a_paused_container_but_still_restarts_th
         ),
         "running"
     );
+    let paused_pid_before = inspect_json(storage_dir.path(), "restart-all-paused-paused1")["pid"]
+        .as_i64()
+        .expect("a real pid");
+
     let pause = ociman(storage_dir.path(), &["pause", "restart-all-paused-paused1"]);
     assert!(pause.status.success());
-
-    let restart_all = ociman(storage_dir.path(), &["restart", "--time", "1", "--all"]);
-    assert!(
-        !restart_all.status.success(),
-        "a genuinely paused container in the mix should still surface a real error"
-    );
-
-    // The other, non-paused container should still have been
-    // restarted successfully regardless of the paused one's failure.
-    let first_pid_view = inspect_json(storage_dir.path(), "restart-all-paused-run1");
-    assert_eq!(
-        first_pid_view["status"].as_str(),
-        Some("running"),
-        "the non-paused container should still be restarted despite the paused one's failure"
-    );
-
-    // The paused container itself should be completely untouched.
     assert_eq!(
         wait_for_status(
             storage_dir.path(),
             "restart-all-paused-paused1",
             "paused",
-            Duration::from_millis(200)
+            Duration::from_secs(5)
         ),
         "paused"
     );
 
-    ociman(
-        storage_dir.path(),
-        &["unpause", "restart-all-paused-paused1"],
+    let restart_all = ociman(storage_dir.path(), &["restart", "--time", "1", "--all"]);
+    assert!(
+        restart_all.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&restart_all.stderr)
     );
+
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            "restart-all-paused-run1",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running",
+        "the non-paused container should still be restarted"
+    );
+
+    // The previously-paused container should now be genuinely
+    // running again, with a real, different pid -- not stuck paused,
+    // and not merely reporting success without actually restarting.
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            "restart-all-paused-paused1",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running",
+        "restart --all must genuinely restart a container that was paused too"
+    );
+    let paused_pid_after = inspect_json(storage_dir.path(), "restart-all-paused-paused1")["pid"]
+        .as_i64()
+        .expect("a real pid");
+    assert_ne!(
+        paused_pid_before, paused_pid_after,
+        "restart should have replaced the previously-paused container's own process with a new \
+         one"
+    );
+
     ociman(storage_dir.path(), &["stop", "--time", "0", "-a"]);
     ociman(storage_dir.path(), &["rm", "-a", "-f"]);
 }
