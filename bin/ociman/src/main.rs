@@ -2337,7 +2337,21 @@ enum Command {
     /// process to report on at all — see `cmd_info`'s own doc comment
     /// for exactly which fields this reports and why, and what it
     /// deliberately doesn't yet.
-    Info,
+    Info {
+        /// Render a single field via a Go-template-*lite* string
+        /// (`--format`, matching real `podman info --format`/`docker
+        /// info --format`) — same engine and scope as `ociman
+        /// inspect`/`ps`/`images`/`volume ls --format` (`0332`-
+        /// `0335`): `{{.field}}`/`{{.nested.field}}` placeholders
+        /// only, no pipelines/functions/control flow, field names
+        /// this project's own JSON output field names directly
+        /// (`{{.host.hostname}}`, `{{.store.images}}`,
+        /// `{{.version.version}}`, ...). Takes priority over
+        /// `--json`/the default plain-text report when given; an
+        /// unresolvable field path is a real, immediate error.
+        #[arg(long = "format", value_name = "TEMPLATE")]
+        format: Option<String>,
+    },
 }
 
 /// `ociman healthcheck`'s own subcommands — matching real `podman
@@ -2819,7 +2833,7 @@ fn main() -> std::process::ExitCode {
                 cli.global.json,
             ),
             Some(Command::Version) => cmd_version(cli.global.json),
-            Some(Command::Info) => cmd_info(cli.global.json),
+            Some(Command::Info { format }) => cmd_info(cli.global.json, format.as_deref()),
         }
     })
 }
@@ -3421,7 +3435,7 @@ struct InfoReport {
 /// `key: value` listing (not real podman's own full YAML rendering of
 /// its much larger, deeply nested report) grouped under the same
 /// three section headers as `--json`.
-fn cmd_info(json: bool) -> anyhow::Result<()> {
+fn cmd_info(json: bool, format: Option<&str>) -> anyhow::Result<()> {
     let uname = rustix::system::uname();
     let sysinfo = rustix::system::sysinfo();
     let platform = Platform::host();
@@ -3453,6 +3467,11 @@ fn cmd_info(json: bool) -> anyhow::Result<()> {
         version: version_report(),
     };
 
+    if let Some(template) = format {
+        let json_value = serde_json::to_value(&report)?;
+        println!("{}", render_format_template(template, &json_value)?);
+        return Ok(());
+    }
     if json {
         oci_cli_common::output::print_json(&report)?;
         return Ok(());

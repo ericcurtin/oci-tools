@@ -124,3 +124,71 @@ fn info_container_and_image_counts_reflect_real_current_storage_state() {
     assert_eq!(after_view["store"]["images"], 1);
     assert_eq!(after_view["store"]["containers"], 1);
 }
+
+/// `info --format` (0337) renders a single (possibly nested) field
+/// with no surrounding JSON quoting -- reusing the exact same
+/// Go-template-*lite* engine `ociman inspect`/`ps`/`images`/`volume
+/// ls --format` (`0332`-`0335`) already established.
+#[test]
+fn info_format_renders_a_nested_field() {
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let format = ociman(
+        storage_dir.path(),
+        &["info", "--format", "{{.version.version}}"],
+    );
+    assert!(
+        format.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&format.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&format.stdout).trim(),
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+/// Multiple placeholders (from different top-level sections) mixed
+/// with literal text all get substituted, and `--format` takes
+/// priority over `--json`/the default plain-text report when both are
+/// given -- same precedence `inspect`/`ps`/`images`/`volume ls
+/// --format` already established.
+#[test]
+fn info_format_supports_multiple_placeholders_and_takes_priority_over_json() {
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let format = ociman(
+        storage_dir.path(),
+        &[
+            "info",
+            "--json",
+            "--format",
+            "images={{.store.images}} containers={{.store.containers}}",
+        ],
+    );
+    assert!(format.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&format.stdout).trim(),
+        "images=0 containers=0",
+        "the format template's own plain output, not --json's own object, should have won"
+    );
+}
+
+/// An unresolvable field path is a real, immediate error, matching
+/// real Go templates' own "can't evaluate field" failure for a typo'd
+/// field name rather than a silent empty string.
+#[test]
+fn info_format_of_an_unknown_field_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let bad = ociman(
+        storage_dir.path(),
+        &["info", "--format", "{{.nosuchfield}}"],
+    );
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("no field"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
