@@ -7,7 +7,7 @@ performance-sensitive change has been measured directly against a real
 installed `crun`/`runc`/`podman`/`docker`, by hand, with `hyperfine` —
 see the many `docs/design/NNNN-performance-reverification-N.md` notes
 (0018, 0105, 0113, 0120, 0139, 0150, 0161, 0170, 0176, 0183, 0221, 0245,
-0288, 0314, 0331, 0360) for the full, individual, dated results.
+0288, 0314, 0331, 0360, 0372) for the full, individual, dated results.
 
 `ci/bench.sh` consolidates that same, previously ad hoc (re-typed by
 hand each time) methodology into one reusable, runnable script:
@@ -95,28 +95,28 @@ it just stops it from failing outright on `crun`.
 
 ## Representative historical results
 
-From `docs/design/0360` (the most recent full re-verification as of
+From `docs/design/0372` (the most recent full re-verification as of
 this writing), this project's own aarch64 dev host, `crun 1.14.1`/
 `runc 1.3.4`/`podman 4.9.3`/`docker 29.2.1`:
 
 | comparison | this project | real equivalent | speedup |
 |---|---:|---:|---:|
-| `ocirun run` vs `crun run` | 3.0ms | 6.5ms | 2.18× |
-| `ocirun run` vs `runc run` | 3.0ms | 21.6ms | 7.22× |
-| `ocirun exec` vs `crun exec` (`0279`) | 2.0ms | 3.6ms | 1.79× |
-| `ocirun exec` vs `runc exec` (`0279`) | 2.0ms | 18.9ms | 9.33× |
-| `ociman exec` vs `podman exec` (`0279`) | 2.8ms | 140.2ms | 49.83× |
-| `ociman exec` vs `docker exec` (`0279`) | 2.8ms | 46.8ms | 16.62× |
-| `ociman run --rm` vs `podman run --rm` | 32.3ms | 188.1ms | 5.83× |
-| `ociman run --rm` vs `docker run --rm` | 32.3ms | 285.5ms | 8.85× |
-| `ociman run -d` vs `podman run -d` | 37.6ms | 134.2ms | 3.57× |
-| `ociman run -d` vs `docker run -d` | 37.6ms | 172.8ms | 4.60× |
-| `ociman rm` (destroy-only) vs `podman rm` | 1.7ms | 67.0ms | 39.58× |
-| `ociman commit` vs `podman commit` | 3.5ms | 99.2ms | 28.57× |
-| `ociman build --no-cache` vs `podman build --no-cache` | 67.6ms | 1341ms | 19.85× |
-| `ociman build --no-cache` vs `docker build --no-cache` | 67.6ms | 1129ms | 16.71× |
-| `ociman build` (cached) vs `podman build` (cached) | 8.5ms | 171.9ms | 20.25× |
-| `ociman build` (cached) vs `docker build` (cached) | 8.5ms | 241.2ms | 28.41× |
+| `ocirun run` vs `crun run` | 3.1ms | 7.0ms | 2.24× |
+| `ocirun run` vs `runc run` | 3.1ms | 20.9ms | 6.67× |
+| `ocirun exec` vs `crun exec` (`0279`) | 1.9ms | 3.1ms | 1.60× |
+| `ocirun exec` vs `runc exec` (`0279`) | 1.9ms | 18.7ms | 9.82× |
+| `ociman exec` vs `podman exec` (`0279`) | 2.8ms | 143.7ms | 50.62× |
+| `ociman exec` vs `docker exec` (`0279`) | 2.8ms | 44.2ms | 15.58× |
+| `ociman run --rm` vs `podman run --rm` | 32.7ms | 188.7ms | 5.78× |
+| `ociman run --rm` vs `docker run --rm` | 32.7ms | 294.0ms | 9.00× |
+| `ociman run -d` vs `podman run -d` | 32.8ms | 140.6ms | 4.29× |
+| `ociman run -d` vs `docker run -d` | 32.8ms | 174.8ms | 5.33× |
+| `ociman rm` (destroy-only) vs `podman rm` | 1.7ms | 71.7ms | 42.45× |
+| `ociman commit` vs `podman commit` | 3.4ms | 103.8ms | 30.16× |
+| `ociman build --no-cache` vs `podman build --no-cache` | 62.6ms | 1347ms | 21.52× |
+| `ociman build --no-cache` vs `docker build --no-cache` | 62.6ms | 1152ms | 18.41× |
+| `ociman build` (cached) vs `podman build` (cached) | 8.2ms | 181.6ms | 22.23× |
+| `ociman build` (cached) vs `docker build` (cached) | 8.2ms | 243.2ms | 29.77× |
 
 Absolute numbers vary session to session (host load, exact tool
 versions) and will differ on any other host entirely — the relative
@@ -124,9 +124,11 @@ gap holding steady release after release, re-verified repeatedly
 rather than assumed to still be true forever, is the actual point.
 Reconfirmed at every single increment since 0219 (each commit message
 carries its own `ci/bench.sh` figures), most recently and formally in
-`docs/design/0360` (spanning 0332-0359, twenty-eight increments since
-`0331`, none a hot-path rewrite) — every figure above still a
-decisive win, sessions varying with host load, never a real
+`docs/design/0372` (spanning 0361-0371, eleven increments since
+`0360`, two of which — `0363`/`0370` — got their own individual
+targeted re-runs at the time for genuinely touching a hot path) —
+every figure above still a decisive win, sessions varying with host
+load, never a real
 regression.
 
 ## What this doesn't cover yet
