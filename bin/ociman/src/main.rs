@@ -1301,20 +1301,24 @@ enum Command {
         #[arg(long = "format", value_name = "TEMPLATE")]
         format: Option<String>,
     },
-    /// Reclaim disk space no longer needed: any dangling (untagged,
-    /// `docs/design/0179`) image not currently used by any container,
-    /// unreferenced blobs (`Store::gc`'s own real mark-and-sweep,
-    /// already implemented but never wired to any command before this
-    /// one), and rootfs-cache entries (`docs/design/0109`) for a
-    /// manifest digest no image reference resolves to anymore. Matches
-    /// real `docker system prune`/`podman system prune`'s own default
-    /// exactly (checked directly, not assumed — both real tools'
-    /// `-a`/`--all` help text says "not just dangling ones", and a
-    /// real dangling image was confirmed removed by each, with no
-    /// `--all`, by testing directly) — never run implicitly by
-    /// `rmi`/`rm`, which would tax every ordinary removal with a full
-    /// reachability scan for a benefit only worth paying for
-    /// occasionally.
+    /// Reclaim disk space no longer needed: every `Created`/`Stopped`
+    /// container (unconditionally, regardless of `--all` — see
+    /// [`prune_eligible_containers`]'s own doc comment), any dangling
+    /// (untagged, `docs/design/0179`) image not currently used by any
+    /// remaining container, unreferenced blobs (`Store::gc`'s own real
+    /// mark-and-sweep, already implemented but never wired to any
+    /// command before this one), and rootfs-cache entries
+    /// (`docs/design/0109`) for a manifest digest no image reference
+    /// resolves to anymore. Matches real `docker system prune`/
+    /// `podman system prune`'s own default exactly (checked directly,
+    /// not assumed — both real tools' own `-a`/`--all` help text says
+    /// "not just dangling ones" for *images* specifically, and a real
+    /// dangling image *and* a real stopped container were each
+    /// confirmed removed by a real installed `podman system prune -f`,
+    /// with no `--all` at all, by testing directly) — never run
+    /// implicitly by `rmi`/`rm`, which would tax every ordinary
+    /// removal with a full reachability scan for a benefit only worth
+    /// paying for occasionally.
     Prune {
         /// Also remove every *tagged* image not currently used by any
         /// container (running or stopped) — matching real `docker
@@ -4552,10 +4556,11 @@ fn cmd_history(reference_str: &str, json: bool, format: Option<&str>) -> anyhow:
 /// reclamation pass this command runs, reported separately (never
 /// summed into one opaque total) since they reclaim genuinely
 /// different kinds of on-disk state for different reasons.
-/// `images_removed` is always present but only ever non-empty with
-/// `--all` (without it, this pass never runs at all).
+/// `containers_removed`/`images_removed` are always present but may
+/// be empty (an empty-store `ociman prune` reclaims nothing at all).
 #[derive(Debug, Serialize)]
 struct PruneResult {
+    containers_removed: Vec<String>,
     images_removed: Vec<String>,
     blobs_removed: usize,
     blobs_reclaimed_bytes: u64,
@@ -5194,6 +5199,21 @@ fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
     // actually reclaim them.
     let dangling_only = filters.dangling.unwrap_or(!all);
     let containers = open_container_store()?;
+
+    // Every `Created`/`Stopped` container is reclaimed too, matching
+    // real `podman system prune`'s own checked-directly default
+    // exactly (a real installed `podman system prune -f`, no `--all`,
+    // removes a real stopped container unconditionally — see
+    // `prune_eligible_containers`'s own doc comment). Runs *before*
+    // `images_in_use_digests` below so an image only a container just
+    // removed here still referenced becomes eligible for the very
+    // same image-removal pass, rather than needing a second `ociman
+    // prune` invocation to actually reclaim it — the same real,
+    // checked-directly ordering `~/git/podman/pkg/domain/infra/abi/
+    // system.go`'s own `SystemPrune` uses (containers pruned strictly
+    // before images).
+    let containers_removed = prune_eligible_containers(&containers)?;
+
     let in_use_digests = images_in_use_digests(&store, &containers)?;
     let mut images_removed = Vec::new();
     for record in store.list_images().context("listing images")? {
@@ -5251,6 +5271,7 @@ fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
 
     if json {
         oci_cli_common::output::print_json(&PruneResult {
+            containers_removed,
             images_removed,
             blobs_removed: blob_report.removed.len(),
             blobs_reclaimed_bytes: blob_report.reclaimed_bytes,
@@ -5260,6 +5281,11 @@ fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
             build_scratch_reclaimed_bytes,
         })?;
     } else {
+        println!(
+            "containers: removed {} ({})",
+            containers_removed.len(),
+            containers_removed.join(", ")
+        );
         println!(
             "images: removed {} ({})",
             images_removed.len(),
@@ -7059,14 +7085,7 @@ fn cmd_container_exists(name: &str) -> anyhow::Result<()> {
 /// anything real for, by actually signaling a live process).
 fn cmd_container_prune(json: bool) -> anyhow::Result<()> {
     let containers = open_container_store()?;
-    let mut removed = Vec::new();
-    for state in containers.list().context("listing containers")? {
-        if matches!(state.effective_status(), Status::Created | Status::Stopped) {
-            remove_container(&containers, &state.id, true, None)
-                .with_context(|| format!("removing container {}", state.id))?;
-            removed.push(state.id);
-        }
-    }
+    let removed = prune_eligible_containers(&containers)?;
     if json {
         oci_cli_common::output::print_json(&removed)?;
     } else {
@@ -7075,6 +7094,28 @@ fn cmd_container_prune(json: bool) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The actual removal pass shared by [`cmd_container_prune`]
+/// (`ociman container prune`) and [`cmd_prune`] (`ociman prune`, real
+/// `podman system prune`'s own equivalent — checked directly against
+/// a real installed `podman system prune -f`, which removes a
+/// stopped container with *no* `--all` needed at all, unconditionally,
+/// unlike this project's own image-removal pass's `--all`-gated
+/// scope): every `Created`/`Stopped` container is removed, `Running`/
+/// `Paused` ones are always left untouched. See
+/// [`ContainerCommand::Prune`]'s own doc comment for the exact real,
+/// checked-directly eligibility filter this ports.
+fn prune_eligible_containers(containers: &StateStore) -> anyhow::Result<Vec<String>> {
+    let mut removed = Vec::new();
+    for state in containers.list().context("listing containers")? {
+        if matches!(state.effective_status(), Status::Created | Status::Stopped) {
+            remove_container(containers, &state.id, true, None)
+                .with_context(|| format!("removing container {}", state.id))?;
+            removed.push(state.id);
+        }
+    }
+    Ok(removed)
 }
 
 /// `ociman image exists` — resolves the same way every other
