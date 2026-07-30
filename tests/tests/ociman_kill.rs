@@ -434,3 +434,166 @@ fn kill_all_with_no_containers_at_all_succeeds_as_a_no_op() {
     );
     assert!(out.stdout.is_empty());
 }
+
+/// Multiple explicit ids (0317, a real, previously-unsupported gap:
+/// `ociman kill` only ever accepted exactly one target before this)
+/// each get signaled, and each one's own *raw* given name (not the
+/// resolved canonical id) is printed on success -- matching this
+/// command's own existing single-target convention, and real podman's
+/// own identical `RawInput`-over-`Id` printing rule.
+#[test]
+fn kill_with_multiple_explicit_ids_signals_each_and_prints_the_raw_name_given() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/kill-multi:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run1 = ociman_run_detached_named(
+        storage_dir.path(),
+        "kill-multi-run1",
+        "ociman-test/kill-multi:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let mut run2 = ociman_run_detached_named(
+        storage_dir.path(),
+        "kill-multi-run2",
+        "ociman-test/kill-multi:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-multi-run1",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-multi-run2",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let kill = ociman(
+        storage_dir.path(),
+        &["kill", "kill-multi-run1", "kill-multi-run2"],
+    );
+    assert!(
+        kill.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&kill.stderr)
+    );
+    let mut lines: Vec<String> = String::from_utf8_lossy(&kill.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    lines.sort();
+    assert_eq!(
+        lines,
+        vec!["kill-multi-run1", "kill-multi-run2"],
+        "kill should print each raw name given, not a resolved id"
+    );
+
+    run1.wait().unwrap();
+    run2.wait().unwrap();
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-multi-run1",
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-multi-run2",
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped"
+    );
+
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// An unresolvable id among several explicit targets aborts the whole
+/// call before signaling *any* of them, matching real podman's own
+/// identical two-phase behavior (checked directly, `getContainers`'s
+/// own `default` case: a `LookupContainer` failure on any one name
+/// aborts immediately).
+#[test]
+fn kill_with_one_nonexistent_id_among_several_aborts_before_signaling_any() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/kill-multi-bad:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run1 = ociman_run_detached_named(
+        storage_dir.path(),
+        "kill-multi-bad-run1",
+        "ociman-test/kill-multi-bad:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-multi-bad-run1",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let kill = ociman(
+        storage_dir.path(),
+        &[
+            "kill",
+            "kill-multi-bad-run1",
+            "kill-multi-bad-does-not-exist",
+        ],
+    );
+    assert!(
+        !kill.status.success(),
+        "an unresolvable id among several should abort the whole call"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-multi-bad-run1",
+            "running",
+            Duration::from_millis(200)
+        ),
+        "running",
+        "the real container must be completely untouched by the aborted call"
+    );
+
+    let real_kill = ociman(storage_dir.path(), &["kill", "kill-multi-bad-run1"]);
+    assert!(real_kill.status.success());
+    run1.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}

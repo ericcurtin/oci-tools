@@ -1832,11 +1832,21 @@ enum Command {
     /// container that isn't running (matches real podman: `con.Kill`
     /// on a non-running container returns `ErrCtrStateInvalid`).
     Kill {
-        /// The container's ID or `--name` — omit when using `--all`.
-        /// Mutually exclusive with `--all`, matching real `podman
-        /// kill`'s own identical rule (checked directly,
-        /// `~/git/podman/cmd/podman/containers/kill.go`).
-        id: Option<String>,
+        /// The container ID(s)/`--name`(s) — omit when using `--all`.
+        /// Real `podman kill id1 id2` (checked directly,
+        /// `~/git/podman/cmd/podman/containers/kill.go`'s own `Use:
+        /// "kill [options] CONTAINER [CONTAINER...]"`, and `pkg/
+        /// domain/infra/abi/containers.go`'s own `getContainers`
+        /// default case) resolves *every* given identifier first: an
+        /// unresolvable one aborts the whole call before signaling
+        /// anything, the same convention `ociman rm`'s own multi-
+        /// target resolve loop already established. Once every given
+        /// id has resolved, though, each one is still genuinely
+        /// attempted regardless of an earlier one's own signal-send
+        /// failure (0317) — matching real podman's own identical
+        /// "resolve eagerly, then attempt every one tolerantly" two-
+        /// phase behavior exactly. Mutually exclusive with `--all`.
+        ids: Vec<String>,
         /// Signal to send (name or number).
         #[arg(short, long, default_value = "KILL")]
         signal: String,
@@ -2588,7 +2598,7 @@ fn main() -> std::process::ExitCode {
                 signal,
                 all,
             }) => cmd_stop(id.as_deref(), time, signal.as_deref(), all),
-            Some(Command::Kill { id, signal, all }) => cmd_kill(id.as_deref(), &signal, all),
+            Some(Command::Kill { ids, signal, all }) => cmd_kill(&ids, &signal, all),
             Some(Command::Pause { id }) => cmd_pause(&id),
             Some(Command::Unpause { id }) => cmd_unpause(&id),
             Some(Command::Update {
@@ -8517,9 +8527,23 @@ fn restart_one(
 /// failure (a genuinely different problem than "just not live") still
 /// surfaces as a real error, with every other container still
 /// attempted.
-fn cmd_kill(id: Option<&str>, signal: &str, all: bool) -> anyhow::Result<()> {
+///
+/// Multiple explicit ids (0317, a real, previously-unsupported gap:
+/// `ociman kill` only ever accepted exactly one target before this,
+/// unlike real podman's own `kill [options] CONTAINER
+/// [CONTAINER...]`) resolve every one *first* -- an unresolvable one
+/// aborts the whole call before signaling anything at all, matching
+/// real podman's own identical two-phase behavior exactly (checked
+/// directly, `getContainers`'s own `default` case). Once every given
+/// id has resolved, though, each one is still genuinely attempted
+/// regardless of an earlier one's own signal-send failure, printing
+/// each one's own *raw* given string on success (matching this
+/// command's own existing single-target convention: `RawInput`, not
+/// the resolved canonical id, same as real podman's own CLI-level
+/// `fmt.Println(r.RawInput)`).
+fn cmd_kill(ids: &[String], signal: &str, all: bool) -> anyhow::Result<()> {
     anyhow::ensure!(
-        id.is_none() || !all,
+        ids.is_empty() || !all,
         "cannot give both a container ID/name and --all"
     );
     let sig = oci_runtime_core::signal::parse(signal)
@@ -8565,20 +8589,58 @@ fn cmd_kill(id: Option<&str>, signal: &str, all: bool) -> anyhow::Result<()> {
         };
     }
 
-    let id = id.ok_or_else(|| {
-        anyhow::anyhow!("no container ID/name given (try `ociman kill <ID>` or `--all`)")
-    })?;
-    let resolved = resolve_container_id(&containers, id)?;
-    let state = containers.load(&resolved)?;
+    anyhow::ensure!(
+        !ids.is_empty(),
+        "no container ID/name given (try `ociman kill <ID>` or `--all`)"
+    );
+
+    // The overwhelmingly common case -- exactly one target -- keeps
+    // the original, simplest possible path.
+    if let [id] = ids {
+        let resolved = resolve_container_id(&containers, id)?;
+        kill_one(&containers, &resolved, id, sig)?;
+        return Ok(());
+    }
+
+    // Two or more explicit targets: resolve every one first, aborting
+    // the whole call before signaling anything if any of them don't
+    // exist at all -- matching real podman's own identical two-phase
+    // behavior for a plain multi-id `kill` (checked directly,
+    // `getContainers`'s own `default` case).
+    let mut resolved_ids = Vec::with_capacity(ids.len());
+    for id in ids {
+        resolved_ids.push(resolve_container_id(&containers, id)?);
+    }
+
+    let mut first_error = None;
+    for (raw_id, resolved) in ids.iter().zip(resolved_ids.iter()) {
+        if let Err(e) = kill_one(&containers, resolved, raw_id, sig) {
+            eprintln!("error killing {raw_id}: {e:#}");
+            first_error.get_or_insert(e);
+        }
+    }
+    match first_error {
+        Some(e) => Err(e.context("killing containers")),
+        None => Ok(()),
+    }
+}
+
+/// The actual single-container kill logic (a container that isn't
+/// running is a real, surfaced error, see [`cmd_kill`]'s own doc
+/// comment) — factored out so both the single- and multi-target paths
+/// above share it, printing `raw_id` (the original given string, not
+/// `resolved`) on success to match this command's own existing
+/// single-target convention.
+fn kill_one(containers: &StateStore, resolved: &str, raw_id: &str, sig: i32) -> anyhow::Result<()> {
+    let state = containers.load(resolved)?;
     if state.effective_status() == Status::Stopped {
-        anyhow::bail!("container {id:?} is not running");
+        anyhow::bail!("container {raw_id:?} is not running");
     }
     let pid = state
         .pid
-        .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded pid"))?;
+        .ok_or_else(|| anyhow::anyhow!("container {raw_id:?} has no recorded pid"))?;
     oci_runtime_core::process::kill(pid, sig).context("sending signal")?;
-
-    println!("{id}");
+    println!("{raw_id}");
     Ok(())
 }
 
