@@ -1934,3 +1934,106 @@ fn rm_ignore_tolerates_an_unreadable_cidfile() {
     );
     assert!(out.stdout.is_empty());
 }
+
+/// `ociman ps --format` (0333) renders one line per listed container,
+/// reusing the exact same Go-template-*lite* engine `ociman inspect
+/// --format` (`0332`) already established.
+#[test]
+fn ps_format_renders_one_line_per_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-format:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    for name in ["fmt-one", "fmt-two"] {
+        let create = ociman(
+            storage_dir.path(),
+            &[
+                "create",
+                "--name",
+                name,
+                "ociman-test/ps-format:latest",
+                "true",
+            ],
+        );
+        assert!(create.status.success(), "{create:?}");
+    }
+
+    let ps = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--format", "{{.name}}={{.status}}"],
+    );
+    assert!(
+        ps.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ps.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&ps.stdout).into_owned();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines.contains(&"fmt-one=created"), "{lines:?}");
+    assert!(lines.contains(&"fmt-two=created"), "{lines:?}");
+}
+
+/// `--format`, when given, takes priority over `--quiet`/`--json` and
+/// the default table, matching real `podman ps`'s own identical
+/// precedence -- and an unresolvable field path is a real, immediate
+/// error, same as `inspect --format`.
+#[test]
+fn ps_format_takes_priority_and_errors_on_an_unknown_field() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-format-priority:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "fmt-priority",
+            "ociman-test/ps-format-priority:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let ps = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "-q", "--format", "{{.id}}"],
+    );
+    assert!(ps.status.success());
+    let id_only = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+    assert_eq!(
+        id_only.len(),
+        12,
+        "the format template's own plain id, not -q's own behavior, should have won: {id_only:?}"
+    );
+
+    let bad = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--format", "{{.nosuchfield}}"],
+    );
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("no field"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}

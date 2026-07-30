@@ -1503,6 +1503,22 @@ enum Command {
         /// `--json`, neither of which ever prints a header at all.
         #[arg(long)]
         noheading: bool,
+        /// Render one line per listed container via a Go-template-
+        /// *lite* string (`--format`, matching real `podman ps
+        /// --format`/`docker ps --format`'s own identical flag; no
+        /// `-f` short alias here — real podman's own `ps` has none
+        /// either, `-f` already being `--filter`'s own short form on
+        /// this specific command, unlike `inspect --format`, `0332`,
+        /// which has no `--filter` to collide with) — same engine and
+        /// scope as `inspect --format`: `{{.field}}`/
+        /// `{{.nested.field}}` placeholders only, no pipelines/
+        /// functions/control flow, field names this project's own
+        /// JSON output field names directly. Takes priority over
+        /// `--quiet`/`--json`/the default table when given (matching
+        /// real podman's own identical precedence); an unresolvable
+        /// field path is a real, immediate error.
+        #[arg(long = "format", value_name = "TEMPLATE")]
+        format: Option<String>,
     },
     /// Start an already-`Stopped` container again, reusing its own
     /// existing rootfs/config exactly as `run` originally left it —
@@ -2622,6 +2638,7 @@ fn main() -> std::process::ExitCode {
                 last,
                 no_trunc,
                 noheading,
+                format,
             }) => cmd_ps(
                 all,
                 quiet,
@@ -2630,6 +2647,7 @@ fn main() -> std::process::ExitCode {
                 last,
                 no_trunc,
                 noheading,
+                format.as_deref(),
             ),
             Some(Command::Start { id, attach }) => cmd_start(&id, attach),
             Some(Command::Attach { id }) => cmd_attach(&id),
@@ -6799,6 +6817,7 @@ fn earliest_referenced_creation(
         .map(|earliest| earliest.expect("references is non-empty when this is called"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_ps(
     all: bool,
     quiet: bool,
@@ -6807,6 +6826,7 @@ fn cmd_ps(
     last: i64,
     no_trunc: bool,
     noheading: bool,
+    format: Option<&str>,
 ) -> anyhow::Result<()> {
     let filters = parse_ps_filters(filter)?;
     let containers = open_container_store()?;
@@ -6960,6 +6980,13 @@ fn cmd_ps(
         }
     }
 
+    if let Some(template) = format {
+        for view in &views {
+            let json_value = serde_json::to_value(view)?;
+            println!("{}", render_format_template(template, &json_value)?);
+        }
+        return Ok(());
+    }
     if quiet {
         for view in &views {
             println!("{}", view.id);
