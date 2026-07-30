@@ -3208,15 +3208,20 @@ pub(crate) fn set_env_var(env: &mut Vec<String>, key: &str, value: &str) {
     }
 }
 
-/// Apply `-e`/`--env` overrides to `env` (an already-resolved process
-/// environment — an image's own default, or a bundle's already-loaded
-/// one for `exec`), matching real `docker run -e`/`podman run -e`
-/// exactly: `KEY=value` sets or replaces it; a bare `KEY` (no `=` at
-/// all) pulls the value from `ociman`'s own process environment,
-/// dropped entirely if unset there — the same bare-name convention
-/// `parse_build_args` already established for `--build-arg`, checked
-/// directly against real docker's own documented `-e`/`--env` behavior
-/// ("pass the value through from the local environment").
+/// Apply `-e`/`--env` (or a `--env-file`'s own already-line-split
+/// entries) to `env` (an already-resolved process environment — an
+/// image's own default, or a bundle's already-loaded one for `exec`),
+/// matching real `docker run -e`/`podman run -e` exactly: `KEY=value`
+/// sets or replaces it; a bare `KEY` (no `=` at all) pulls the value
+/// from `ociman`'s own process environment, dropped entirely if
+/// unset there — the same bare-name convention `parse_build_args`
+/// already established for `--build-arg`; a bare `KEY*` (a trailing
+/// `*`, no `=`) sets every currently-set process environment variable
+/// whose name starts with `KEY` — checked directly against real
+/// `~/git/podman/pkg/env/env.go`'s own `parseEnv` (shared, there, by
+/// `-e`/`--env`, `--env-file`, and `--build-arg-file`'s own `ParseFile`/
+/// `ParseSlice` callers alike): `strings.CutSuffix(name, "*")` then a
+/// linear `os.Environ()` scan for a matching prefix.
 ///
 /// Reuses [`set_env_var`]'s own "replace an already-present key in
 /// place, otherwise append" semantics rather than blindly appending a
@@ -3226,18 +3231,55 @@ pub(crate) fn set_env_var(env: &mut Vec<String>, key: &str, value: &str) {
 /// original (pre-override) value in effect for exactly the callers
 /// that actually call `getenv` — a real, meaningful difference, not a
 /// cosmetic one, checked directly against `man 3 getenv`'s own
-/// documented linear-scan behavior.
+/// documented linear-scan behavior. Calling this once per
+/// `--env-file` (in the order given), then once more for `-e`/`--env`
+/// (always last), reproduces real podman's own exact fold order
+/// without needing any separate accumulator of its own — later calls'
+/// `set_env_var` in-place replacement already gives each subsequent
+/// source the final say for a shared key.
 pub(crate) fn apply_env_overrides(env: &mut Vec<String>, overrides: &[String]) {
     for over in overrides {
         match over.split_once('=') {
             Some((key, value)) => set_env_var(env, key, value),
-            None => {
-                if let Ok(value) = std::env::var(over) {
-                    set_env_var(env, over, &value);
+            None => match over.strip_suffix('*') {
+                Some(prefix) => {
+                    for (key, value) in std::env::vars() {
+                        if key.starts_with(prefix) {
+                            set_env_var(env, &key, &value);
+                        }
+                    }
                 }
-            }
+                None => {
+                    if let Ok(value) = std::env::var(over) {
+                        set_env_var(env, over, &value);
+                    }
+                }
+            },
         }
     }
+}
+
+/// Read one `--env-file`'s own lines into the same `KEY=value`/
+/// bare-`KEY`/bare-`KEY*` shape [`apply_env_overrides`] already
+/// understands — matching real `podman run --env-file`/`podman exec
+/// --env-file`/`docker run --env-file` exactly (checked directly
+/// against `~/git/podman/pkg/env/env.go`'s own `ParseFile`): each
+/// line has its own leading whitespace trimmed first, then a line
+/// that's now completely empty, or whose first remaining character is
+/// `#`, is skipped — deliberately more tolerant than
+/// [`read_build_arg_file`]'s own untrimmed, exact-`#`-at-column-zero
+/// check, matching the two real upstream functions' own genuinely
+/// different behaviors exactly (`ParseFile` trims first; buildah's
+/// own `readBuildArgFile` doesn't).
+pub(crate) fn read_env_file(path: &Path) -> anyhow::Result<Vec<String>> {
+    let contents =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(contents
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect())
 }
 
 pub(crate) fn format_pairs(pairs: &[(String, String)]) -> String {
@@ -3390,6 +3432,64 @@ mod tests {
         let mut env = vec!["PATH=/usr/bin".to_string()];
         apply_env_overrides(&mut env, &["OCIMAN_TEST_DEFINITELY_UNSET_XYZ".to_string()]);
         assert_eq!(env, vec!["PATH=/usr/bin".to_string()]);
+    }
+
+    #[test]
+    fn apply_env_overrides_wildcard_prefix_sets_every_matching_host_variable() {
+        // SAFETY: same single-threaded-for-the-duration-of-this-call
+        // reasoning as `apply_env_overrides_bare_key_pulls_from_the_
+        // process_environment` above.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("OCIMAN_TEST_WILDCARD_ONE", "one");
+            std::env::set_var("OCIMAN_TEST_WILDCARD_TWO", "two");
+            std::env::set_var("OCIMAN_TEST_WILDCARD_OTHER_UNRELATED", "unrelated");
+        }
+        let mut env = vec!["OCIMAN_TEST_WILDCARD_OTHER_UNRELATED=preexisting".to_string()];
+        apply_env_overrides(&mut env, &["OCIMAN_TEST_WILDCARD_*".to_string()]);
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("OCIMAN_TEST_WILDCARD_ONE");
+            std::env::remove_var("OCIMAN_TEST_WILDCARD_TWO");
+            std::env::remove_var("OCIMAN_TEST_WILDCARD_OTHER_UNRELATED");
+        }
+        assert!(env.contains(&"OCIMAN_TEST_WILDCARD_ONE=one".to_string()));
+        assert!(env.contains(&"OCIMAN_TEST_WILDCARD_TWO=two".to_string()));
+        assert!(
+            env.contains(&"OCIMAN_TEST_WILDCARD_OTHER_UNRELATED=unrelated".to_string()),
+            "a variable matching the prefix should still be set even though it was already \
+             present, replaced in place rather than left at its preexisting value"
+        );
+    }
+
+    #[test]
+    fn apply_env_overrides_wildcard_with_no_matches_leaves_env_unchanged() {
+        let mut env = vec!["PATH=/usr/bin".to_string()];
+        apply_env_overrides(
+            &mut env,
+            &["OCIMAN_TEST_DEFINITELY_UNSET_WILDCARD_*".to_string()],
+        );
+        assert_eq!(env, vec!["PATH=/usr/bin".to_string()]);
+    }
+
+    #[test]
+    fn read_env_file_skips_blank_and_comment_lines_even_with_leading_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env.list");
+        std::fs::write(
+            &path,
+            "\n  \n# a comment\n  # an indented comment\nFOO=bar\nBARE_KEY\n",
+        )
+        .unwrap();
+        let entries = read_env_file(&path).unwrap();
+        assert_eq!(entries, vec!["FOO=bar".to_string(), "BARE_KEY".to_string()]);
+    }
+
+    #[test]
+    fn read_env_file_missing_path_is_a_real_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.list");
+        assert!(read_env_file(&path).is_err());
     }
 
     #[test]

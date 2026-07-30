@@ -473,17 +473,42 @@ struct RunArgs {
     /// the default is writable.
     #[arg(long = "read-only")]
     read_only: bool,
-    /// Set an additional environment variable, `KEY=value`, or
-    /// pull one from `ociman`'s own process environment by bare
-    /// name (`KEY`, dropped entirely if unset there) — matching
-    /// real `docker run -e`/`podman run -e` exactly, including the
-    /// bare-name pass-through (same convention `--build-arg`
-    /// already uses). Repeatable; overrides an image's own default
-    /// value for the same name rather than adding a second,
-    /// shadowed entry (see `apply_env_overrides`'s own doc
-    /// comment for why that distinction is real, not cosmetic).
+    /// Set an additional environment variable, `KEY=value`, a bare
+    /// `KEY` (pulled from `ociman`'s own process environment,
+    /// dropped entirely if unset there), or a `KEY*` prefix (every
+    /// currently-set process environment variable whose name starts
+    /// with `KEY` is set) — matching real `docker run -e`/`podman
+    /// run -e` exactly, including both the bare-name pass-through
+    /// (same convention `--build-arg` already uses) and the
+    /// wildcard-prefix form (checked directly against
+    /// `~/git/podman/pkg/env/env.go`'s own `parseEnv`, shared by
+    /// `-e`/`--env` and `--env-file` alike there). Repeatable;
+    /// overrides an image's own default value (or an earlier
+    /// `--env-file`'s own value) for the same name rather than
+    /// adding a second, shadowed entry (see `apply_env_overrides`'s
+    /// own doc comment for why that distinction is real, not
+    /// cosmetic), and always wins over every `--env-file`
+    /// regardless of flag order on the command line, matching real
+    /// `podman run -e`/`--env-file`'s own identical precedence
+    /// (`~/git/podman/pkg/specgenutil/specgen.go`).
     #[arg(short, long = "env")]
     env: Vec<String>,
+    /// Read additional `KEY=value`/bare-`KEY`/`KEY*` entries (one
+    /// per line, same shape `-e`/`--env` itself accepts) from a
+    /// file, matching real `docker run --env-file`/`podman run
+    /// --env-file` exactly (checked directly against
+    /// `~/git/podman/pkg/env/env.go`'s own `ParseFile`): each
+    /// line's own leading whitespace is trimmed first, then a
+    /// completely empty line or one whose first remaining character
+    /// is `#` is skipped. Repeatable; each file's own entries
+    /// override an earlier file's (or the image's own default) for
+    /// the same name, in the order given on the command line — but
+    /// always lose to `-e`/`--env`, applied last, regardless of
+    /// where `-e`/`--env-file` each appear on the command line
+    /// (matching real podman's own identical, order-independent
+    /// precedence).
+    #[arg(long = "env-file", value_name = "PATH")]
+    env_file: Vec<PathBuf>,
     /// Set the container's own UTS hostname, matching real
     /// `docker run --hostname`/`podman run --hostname` exactly.
     /// Defaults to the container's own generated id (real
@@ -2205,18 +2230,33 @@ enum Command {
         /// reason).
         #[arg(short = 'w', long = "workdir")]
         workdir: Option<String>,
-        /// Set an additional environment variable, `KEY=value`, or
-        /// pull one from `ociman`'s own process environment by bare
-        /// name (`KEY`, dropped entirely if unset there) — matching
-        /// real `podman exec -e`/`docker exec -e` exactly. Repeatable;
-        /// overrides the container's own already-running process
-        /// environment for the same name (see `apply_env_overrides`'s
-        /// own doc comment for why replacing in place, rather than
+        /// Set an additional environment variable, `KEY=value`, a
+        /// bare `KEY` (pulled from `ociman`'s own process
+        /// environment, dropped entirely if unset there), or a
+        /// `KEY*` prefix (every currently-set process environment
+        /// variable whose name starts with `KEY` is set) — matching
+        /// real `podman exec -e`/`docker exec -e` exactly, including
+        /// the wildcard-prefix form (checked directly against
+        /// `~/git/podman/pkg/env/env.go`'s own `parseEnv`).
+        /// Repeatable; overrides the container's own already-running
+        /// process environment (or an earlier `--env-file`'s own
+        /// value) for the same name (see `apply_env_overrides`'s own
+        /// doc comment for why replacing in place, rather than
         /// appending a second, shadowed entry, is a real correctness
         /// fix, not just a cosmetic one) rather than adding a second
-        /// entry for it.
+        /// entry for it, and always wins over every `--env-file`
+        /// regardless of flag order, matching real podman's own
+        /// identical precedence.
         #[arg(short, long = "env")]
         env: Vec<String>,
+        /// Read additional `KEY=value`/bare-`KEY`/`KEY*` entries
+        /// (one per line, same shape `-e`/`--env` itself accepts)
+        /// from a file, matching real `podman exec --env-file`/
+        /// `docker exec --env-file` exactly — see `RunArgs::env_file`'s
+        /// own doc comment for the exact parsing/precedence rules,
+        /// identical here.
+        #[arg(long = "env-file", value_name = "PATH")]
+        env_file: Vec<PathBuf>,
         /// Command and arguments to run inside the container.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
@@ -2846,8 +2886,28 @@ fn main() -> std::process::ExitCode {
                 user,
                 workdir,
                 env,
+                env_file,
                 args,
-            }) => cmd_exec(&id, user.as_deref(), workdir.as_deref(), &env, &args),
+            }) => {
+                // Same flatten-then-single-`apply_env_overrides`-call
+                // approach `run`/`create` use, and for the identical
+                // reason: `--env-file` folds in first (in the order
+                // given), `-e`/`--env` always wins last, regardless
+                // of flag order (see `RunArgs::env_file`'s own doc
+                // comment).
+                let mut combined_env = Vec::new();
+                for path in &env_file {
+                    combined_env.extend(build::read_env_file(path)?);
+                }
+                combined_env.extend(env);
+                cmd_exec(
+                    &id,
+                    user.as_deref(),
+                    workdir.as_deref(),
+                    &combined_env,
+                    &args,
+                )
+            }
             Some(Command::Logs { id, follow, tail }) => cmd_logs(&id, follow, tail),
             Some(Command::Save {
                 reference,
@@ -5857,6 +5917,24 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
                 .with_context(|| format!("writing {}", snapshot_path.display()))?;
         }
 
+        // `--env-file` folds in first (in the order given), `-e`/
+        // `--env` always wins last, regardless of flag order on the
+        // command line — matching real `podman run`/`create`'s own
+        // fixed precedence exactly (see `apply_env_overrides`'s own
+        // doc comment). Flattened into one combined list *before*
+        // calling `synthesize_spec` (rather than threading
+        // `args.env_file` through its own already-long parameter
+        // list): applying one concatenated list in order through
+        // `apply_env_overrides` a single time is exactly equivalent
+        // to applying each source separately in the same order, since
+        // each entry only ever replaces an already-present key in
+        // place.
+        let mut combined_env = Vec::new();
+        for path in &args.env_file {
+            combined_env.extend(build::read_env_file(path)?);
+        }
+        combined_env.extend(args.env.iter().cloned());
+
         let mut spec = synthesize_spec(
             &config,
             &container_id,
@@ -5872,7 +5950,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             no_new_privileges,
             capabilities,
             args.read_only,
-            &args.env,
+            &combined_env,
             args.hostname.as_deref(),
             args.workdir.as_deref(),
             entrypoint.as_deref(),

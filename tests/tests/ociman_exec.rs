@@ -398,6 +398,79 @@ fn exec_env_flag_overrides_an_existing_variable_in_place() {
     ociman(storage_dir.path(), &["rm", "--force", &id]);
 }
 
+/// `exec --env-file` reads `KEY=value` entries from a real file and
+/// applies them the same way `-e`/`--env` does, but always loses to
+/// `-e`/`--env` for a shared key regardless of flag order — matching
+/// real `podman exec --env-file`'s own identical precedence
+/// (`RunArgs::env_file`'s own doc comment has the full detail; this
+/// mirrors `ociman_run.rs`'s own `run_env_file_flag_*` tests for
+/// `exec` specifically).
+#[test]
+fn exec_env_file_flag_reads_entries_and_loses_to_env_flag_for_a_shared_key() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/exec-env-file:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            env: vec!["PATH=/bin".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/exec-env-file:latest",
+        &["/bin/sh", "-c", "sleep 5"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let env_file_dir = tempfile::tempdir().unwrap();
+    let env_file_path = env_file_dir.path().join("env.list");
+    std::fs::write(&env_file_path, "PATH=/from-file/bin\nEXTRA=from-file\n").unwrap();
+
+    let exec = ociman(
+        storage_dir.path(),
+        &[
+            "exec",
+            "--env-file",
+            env_file_path.to_str().unwrap(),
+            // `-e` given before `--env-file` on the command line --
+            // still wins, precedence is fixed, not order-dependent.
+            "--env",
+            "PATH=/from-flag/bin",
+            &id,
+            "/bin/sh",
+            "-c",
+            "echo \"$PATH\" \"$EXTRA\"",
+        ],
+    );
+    assert!(
+        exec.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&exec.stdout),
+        "/from-flag/bin from-file\n",
+        "-e should win over --env-file for the shared PATH key; EXTRA comes from the file alone"
+    );
+
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "--force", &id]);
+}
+
 #[test]
 fn exec_user_flag_resolves_a_named_user_via_the_containers_own_etc_passwd() {
     let Some(busybox) = busybox_path() else {

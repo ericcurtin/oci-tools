@@ -743,6 +743,201 @@ fn run_env_flag_overrides_an_existing_variable_and_adds_a_new_one() {
     );
 }
 
+/// `--env-file` reads `KEY=value` entries from a real file, matching
+/// real `docker run --env-file`/`podman run --env-file` exactly:
+/// blank lines and `#`-comment lines (even with leading whitespace,
+/// unlike `--build-arg-file`'s own untrimmed check) are skipped, and
+/// an entry overrides an already-present same-key value in place.
+#[test]
+fn run_env_file_flag_reads_entries_from_a_real_file() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/env-file:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            env: vec!["PATH=/bin".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let env_file_dir = tempfile::tempdir().unwrap();
+    let env_file_path = env_file_dir.path().join("env.list");
+    std::fs::write(
+        &env_file_path,
+        "\n  # a comment, with leading whitespace\nPATH=/from-file/bin\nEXTRA=from-file\n",
+    )
+    .unwrap();
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--env-file"])
+        .arg(&env_file_path)
+        .args(["ociman-test/env-file:latest"])
+        .args(["/bin/sh", "-c", "echo \"$PATH\" \"$EXTRA\""])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "/from-file/bin from-file\n",
+        "--env-file's own PATH should override the image's default in place, EXTRA added"
+    );
+}
+
+/// `-e`/`--env` always wins over `--env-file` for a shared key,
+/// regardless of which one appears first on the command line --
+/// matching real `podman run`'s own fixed precedence exactly
+/// (`~/git/podman/pkg/specgenutil/specgen.go`: env-file folds in
+/// first, `-e`/`--env` is applied last).
+#[test]
+fn run_env_flag_always_wins_over_env_file_regardless_of_order() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/env-precedence:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let env_file_dir = tempfile::tempdir().unwrap();
+    let env_file_path = env_file_dir.path().join("env.list");
+    std::fs::write(&env_file_path, "SHARED=from-file\n").unwrap();
+
+    // `-e` given *before* `--env-file` on the command line -- still
+    // wins, since precedence is fixed, not flag-order-dependent.
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "-e", "SHARED=from-flag", "--env-file"])
+        .arg(&env_file_path)
+        .args(["ociman-test/env-precedence:latest"])
+        .args(["/bin/sh", "-c", "echo \"$SHARED\""])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "from-flag\n",
+        "-e should always win over --env-file, even given first on the command line"
+    );
+}
+
+/// A repeated `--env-file` folds in file-given order, a later file's
+/// own value for a shared key overriding an earlier file's --
+/// matching real podman's own identical fold order.
+#[test]
+fn run_env_file_flag_is_repeatable_and_later_files_win() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/env-file-repeat:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let env_file_dir = tempfile::tempdir().unwrap();
+    let first_path = env_file_dir.path().join("first.list");
+    let second_path = env_file_dir.path().join("second.list");
+    std::fs::write(&first_path, "SHARED=first\nONLY_FIRST=first-only\n").unwrap();
+    std::fs::write(&second_path, "SHARED=second\n").unwrap();
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--env-file"])
+        .arg(&first_path)
+        .arg("--env-file")
+        .arg(&second_path)
+        .args(["ociman-test/env-file-repeat:latest"])
+        .args(["/bin/sh", "-c", "echo \"$SHARED\" \"$ONLY_FIRST\""])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "second first-only\n",
+        "the second --env-file's own SHARED should win over the first's"
+    );
+}
+
+/// A bare `KEY*` in `-e`/`--env` sets every currently-set process
+/// environment variable whose name starts with `KEY`, matching real
+/// `podman run -e`'s own wildcard-prefix form exactly (checked
+/// directly against `~/git/podman/pkg/env/env.go`'s own `parseEnv`).
+#[test]
+fn run_env_flag_wildcard_prefix_pulls_every_matching_host_variable() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/env-wildcard:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .env("OCIMAN_WILDCARD_TEST_ONE", "one")
+        .env("OCIMAN_WILDCARD_TEST_TWO", "two")
+        .args(["run", "--rm", "-e", "OCIMAN_WILDCARD_TEST_*"])
+        .args(["ociman-test/env-wildcard:latest"])
+        .args([
+            "/bin/sh",
+            "-c",
+            "echo \"$OCIMAN_WILDCARD_TEST_ONE\" \"$OCIMAN_WILDCARD_TEST_TWO\"",
+        ])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "one two\n",
+        "both host variables sharing the given prefix should be set"
+    );
+}
+
 /// `--hostname` really does set the container's own UTS hostname,
 /// matching real `docker run --hostname`/`podman run --hostname`
 /// exactly -- checked the most direct way available: printing the
