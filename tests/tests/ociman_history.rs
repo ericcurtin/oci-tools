@@ -172,3 +172,147 @@ fn history_of_an_image_with_no_history_at_all_says_so() {
     let views: serde_json::Value = serde_json::from_slice(&history_json.stdout).unwrap();
     assert!(views.as_array().unwrap().is_empty());
 }
+
+/// `history --format` (0338) renders one line per history entry,
+/// newest first (same order the plain table/`--json` already use),
+/// reusing the exact same Go-template-*lite* engine `ociman
+/// inspect`/`ps`/`images`/`volume ls`/`info --format` (`0332`-`0337`)
+/// already established.
+#[test]
+fn history_format_renders_one_line_per_entry_newest_first() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/history-format-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/history-format-base:latest\n\
+         RUN echo hello > /marker.txt\n\
+         ENV FOO=bar\n",
+    );
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/history-format-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let format = ociman(
+        storage_dir.path(),
+        &[
+            "history",
+            "ociman-test/history-format-result:latest",
+            "--format",
+            "{{.created_by}}",
+        ],
+    );
+    assert!(
+        format.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&format.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&format.stdout).into_owned();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0], "ENV FOO=bar", "newest first: {lines:?}");
+    assert_eq!(
+        lines[1], "RUN /bin/sh -c echo hello > /marker.txt",
+        "{lines:?}"
+    );
+}
+
+/// `--format`, when given, takes priority over `--json`/the default
+/// table, and an unresolvable field path is a real, immediate error --
+/// same precedence and error behavior the whole `--format` family
+/// already established.
+#[test]
+fn history_format_takes_priority_and_errors_on_an_unknown_field() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/history-format-priority:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/history-format-priority:latest\nRUN true\n",
+    );
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/history-format-priority-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let format = ociman(
+        storage_dir.path(),
+        &[
+            "history",
+            "ociman-test/history-format-priority-result:latest",
+            "--json",
+            "--format",
+            "{{.size}}",
+        ],
+    );
+    assert!(format.status.success());
+    assert!(
+        String::from_utf8_lossy(&format.stdout)
+            .trim()
+            .parse::<u64>()
+            .is_ok(),
+        "the format template's own plain number, not --json's own array, should have won: {:?}",
+        format.stdout
+    );
+
+    let bad = ociman(
+        storage_dir.path(),
+        &[
+            "history",
+            "ociman-test/history-format-priority-result:latest",
+            "--format",
+            "{{.nosuchfield}}",
+        ],
+    );
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("no field"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}

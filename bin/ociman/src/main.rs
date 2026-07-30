@@ -1223,6 +1223,19 @@ enum Command {
         /// Image reference, exactly as it was pulled, built, or
         /// tagged.
         reference: String,
+        /// Render one line per history entry via a Go-template-*lite*
+        /// string (`--format`, matching real `podman history
+        /// --format`/`docker history --format`) — same engine and
+        /// scope as `ociman inspect`/`ps`/`images`/`volume ls`/`info
+        /// --format` (`0332`-`0337`): `{{.field}}` placeholders only,
+        /// no pipelines/functions/control flow, field names this
+        /// project's own JSON output field names directly
+        /// (`{{.created}}`, `{{.created_by}}`, `{{.size}}`,
+        /// `{{.comment}}`). Takes priority over `--json`/the default
+        /// table when given; an unresolvable field path is a real,
+        /// immediate error.
+        #[arg(long = "format", value_name = "TEMPLATE")]
+        format: Option<String>,
     },
     /// Reclaim disk space no longer needed: any dangling (untagged,
     /// `docs/design/0179`) image not currently used by any container,
@@ -2658,7 +2671,9 @@ fn main() -> std::process::ExitCode {
             }) => cmd_rmi(&references, force, all, ignore, cli.global.json),
             Some(Command::Tag { source, target }) => cmd_tag(&source, &target, cli.global.json),
             Some(Command::Untag { image, references }) => cmd_untag(&image, &references),
-            Some(Command::History { reference }) => cmd_history(&reference, cli.global.json),
+            Some(Command::History { reference, format }) => {
+                cmd_history(&reference, cli.global.json, format.as_deref())
+            }
             Some(Command::Prune { all, filter }) => cmd_prune(cli.global.json, all, &filter),
             Some(Command::System { command }) => match command {
                 SystemCommand::Df { verbose } => cmd_system_df(cli.global.json, verbose),
@@ -4120,7 +4135,7 @@ fn history_layer_sizes(history: &[HistoryEntry], layers: &[Descriptor]) -> Vec<u
         .collect()
 }
 
-fn cmd_history(reference_str: &str, json: bool) -> anyhow::Result<()> {
+fn cmd_history(reference_str: &str, json: bool, format: Option<&str>) -> anyhow::Result<()> {
     let reference = Reference::parse(reference_str)
         .with_context(|| format!("parsing image reference {reference_str:?}"))?;
     let store = open_store()?;
@@ -4154,6 +4169,14 @@ fn cmd_history(reference_str: &str, json: bool) -> anyhow::Result<()> {
     // bottom-layer-first (the same append order `record_layer`/
     // `record_empty_history` always use).
     views.reverse();
+
+    if let Some(template) = format {
+        for view in &views {
+            let json_value = serde_json::to_value(view)?;
+            println!("{}", render_format_template(template, &json_value)?);
+        }
+        return Ok(());
+    }
 
     if json {
         oci_cli_common::output::print_json(&views)?;
