@@ -189,6 +189,65 @@ fn volume_ls_format_takes_priority_and_errors_on_an_unknown_field() {
     );
 }
 
+/// `volume ls -q`/`--quiet` (0348) prints only volume names, one per
+/// line, no header — matching real `podman volume ls -q`/`docker
+/// volume ls -q` exactly (checked directly, `~/git/podman/cmd/podman/
+/// volumes/list.go`: renders `{{.Name}}\n`).
+#[test]
+fn volume_ls_quiet_prints_only_names_with_no_header() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    ociman(storage_dir.path(), &["volume", "create", "quiet-vol-a"]);
+    ociman(storage_dir.path(), &["volume", "create", "quiet-vol-b"]);
+
+    let quiet = ociman(storage_dir.path(), &["volume", "ls", "-q"]);
+    assert!(
+        quiet.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&quiet.stdout).into_owned();
+    let mut lines: Vec<&str> = stdout.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(lines, vec!["quiet-vol-a", "quiet-vol-b"], "{lines:?}");
+
+    // Long form behaves identically to the short form.
+    let quiet_long = ociman(storage_dir.path(), &["volume", "ls", "--quiet"]);
+    assert!(quiet_long.status.success());
+    assert_eq!(quiet_long.stdout, quiet.stdout);
+}
+
+/// `-q`/`--quiet` on an empty store prints nothing at all -- not even
+/// this project's own usual "no volumes" friendly empty-state message
+/// (that message is specific to the default table, matching real
+/// podman's own checked-directly behavior of a plain, empty quiet
+/// report either way).
+#[test]
+fn volume_ls_quiet_on_an_empty_store_prints_nothing() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let quiet = ociman(storage_dir.path(), &["volume", "ls", "-q"]);
+    assert!(quiet.status.success());
+    assert!(quiet.stdout.is_empty(), "{quiet:?}");
+}
+
+/// `--quiet` and `--format` together is a clear, immediate error,
+/// matching real `podman volume ls`'s own identical restriction
+/// exactly (`~/git/podman/cmd/podman/volumes/list.go`'s own checked-
+/// directly error text).
+#[test]
+fn volume_ls_quiet_and_format_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &["volume", "ls", "-q", "--format", "{{.name}}"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot be used together"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn volume_inspect_reports_the_real_mountpoint() {
     let storage_dir = tempfile::tempdir().unwrap();

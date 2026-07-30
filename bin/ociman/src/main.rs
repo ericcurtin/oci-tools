@@ -2583,6 +2583,15 @@ enum VolumeCommand {
         /// real, immediate error.
         #[arg(long = "format", value_name = "TEMPLATE")]
         format: Option<String>,
+        /// Print only volume names, one per line, no header —
+        /// matching real `podman volume ls -q`/`--quiet`/`docker
+        /// volume ls -q` exactly (checked directly, `~/git/podman/
+        /// cmd/podman/volumes/list.go`: renders `{{.Name}}\n` with no
+        /// header). Conflicts with `--format` (matching real
+        /// podman's own identical, checked-directly restriction:
+        /// "quiet and format flags cannot be used together").
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Print low-level JSON for a named volume — matching real
     /// `docker volume inspect`/`podman volume inspect`'s own general
@@ -2935,7 +2944,9 @@ fn main() -> std::process::ExitCode {
                 VolumeCommand::Create { name } => {
                     cmd_volume_create(name.as_deref(), cli.global.json)
                 }
-                VolumeCommand::Ls { format } => cmd_volume_ls(cli.global.json, format.as_deref()),
+                VolumeCommand::Ls { format, quiet } => {
+                    cmd_volume_ls(cli.global.json, format.as_deref(), quiet)
+                }
                 VolumeCommand::Inspect { name } => cmd_volume_inspect(&name, cli.global.json),
                 VolumeCommand::Rm { name, force } => cmd_volume_rm(&name, force),
                 VolumeCommand::Rename { name, new_name } => cmd_volume_rename(&name, &new_name),
@@ -9960,7 +9971,14 @@ fn cmd_volume_create(name: Option<&str>, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_volume_ls(json: bool, format: Option<&str>) -> anyhow::Result<()> {
+fn cmd_volume_ls(json: bool, format: Option<&str>, quiet: bool) -> anyhow::Result<()> {
+    // Matches real `podman volume ls`'s own identical restriction
+    // exactly (`~/git/podman/cmd/podman/volumes/list.go`'s own
+    // checked-directly error text).
+    anyhow::ensure!(
+        !(quiet && format.is_some()),
+        "quiet and format flags cannot be used together"
+    );
     let store = open_volume_store()?;
     let records = store.list().context("listing volumes")?;
     if let Some(template) = format {
@@ -9968,6 +9986,12 @@ fn cmd_volume_ls(json: bool, format: Option<&str>) -> anyhow::Result<()> {
             let view = VolumeView::from_record(&store, record);
             let json_value = serde_json::to_value(&view)?;
             println!("{}", render_format_template(template, &json_value)?);
+        }
+        return Ok(());
+    }
+    if quiet {
+        for record in &records {
+            println!("{}", record.name);
         }
         return Ok(());
     }
