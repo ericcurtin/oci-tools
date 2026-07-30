@@ -531,3 +531,153 @@ fn exec_user_flag_resolves_a_named_user_via_the_containers_own_etc_passwd() {
     run.wait().unwrap();
     ociman(storage_dir.path(), &["rm", "--force", &id]);
 }
+
+/// `ociman exec --preserve-fds` (0351), matching real `podman exec
+/// --preserve-fds` exactly (checked directly against a real installed
+/// `podman exec --help`) -- correcting this project's own earlier,
+/// mistaken belief (design `0294`) that podman lacks this flag on
+/// `exec` at all. By default, every fd above stdio is closed before
+/// the exec'd process ever runs; `--preserve-fds N` keeps exactly the
+/// first `N` of them instead.
+///
+/// Same real `pre_exec`/`dup2`-onto-fd-3 technique
+/// `ocirun_exec.rs`'s own identical test already established.
+#[test]
+fn exec_preserve_fds_closes_extra_fds_by_default_but_keeps_them_with_the_flag() {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/exec-preserve-fds:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/exec-preserve-fds:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let run_with_fd3_open = |extra_args: &[&str]| -> std::process::Output {
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let raw_fd = marker.as_file().as_raw_fd();
+        let mut cmd = Command::new(bin_path("ociman"));
+        cmd.env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+            .env_remove("OCI_TOOLS_LOG")
+            .arg("exec")
+            .args(extra_args)
+            .args([
+                &id,
+                "/bin/sh",
+                "-c",
+                "test -e /proc/self/fd/3 && echo fd3-present || echo fd3-absent",
+            ]);
+        // SAFETY: only calls `dup2(2)`/`fcntl(2)` (both async-signal-
+        // safe, no allocation) in the forked-but-not-yet-exec'd child,
+        // only ever affecting that child's own fd table.
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(raw_fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = cmd.output().expect("failed to spawn ociman exec");
+        drop(marker);
+        out
+    };
+
+    let without_flag = run_with_fd3_open(&[]);
+    assert!(
+        without_flag.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&without_flag.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&without_flag.stdout).trim(),
+        "fd3-absent",
+        "fd 3 must be closed by default, matching real podman: {without_flag:?}"
+    );
+
+    let with_flag = run_with_fd3_open(&["--preserve-fds", "1"]);
+    assert!(
+        with_flag.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_flag.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&with_flag.stdout).trim(),
+        "fd3-present",
+        "fd 3 must be preserved with --preserve-fds 1: {with_flag:?}"
+    );
+
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "--force", &id]);
+}
+
+/// `--preserve-fds N` fails fast, before ever exec'ing anything at
+/// all, if fewer than `N` fds are actually open starting at fd 3 --
+/// matching real podman's own identical upfront `IsFdInherited` check
+/// exactly.
+#[test]
+fn exec_preserve_fds_rejects_a_claim_with_no_matching_open_fd() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/exec-preserve-fds-reject:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/exec-preserve-fds-reject:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let out = ociman(
+        storage_dir.path(),
+        &["exec", "--preserve-fds", "5", &id, "true"],
+    );
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is not available"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "--force", &id]);
+}

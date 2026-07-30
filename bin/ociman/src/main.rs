@@ -1452,6 +1452,28 @@ enum Command {
         /// see [`ANNOTATION_INTERACTIVE`]'s own doc comment for why).
         #[arg(short, long)]
         interactive: bool,
+        /// Pass `N` additional file descriptors, starting at fd 3
+        /// (right after stdio), through to the container's own
+        /// process untouched — matching real `podman run
+        /// --preserve-fds` exactly (checked directly against a real
+        /// installed `podman run --help`; genuinely present there,
+        /// contradicting this project's own earlier, mistaken `0294`
+        /// doc comment — see `docs/design/0351` for the correction).
+        /// **Only on `run`, deliberately not on `create` too**: real
+        /// podman itself has this exact same asymmetry (checked
+        /// directly, `~/git/podman/cmd/podman/containers/create.go`
+        /// has no equivalent flag registration at all) — `create`
+        /// never launches anything at all, so there is no live
+        /// process at create time this could ever actually apply to
+        /// in the first place (a later `ociman start` reruns from a
+        /// completely fresh `ociman` process, with no way to inherit
+        /// fds from the original `create` invocation's own process
+        /// even if it wanted to). The caller must already have those
+        /// `N` fds open at exactly fd 3.. before invoking `ociman` at
+        /// all — a real, immediate error otherwise, matching real
+        /// podman's own checked-directly `IsFdInherited` validation.
+        #[arg(long = "preserve-fds", default_value_t = 0)]
+        preserve_fds: u32,
     },
     /// Pull (if not already present) and extract an image's container,
     /// same as `run`, but never launch it -- matching real `docker
@@ -2323,6 +2345,24 @@ enum Command {
         /// identical here.
         #[arg(long = "env-file", value_name = "PATH")]
         env_file: Vec<PathBuf>,
+        /// Pass `N` additional file descriptors, starting at fd 3
+        /// (right after stdio), through to the exec'd process
+        /// untouched — matching real `podman exec --preserve-fds`
+        /// exactly. Checked directly against a real installed
+        /// `podman exec --help`: genuinely present and enabled in
+        /// local (non-`--remote`) mode, contradicting this project's
+        /// own earlier, mistaken `0294` doc comment, which claimed
+        /// podman has no such flag on `exec` at all (a stale citation
+        /// of `0276`, which is actually about `ocirun exec -g`/
+        /// `--additional-gids` and never once mentions this flag —
+        /// see `docs/design/0351` for the correction). The caller
+        /// must already have those `N` fds open at exactly fd 3..
+        /// before invoking `ociman` at all — a real, immediate error
+        /// otherwise (matching real podman's own checked-directly
+        /// `IsFdInherited` validation, `~/git/podman/cmd/podman/
+        /// containers/run.go`, reused verbatim for `exec` there too).
+        #[arg(long = "preserve-fds", default_value_t = 0)]
+        preserve_fds: u32,
         /// Command and arguments to run inside the container.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
@@ -2839,7 +2879,8 @@ fn main() -> std::process::ExitCode {
                 rm,
                 detach,
                 interactive,
-            }) => cmd_run(args, rm, detach, interactive),
+                preserve_fds,
+            }) => cmd_run(args, rm, detach, interactive, preserve_fds),
             Some(Command::Create {
                 args,
                 rm,
@@ -2991,6 +3032,7 @@ fn main() -> std::process::ExitCode {
                 workdir,
                 env,
                 env_file,
+                preserve_fds,
                 args,
             }) => {
                 // Same flatten-then-single-`apply_env_overrides`-call
@@ -3009,6 +3051,7 @@ fn main() -> std::process::ExitCode {
                     user.as_deref(),
                     workdir.as_deref(),
                     &combined_env,
+                    preserve_fds,
                     &args,
                 )
             }
@@ -6225,7 +6268,42 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
     })
 }
 
-fn cmd_run(args: RunArgs, rm: bool, detach: bool, interactive: bool) -> anyhow::Result<()> {
+/// Fail fast, with a clear error, if `--preserve-fds N` claims more
+/// fds than this process's own caller actually left open — matching
+/// real podman's own identical upfront check exactly (`~/git/podman/
+/// cmd/podman/containers/run.go`'s own `rootless.IsFdInherited` loop
+/// over `fd := 3; fd < 3+PreserveFDs`, reused verbatim for `exec` at
+/// `~/git/podman/cmd/podman/containers/exec.go`): every fd `3..3+n`
+/// must already exist by the time `ociman` itself starts (the caller
+/// is responsible for having opened them *before* invoking `ociman`
+/// at all). Checks `/proc/self/fd/<fd>` existence, the same technique
+/// `ocirun`'s own already-established `verify_preserve_fds` (0291)
+/// uses -- a real, if unusual, deliberate small duplication (this
+/// project has no shared crate for CLI-argument-validation-only
+/// helpers, and this one's own error text intentionally matches real
+/// podman's exactly, not real runc's own differently-worded one
+/// `ocirun`'s own copy matches instead).
+fn verify_preserve_fds(n: u32) -> anyhow::Result<()> {
+    for offset in 0..n {
+        let fd = 3 + offset;
+        let path = format!("/proc/self/fd/{fd}");
+        anyhow::ensure!(
+            Path::new(&path).exists(),
+            "file descriptor {fd} is not available - the preserve-fds option requires that \
+             file descriptors must be passed"
+        );
+    }
+    Ok(())
+}
+
+fn cmd_run(
+    args: RunArgs,
+    rm: bool,
+    detach: bool,
+    interactive: bool,
+    preserve_fds: u32,
+) -> anyhow::Result<()> {
+    verify_preserve_fds(preserve_fds)?;
     let PreparedContainer {
         container_id,
         mut state,
@@ -6280,6 +6358,7 @@ fn cmd_run(args: RunArgs, rm: bool, detach: bool, interactive: bool) -> anyhow::
                 // `Command::Run`'s own doc comment) — a detached
                 // container's own stdin is always closed either way.
                 false,
+                preserve_fds,
             )?;
         }
         return Ok(());
@@ -6294,6 +6373,7 @@ fn cmd_run(args: RunArgs, rm: bool, detach: bool, interactive: bool) -> anyhow::
         &log_path,
         rm,
         interactive,
+        preserve_fds,
     )?;
 
     // The container's own exit code becomes ours, matching `ocirun
@@ -6394,6 +6474,7 @@ unsafe fn launch_detached_and_confirm(
     rm: bool,
     print_id: bool,
     interactive: bool,
+    preserve_fds: u32,
 ) -> anyhow::Result<()> {
     let container_id_for_keeper = container_id.to_string();
 
@@ -6475,6 +6556,7 @@ unsafe fn launch_detached_and_confirm(
                 &log_path,
                 rm,
                 interactive,
+                preserve_fds,
             ) {
                 Ok(_) => 0,
                 Err(_) => oci_runtime_core::launch::SETUP_FAILURE_EXIT_CODE,
@@ -6527,6 +6609,7 @@ fn run_and_finalize(
     log_path: &Path,
     rm: bool,
     interactive: bool,
+    preserve_fds: u32,
 ) -> anyhow::Result<i32> {
     // A fresh scope-name nonce for *this* launch (0159) — set on
     // `state` in memory now, piggy-backed on `record_running`'s own
@@ -6599,12 +6682,12 @@ fn run_and_finalize(
             // too) verbatim, matching real `docker run`/`podman run`
             // exactly (0196).
             false,
-            // `preserve_fds: 0` -- `ociman run`/`create` have no
-            // `--preserve-fds` flag of their own (real `docker run`/
-            // `podman run` don't either; this is a `runc`/`crun`-level
-            // concept for specialized orchestrators, not a container-
-            // engine-level one).
-            0,
+            // `ociman run --preserve-fds`'s own real, given value
+            // (0351) -- `ociman create` deliberately still has no
+            // equivalent flag of its own, matching real podman's own
+            // identical asymmetry exactly (see `Command::Run`'s own
+            // `preserve_fds` doc comment for why).
+            preserve_fds,
             // `no_pivot: false` -- same reasoning, `--no-pivot` too is
             // a `runc`/`crun`-level escape hatch neither `docker run`/
             // `podman run` expose.
@@ -8934,6 +9017,14 @@ fn cmd_start(id: &str, attach: bool) -> anyhow::Result<()> {
             rm,
             !attach,
             interactive,
+            // `ociman start` has no `--preserve-fds` flag of its own,
+            // matching real `podman start`'s own identical lack of
+            // one (checked directly, `~/git/podman/cmd/podman/
+            // containers/start.go`) -- there is no fresh CLI
+            // invocation-time fd to inherit from at all here, the
+            // container is simply being resumed, not launched with a
+            // brand new set of caller-provided fds.
+            0,
         )?;
     }
     if attach {
@@ -11658,8 +11749,10 @@ fn cmd_exec(
     user: Option<&str>,
     cwd: Option<&str>,
     extra_env: &[String],
+    preserve_fds: u32,
     args: &[String],
 ) -> anyhow::Result<()> {
+    verify_preserve_fds(preserve_fds)?;
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)?;
     let state = containers.load(&resolved)?;
@@ -11740,10 +11833,11 @@ fn cmd_exec(
             .unwrap_or_else(|| process_spec.cwd.clone()),
         env: effective_env,
         args: args.to_vec(),
-        // `preserve_fds: 0` -- `ociman exec` has no `--preserve-fds`
-        // flag of its own, matching real `podman exec`'s own
-        // identical lack of one (checked directly, 0276).
-        preserve_fds: 0,
+        // `ociman exec --preserve-fds`'s own real, given value
+        // (0351) -- see `Command::Exec`'s own `preserve_fds` doc
+        // comment for the correction to this project's own earlier,
+        // mistaken claim that real podman lacks this flag on `exec`.
+        preserve_fds,
         // `ociman exec` has no `--timeout` flag of its own, matching
         // real `podman exec`'s own identical lack of one (checked
         // directly).

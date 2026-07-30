@@ -4061,3 +4061,172 @@ fn run_cidfile_write_failure_is_tolerated_not_fatal() {
         .output()
         .unwrap();
 }
+
+/// `ociman run --preserve-fds` (0351), matching real `podman run
+/// --preserve-fds` exactly (checked directly against a real installed
+/// `podman run --help`) -- correcting this project's own earlier,
+/// mistaken belief (design `0294`) that podman lacks this flag on
+/// `run` at all. By default, every fd above stdio is closed before
+/// the container's own process ever runs (`0291`'s own already-
+/// established default for `ocirun`, shared here via the identical
+/// underlying `oci_runtime_core::launch::run_reporting_pid` primitive
+/// every `ociman run` already goes through); `--preserve-fds N` keeps
+/// exactly the first `N` of them instead.
+///
+/// Same real `pre_exec`/`dup2`-onto-fd-3 technique
+/// `ocirun_run.rs`'s own identical test already established, needed
+/// to make this deterministic regardless of whatever fd numbers the
+/// test harness itself already happens to have open.
+#[test]
+fn run_preserve_fds_closes_extra_fds_by_default_but_keeps_them_with_the_flag() {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/preserve-fds:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let run_with_fd3_open = |extra_args: &[&str]| -> std::process::Output {
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let raw_fd = marker.as_file().as_raw_fd();
+        let mut cmd = Command::new(bin_path("ociman"));
+        cmd.env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+            .env_remove("OCI_TOOLS_LOG")
+            .arg("run")
+            .arg("--rm")
+            .args(extra_args)
+            .arg("ociman-test/preserve-fds:latest")
+            .args([
+                "/bin/sh",
+                "-c",
+                "test -e /proc/self/fd/3 && echo fd3-present || echo fd3-absent",
+            ]);
+        // SAFETY: only calls `dup2(2)`/`fcntl(2)` (both async-signal-
+        // safe, no allocation) in the forked-but-not-yet-exec'd child,
+        // only ever affecting that child's own fd table -- see
+        // `ocirun_run.rs`'s own identical test for the full
+        // `FD_CLOEXEC` gotcha this also guards against.
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(raw_fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = cmd.output().expect("failed to spawn ociman run");
+        drop(marker);
+        out
+    };
+
+    let without_flag = run_with_fd3_open(&[]);
+    assert!(
+        without_flag.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&without_flag.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&without_flag.stdout).trim(),
+        "fd3-absent",
+        "fd 3 must be closed by default, matching real podman: {without_flag:?}"
+    );
+
+    let with_flag = run_with_fd3_open(&["--preserve-fds", "1"]);
+    assert!(
+        with_flag.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_flag.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&with_flag.stdout).trim(),
+        "fd3-present",
+        "fd 3 must be preserved with --preserve-fds 1: {with_flag:?}"
+    );
+}
+
+/// `--preserve-fds N` fails fast, before ever launching a container at
+/// all, if fewer than `N` fds are actually open starting at fd 3 --
+/// matching real podman's own identical upfront `IsFdInherited` check
+/// exactly (see `verify_preserve_fds`'s own doc comment in
+/// `bin/ociman/src/main.rs`).
+#[test]
+fn run_preserve_fds_rejects_a_claim_with_no_matching_open_fd() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/preserve-fds-reject:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "--preserve-fds",
+            "5",
+            "ociman-test/preserve-fds-reject:latest",
+            "true",
+        ])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is not available"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Nothing was ever created -- the check happens before any real
+    // launch work at all.
+    let ps = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .args(["ps", "-a", "-q"])
+        .output()
+        .unwrap();
+    assert!(ps.stdout.is_empty(), "{ps:?}");
+}
+
+/// `ociman create` has no `--preserve-fds` flag at all, matching real
+/// `podman create`'s own identical, checked-directly absence
+/// (confirmed directly: `podman create --help` shows no such flag,
+/// unlike `podman run --help`, which does) -- a real, deliberate
+/// asymmetry, not an oversight.
+#[test]
+fn create_has_no_preserve_fds_flag() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .args(["create", "--preserve-fds", "1", "irrelevant:latest", "true"])
+        .output()
+        .expect("failed to spawn ociman create");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unexpected argument"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
