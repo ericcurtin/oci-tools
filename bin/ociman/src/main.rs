@@ -1788,10 +1788,15 @@ enum Command {
     /// `docker stop`/`podman stop`. A no-op (not an error) on an
     /// already-stopped container.
     Stop {
-        /// The container's ID or `--name` — omit when using `--all`.
-        /// Mutually exclusive with `--all`, matching real `podman
-        /// stop`'s own identical rule.
-        id: Option<String>,
+        /// The container ID(s)/`--name`(s) — omit when using `--all`.
+        /// Real `podman stop id1 id2` (checked directly, `~/git/
+        /// podman/cmd/podman/containers/stop.go`'s own `Use: "stop
+        /// [options] CONTAINER [CONTAINER...]"`) resolves every given
+        /// identifier first: an unresolvable one aborts the whole
+        /// call before stopping anything, unless `--ignore` is given
+        /// (0318), matching `ociman rm`'s own identical multi-target
+        /// convention exactly. Mutually exclusive with `--all`.
+        ids: Vec<String>,
         /// Seconds to wait after the initial signal before escalating
         /// to `KILL`. With none given, falls back to the container's
         /// own persisted `run`/`create --stop-timeout` (0301), else
@@ -1810,12 +1815,12 @@ enum Command {
         /// which honor both unless overridden.
         #[arg(short, long)]
         signal: Option<String>,
-        /// Stop every real container instead of the one named on the
-        /// command line — matching real `podman stop --all` exactly
-        /// (checked directly, `~/git/podman/cmd/podman/containers/
-        /// stop.go`, `pkg/domain/infra/abi/containers.go`'s own
-        /// `containerStopImpl`/`getContainers`): every container is
-        /// attempted, an already-`Stopped` one silently tolerated
+        /// Stop every real container instead of the one(s) named on
+        /// the command line — matching real `podman stop --all`
+        /// exactly (checked directly, `~/git/podman/cmd/podman/
+        /// containers/stop.go`, `pkg/domain/infra/abi/containers.go`'s
+        /// own `containerStopImpl`/`getContainers`): every container
+        /// is attempted, an already-`Stopped` one silently tolerated
         /// (real `ErrCtrStopped`, exactly `stop`'s own existing no-
         /// `--all` no-op already established), any other genuine
         /// failure (in particular a paused one — see
@@ -1824,6 +1829,27 @@ enum Command {
         /// attempted regardless (0313).
         #[arg(short, long)]
         all: bool,
+        /// Read a container ID from `FILE` (repeatable) — matching
+        /// real `podman stop --cidfile` exactly (checked directly,
+        /// `~/git/podman/cmd/podman/containers/stop.go`): the file's
+        /// own first line only, merged into the same target list an
+        /// explicit `ID`/`--name` argument already builds. Mutually
+        /// exclusive with `--all` (0318).
+        #[arg(long = "cidfile", value_name = "FILE")]
+        cidfile: Vec<PathBuf>,
+        /// Tolerate a container ID/name that doesn't resolve to
+        /// anything at all (dropped from the target list instead of
+        /// aborting the whole call), and a `--cidfile` that doesn't
+        /// exist (skipped instead of erroring) — matching real
+        /// `podman stop --ignore` exactly (checked directly,
+        /// `~/git/podman/cmd/podman/containers/stop.go`/`pkg/domain/
+        /// infra/abi/containers.go`'s own `getContainers`), the same
+        /// narrow gate `ociman rm --ignore` (0311) already established
+        /// (never widens to a running-without-`--force`-style refusal
+        /// or any other failure kind). Has no effect combined with
+        /// `--all` (nothing to resolve there in the first place).
+        #[arg(short, long)]
+        ignore: bool,
     },
     /// Send a signal to a running container's own init process — one
     /// immediate send, no grace period, no escalation (unlike `stop`),
@@ -2593,11 +2619,13 @@ fn main() -> std::process::ExitCode {
                 cli.global.json,
             ),
             Some(Command::Stop {
-                id,
+                ids,
                 time,
                 signal,
                 all,
-            }) => cmd_stop(id.as_deref(), time, signal.as_deref(), all),
+                cidfile,
+                ignore,
+            }) => cmd_stop(&ids, time, signal.as_deref(), all, &cidfile, ignore),
             Some(Command::Kill { ids, signal, all }) => cmd_kill(&ids, &signal, all),
             Some(Command::Pause { id }) => cmd_pause(&id),
             Some(Command::Unpause { id }) => cmd_unpause(&id),
@@ -6872,25 +6900,48 @@ fn cmd_rm(
     // behavior exactly: forcing implies ignoring too, the same
     // convention `ociman rmi --force` already established.
     let ignore = ignore || force;
+    // Whether *anything* was given at all, captured before the merge
+    // below -- matching real podman's own checked-directly CLI-level
+    // validation exactly (`validate.CheckAllLatestAndIDFile`): "you
+    // must provide at least one name or id" is judged by whether
+    // `--cidfile` was ever *given*, never by whether it later actually
+    // resolved to anything (0318's own correction: a previous, real
+    // gap here wrongly always hard-errored on a missing cidfile even
+    // under `--ignore`, contradicting real podman's own source, which
+    // this now matches).
+    let nothing_given = ids.is_empty() && cidfiles.is_empty();
     // Real podman's own exact semantics (`~/git/podman/cmd/podman/
     // containers/rm.go`): the file's own first line only
     // (`strings.Cut(content, "\n")`), merged into the same target list
-    // an explicit `ID`/`--name` argument already builds -- no
-    // distinction after this point.
+    // an explicit `ID`/`--name` argument already builds. `--ignore`
+    // additionally tolerates the cidfile itself not existing at all
+    // (skipped, not an error) -- checked directly, matching real
+    // podman's own identical `errors.Is(err, os.ErrNotExist)` gate
+    // exactly (0318).
     let mut ids: Vec<String> = ids.to_vec();
     for path in cidfiles {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("reading --cidfile {}", path.display()))?;
-        ids.push(content.split('\n').next().unwrap_or("").to_string());
+        match std::fs::read_to_string(path) {
+            Ok(content) => ids.push(content.split('\n').next().unwrap_or("").to_string()),
+            Err(e) if ignore && e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading --cidfile {}", path.display()));
+            }
+        }
     }
     let ids = &ids;
 
     let containers = open_container_store()?;
     match (ids.is_empty(), all) {
         (false, true) => anyhow::bail!("cannot give both a container ID/name and --all"),
-        (true, false) => {
+        (true, false) if nothing_given => {
             anyhow::bail!("no container ID/name given (try `ociman rm <ID>` or `--all`)")
         }
+        // `ids` ended up empty despite something genuinely having
+        // been given (a `--cidfile` that turned out unreadable and
+        // `--ignore` tolerated that) -- a silent, successful no-op,
+        // matching real podman's own identical behavior in exactly
+        // this case (0318).
+        (true, false) => Ok(()),
         (false, false) => {
             // Resolve every given identifier first: an unresolvable
             // one aborts before anything at all is removed (checked
@@ -7719,16 +7770,65 @@ fn reset_failed_systemd_scope(container_id: &str, state: &oci_runtime_core::Pers
 /// a real, reported error, with every other container still attempted
 /// regardless (matching `kill --all`'s own identical "attempt every
 /// one, report the first real failure at the end" shape, 0312).
+///
+/// Multiple explicit ids, `--cidfile`, and `--ignore` (0318, closing
+/// `ociman stop`'s own remaining real gaps against real `podman stop`)
+/// all reuse `ociman rm`'s own already-established multi-target
+/// pattern verbatim: cidfile-sourced ids merge into the same list an
+/// explicit `ID`/`--name` argument builds; every id is resolved first,
+/// an unresolvable one aborting the whole call unless `--ignore` drops
+/// it from the target list instead (the same narrow gate `rm --ignore`
+/// already established, `0311`); once resolved, every target is still
+/// genuinely attempted regardless of an earlier one's own stop
+/// failure. Unlike `rm`, there is no `--force`-implies-`--ignore`
+/// convention here — real `stop` has no `--force` at all.
 fn cmd_stop(
-    id: Option<&str>,
+    ids: &[String],
     time_secs: Option<u64>,
     signal: Option<&str>,
     all: bool,
+    cidfiles: &[PathBuf],
+    ignore: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        id.is_none() || !all,
+        cidfiles.is_empty() || !all,
+        "--all and --cidfile cannot be used together"
+    );
+    anyhow::ensure!(
+        ids.is_empty() || !all,
         "cannot give both a container ID/name and --all"
     );
+    // Matches real podman's own checked-directly CLI-level validation
+    // exactly (`validate.CheckAllLatestAndIDFile`): "you must provide
+    // at least one name or id" is judged by whether `--cidfile` was
+    // ever *given* at all, never by whether it later actually
+    // resolved to anything -- captured here, before the merge below,
+    // specifically so a `--cidfile` that turns out unreadable-but-
+    // `--ignore`d still counts as "something was given" even once the
+    // merged list below ends up empty because of it.
+    let nothing_given = ids.is_empty() && cidfiles.is_empty() && !all;
+    anyhow::ensure!(
+        !nothing_given,
+        "no container ID/name given (try `ociman stop <ID>` or `--all`)"
+    );
+    // Real podman's own exact semantics (`~/git/podman/cmd/podman/
+    // containers/stop.go`): the file's own first line only, merged
+    // into the same target list an explicit `ID`/`--name` argument
+    // already builds. `--ignore` additionally tolerates the cidfile
+    // itself not existing at all (skipped, not an error) -- checked
+    // directly, matching real podman's own identical
+    // `errors.Is(err, os.ErrNotExist)` gate exactly.
+    let mut ids: Vec<String> = ids.to_vec();
+    for path in cidfiles {
+        match std::fs::read_to_string(path) {
+            Ok(content) => ids.push(content.split('\n').next().unwrap_or("").to_string()),
+            Err(e) if ignore && e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading --cidfile {}", path.display()));
+            }
+        }
+    }
+
     if all {
         let containers = open_container_store()?;
         let mut first_error = None;
@@ -7749,12 +7849,49 @@ fn cmd_stop(
             None => Ok(()),
         };
     }
-    let id = id.ok_or_else(|| {
-        anyhow::anyhow!("no container ID/name given (try `ociman stop <ID>` or `--all`)")
-    })?;
-    stop_container(id, time_secs, signal, true)?;
-    println!("{id}");
-    Ok(())
+
+    // `ids` can genuinely be empty here despite `nothing_given` being
+    // `false` above: a `--cidfile` really was given, it just turned
+    // out unreadable and `--ignore` tolerated that. Matches real
+    // podman's own identical behavior in exactly this case (checked
+    // directly): a silent, successful no-op, not an error -- the
+    // CLI-level "you must provide at least one" validation already
+    // ran once, earlier, against whether `--cidfile` was *given*, not
+    // whether it ultimately resolved to anything.
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    // Resolve every given identifier first: an unresolvable one
+    // aborts before anything at all is stopped (matching real
+    // podman's own identical two-phase `getContainers` behavior) --
+    // unless `--ignore` is given, in which case it's dropped from the
+    // target list instead, the same narrow gate `ociman rm --ignore`
+    // already established (0311).
+    let containers = open_container_store()?;
+    let mut targets = Vec::with_capacity(ids.len());
+    for id in &ids {
+        match resolve_container_id(&containers, id) {
+            Ok(_) => targets.push(id.clone()),
+            Err(_) if ignore => continue,
+            Err(e) => return Err(e).with_context(|| format!("resolving {id:?}")),
+        }
+    }
+
+    let mut first_error = None;
+    for id in &targets {
+        match stop_container(id, time_secs, signal, true) {
+            Ok(()) => println!("{id}"),
+            Err(e) => {
+                eprintln!("error stopping {id}: {e:#}");
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    match first_error {
+        Some(e) => Err(e.context("stopping containers")),
+        None => Ok(()),
+    }
 }
 
 /// The image's own declared `STOPSIGNAL`, if the container's image

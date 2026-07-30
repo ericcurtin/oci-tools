@@ -922,3 +922,313 @@ fn stop_and_restart_on_a_paused_container_are_a_real_immediate_error() {
     wait_for_container_status(storage_dir.path(), &id, "stopped", Duration::from_secs(20));
     ociman(storage_dir.path(), &["rm", &id]);
 }
+
+/// Multiple explicit ids (0318, a real, previously-unsupported gap:
+/// `ociman stop` only ever accepted exactly one target before this,
+/// unlike real podman's own `stop [options] CONTAINER
+/// [CONTAINER...]`) each get stopped, printing each one's own raw
+/// given name.
+#[test]
+fn stop_with_multiple_explicit_ids_stops_each() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stop-multi:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run1 = ociman_run_detached_named(
+        storage_dir.path(),
+        "stop-multi-run1",
+        "ociman-test/stop-multi:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let mut run2 = ociman_run_detached_named(
+        storage_dir.path(),
+        "stop-multi-run2",
+        "ociman-test/stop-multi:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "stop-multi-run1",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "stop-multi-run2",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let stop = ociman(
+        storage_dir.path(),
+        &["stop", "--time", "1", "stop-multi-run1", "stop-multi-run2"],
+    );
+    assert!(
+        stop.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let mut lines: Vec<String> = String::from_utf8_lossy(&stop.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    lines.sort();
+    assert_eq!(lines, vec!["stop-multi-run1", "stop-multi-run2"]);
+
+    run1.wait().unwrap();
+    run2.wait().unwrap();
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "stop-multi-run1",
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "stop-multi-run2",
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped"
+    );
+
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// An unresolvable id among several explicit targets aborts the whole
+/// call before stopping *any* of them, matching real podman's own
+/// identical two-phase behavior for a plain multi-id `stop` (checked
+/// directly, `getContainers`'s own `default` case).
+#[test]
+fn stop_with_one_nonexistent_id_among_several_aborts_before_stopping_any() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stop-multi-bad:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run1 = ociman_run_detached_named(
+        storage_dir.path(),
+        "stop-multi-bad-run1",
+        "ociman-test/stop-multi-bad:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "stop-multi-bad-run1",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let stop = ociman(
+        storage_dir.path(),
+        &[
+            "stop",
+            "--time",
+            "1",
+            "stop-multi-bad-run1",
+            "stop-multi-bad-does-not-exist",
+        ],
+    );
+    assert!(
+        !stop.status.success(),
+        "an unresolvable id among several should abort the whole call"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "stop-multi-bad-run1",
+            "running",
+            Duration::from_millis(200)
+        ),
+        "running",
+        "the real container must be completely untouched by the aborted call"
+    );
+
+    // `--ignore` tolerates the unresolvable one instead.
+    let stop_ignore = ociman(
+        storage_dir.path(),
+        &[
+            "stop",
+            "--time",
+            "1",
+            "--ignore",
+            "stop-multi-bad-run1",
+            "stop-multi-bad-does-not-exist",
+        ],
+    );
+    assert!(
+        stop_ignore.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop_ignore.stderr)
+    );
+    run1.wait().unwrap();
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "stop-multi-bad-run1",
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped"
+    );
+
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// `--cidfile` (0318) matches real `podman stop --cidfile` exactly:
+/// the file's own first line only, trailing content ignored, merged
+/// into the same target list an explicit `ID`/`--name` argument
+/// already builds -- same technique `ociman_ps.rs`'s own
+/// `rm_cidfile_reads_the_container_id_from_a_file_and_ignores_
+/// trailing_content` already established.
+#[test]
+fn stop_cidfile_reads_the_container_id_from_a_file_and_ignores_trailing_content() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stop-cidfile:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached_named(
+        storage_dir.path(),
+        "stop-cidfile-target",
+        "ociman-test/stop-cidfile:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "stop-cidfile-target",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let cidfile = storage_dir.path().join("cid.txt");
+    std::fs::write(&cidfile, "stop-cidfile-target\ngarbage second line").unwrap();
+
+    let stop = ociman(
+        storage_dir.path(),
+        &[
+            "stop",
+            "--time",
+            "1",
+            "--cidfile",
+            cidfile.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        stop.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&stop.stdout).trim(),
+        "stop-cidfile-target"
+    );
+
+    run.wait().unwrap();
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "stop-cidfile-target",
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped"
+    );
+
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// Real `podman stop`'s own `--cidfile` and `--all` are mutually
+/// exclusive, matching `rm`/`restart`'s own identical rule.
+#[test]
+fn stop_all_and_cidfile_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let cidfile = storage_dir.path().join("cid.txt");
+    std::fs::write(&cidfile, "some-id").unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &["stop", "--all", "--cidfile", cidfile.to_str().unwrap()],
+    );
+    assert!(!out.status.success());
+}
+
+/// A cidfile that can't be read at all is a hard error without
+/// `--ignore`, but a silent, successful no-op *with* `--ignore` and
+/// nothing else given -- matching real podman's own identical
+/// checked-directly behavior exactly (0318).
+#[test]
+fn stop_cidfile_that_cannot_be_read_is_a_hard_error_unless_ignored() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &["stop", "--cidfile", "/does/not/exist/at/all"],
+    );
+    assert!(!out.status.success());
+
+    let out_ignored = ociman(
+        storage_dir.path(),
+        &["stop", "--ignore", "--cidfile", "/does/not/exist/at/all"],
+    );
+    assert!(
+        out_ignored.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_ignored.stderr)
+    );
+    assert!(out_ignored.stdout.is_empty());
+}
+
+/// Giving nothing at all (no ids, no `--cidfile`, no `--all`) is
+/// always a clear error, `--ignore` or not -- `--ignore` alone doesn't
+/// satisfy the "you must give something" rule.
+#[test]
+fn stop_with_nothing_given_at_all_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["stop"]);
+    assert!(!out.status.success());
+    let out_ignore = ociman(storage_dir.path(), &["stop", "--ignore"]);
+    assert!(!out_ignore.status.success());
+}

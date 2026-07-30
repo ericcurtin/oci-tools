@@ -1746,13 +1746,13 @@ fn rm_all_and_cidfile_together_is_a_clear_error() {
 }
 
 /// A `--cidfile` that can't be read at all (missing file) is a clear,
-/// immediate error regardless of `--ignore` (0310's own deliberately
-/// narrow scope, kept even now that `--ignore` exists — see
-/// `rm_ignore_still_errors_on_an_unreadable_cidfile` below for the
-/// direct proof `--ignore` doesn't widen to this case too): unlike
-/// real podman's own `--ignore`-gated tolerance for exactly this
-/// case, the honest behavior here is a hard failure, not a silent
-/// skip.
+/// immediate error *without* `--ignore` — see
+/// `rm_ignore_tolerates_an_unreadable_cidfile` below for the
+/// complementary case: with `--ignore`, matching real podman's own
+/// identical `errors.Is(err, os.ErrNotExist)` tolerance, it's a silent
+/// skip instead (0318 — corrects `0311`'s own original, incomplete
+/// claim that `--ignore` never widened to this case at all, which
+/// didn't actually match real podman's own source).
 #[test]
 fn rm_cidfile_of_a_missing_file_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();
@@ -1909,21 +1909,28 @@ fn rm_ignore_does_not_tolerate_a_non_stopped_container_without_force() {
     );
 }
 
-/// `--ignore` never widens `--cidfile`'s own separate "the file itself
-/// can't be read" case (0310's own deliberately narrow scope): a
-/// missing cidfile is still a hard, immediate error even with
-/// `--ignore` given.
+/// `--ignore` *does* widen to `--cidfile`'s own separate "the file
+/// itself can't be read" case (0318 — corrects `0311`'s own original
+/// claim that it never did, which turned out not to match real
+/// podman's own source, `~/git/podman/cmd/podman/containers/rm.go`'s
+/// own `errors.Is(err, os.ErrNotExist)` check): a missing cidfile,
+/// with `--ignore` and nothing else given, is a silent, successful
+/// no-op — matching real podman's own identical checked-directly
+/// behavior exactly (the CLI-level "you must provide at least one
+/// name or id" validation only ever checks whether `--cidfile` was
+/// *given*, never whether it later actually resolved to anything).
 #[test]
-fn rm_ignore_still_errors_on_an_unreadable_cidfile() {
+fn rm_ignore_tolerates_an_unreadable_cidfile() {
     let storage_dir = tempfile::tempdir().unwrap();
     Store::open(storage_dir.path()).unwrap();
     let out = ociman(
         storage_dir.path(),
         &["rm", "--ignore", "--cidfile", "/no/such/cidfile-path.txt"],
     );
-    assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("reading --cidfile"),
-        "{out:?}"
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    assert!(out.stdout.is_empty());
 }
