@@ -243,6 +243,159 @@ fn volume_rm_removes_a_real_volume() {
     assert_eq!(String::from_utf8_lossy(&ls.stdout).trim(), "no volumes");
 }
 
+/// `ociman volume rename` (0347) actually moves the volume's own real
+/// content -- not just a metadata-only rename -- matching real
+/// `podman volume rename` exactly. Prints nothing on success, same as
+/// real podman's own checked-directly silent completion.
+#[test]
+fn volume_rename_moves_real_content_to_the_new_name() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let create = ociman(storage_dir.path(), &["volume", "create", "old-vol"]);
+    assert!(create.status.success());
+    let mountpoint = volume_mountpoint(storage_dir.path(), "old-vol");
+    std::fs::write(mountpoint.join("hello.txt"), b"real content").unwrap();
+
+    let rename = ociman(
+        storage_dir.path(),
+        &["volume", "rename", "old-vol", "new-vol"],
+    );
+    assert!(
+        rename.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rename.stderr)
+    );
+    assert!(
+        rename.stdout.is_empty(),
+        "real podman volume rename prints nothing on success: {rename:?}"
+    );
+
+    let inspect_old = ociman(storage_dir.path(), &["volume", "inspect", "old-vol"]);
+    assert!(!inspect_old.status.success(), "old-vol should be gone");
+
+    let new_mountpoint = volume_mountpoint(storage_dir.path(), "new-vol");
+    assert_eq!(
+        std::fs::read(new_mountpoint.join("hello.txt")).unwrap(),
+        b"real content",
+        "the real file content must have moved with the volume, not been lost"
+    );
+
+    let ls = ociman(
+        storage_dir.path(),
+        &["volume", "ls", "--format", "{{.name}}"],
+    );
+    assert_eq!(String::from_utf8_lossy(&ls.stdout).trim(), "new-vol");
+}
+
+/// Renaming a volume to its own current name is a real, silent no-op
+/// success -- matching real `podman volume rename`'s own identical
+/// early-return exactly (checked directly,
+/// `~/git/podman/libpod/runtime_volume.go`).
+#[test]
+fn volume_rename_to_its_own_current_name_is_a_silent_no_op() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let create = ociman(storage_dir.path(), &["volume", "create", "same-name"]);
+    assert!(create.status.success());
+
+    let rename = ociman(
+        storage_dir.path(),
+        &["volume", "rename", "same-name", "same-name"],
+    );
+    assert!(
+        rename.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rename.stderr)
+    );
+
+    let inspect = ociman(storage_dir.path(), &["volume", "inspect", "same-name"]);
+    assert!(inspect.status.success());
+}
+
+/// Renaming a volume to a name that already resolves to a real,
+/// *different* volume is a clear error, matching real podman's own
+/// `ErrVolumeExists` -- neither volume is touched.
+#[test]
+fn volume_rename_to_an_already_existing_different_volume_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    ociman(storage_dir.path(), &["volume", "create", "first"]);
+    ociman(storage_dir.path(), &["volume", "create", "second"]);
+
+    let rename = ociman(storage_dir.path(), &["volume", "rename", "first", "second"]);
+    assert!(!rename.status.success());
+    assert!(
+        String::from_utf8_lossy(&rename.stderr).contains("already exists"),
+        "{}",
+        String::from_utf8_lossy(&rename.stderr)
+    );
+
+    // Both original volumes are still present and untouched.
+    assert!(
+        ociman(storage_dir.path(), &["volume", "inspect", "first"])
+            .status
+            .success()
+    );
+    assert!(
+        ociman(storage_dir.path(), &["volume", "inspect", "second"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn volume_rename_of_an_unknown_volume_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let rename = ociman(
+        storage_dir.path(),
+        &["volume", "rename", "never-created", "whatever"],
+    );
+    assert!(!rename.status.success());
+}
+
+/// `ociman volume rename` refuses a volume a running container
+/// depends on, the same rule `volume rm` enforces with no `--force`
+/// -- there's no `--force` escape hatch for `rename` at all, matching
+/// real podman's own identical unconditional refusal (checked
+/// directly, `~/git/podman/libpod/runtime_volume.go`: no
+/// force-equivalent parameter exists on `RenameVolume` at all).
+#[test]
+fn volume_rename_refuses_a_volume_a_running_container_depends_on() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/volume-rename-in-use:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let mut child = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/volume-rename-in-use:latest",
+        &["-d", "-v", "depvol:/data", "sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20));
+
+    let rename = ociman(
+        storage_dir.path(),
+        &["volume", "rename", "depvol", "depvol2"],
+    );
+    assert!(!rename.status.success());
+    assert!(
+        String::from_utf8_lossy(&rename.stderr).contains("is being used by"),
+        "{}",
+        String::from_utf8_lossy(&rename.stderr)
+    );
+
+    ociman(storage_dir.path(), &["kill", &id]);
+    child.wait().ok();
+}
+
 /// The full real round trip: `-v name:/path` in `ociman run` actually
 /// auto-creates the named volume on first use, mounts its own real
 /// `_data` directory into the container, and the same volume's own

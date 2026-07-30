@@ -154,6 +154,44 @@ impl VolumeStore {
         fs::remove_dir_all(self.volume_dir(name))?;
         Ok(true)
     }
+
+    /// Rename `old_name`'s own real on-disk directory (`_data` and
+    /// `metadata.json` together) to `new_name`, matching real `podman
+    /// volume rename`'s own real, atomic directory move exactly
+    /// (`~/git/podman/libpod/sqlite_state.go`'s own `os.Rename
+    /// (oldPath, newPath)`) — this project has no separate database-
+    /// vs-storage-path split to keep in sync the way real podman's
+    /// own two-step commit does, so a single `fs::rename` of the
+    /// whole directory is both simpler and already atomic with
+    /// respect to a concurrent reader, the same `rename(2)` guarantee
+    /// real podman itself relies on.
+    ///
+    /// Existence of `old_name`, non-existence of `new_name`, and
+    /// in-use-by-container checks are all the *caller's* own
+    /// responsibility (`cmd_volume_rename`) — this module's own
+    /// established "low-level primitive, business rules live in
+    /// `main.rs`" convention, the same split `remove`'s own doc
+    /// comment (via `cmd_volume_rm`) already establishes.
+    pub(crate) fn rename(&self, old_name: &str, new_name: &str) -> io::Result<()> {
+        fs::rename(self.volume_dir(old_name), self.volume_dir(new_name))?;
+        // The persisted record's own `name` field must match the
+        // directory it now lives in: `list()`/`get()` both read it
+        // back verbatim rather than inferring it from the directory
+        // name, so leaving it stale here would silently keep
+        // reporting the *old* name for a volume only ever creatable
+        // again, from now on, under its new one.
+        let mut record = self.get(new_name)?.ok_or_else(|| {
+            io::Error::other(format!(
+                "renamed volume {new_name:?} has no metadata.json after the move"
+            ))
+        })?;
+        record.name = new_name.to_string();
+        fs::write(
+            self.metadata_path(new_name),
+            serde_json::to_vec(&record).map_err(io::Error::from)?,
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -226,6 +264,36 @@ mod tests {
         assert!(store.remove("gone-soon").unwrap());
         assert!(!store.exists("gone-soon"));
         assert!(!store.remove("gone-soon").unwrap());
+    }
+
+    #[test]
+    fn rename_moves_the_real_directory_and_updates_the_persisted_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VolumeStore::open(dir.path()).unwrap();
+        store.get_or_create("old-name").unwrap();
+        fs::write(store.data_dir("old-name").join("marker.txt"), b"hi").unwrap();
+
+        store.rename("old-name", "new-name").unwrap();
+
+        assert!(!store.exists("old-name"));
+        assert!(store.exists("new-name"));
+        // The real file content moved with the directory, not just an
+        // empty new one created fresh.
+        assert_eq!(
+            fs::read(store.data_dir("new-name").join("marker.txt")).unwrap(),
+            b"hi"
+        );
+        // The persisted record's own `name` field matches the new
+        // name too, not left stale at the old one.
+        let record = store.get("new-name").unwrap().unwrap();
+        assert_eq!(record.name, "new-name");
+    }
+
+    #[test]
+    fn rename_of_a_nonexistent_volume_is_a_real_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VolumeStore::open(dir.path()).unwrap();
+        assert!(store.rename("does-not-exist", "new-name").is_err());
     }
 
     #[test]

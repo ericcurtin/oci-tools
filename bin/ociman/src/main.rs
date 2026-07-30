@@ -2607,6 +2607,28 @@ enum VolumeCommand {
         #[arg(short, long)]
         force: bool,
     },
+    /// Rename an existing volume — matching real `podman volume
+    /// rename` exactly (checked directly, `~/git/podman/libpod/
+    /// runtime_volume.go`): refuses a volume any container (running
+    /// or stopped) still references, the same rule `volume rm`
+    /// enforces with no `--force` given (this project has no separate
+    /// "currently mounted" concept beyond that to also check, unlike
+    /// real podman's own additional live `MountCount` gate — every
+    /// mount here is just a plain bind referenced from a container's
+    /// own already-inspectable bundle spec, so "in use by a
+    /// container" already covers it); a new name that already
+    /// resolves to a real, different volume is a clear error
+    /// (matching real podman's own `ErrVolumeExists`); renaming a
+    /// volume to its own current name is a real, silent no-op success
+    /// (matching real podman's own identical early-return). Prints
+    /// nothing on success, matching real `podman volume rename`'s own
+    /// checked-directly silent completion.
+    Rename {
+        /// The volume's current name.
+        name: String,
+        /// The volume's new name.
+        new_name: String,
+    },
     /// Remove every real volume not currently referenced by any
     /// container (running or stopped) — matching real `docker volume
     /// prune`/`podman volume prune`.
@@ -2916,6 +2938,7 @@ fn main() -> std::process::ExitCode {
                 VolumeCommand::Ls { format } => cmd_volume_ls(cli.global.json, format.as_deref()),
                 VolumeCommand::Inspect { name } => cmd_volume_inspect(&name, cli.global.json),
                 VolumeCommand::Rm { name, force } => cmd_volume_rm(&name, force),
+                VolumeCommand::Rename { name, new_name } => cmd_volume_rename(&name, &new_name),
                 VolumeCommand::Prune => cmd_volume_prune(cli.global.json),
                 VolumeCommand::Exists { name } => cmd_volume_exists(&name),
                 VolumeCommand::Export { name, output } => {
@@ -10042,6 +10065,45 @@ fn cmd_volume_rm(name: &str, force: bool) -> anyhow::Result<()> {
         .remove(name)
         .with_context(|| format!("removing volume {name:?}"))?;
     println!("{name}");
+    Ok(())
+}
+
+/// See [`VolumeCommand::Rename`]'s own doc comment for the exact,
+/// checked-directly semantics this ports from real `podman volume
+/// rename` (`~/git/podman/libpod/runtime_volume.go`).
+fn cmd_volume_rename(name: &str, new_name: &str) -> anyhow::Result<()> {
+    let store = open_volume_store()?;
+    anyhow::ensure!(
+        store.exists(name),
+        "no volume with name {name:?} found: no such volume"
+    );
+    // Renaming to the volume's own current name is a real, silent
+    // no-op success -- matching real podman's own identical early
+    // return (`if vol.Name() == newName { return vol, nil }`) --
+    // checked *before* the `is_valid_volume_name`/already-exists
+    // gates below, matching real podman's own identical ordering (its
+    // own check runs before the name-regex validation too).
+    if name == new_name {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        volume::is_valid_volume_name(new_name),
+        "invalid volume name {new_name:?}: names must match [a-zA-Z0-9][a-zA-Z0-9_.-]*"
+    );
+    anyhow::ensure!(
+        !store.exists(new_name),
+        "volume with name {new_name:?} already exists"
+    );
+    let containers = open_container_store()?;
+    let dependents = containers_using_volume(&containers, &store, name)?;
+    anyhow::ensure!(
+        dependents.is_empty(),
+        "volume {name:?} is being used by the following container(s): {}",
+        dependents.join(", ")
+    );
+    store
+        .rename(name, new_name)
+        .with_context(|| format!("renaming volume {name:?} to {new_name:?}"))?;
     Ok(())
 }
 
