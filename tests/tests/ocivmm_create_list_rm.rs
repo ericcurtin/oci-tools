@@ -216,6 +216,66 @@ fn rm_all_removes_every_vm() {
     assert_eq!(String::from_utf8_lossy(&list.stdout).trim(), "no VMs");
 }
 
+/// Multiple explicit names in one call (mirroring `ocibox rm`'s own
+/// already-established multi-name support, `0321`): every one is
+/// genuinely removed, in the order given, not just the first.
+#[test]
+fn rm_accepts_multiple_explicit_names_in_one_call() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    for name in ["first", "second", "third"] {
+        seed_vm_record(
+            storage_dir.path(),
+            name,
+            "ubuntu:26.04",
+            "2026-01-01T00:00:00Z",
+        );
+    }
+
+    let rm = ocivmm(storage_dir.path(), &["rm", "first", "third"]);
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&rm.stdout).into_owned();
+    let removed: Vec<&str> = stdout.lines().collect();
+    assert_eq!(removed, vec!["first", "third"]);
+
+    assert!(!storage_dir.path().join("vms").join("first").exists());
+    assert!(storage_dir.path().join("vms").join("second").is_dir());
+    assert!(!storage_dir.path().join("vms").join("third").exists());
+}
+
+/// One unresolvable name among several genuine ones must abort the
+/// *whole* call before removing anything at all -- matching this
+/// project's own established "resolve everything first" multi-target
+/// convention (`ociman rm`/`kill`/`stop`, `0310`-`0318`), not a
+/// partial removal of only the names that did resolve.
+#[test]
+fn rm_with_one_unresolvable_name_among_several_removes_nothing() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    seed_vm_record(
+        storage_dir.path(),
+        "realvm",
+        "ubuntu:26.04",
+        "2026-01-01T00:00:00Z",
+    );
+
+    let rm = ocivmm(storage_dir.path(), &["rm", "realvm", "doesnotexist"]);
+    assert!(!rm.status.success());
+    assert!(
+        String::from_utf8_lossy(&rm.stderr).contains("no such VM"),
+        "{}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert!(
+        storage_dir.path().join("vms").join("realvm").is_dir(),
+        "the resolvable VM must survive untouched since the whole call aborted"
+    );
+}
+
 #[test]
 fn rm_all_on_an_empty_store_is_a_silent_success() {
     let storage_dir = tempfile::tempdir().unwrap();

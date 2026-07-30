@@ -156,13 +156,20 @@ enum Command {
     /// List created VMs (name, image, creation time), sorted by name.
     #[command(alias = "ls")]
     List,
-    /// Remove a VM entirely (its disk image and persisted record).
+    /// Remove one or more VMs entirely (each one's disk image and
+    /// persisted record).
     Rm {
-        /// The VM's name, exactly as shown by `ocivmm list`. Required
-        /// unless `--all` is given instead.
-        name: Option<String>,
-        /// Remove every existing VM. Mutually exclusive with a
-        /// positional `name`.
+        /// The VM name(s), exactly as shown by `ocivmm list`. At least
+        /// one, or `--all`, is required. Every given name must resolve
+        /// to a real, existing VM before anything is actually removed
+        /// -- an unresolvable one aborts the whole call rather than
+        /// removing only some of the given names, the same "resolve
+        /// everything first" convention this workspace's own `ociman
+        /// rm`/`kill`/`stop` multi-target support already established
+        /// (`docs/design/0310`-`0318`).
+        names: Vec<String>,
+        /// Remove every existing VM. Mutually exclusive with any
+        /// positional `names`.
         #[arg(long, short = 'a')]
         all: bool,
     },
@@ -235,7 +242,7 @@ fn main() -> std::process::ExitCode {
                 disk_mib.unwrap_or(DEFAULT_DISK_MIB),
             ),
             Some(Command::List) => cmd_list(cli.global.json),
-            Some(Command::Rm { name, all }) => cmd_rm(name.as_deref(), all),
+            Some(Command::Rm { names, all }) => cmd_rm(&names, all),
             Some(Command::Cp { src, dst }) => cmd_cp(&src, &dst),
             Some(Command::Boot { spec }) => cmd_boot(&spec),
             None => anyhow::bail!("no subcommand given (try `ocivmm run ubuntu:26.04`)"),
@@ -779,12 +786,12 @@ fn remove_one_vm(name: &str) -> anyhow::Result<()> {
 }
 
 /// `ocivmm rm <NAME>` / `ocivmm rm --all`.
-fn cmd_rm(name: Option<&str>, all: bool) -> anyhow::Result<()> {
-    match (name, all) {
-        (Some(_), true) => anyhow::bail!("cannot give both a VM name and --all"),
-        (None, false) => anyhow::bail!("no VM name given (try `ocivmm rm <NAME>` or `--all`)"),
-        (Some(name), false) => remove_one_vm(name),
-        (None, true) => {
+fn cmd_rm(names: &[String], all: bool) -> anyhow::Result<()> {
+    match (names.is_empty(), all) {
+        (false, true) => anyhow::bail!("cannot give both a VM name and --all"),
+        (true, false) => anyhow::bail!("no VM name given (try `ocivmm rm <NAME>` or `--all`)"),
+        (false, false) => remove_named_vms(names),
+        (true, true) => {
             let mut first_error = None;
             for record in list_vms()? {
                 if let Err(e) = remove_one_vm(&record.name) {
@@ -797,6 +804,30 @@ fn cmd_rm(name: Option<&str>, all: bool) -> anyhow::Result<()> {
                 None => Ok(()),
             }
         }
+    }
+}
+
+/// Remove every one of `names` (`ocivmm rm` with one or more explicit
+/// names, no `--all`): every name must resolve to a real, existing VM
+/// first -- an unresolvable one aborts the whole call before removing
+/// anything at all -- but once every one resolves, each is still
+/// genuinely attempted regardless of an earlier one's own removal
+/// failure (matching `--all`'s own identical resilience just above).
+fn remove_named_vms(names: &[String]) -> anyhow::Result<()> {
+    for name in names {
+        validate_vm_name(name)?;
+        anyhow::ensure!(vms_root().join(name).is_dir(), "{name}: no such VM");
+    }
+    let mut first_error = None;
+    for name in names {
+        if let Err(e) = remove_one_vm(name) {
+            eprintln!("error removing {name}: {e:#}");
+            first_error.get_or_insert(e);
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
