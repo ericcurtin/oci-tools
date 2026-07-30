@@ -272,9 +272,20 @@ enum Command {
     },
     /// Update a running container's real cgroup resource limits in
     /// place — matching real `runc update`'s own `--resources`/`-r`
-    /// JSON-file mode exactly (its own many individual ad-hoc
-    /// `--memory`/`--cpu-shares`/... flags aren't supported yet, a
-    /// deliberately narrower first slice; see `docs/design/0099`).
+    /// JSON-file mode, *and* (0353) a first slice of its own many
+    /// individual ad-hoc flags — `--memory`/`--memory-swap`/
+    /// `--pids-limit`/`--cpuset-cpus`/`--cpuset-mems`, the exact same
+    /// set real `crun update` also supports (checked directly,
+    /// `~/git/crun/src/update.c`) — closing a real, previously-
+    /// documented-but-never-revisited gap from this project's own
+    /// milestone-3 design note (`docs/design/0099`: "a deliberate,
+    /// documented scope limit, not attempted here"). Real runc's own
+    /// remaining, still-unimplemented ad-hoc flags
+    /// (`--blkio-weight`/`--cpu-period`/`--cpu-quota`/`--cpu-share`/
+    /// `--cpu-rt-period`/`--cpu-rt-runtime`/`--cpu-idle`/
+    /// `--kernel-memory`/`--kernel-memory-tcp`, plus real runc's own
+    /// Intel RDT-only `--l3-cache-schema`/`--mem-bw-schema`) remain a
+    /// separate, still-deferred candidate.
     Update {
         /// The container's ID.
         id: String,
@@ -282,9 +293,56 @@ enum Command {
         /// apply (same shape as `config.json`'s own
         /// `linux.resources`), or `-` to read it from stdin. Any
         /// field the JSON leaves unset is left completely alone —
-        /// this only ever changes what's actually given.
+        /// this only ever changes what's actually given. Matching
+        /// real `runc update`'s own checked-directly documented
+        /// behavior exactly (`~/git/runc/update.go`: *"if data is to
+        /// be read from a file or the standard input, all other
+        /// options are ignored"*): when given, every ad-hoc flag
+        /// below is silently ignored, even if also given — not an
+        /// error, matching real runc's own identical, deliberately
+        /// permissive precedence.
         #[arg(short, long)]
-        resources: PathBuf,
+        resources: Option<PathBuf>,
+        /// Memory usage limit, matching real `runc update --memory`/
+        /// `crun update --memory` exactly: a plain byte count, or one
+        /// followed by a `k`/`m`/`g`/`t` unit suffix (binary units,
+        /// matching real docker/podman's own `RAMInBytes` convention
+        /// this project's own `ociman run --memory` already uses —
+        /// real runc's own identical parser; real crun's own is
+        /// narrower, plain-integer-only, a strict subset of what this
+        /// accepts, so nothing crun-specific is lost).
+        #[arg(long)]
+        memory: Option<String>,
+        /// Total memory **+ swap** limit (same units as `--memory`),
+        /// matching real `runc update --memory-swap`/`crun update
+        /// --memory-swap` exactly. `-1` means unlimited swap (the
+        /// same real convention `ociman run --memory-swap` already
+        /// established).
+        #[arg(long = "memory-swap", allow_hyphen_values = true)]
+        memory_swap: Option<String>,
+        /// Maximum number of processes/threads, matching real `runc
+        /// update --pids-limit`/`crun update --pids-limit` exactly --
+        /// passed straight through to `pids.max` with no clamping or
+        /// renormalizing at all (unlike `ociman run --pids-limit`'s
+        /// own friendlier "any non-positive value means unlimited"
+        /// convenience convention): real runc's own update.go is a
+        /// bare `int64(cmd.Int("pids-limit"))` pass-through, and the
+        /// real runtime-spec's own documented `-1`-means-unlimited
+        /// convention (`oci_spec_types::runtime::LinuxPids::limit`'s
+        /// own doc comment) already covers the one value that
+        /// actually matters in practice.
+        #[arg(long = "pids-limit", allow_hyphen_values = true)]
+        pids_limit: Option<i64>,
+        /// Which CPUs the container's own cgroup may run on
+        /// (`cpuset.cpus`-style range list), matching real `runc
+        /// update --cpuset-cpus`/`crun update --cpuset-cpus` exactly.
+        #[arg(long = "cpuset-cpus")]
+        cpuset_cpus: Option<String>,
+        /// Which NUMA memory nodes the container's own cgroup may use
+        /// (`cpuset.mems`-style range list), matching real `runc
+        /// update --cpuset-mems`/`crun update --cpuset-mems` exactly.
+        #[arg(long = "cpuset-mems")]
+        cpuset_mems: Option<String>,
     },
     /// Freeze every process in a running container via the real
     /// cgroup v2 freezer (`cgroup.freeze`) — matching real `runc
@@ -433,7 +491,24 @@ fn main() -> std::process::ExitCode {
                 format,
                 ps_args,
             }) => cmd_ps(&root, &id, &format, &ps_args),
-            Some(Command::Update { id, resources }) => cmd_update(&root, &id, &resources),
+            Some(Command::Update {
+                id,
+                resources,
+                memory,
+                memory_swap,
+                pids_limit,
+                cpuset_cpus,
+                cpuset_mems,
+            }) => cmd_update(
+                &root,
+                &id,
+                resources.as_deref(),
+                memory.as_deref(),
+                memory_swap.as_deref(),
+                pids_limit,
+                cpuset_cpus.as_deref(),
+                cpuset_mems.as_deref(),
+            ),
             Some(Command::Pause { id }) => cmd_pause(&root, &id),
             Some(Command::Resume { id }) => cmd_resume(&root, &id),
             Some(Command::Events { id, stats }) => cmd_events(&root, &id, stats),
@@ -1018,16 +1093,116 @@ fn resolve_cgroup_dir(root: &Path, id: &str) -> anyhow::Result<PathBuf> {
 /// mode only), and the container's own persisted `config.json` is not
 /// rewritten to reflect the change (a later `ocirun state` still shows
 /// the limits it was *created* with) — see `docs/design/0099`.
-fn cmd_update(root: &Path, id: &str, resources_path: &Path) -> anyhow::Result<()> {
+/// Parse a `--memory`/`--memory-swap` value the same way real
+/// `docker run --memory`/`podman run --memory`/real runc's own
+/// `update.go` (`units.RAMInBytes`) do: a plain non-negative integer
+/// (bytes), or one followed by a single case-insensitive unit suffix
+/// -- `b` (bytes, a no-op), `k`/`m`/`g`/`t` for binary kibi-/mebi-/
+/// gibi-/tebibytes (`1024^1..4`, *not* decimal SI units). A real, if
+/// small, deliberate duplication of `ociman`'s own identical
+/// `parse_memory_limit` (this project has no shared crate for CLI-
+/// argument-parsing-only helpers, the same reasoning `0351`'s own
+/// `verify_preserve_fds` duplication already gives) -- richer than
+/// real crun's own plain-integer-only convention, but a strict
+/// superset of it (a bare number with no suffix parses identically
+/// either way), so nothing crun-specific is lost by accepting more.
+fn parse_memory_limit(value: &str) -> anyhow::Result<i64> {
+    let value = value.trim();
+    anyhow::ensure!(!value.is_empty(), "--memory value cannot be empty");
+    let (number, multiplier) = match value.chars().last().unwrap().to_ascii_lowercase() {
+        'b' => (&value[..value.len() - 1], 1u64),
+        'k' => (&value[..value.len() - 1], 1024u64),
+        'm' => (&value[..value.len() - 1], 1024 * 1024),
+        'g' => (&value[..value.len() - 1], 1024 * 1024 * 1024),
+        't' => (&value[..value.len() - 1], 1024u64 * 1024 * 1024 * 1024),
+        _ => (value, 1u64),
+    };
+    let number: u64 = number
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid --memory value {value:?}"))?;
+    let bytes = number
+        .checked_mul(multiplier)
+        .with_context(|| format!("--memory value {value:?} is too large"))?;
+    i64::try_from(bytes).with_context(|| format!("--memory value {value:?} is too large"))
+}
+
+/// Same syntax as [`parse_memory_limit`], plus real `runc update
+/// --memory-swap`'s own `-1` convention for "unlimited swap".
+fn parse_memory_swap_limit(value: &str) -> anyhow::Result<i64> {
+    if value.trim() == "-1" {
+        return Ok(-1);
+    }
+    parse_memory_limit(value)
+}
+
+/// Build a [`oci_spec_types::runtime::LinuxResources`] from this
+/// command's own ad-hoc flags -- only ever called when `--resources`
+/// was *not* given (see [`Command::Update::resources`]'s own doc
+/// comment for exactly why real runc/crun both ignore every ad-hoc
+/// flag outright once a file/stdin source is given instead). Each
+/// field left as `None`/empty is a real, deliberate no-op -- matching
+/// every one of these ad-hoc flags' own real upstream "only ever
+/// change what's actually given" convention (the same one the
+/// JSON-file mode's own doc comment already establishes).
+#[allow(clippy::too_many_arguments)]
+fn resources_from_flags(
+    memory: Option<&str>,
+    memory_swap: Option<&str>,
+    pids_limit: Option<i64>,
+    cpuset_cpus: Option<&str>,
+    cpuset_mems: Option<&str>,
+) -> anyhow::Result<oci_spec_types::runtime::LinuxResources> {
+    let mut resources = oci_spec_types::runtime::LinuxResources::default();
+    if memory.is_some() || memory_swap.is_some() {
+        let mut mem = oci_spec_types::runtime::LinuxMemory::default();
+        if let Some(memory) = memory {
+            mem.limit = Some(parse_memory_limit(memory)?);
+        }
+        if let Some(memory_swap) = memory_swap {
+            mem.swap = Some(parse_memory_swap_limit(memory_swap)?);
+        }
+        resources.memory = Some(mem);
+    }
+    if let Some(limit) = pids_limit {
+        resources.pids = Some(oci_spec_types::runtime::LinuxPids { limit: Some(limit) });
+    }
+    if cpuset_cpus.is_some() || cpuset_mems.is_some() {
+        let mut cpu = oci_spec_types::runtime::LinuxCpu::default();
+        if let Some(cpuset_cpus) = cpuset_cpus {
+            cpu.cpus = cpuset_cpus.to_string();
+        }
+        if let Some(cpuset_mems) = cpuset_mems {
+            cpu.mems = cpuset_mems.to_string();
+        }
+        resources.cpu = Some(cpu);
+    }
+    Ok(resources)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_update(
+    root: &Path,
+    id: &str,
+    resources_path: Option<&Path>,
+    memory: Option<&str>,
+    memory_swap: Option<&str>,
+    pids_limit: Option<i64>,
+    cpuset_cpus: Option<&str>,
+    cpuset_mems: Option<&str>,
+) -> anyhow::Result<()> {
     let cgroup_dir = resolve_cgroup_dir(root, id)?;
 
-    let resources: oci_spec_types::runtime::LinuxResources = if resources_path == Path::new("-") {
-        serde_json::from_reader(std::io::stdin()).context("reading resources JSON from stdin")?
-    } else {
-        let file = std::fs::File::open(resources_path)
-            .with_context(|| format!("opening {}", resources_path.display()))?;
-        serde_json::from_reader(file)
-            .with_context(|| format!("parsing {} as JSON", resources_path.display()))?
+    let resources: oci_spec_types::runtime::LinuxResources = match resources_path {
+        Some(path) if path == Path::new("-") => serde_json::from_reader(std::io::stdin())
+            .context("reading resources JSON from stdin")?,
+        Some(path) => {
+            let file =
+                std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+            serde_json::from_reader(file)
+                .with_context(|| format!("parsing {} as JSON", path.display()))?
+        }
+        None => resources_from_flags(memory, memory_swap, pids_limit, cpuset_cpus, cpuset_mems)?,
     };
 
     let writes = oci_runtime_core::cgroups::plan_resources(&resources);
@@ -1277,4 +1452,84 @@ fn cmd_exec(
     // The exec'd process's own exit code becomes ours, same convention
     // `run`/`create` already follow.
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `parse_memory_limit`/`resources_from_flags` are non-trivial
+    // parsing/construction logic worth their own direct unit tests --
+    // unlike the rest of this binary, which relies entirely on
+    // `tests/tests/ocirun_*.rs` spawning the real built binary against
+    // a real cgroup, these two functions have no process/filesystem/
+    // cgroup involvement at all, so an ordinary in-process unit test
+    // is both possible and the most direct way to check them (the
+    // same reasoning `ociman`'s own identically-named `parse_memory_
+    // limit` test module already established for its own copy).
+
+    #[test]
+    fn parse_memory_limit_handles_every_real_docker_podman_unit_suffix() {
+        assert_eq!(parse_memory_limit("100").unwrap(), 100);
+        assert_eq!(parse_memory_limit("100b").unwrap(), 100);
+        assert_eq!(parse_memory_limit("1k").unwrap(), 1024);
+        assert_eq!(parse_memory_limit("100m").unwrap(), 100 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("1g").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_memory_limit("1K").unwrap(),
+            1024,
+            "case-insensitive suffix"
+        );
+    }
+
+    #[test]
+    fn parse_memory_limit_rejects_garbage_and_empty() {
+        assert!(parse_memory_limit("").is_err());
+        assert!(parse_memory_limit("not-a-number").is_err());
+        assert!(parse_memory_limit("m").is_err());
+    }
+
+    #[test]
+    fn parse_memory_swap_limit_accepts_the_real_unlimited_sentinel() {
+        assert_eq!(parse_memory_swap_limit("-1").unwrap(), -1);
+        assert_eq!(parse_memory_swap_limit("100m").unwrap(), 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn resources_from_flags_with_nothing_given_is_a_real_empty_default() {
+        let resources = resources_from_flags(None, None, None, None, None).unwrap();
+        assert_eq!(
+            resources,
+            oci_spec_types::runtime::LinuxResources::default()
+        );
+    }
+
+    #[test]
+    fn resources_from_flags_builds_memory_and_swap_together() {
+        let resources = resources_from_flags(Some("100m"), Some("200m"), None, None, None).unwrap();
+        let mem = resources.memory.unwrap();
+        assert_eq!(mem.limit, Some(100 * 1024 * 1024));
+        assert_eq!(mem.swap, Some(200 * 1024 * 1024));
+    }
+
+    #[test]
+    fn resources_from_flags_builds_pids_limit_alone() {
+        let resources = resources_from_flags(None, None, Some(50), None, None).unwrap();
+        assert_eq!(resources.pids.unwrap().limit, Some(50));
+        assert!(resources.memory.is_none());
+        assert!(resources.cpu.is_none());
+    }
+
+    #[test]
+    fn resources_from_flags_builds_cpuset_cpus_and_mems_together() {
+        let resources = resources_from_flags(None, None, None, Some("0-1"), Some("0")).unwrap();
+        let cpu = resources.cpu.unwrap();
+        assert_eq!(cpu.cpus, "0-1");
+        assert_eq!(cpu.mems, "0");
+    }
+
+    #[test]
+    fn resources_from_flags_propagates_a_real_parse_error() {
+        assert!(resources_from_flags(Some("not-a-number"), None, None, None, None).is_err());
+    }
 }

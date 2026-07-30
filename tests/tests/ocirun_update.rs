@@ -158,6 +158,110 @@ fn update_writes_real_memory_and_pids_limits_to_the_running_containers_own_cgrou
     cleanup(root_dir.path(), "memory-pids-test", &cgroup_dir);
 }
 
+/// `ocirun update`'s own ad-hoc `--memory`/`--pids-limit` flags
+/// (0353), matching real `runc update`/`crun update`'s own identical
+/// flags exactly — the same real cgroup effect the `--resources`
+/// JSON-file test above already proves, reached through the CLI
+/// flags instead of a hand-authored file.
+#[test]
+fn update_ad_hoc_memory_and_pids_limit_flags_write_the_real_cgroup() {
+    let Some((bundle_dir, root_dir, cgroup_dir)) =
+        create_and_start_with_real_cgroup("adhoc-memory-pids-test")
+    else {
+        return;
+    };
+    let _ = &bundle_dir;
+
+    let update = ocirun(
+        root_dir.path(),
+        &[
+            "update",
+            "adhoc-memory-pids-test",
+            "--memory",
+            "100m",
+            "--pids-limit",
+            "50",
+        ],
+    );
+    assert!(
+        update.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("memory.max"))
+            .unwrap()
+            .trim(),
+        "104857600",
+        "--memory 100m must parse as 100 * 1024 * 1024 bytes, matching real docker/podman/runc \
+         binary-unit convention"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("pids.max"))
+            .unwrap()
+            .trim(),
+        "50"
+    );
+
+    cleanup(root_dir.path(), "adhoc-memory-pids-test", &cgroup_dir);
+}
+
+/// A real, checked-directly upstream quirk (`~/git/runc/update.go`'s
+/// own doc comment: *"if data is to be read from a file or the
+/// standard input, all other options are ignored"*): `--resources`
+/// together with any ad-hoc flag silently ignores the ad-hoc flag
+/// entirely, rather than erroring or merging the two -- ported
+/// verbatim, not "fixed" into a more intuitive-seeming merge.
+#[test]
+fn update_resources_file_takes_priority_and_silently_ignores_every_ad_hoc_flag() {
+    let Some((bundle_dir, root_dir, cgroup_dir)) =
+        create_and_start_with_real_cgroup("resources-priority-test")
+    else {
+        return;
+    };
+
+    let resources_path = bundle_dir.path().join("resources.json");
+    std::fs::write(&resources_path, r#"{"pids": {"limit": 9}}"#).unwrap();
+
+    let update = ocirun(
+        root_dir.path(),
+        &[
+            "update",
+            "resources-priority-test",
+            "--resources",
+            resources_path.to_str().unwrap(),
+            "--pids-limit",
+            "999",
+            "--memory",
+            "1g",
+        ],
+    );
+    assert!(
+        update.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("pids.max"))
+            .unwrap()
+            .trim(),
+        "9",
+        "the --resources file's own value must win, not the ad-hoc --pids-limit 999"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("memory.max"))
+            .unwrap()
+            .trim(),
+        "max",
+        "memory.max must stay untouched -- the file doesn't mention memory, and --memory must \
+         be silently ignored, not applied"
+    );
+
+    cleanup(root_dir.path(), "resources-priority-test", &cgroup_dir);
+}
+
 #[test]
 fn update_only_touches_the_fields_the_given_json_actually_sets() {
     let Some((bundle_dir, root_dir, cgroup_dir)) =
