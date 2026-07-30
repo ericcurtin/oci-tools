@@ -396,25 +396,50 @@ pub fn is_frozen(cgroup_dir: &Path) -> io::Result<bool> {
 /// Send `signal` to `pid`, then — if `pid`'s own real, current cgroup
 /// (discovered via [`cgroup_dir_for_running_pid`], the same technique
 /// `ociman`'s own `display_status`/`cmd_top` already use) is currently
-/// frozen — thaw it so the signal actually takes effect.
+/// frozen — thaw it so the signal's effect is never left stuck behind
+/// a stale freeze.
 ///
-/// A frozen cgroup's own freezer *queues* a delivered signal rather
-/// than running it at all until thawed (confirmed directly against
-/// real runc's own `signalInit`, `~/git/runc/libcontainer/
-/// container_linux.go`: "For cgroup v1, killing a process in a frozen
-/// cgroup does nothing until it's thawed. Only thaw the cgroup for
-/// SIGKILL." — generalized here to *any* signal, not just `SIGKILL`,
-/// since a frozen cgroup's own freezer queues every signal completely
-/// identically, not just that one; real crun's own `libcrun_kill_
-/// linux`, `~/git/crun/src/libcrun/linux.c`, never thaws at all, for
-/// any signal — checked directly, neither reference runtime actually
-/// gets this right in general). Without this, `kill`ing a genuinely
-/// paused container reports success (the signal really was sent)
-/// while silently doing nothing at all — a real, previously-
-/// discovered gap (`docs/design/0312`) confirmed live: real `podman
-/// kill` on a paused container genuinely reports it `Exited (137)`
-/// afterward, not a silent no-op, which this project's own `kill`
-/// must match too (and does, for every signal, not just `SIGKILL`).
+/// Corrected understanding (`docs/design/0325`, superseding `0319`'s
+/// own original, imprecise premise): cgroup v2's freezer does **not**
+/// queue every signal identically. The kernel's own authoritative
+/// docs (`Documentation/admin-guide/cgroup-v2.rst`, "cgroup.freeze")
+/// say plainly: "Processes in the frozen cgroup can be killed by a
+/// fatal signal" — confirmed empirically too (a raw `SIGKILL`, or any
+/// signal a process hasn't installed a handler for, reaches and
+/// terminates a still-frozen process in well under a second, no thaw
+/// needed at all). What genuinely *is* queued until thaw is a signal
+/// the target process has installed a handler for (not "fatal" from
+/// the kernel's point of view) — confirmed empirically too: a process
+/// with a live `SIGTERM` trap, sent `SIGTERM` while frozen, neither
+/// runs the trap nor exits until the cgroup actually thaws. This is
+/// exactly the case `stop`'s own graceful phase depends on: a real
+/// container's init process commonly *does* install a handler for its
+/// own graceful-shutdown signal.
+///
+/// So this function's own thaw-after-signal is still genuinely
+/// necessary — just not for the reason originally documented. Two
+/// real, independent problems it closes: (1) a paused container whose
+/// process has its own signal handler would otherwise have that
+/// signal queued forever, never actually taking effect, exactly like
+/// real runc's own `signalInit` (`~/git/runc/libcontainer/
+/// container_linux.go`, cgroup-v1-specific comment: "killing a
+/// process in a frozen cgroup does nothing until it's thawed") and
+/// real crun's own `libcrun_kill_linux` (`~/git/crun/src/libcrun/
+/// linux.c`, no freezer awareness at all, for any signal) both still
+/// leave unhandled in general; (2) even for a genuinely fatal signal
+/// that *did* immediately kill the process, the cgroup's own `frozen`
+/// flag is a property of the cgroup itself, not of the (now-dead)
+/// process inside it — it stays stuck at `1` forever unless something
+/// explicitly thaws it, which would otherwise leave `ociman`'s own
+/// `display_status`/`ps`/`inspect` permanently misreporting a
+/// genuinely-dead container as still `Paused`. Without this, `kill`ing
+/// a genuinely paused container previously either left it silently
+/// alive (case 1) or reported it forever `Paused` despite already
+/// being dead (case 2) — a real, previously-discovered gap
+/// (`docs/design/0312`) confirmed live: real `podman kill` on a
+/// paused container genuinely reports it `Exited (137)` afterward,
+/// not either of those, which this project's own `kill` must match
+/// too (and does, for every signal, not just `SIGKILL`).
 ///
 /// Best-effort at resolving the cgroup itself (matching `display_
 /// status`'s own identical tolerance): a pid whose cgroup can't be
@@ -423,8 +448,9 @@ pub fn is_frozen(cgroup_dir: &Path) -> io::Result<bool> {
 /// signal into a reported failure over a check that was only ever a
 /// bonus in the first place. A *found*, and genuinely frozen, cgroup
 /// that then fails to actually thaw, though, is a real error: the
-/// entire point of this function succeeding is that the signal
-/// actually took effect, and it provably didn't in that case.
+/// entire point of this function succeeding is that the container's
+/// own status is never left stuck misreporting `Paused` after this
+/// call.
 pub fn kill_thawing_if_paused(cgroup_root: &Path, pid: i32, signal: i32) -> io::Result<()> {
     crate::process::kill(pid, signal)?;
     if let Ok(cgroup_dir) = cgroup_dir_for_running_pid(cgroup_root, pid)
@@ -754,6 +780,7 @@ pub fn print_ps_table(pids: &[i32], ps_args: &[String]) -> io::Result<()> {
 mod tests {
     use super::*;
     use oci_spec_types::runtime::{LinuxCpu, LinuxMemory, LinuxPids};
+    use std::time::Duration;
 
     #[test]
     fn empty_resources_plan_no_writes() {
@@ -1146,7 +1173,7 @@ mod tests {
         // itself has already started retrying.
         let dir_clone = dir.clone();
         let remover = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(60));
+            std::thread::sleep(Duration::from_millis(60));
             let _ = std::fs::remove_file(dir_clone.join("cgroup.procs"));
         });
         remove(&dir).unwrap();
@@ -1180,7 +1207,7 @@ mod tests {
     fn wait_frozen_returns_as_soon_as_a_real_frozen_1_line_appears() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
-        wait_frozen(dir.path(), std::time::Duration::from_millis(1), 5).unwrap();
+        wait_frozen(dir.path(), Duration::from_millis(1), 5).unwrap();
     }
 
     #[test]
@@ -1191,10 +1218,10 @@ mod tests {
 
         let events_path_clone = events_path.clone();
         let writer = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(20));
             std::fs::write(&events_path_clone, "populated 1\nfrozen 1\n").unwrap();
         });
-        wait_frozen(dir.path(), std::time::Duration::from_millis(5), 100).unwrap();
+        wait_frozen(dir.path(), Duration::from_millis(5), 100).unwrap();
         writer.join().unwrap();
     }
 
@@ -1202,7 +1229,7 @@ mod tests {
     fn wait_frozen_times_out_clearly_if_the_kernel_never_confirms_it() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
-        let err = wait_frozen(dir.path(), std::time::Duration::from_millis(1), 3).unwrap_err();
+        let err = wait_frozen(dir.path(), Duration::from_millis(1), 3).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 
@@ -1417,5 +1444,187 @@ mod tests {
         // A pid that (almost certainly) doesn't exist at all, so
         // `/proc/<pid>/cgroup` itself can't be read.
         assert!(cgroup_dir_for_running_pid(Path::new("/sys/fs/cgroup"), i32::MAX - 1).is_err());
+    }
+
+    /// Locks in `docs/design/0325`'s own corrected understanding of
+    /// cgroup v2's freezer against a real, live cgroup (a genuine
+    /// `systemd-run --user --scope` carrier, the same real-cgroup
+    /// technique `systemd_cgroup`'s own tests already establish) --
+    /// not merely asserted in a doc comment. Two real child processes,
+    /// each in its own real, genuinely frozen cgroup:
+    ///
+    /// - One with **no handler installed** for the signal it's sent
+    ///   (`SIGKILL`, which can never be handled by any process at
+    ///   all): dies within the poll window *without ever thawing the
+    ///   cgroup* -- a fatal signal is delivered straight through a
+    ///   freeze, exactly as the kernel's own
+    ///   `Documentation/admin-guide/cgroup-v2.rst` ("cgroup.freeze")
+    ///   states: "Processes in the frozen cgroup can be killed by a
+    ///   fatal signal."
+    /// - One with a **live handler installed** for the signal it's
+    ///   sent (`SIGUSR1`, deliberately non-fatal from the kernel's own
+    ///   point of view once handled): does *not* react at all while
+    ///   still frozen, only actually running its handler (and exiting
+    ///   with a distinctive, otherwise-unreachable code) once the
+    ///   cgroup is explicitly thawed -- confirming a *handled* signal
+    ///   genuinely is queued rather than delivered while frozen, the
+    ///   real, narrower case [`kill_thawing_if_paused`] actually
+    ///   exists for.
+    #[test]
+    fn cgroup_v2_freezer_lets_a_fatal_signal_through_but_queues_a_handled_one() {
+        if !systemd_user_session_available() {
+            eprintln!("skipping: no reachable `systemd --user` session");
+            return;
+        }
+
+        // Real subprocesses via `systemd-run --user --scope`, launched
+        // with plain `std::process::Command` (safe: `Command::spawn`
+        // itself does the fork+exec, never a raw `libc::fork()` inside
+        // this already-multi-threaded `cargo test` process -- see
+        // `process::debug_assert_single_threaded`'s own doc comment
+        // for exactly why a raw fork here would be unsound). `--scope`
+        // execs the given command in place, so `child.id()` is the
+        // real, final target pid directly, not some wrapper's.
+        let mut sigkill_child = std::process::Command::new("systemd-run")
+            .args([
+                "--user",
+                "--scope",
+                "-p",
+                "Delegate=yes",
+                "--",
+                "sleep",
+                "300",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let sigkill_pid = sigkill_child.id() as i32;
+        std::thread::sleep(Duration::from_millis(300));
+        let sigkill_dir =
+            cgroup_dir_for_running_pid(Path::new("/sys/fs/cgroup"), sigkill_pid).unwrap();
+        set_frozen(&sigkill_dir, true).unwrap();
+        assert!(is_frozen(&sigkill_dir).unwrap());
+
+        // SAFETY: a plain `kill(2)` syscall on a real, independent
+        // subprocess's own pid.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::kill(sigkill_pid, libc::SIGKILL);
+        }
+        let exited_while_still_frozen =
+            wait_for_child_exit_no_thaw(&mut sigkill_child, Duration::from_secs(2));
+        assert!(
+            exited_while_still_frozen,
+            "a fatal signal (SIGKILL) must reach and terminate a process even while its \
+             cgroup is still frozen and never explicitly thawed"
+        );
+        // Note: this project's own `display_status` (`ociman`'s own
+        // `ps`/`inspect`) can independently get a stale "still Paused"
+        // read after this (the cgroup's own `frozen` flag is a
+        // property of the cgroup, not the now-dead process) -- but
+        // whether that stale window is actually observed here depends
+        // on how quickly systemd itself notices the now-empty
+        // delegated scope and removes its cgroup outright (timing not
+        // asserted on here, to keep this test robust across systemd
+        // versions/timings); best-effort cleanup regardless of which
+        // happened.
+        let _ = set_frozen(&sigkill_dir, false);
+        let _ = std::fs::remove_dir(&sigkill_dir);
+
+        let mut sigusr1_child = std::process::Command::new("systemd-run")
+            .args([
+                "--user",
+                "--scope",
+                "-p",
+                "Delegate=yes",
+                "--",
+                "bash",
+                "-c",
+                // A real, live handler -- deliberately not "fatal" from
+                // the kernel's own point of view once installed.
+                "trap 'exit 42' USR1; while true; do sleep 0.2; done",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let sigusr1_pid = sigusr1_child.id() as i32;
+        std::thread::sleep(Duration::from_millis(300));
+        let sigusr1_dir =
+            cgroup_dir_for_running_pid(Path::new("/sys/fs/cgroup"), sigusr1_pid).unwrap();
+        set_frozen(&sigusr1_dir, true).unwrap();
+        assert!(is_frozen(&sigusr1_dir).unwrap());
+
+        // SAFETY: same as above.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::kill(sigusr1_pid, libc::SIGUSR1);
+        }
+        let exited_while_still_frozen =
+            wait_for_child_exit_no_thaw(&mut sigusr1_child, Duration::from_secs(1));
+        assert!(
+            !exited_while_still_frozen,
+            "a signal the target process has installed a real handler for must be queued, \
+             not delivered, while its cgroup is still frozen"
+        );
+
+        set_frozen(&sigusr1_dir, false).unwrap();
+        let status = sigusr1_child
+            .wait_timeout(Duration::from_secs(5))
+            .expect("the handler must actually run once the cgroup is thawed");
+        assert_eq!(
+            status.code(),
+            Some(42),
+            "the SIGUSR1 handler's own distinctive exit code must show up once thawed, proving \
+             the queued signal was finally delivered rather than lost"
+        );
+        let _ = std::fs::remove_dir(&sigusr1_dir);
+    }
+
+    /// Polls (non-blocking `try_wait`) for up to `timeout` for `child`
+    /// to have exited at all, for any reason -- `true` the moment it's
+    /// reaped, `false` if it's still alive once `timeout` elapses
+    /// (deliberately never blocks past that, since the whole point of
+    /// the fatal-signal-while-frozen case is proving it exits
+    /// *without* ever needing a thaw).
+    fn wait_for_child_exit_no_thaw(child: &mut std::process::Child, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// Small, test-only extension: block (bounded by `timeout`) for a
+    /// child that isn't expected to still be alive much longer, purely
+    /// so the test above has a bounded (never truly-infinite) wait
+    /// even if something regresses.
+    trait WaitTimeout {
+        fn wait_timeout(&mut self, timeout: Duration) -> Option<std::process::ExitStatus>;
+    }
+    impl WaitTimeout for std::process::Child {
+        fn wait_timeout(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+            let deadline = std::time::Instant::now() + timeout;
+            while std::time::Instant::now() < deadline {
+                if let Ok(Some(status)) = self.try_wait() {
+                    return Some(status);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None
+        }
+    }
+
+    /// Same real, reachable-`systemd --user`-session probe
+    /// `systemd_cgroup`'s own tests use.
+    fn systemd_user_session_available() -> bool {
+        std::process::Command::new("systemctl")
+            .args(["--user", "is-system-running"])
+            .output()
+            .is_ok_and(|out| !out.stdout.is_empty())
     }
 }

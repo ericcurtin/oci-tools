@@ -52,12 +52,20 @@ successfully sent; every subsequent send in the same call is a
 harmless no-op thaw-check against an already-thawed cgroup.
 
 Before this fix, attempting the signal-then-escalate dance against a
-still-frozen cgroup would have silently hung for the *entire* grace-
-plus-escalation window (a signal a frozen cgroup's own freezer only
-ever queues, never delivers, until thawed) and then falsely reported
-success — this is the exact silent-false-success bug `0312` first
-discovered for `kill`, now closed for `stop`/`restart` too, not merely
-a cosmetic improvement over real podman's own equally real refusal.
+still-frozen cgroup risked hanging for the *entire* grace-plus-
+escalation window and then falsely reporting success. (Corrected,
+`docs/design/0325`: for `stop`'s own real, default `TERM`-then-`KILL`
+sequence specifically, the risk is real precisely because a real
+container's init process commonly *does* install a handler for its
+own graceful-shutdown signal — a signal genuinely queued, not
+delivered, while frozen; the final `KILL` escalation would have gotten
+through even without this fix, cgroup v2's freezer letting fatal
+signals through regardless, but would have left `display_status`'s own
+`is_frozen` check permanently misreporting `Paused` afterward, a
+second, independent problem this same fix also closes.) This is the
+exact silent-false-success bug `0312` first discovered for `kill`, now
+closed for `stop`/`restart` too, not merely a cosmetic improvement over
+real podman's own equally real refusal.
 
 ## Verified
 
@@ -117,11 +125,14 @@ failing. `ocibox`'s own remaining gaps (icon handling for `export
 --app`, `stop`/`upgrade`/`generate-entry`/`assemble`) and `ocivmm`'s
 own remaining gaps (a lighter-weight offline `create` success-path
 fixture, the HVF/macOS phase-4 blocker) remain separately-scoped
-future candidates, as does `ociman rm --force`'s own similar-but-
-distinct signal-to-a-paused-container consideration (spotted while
-implementing this note: `remove_container`'s own SIGKILL-before-
-removal step also predates this project's thaw-aware primitive, though
-its own consequence is milder — the container's own files are removed
-regardless of whether the underlying process ever actually died — a
-real, separately-scoped candidate of its own, not touched here to keep
-this note narrowly scoped to `stop`/`restart`).
+future candidates.
+
+`ociman rm --force`'s own similar-looking SIGKILL-before-removal step
+(spotted while implementing this note, flagged here as a candidate)
+was investigated next and, per `docs/design/0325`, does **not**
+actually need this same fix: `remove_container` polls real process
+liveness directly (`process::alive`, a raw `/proc` check), never
+`display_status`/`is_frozen` — so it's already immune to the stale-
+frozen-flag trap `kill`/`stop`/`restart` needed fixing, and a fatal
+`SIGKILL` reaches a frozen process regardless of any thaw. No change
+needed there after all.

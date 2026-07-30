@@ -9,11 +9,30 @@ Scope: `crates/oci-runtime-core/src/cgroups.rs`, `bin/ociman/src/main.rs`,
 
 `0312` discovered, but deliberately deferred, a real correctness gap:
 sending a signal to a container whose cgroup is currently frozen
-(paused) is *queued* by the kernel's own freezer, not delivered at
-all, until the cgroup thaws — so `kill` on a paused container
-previously reported success (the signal genuinely was sent) while the
-container silently stayed alive and paused forever. This note closes
-it, rather than leaving it deferred any longer.
+(paused) can be left stuck rather than actually taking effect — so
+`kill` on a paused container previously reported success (the signal
+genuinely was sent) while the container silently stayed alive and
+paused forever. This note closes it, rather than leaving it deferred
+any longer.
+
+## Correction (`docs/design/0325`)
+
+This note's own original premise — that a frozen cgroup's freezer
+"queues every signal completely identically" (see the next section) —
+was later shown to be imprecise for cgroup v2 specifically. The
+kernel's own authoritative docs and direct empirical testing both
+confirm: a genuinely *fatal* signal (`SIGKILL`, or any signal the
+target process hasn't installed a handler for) reaches and terminates
+a frozen process immediately, no thaw required at all. What actually
+stays queued until thaw is a signal the target process *has* installed
+a live handler for (not "fatal" from the kernel's own point of view) —
+exactly the case a real container's own graceful-shutdown handler puts
+`stop`'s first signal in. **The fix below (thaw after signaling) is
+still fully correct and necessary — only the original reasoning was
+wrong.** See `0325` for the full corrected account and a permanent
+regression test (`cgroups::tests::
+cgroup_v2_freezer_lets_a_fatal_signal_through_but_queues_a_handled_one`)
+locking in the real distinction.
 
 ## Real, checked-directly semantics — neither reference runtime gets this right in general
 
@@ -41,10 +60,11 @@ Read both reference runtimes' own source directly rather than assume:
 
 Given neither individual reference runtime actually gets this right
 for every signal, this project's own fix deliberately generalizes:
-thaw after sending *any* signal, not just `SIGKILL` — a frozen
-cgroup's own freezer queues every signal completely identically, so
-there is no reason to special-case just one. This is a genuine
-improvement over both real crun and real runc's own individual
+thaw after sending *any* signal, not just `SIGKILL` (see this note's
+own "Correction" above for the precise, cgroup-v2-accurate reason this
+still matters: a signal the target process has installed a handler
+for genuinely is queued until thaw, unlike a fatal one). This is a
+genuine improvement over both real crun and real runc's own individual
 implementations, not merely matching one of them.
 
 ## Implementation
