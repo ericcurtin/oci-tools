@@ -22,9 +22,20 @@ fn ocirun_run(dir: &Path, id: &str) -> std::process::Output {
     // (see its own doc comment), so a hook state assertion against the
     // bundle path needs a stable, meaningful value to check, not
     // literally `"."`.
+    //
+    // `--root`, a sibling directory of the bundle itself rather than
+    // this project's own real, shared default (`docs/design/0373`
+    // gave `ocirun run` a real, tracked state record for the first
+    // time) -- matching every other test file's own already-
+    // established "always an isolated, per-test root" convention,
+    // computed here rather than threaded through all twelve of this
+    // file's own call sites, none of which need to know it exists at
+    // all.
     Command::new(bin_path("ocirun"))
         .args(["run", id, "--bundle"])
         .arg(dir)
+        .args(["--root"])
+        .arg(dir.join("state-root"))
         .env_remove("OCI_TOOLS_LOG")
         .output()
         .expect("failed to spawn ocirun run")

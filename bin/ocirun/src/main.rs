@@ -91,9 +91,23 @@ enum Command {
     /// and "start" into one step, foreground, like `runc run`/`crun
     /// run`). The container's own exit code becomes `ocirun`'s exit code.
     Run {
-        /// The container's ID (accepted for CLI-compatibility; not yet
-        /// tracked in the state store — that lands with `create`/
-        /// `start`/`delete`).
+        /// The container's ID — genuinely tracked in the state store
+        /// for the container's own real, entire lifetime (`docs/
+        /// design/0373`), matching real `runc run`/`crun run` exactly
+        /// (checked directly, `~/git/runc/utils_linux.go`'s own
+        /// `startContainer`: both `run` and `create` call the exact
+        /// same `createContainer`/state-persisting factory call
+        /// internally) — a concurrent `ocirun state`/`list`/`exec`/
+        /// `kill` against this same id, issued from another
+        /// invocation while this one is still blocked in the
+        /// foreground, now sees something real, the same real gap
+        /// `ociman run`'s own `record_running` already closed for
+        /// itself (`0023`). Automatically removed once the container
+        /// exits — matching real `runc run`'s own checked-directly
+        /// default (`r.shouldDestroy`, real runc's own `--keep`,
+        /// "do not delete the container after it exits" flag isn't
+        /// implemented here yet, a real, honest, deliberately
+        /// narrower first slice).
         id: String,
         /// Path to the root of the bundle directory (defaults to the
         /// current directory).
@@ -560,6 +574,7 @@ fn main() -> std::process::ExitCode {
                 preserve_fds,
                 no_pivot,
             }) => cmd_run(
+                &root,
                 &id,
                 bundle.as_deref(),
                 pid_file.as_deref(),
@@ -774,6 +789,7 @@ fn cmd_list(root: &Path, format: &str, quiet: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_run(
+    root: &Path,
     id: &str,
     bundle: Option<&Path>,
     pid_file: Option<&Path>,
@@ -789,6 +805,17 @@ fn cmd_run(
     let rootfs =
         oci_runtime_core::validate::validate(&bundle).context("config.json failed validation")?;
 
+    // A real, tracked container for this run's own entire lifetime
+    // (`docs/design/0373`) — the exact same `StateStore::create` real
+    // `runc create` (and, internally, real `runc run` too) already
+    // uses, so a concurrent `ocirun state`/`list`/`exec`/`kill`
+    // against this same id sees something real while this invocation
+    // is still blocked in the foreground below.
+    let store = StateStore::open(root)
+        .with_context(|| format!("opening container state root {}", root.display()))?;
+    let annotations = bundle.spec.annotations.clone();
+    let mut state = store.create(id, dir, &rootfs, annotations)?;
+
     // `launch::run` itself is just `run_reporting_pid` with a no-op
     // callback (see its own doc comment) — called directly here
     // instead so `--pid-file`'s own callback has somewhere to hook in,
@@ -801,7 +828,7 @@ fn cmd_run(
     // performs is sound — see its own safety note for the requirement
     // this satisfies.
     #[allow(unsafe_code)]
-    let exit_code = unsafe {
+    let result = unsafe {
         oci_runtime_core::launch::run_reporting_pid(
             id,
             &bundle,
@@ -825,10 +852,30 @@ fn cmd_run(
                 if let Some(path) = pid_file {
                     write_pid_file(path, pid);
                 }
+                // Same real, checked-directly moment `ociman run`'s
+                // own `record_running` already writes at (`0023`): the
+                // pid is confirmed alive, right before this call
+                // blocks on the container's own exit.
+                state.status = Status::Running;
+                state.pid = Some(pid);
+                let _ = store.write(&state);
             },
         )
     }
-    .context("running container")?;
+    .context("running container");
+
+    // Matching real `runc run`'s own checked-directly default
+    // (`~/git/runc/utils_linux.go`'s own `shouldDestroy`/`runner.
+    // destroy`): a plain, foreground `ocirun run` always removes its
+    // own state once it's done, whether the container actually ran
+    // (any exit code) or the launch itself failed partway through —
+    // there is nothing left for a later `ocirun state`/`list`/
+    // `delete` to ever need to see afterward. Real runc's own
+    // `--keep` (skip this) isn't implemented here yet — a real,
+    // honest, deliberately narrower first slice.
+    let _ = store.remove(id);
+
+    let exit_code = result?;
 
     // The container's own exit code becomes ours, matching runc/crun's
     // `run`: exit code 0 must mean "the container's process exited 0",

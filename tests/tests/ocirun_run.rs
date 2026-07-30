@@ -16,9 +16,10 @@
 //! hard CI dependency.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
-use oci_tools_tests::{bin_path, busybox_path, write_bundle};
+use oci_tools_tests::{bin_path, busybox_path, ocirun, state_status, write_bundle};
 
 /// Whether a real, working `systemd --user` session is reachable —
 /// needed to test cgroup directory creation/process migration for real
@@ -44,9 +45,19 @@ fn systemd_user_scope_available() -> bool {
 }
 
 fn ocirun_run(dir: &Path, id: &str) -> std::process::Output {
+    // `--root`, a sibling directory of the bundle itself rather than
+    // this project's own real, shared default (`docs/design/0373`
+    // gave `ocirun run` a real, tracked state record for the first
+    // time) -- matching every other test file's own already-
+    // established "always an isolated, per-test root" convention,
+    // computed here rather than threaded through every one of this
+    // file's own call sites, none of which need to know it exists at
+    // all.
     Command::new(bin_path("ocirun"))
         .args(["run", id])
         .current_dir(dir)
+        .args(["--root"])
+        .arg(dir.join("state-root"))
         .env_remove("OCI_TOOLS_LOG")
         .output()
         .expect("failed to spawn ocirun run")
@@ -704,4 +715,188 @@ fn run_no_pivot_still_isolates_the_rootfs_just_like_pivot_root() {
             .exists(),
         "no pivot_root scratch directory should exist at all on the --no-pivot path"
     );
+}
+
+/// Like `oci_tools_tests::wait_for_status`, but tolerant of the state
+/// record not existing *at all* yet -- unlike every one of that
+/// shared helper's own existing call sites (always polled only after
+/// an `ocirun create`/`start` invocation has already returned
+/// successfully, guaranteeing a record already exists), this file's
+/// own new tests below start polling the instant a freshly `spawn()`ed
+/// `ocirun run` child process is launched, racing against its own
+/// `store.create` call genuinely running at all yet.
+fn wait_for_status_tolerating_not_yet_created(
+    root: &Path,
+    id: &str,
+    want: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let out = Command::new(bin_path("ocirun"))
+            .args(["--root"])
+            .arg(root)
+            .args(["state", id])
+            .env_remove("OCI_TOOLS_LOG")
+            .output()
+            .expect("failed to spawn ocirun state");
+        if out.status.success() {
+            let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            let status = json["status"].as_str().unwrap().to_string();
+            if status == want || std::time::Instant::now() >= deadline {
+                return status;
+            }
+        } else if std::time::Instant::now() >= deadline {
+            return "does-not-exist".to_string();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `ocirun run` (`docs/design/0373`): a real, tracked state record for
+/// the container's own entire lifetime, matching real `runc run`'s
+/// own checked-directly behavior exactly (`~/git/runc/utils_linux.go`'s
+/// own `startContainer`: `run` and `create` both call the identical,
+/// state-persisting factory call internally). A concurrent `ocirun
+/// state`/`list` call, issued from an entirely separate invocation
+/// while the original `ocirun run` is still blocked in the
+/// foreground, now sees the real, running container -- and, once
+/// that foreground `ocirun run` actually exits, the state is
+/// completely removed again (real runc's own checked-directly default
+/// with no `--keep` given), leaving nothing behind for `ocirun state`
+/// to find afterward.
+#[test]
+fn run_is_visible_to_a_concurrent_state_query_then_fully_removed_after_exit() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let child = Command::new(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args(["run", "run-visibility-test", "--bundle"])
+        .arg(bundle_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ocirun run");
+
+    // The concurrent, entirely separate `ocirun state`/`list`
+    // invocations below are the real point of this test -- they must
+    // see the exact same container the still-blocked `child` above is
+    // running, not nothing at all (the previous, untracked behavior).
+    assert_eq!(
+        wait_for_status_tolerating_not_yet_created(
+            root_dir.path(),
+            "run-visibility-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running",
+        "a concurrent `ocirun state` should see the container reach running"
+    );
+    let list = ocirun(root_dir.path(), &["list", "--format", "json"]);
+    assert!(list.status.success(), "{list:?}");
+    let entries: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let ids: Vec<&str> = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"run-visibility-test"),
+        "a concurrent `ocirun list` should see it too: {ids:?}"
+    );
+
+    // End it early rather than waiting out the full `sleep 30`.
+    let kill = ocirun(root_dir.path(), &["kill", "run-visibility-test", "KILL"]);
+    assert!(kill.status.success(), "{kill:?}");
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for ocirun run");
+    assert!(
+        !output.status.success(),
+        "a KILL-terminated container reports a real, nonzero (128+signal) exit code, matching \
+         run_reports_command_not_found_as_exit_127's own identical convention: {output:?}"
+    );
+
+    // Real runc's own checked-directly default (no `--keep`): nothing
+    // left behind at all once the foreground `run` is actually done.
+    let state = Command::new(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args(["state", "run-visibility-test"])
+        .env_remove("OCI_TOOLS_LOG")
+        .output()
+        .expect("failed to spawn ocirun state");
+    assert!(
+        !state.status.success(),
+        "the container's own state should be completely gone after `run` exits: {state:?}"
+    );
+}
+
+/// A second `ocirun run` reusing an id that's still genuinely in use
+/// (another, still-blocked `ocirun run` of the same id) is a real,
+/// clear error -- matching real `runc run`/`runc create`'s own
+/// identical "container with given ID already exists" refusal exactly
+/// (container IDs are unique within one state root, the same rule
+/// `ocirun create` already enforces).
+#[test]
+fn run_of_an_id_already_in_use_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let mut first = Command::new(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args(["run", "run-duplicate-id-test", "--bundle"])
+        .arg(bundle_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn the first ocirun run");
+    assert_eq!(
+        wait_for_status_tolerating_not_yet_created(
+            root_dir.path(),
+            "run-duplicate-id-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let second = Command::new(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args(["run", "run-duplicate-id-test", "--bundle"])
+        .arg(bundle_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .output()
+        .expect("failed to spawn the second ocirun run");
+    assert!(!second.status.success());
+    assert_eq!(
+        state_status(root_dir.path(), "run-duplicate-id-test"),
+        "running",
+        "the first, still-running container must be completely unaffected by the second, \
+         rejected attempt"
+    );
+
+    let kill = ocirun(root_dir.path(), &["kill", "run-duplicate-id-test", "KILL"]);
+    assert!(kill.status.success(), "{kill:?}");
+    let _ = first.wait();
 }
