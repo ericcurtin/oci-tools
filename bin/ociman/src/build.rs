@@ -2021,6 +2021,11 @@ fn copy_instruction(
     // per-instruction `--from` handling entirely). `None` here simply
     // disables every dockerignore-aware filter below.
     let context_ignore = flags.from.is_none().then_some(stage_ctx.dockerignore);
+    // COPY --exclude= (0340): applies regardless of --from, unlike
+    // .dockerignore -- see combine_ignore_with_exclude's own doc
+    // comment.
+    let combined_ignore = combine_ignore_with_exclude(context_ignore, &flags.exclude)?;
+    let context_ignore = combined_ignore.as_ref();
     let sources = resolve_sources(source_root, sources, "COPY", context_ignore)?;
     // Real Docker/BuildKit rule, checked directly (`copy.go`'s own
     // `createCopyInstruction`: `"When using COPY with more than one
@@ -2137,6 +2142,45 @@ fn copy_instruction(
     Ok(())
 }
 
+/// Combine `context_ignore` (this build's own `.dockerignore`, if
+/// any — `None` for a `COPY --from=<stage>`/`--from=<external-image>`
+/// source, which `.dockerignore` never applies to at all) with
+/// `exclude` (a `COPY`/`ADD` instruction's own `--exclude=` patterns,
+/// `0340` — real, checked directly against `~/git/moby/vendor/
+/// github.com/moby/buildkit/frontend/dockerfile/instructions/
+/// parse.go`: unlike `.dockerignore`, `--exclude=` narrows *this one
+/// instruction's own* copy regardless of `--from`) into one real
+/// `DockerIgnore` a source path must survive both to actually get
+/// copied.
+///
+/// Combined by concatenating both raw pattern lists and recompiling
+/// once — see [`oci_dockerfile::DockerIgnore::raw_patterns`]'s own doc
+/// comment for why that's the only sound way to combine two
+/// independently-sourced pattern lists without breaking `!`-negation
+/// ordering (simply checking both matchers independently and OR-ing
+/// the two booleans together can't reproduce a pattern that spans
+/// both sources, e.g. an instruction-level `--exclude=!keep.txt`
+/// meaning "un-exclude a path `.dockerignore` itself excluded"). When
+/// `exclude` is empty — the overwhelmingly common case — this simply
+/// clones `context_ignore` unchanged rather than paying to recompile
+/// a matcher that would be byte-for-byte identical to the one already
+/// in hand.
+fn combine_ignore_with_exclude(
+    context_ignore: Option<&oci_dockerfile::DockerIgnore>,
+    exclude: &[String],
+) -> anyhow::Result<Option<oci_dockerfile::DockerIgnore>> {
+    if exclude.is_empty() {
+        return Ok(context_ignore.cloned());
+    }
+    let mut patterns = context_ignore
+        .map(|ignore| ignore.raw_patterns().to_vec())
+        .unwrap_or_default();
+    patterns.extend(exclude.iter().cloned());
+    let combined = oci_dockerfile::DockerIgnore::compile(&patterns)
+        .map_err(|_| anyhow::anyhow!("ociman build: --exclude=: invalid pattern"))?;
+    Ok(Some(combined))
+}
+
 /// The human-readable prefix of a `COPY`/`ADD` instruction's own
 /// recorded `created_by` (before [`copy_instruction`]/
 /// [`add_instruction`] each fold in their own real content digest —
@@ -2241,6 +2285,14 @@ fn add_instruction(
         .cloned()
         .collect();
     let url_sources: Vec<&String> = sources.iter().filter(|s| is_remote_url(s)).collect();
+    // ADD --exclude= (0340) -- see combine_ignore_with_exclude's own
+    // doc comment. `dockerignore` is never `None` here (unlike
+    // `copy_instruction`'s own `context_ignore`, `ADD` has no `--from`
+    // to ever disable it for), so the combined result never is
+    // either.
+    let dockerignore = combine_ignore_with_exclude(Some(dockerignore), &flags.exclude)?
+        .expect("combine_ignore_with_exclude never returns None when given Some");
+    let dockerignore = &dockerignore;
     let local_sources = resolve_sources(context, &local_sources, "ADD", Some(dockerignore))?;
     // Same real Docker/BuildKit rule as `copy_instruction` -- see its
     // own doc comment for the exact source checked directly (against

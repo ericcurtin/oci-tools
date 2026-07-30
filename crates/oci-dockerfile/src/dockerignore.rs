@@ -340,6 +340,21 @@ impl CompiledPattern {
 pub struct DockerIgnore {
     patterns: Vec<CompiledPattern>,
     has_negation: bool,
+    /// The exact `raw_patterns` this was [`compile`]d from — kept
+    /// verbatim (not just the already-parsed [`CompiledPattern`]s,
+    /// which have no way to reconstruct their own original source
+    /// text) so a caller that later needs to combine this with a
+    /// *second*, independently-sourced pattern list (`ociman build`'s
+    /// own `COPY`/`ADD --exclude=`, layered on top of this same
+    /// build's own `.dockerignore`) can do so by simply concatenating
+    /// both raw lists and re-[`compile`]ing once, rather than needing
+    /// a separate way to combine two already-compiled matchers (whose
+    /// own internal pattern *order* is exactly what makes `!`-negation
+    /// well-defined — see [`raw_patterns`]'s own doc comment).
+    ///
+    /// [`compile`]: DockerIgnore::compile
+    /// [`raw_patterns`]: DockerIgnore::raw_patterns
+    raw: Vec<String>,
 }
 
 impl DockerIgnore {
@@ -350,6 +365,7 @@ impl DockerIgnore {
         DockerIgnore {
             patterns: Vec::new(),
             has_negation: false,
+            raw: Vec::new(),
         }
     }
 
@@ -373,7 +389,16 @@ impl DockerIgnore {
         Ok(DockerIgnore {
             patterns,
             has_negation,
+            raw: raw_patterns.to_vec(),
         })
+    }
+
+    /// The exact pattern strings this was compiled from, in their
+    /// original order — see this struct's own `raw` field doc comment
+    /// for why a caller ever needs this instead of just using
+    /// [`DockerIgnore::is_ignored`] directly.
+    pub fn raw_patterns(&self) -> &[String] {
+        &self.raw
     }
 
     /// Whether any pattern is a `!`-negated re-inclusion -- when
@@ -476,6 +501,25 @@ mod tests {
 
     fn ignore(patterns: &[&str]) -> DockerIgnore {
         DockerIgnore::compile(&patterns.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    /// `raw_patterns` (`0340`) returns exactly the patterns
+    /// [`DockerIgnore::compile`] was given, verbatim and in order —
+    /// needed so `ociman build`'s own `COPY`/`ADD --exclude=` can
+    /// combine this with a second, independently-sourced pattern list
+    /// by concatenating both raw lists and recompiling once, the only
+    /// way to combine two pattern sources without breaking `!`-negation
+    /// ordering.
+    #[test]
+    fn raw_patterns_returns_exactly_what_was_compiled() {
+        let raw = vec!["*.md".to_string(), "!README.md".to_string()];
+        let compiled = DockerIgnore::compile(&raw).unwrap();
+        assert_eq!(compiled.raw_patterns(), raw.as_slice());
+    }
+
+    #[test]
+    fn empty_dockerignore_has_no_raw_patterns() {
+        assert!(DockerIgnore::empty().raw_patterns().is_empty());
     }
 
     #[test]

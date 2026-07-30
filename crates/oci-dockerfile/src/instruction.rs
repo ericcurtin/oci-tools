@@ -10,13 +10,17 @@
 //! for the reasoning): heredocs (`<<EOF ... EOF`), `ARG`/`ENV`
 //! variable substitution/interpolation within other instructions' own
 //! arguments, and every other BuildKit-only flag (`RUN --mount=`/
-//! `--network=`/`--security=`/`--device=`, `COPY --link`/`--parents`/
-//! `--exclude=`, `ADD --link`/`--keep-git-dir`/`--unpack`) — a
-//! Containerfile using any of these is rejected with a clear error,
-//! not silently misparsed. `ADD --checksum=` *is* now parsed (see
+//! `--network=`/`--security=`/`--device=`, `COPY --link`/`--parents`,
+//! `ADD --link`/`--keep-git-dir`/`--unpack`) — a Containerfile using
+//! any of these is rejected with a clear error, not silently
+//! misparsed. `ADD --checksum=` *is* now parsed (see
 //! [`AddFlags::checksum`]) — its own real syntax/algorithm validation
 //! and enforcement live in `bin/ociman/src/build.rs`'s own
-//! `add_instruction`, not here.
+//! `add_instruction`, not here. `COPY`/`ADD --exclude=` (`0340`) *is*
+//! now parsed too (see [`CopyFlags::exclude`]/[`AddFlags::exclude`]) —
+//! its own real combination with the build's own `.dockerignore`
+//! lives in `bin/ociman/src/build.rs`'s own `copy_instruction`/
+//! `add_instruction` as well.
 
 use crate::lexer::LogicalLine;
 
@@ -32,9 +36,9 @@ pub enum ShellOrExec {
     Exec(Vec<String>),
 }
 
-/// `COPY`'s own flags (`--from`/`--chown`/`--chmod` — the long-stable
-/// set; see the module doc comment for the newer, not-yet-supported
-/// ones).
+/// `COPY`'s own flags (`--from`/`--chown`/`--chmod`/`--exclude` — the
+/// long-stable set plus `--exclude`, `0340`; see the module doc
+/// comment for the still-unsupported newer ones).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CopyFlags {
     /// A build stage name, image reference, or build-context name to
@@ -45,6 +49,14 @@ pub struct CopyFlags {
     pub chown: Option<String>,
     /// Permission mode to `chmod` the copied files to.
     pub chmod: Option<String>,
+    /// `.dockerignore`-syntax patterns (checked directly against real
+    /// BuildKit's own `~/git/moby/vendor/github.com/moby/buildkit/
+    /// frontend/dockerfile/instructions/parse.go`: `AddStrings`, a
+    /// real, repeatable string-list flag, not a single value) further
+    /// excluding matching sources from this one `COPY` — see
+    /// `bin/ociman/src/build.rs`'s own `copy_instruction` for exactly
+    /// how this combines with the build's own `.dockerignore`.
+    pub exclude: Vec<String>,
 }
 
 /// `ADD`'s own flags — no `--from` (`ADD` can only ever pull from the
@@ -64,6 +76,10 @@ pub struct AddFlags {
     /// happen at the point of use instead — see `bin/ociman/src/
     /// build.rs`'s own `add_instruction`.
     pub checksum: Option<String>,
+    /// Same as [`CopyFlags::exclude`] (`0340`) — only ever meaningful
+    /// for a local build-context source, same as `ADD` itself has no
+    /// `--from` at all.
+    pub exclude: Vec<String>,
 }
 
 /// A `HEALTHCHECK` instruction's own parsed value — see
@@ -396,6 +412,7 @@ fn parse_copy(rest: &str) -> Result<Instruction, String> {
             "from" => flags.from = Some(value),
             "chown" => flags.chown = Some(value),
             "chmod" => flags.chmod = Some(value),
+            "exclude" => flags.exclude.push(value),
             other => return Err(format!("COPY: unsupported flag --{other}")),
         }
     }
@@ -415,6 +432,7 @@ fn parse_add(rest: &str) -> Result<Instruction, String> {
             "chown" => flags.chown = Some(value),
             "chmod" => flags.chmod = Some(value),
             "checksum" => flags.checksum = Some(value),
+            "exclude" => flags.exclude.push(value),
             other => return Err(format!("ADD: unsupported flag --{other}")),
         }
     }
@@ -874,6 +892,7 @@ mod tests {
                     from: Some("builder".to_string()),
                     chown: Some("1000:1000".to_string()),
                     chmod: None,
+                    exclude: vec![],
                 },
                 sources: vec!["/src".to_string()],
                 dest: "/dst".to_string(),
@@ -888,6 +907,42 @@ mod tests {
             Instruction::Copy {
                 flags: CopyFlags::default(),
                 sources: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                dest: "/dst".to_string(),
+            }
+        );
+    }
+
+    /// `COPY --exclude=` (`0340`) is repeatable, matching real
+    /// BuildKit's own `AddStrings` flag exactly (checked directly,
+    /// `~/git/moby/vendor/.../instructions/parse.go`).
+    #[test]
+    fn copy_exclude_flag_is_repeatable() {
+        assert_eq!(
+            parse("COPY --exclude=*.md --exclude=.git a b /dst"),
+            Instruction::Copy {
+                flags: CopyFlags {
+                    exclude: vec!["*.md".to_string(), ".git".to_string()],
+                    ..CopyFlags::default()
+                },
+                sources: vec!["a".to_string(), "b".to_string()],
+                dest: "/dst".to_string(),
+            }
+        );
+    }
+
+    /// `ADD --exclude=` (`0340`) parses the same way `COPY
+    /// --exclude=` does, combining with `ADD`'s own other flags.
+    #[test]
+    fn add_exclude_flag_combines_with_chown() {
+        assert_eq!(
+            parse("ADD --chown=1000:1000 --exclude=*.log a /dst"),
+            Instruction::Add {
+                flags: AddFlags {
+                    chown: Some("1000:1000".to_string()),
+                    exclude: vec!["*.log".to_string()],
+                    ..AddFlags::default()
+                },
+                sources: vec!["a".to_string()],
                 dest: "/dst".to_string(),
             }
         );
@@ -920,6 +975,7 @@ mod tests {
                     chown: None,
                     chmod: None,
                     checksum: Some("sha256:deadbeef".to_string()),
+                    exclude: vec![],
                 },
                 sources: vec!["https://example.com/f".to_string()],
                 dest: "/dest".to_string(),
@@ -939,6 +995,7 @@ mod tests {
                     chown: Some("1000:1000".to_string()),
                     chmod: Some("0644".to_string()),
                     checksum: Some("sha256:deadbeef".to_string()),
+                    exclude: vec![],
                 },
                 sources: vec!["https://example.com/f".to_string()],
                 dest: "/dest".to_string(),

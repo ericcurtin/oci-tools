@@ -5126,6 +5126,331 @@ fn dockerignore_does_not_apply_to_copy_from_an_earlier_stage() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), "ignored\n");
 }
 
+/// `COPY --exclude=<pattern>` (`0340`) further narrows a whole-context
+/// copy on top of (or with no `.dockerignore` at all) -- matching real
+/// `podman build`/BuildKit's own identical `.dockerignore`-syntax
+/// `--exclude=` flag.
+#[test]
+fn copy_exclude_excludes_a_named_pattern_with_no_dockerignore_at_all() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copy-exclude-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("keep.txt"), "keep\n").unwrap();
+    std::fs::write(context_dir.path().join("excluded.txt"), "excluded\n").unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copy-exclude-base:latest\n\
+         COPY --exclude=excluded.txt . /app\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/copy-exclude-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/copy-exclude-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "find /app -type f | sort",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "/app/Containerfile\n/app/keep.txt\n"
+    );
+}
+
+/// `--exclude=` is repeatable (matching real BuildKit's own
+/// `AddStrings` flag, checked directly): multiple values all apply.
+#[test]
+fn copy_exclude_is_repeatable() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copy-exclude-repeat-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("keep.txt"), "keep\n").unwrap();
+    std::fs::write(context_dir.path().join("a.log"), "a\n").unwrap();
+    std::fs::write(context_dir.path().join("b.tmp"), "b\n").unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copy-exclude-repeat-base:latest\n\
+         COPY --exclude=*.log --exclude=*.tmp . /app\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/copy-exclude-repeat-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/copy-exclude-repeat-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "find /app -type f | sort",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "/app/Containerfile\n/app/keep.txt\n"
+    );
+}
+
+/// `--exclude=` combines with an already-present `.dockerignore` --
+/// both apply, each excluding its own, different file.
+#[test]
+fn copy_exclude_combines_with_an_existing_dockerignore() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copy-exclude-combine-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("keep.txt"), "keep\n").unwrap();
+    std::fs::write(context_dir.path().join("dockerignored.txt"), "a\n").unwrap();
+    std::fs::write(context_dir.path().join("flag-excluded.txt"), "b\n").unwrap();
+    write_dockerignore(context_dir.path(), "dockerignored.txt\n");
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copy-exclude-combine-base:latest\n\
+         COPY --exclude=flag-excluded.txt . /app\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/copy-exclude-combine-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/copy-exclude-combine-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "find /app -type f | sort",
+        ],
+    );
+    assert!(run.status.success());
+    // Both the `.dockerignore`-excluded file *and* the
+    // `--exclude=`-flagged one are missing; the `.dockerignore` file
+    // itself and `keep.txt` remain, matching real podman/BuildKit's
+    // own combined behavior.
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "/app/.dockerignore\n/app/Containerfile\n/app/keep.txt\n"
+    );
+}
+
+/// Unlike `.dockerignore` (`dockerignore_does_not_apply_to_copy_from_
+/// an_earlier_stage`, just above), `--exclude=` *does* apply to a
+/// `COPY --from=<stage>` source too -- checked directly against real
+/// BuildKit's own source: `ExcludePatterns` is a property of the
+/// `COPY`/`ADD` instruction itself, not the build-context-transfer
+/// step `.dockerignore` belongs to.
+#[test]
+fn copy_exclude_applies_even_with_from_an_earlier_stage() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/copy-exclude-from-stage-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/copy-exclude-from-stage-base:latest AS builder\n\
+         RUN echo keep > /keep.txt && echo excluded > /excluded.txt\n\
+         FROM ociman-test/copy-exclude-from-stage-base:latest\n\
+         COPY --from=builder --exclude=excluded.txt / /app\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/copy-exclude-from-stage-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/copy-exclude-from-stage-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "test -f /app/keep.txt && test ! -e /app/excluded.txt && echo ok",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+}
+
+/// `ADD --exclude=` (`0340`) excludes a local source too, exactly
+/// like `COPY --exclude=` -- `ADD`'s own remote-URL sources are
+/// unaffected (a URL is never subject to any `.dockerignore`/
+/// `--exclude=` filter at all, checked directly, both real tools and
+/// this project's own established behavior alike).
+#[test]
+fn add_exclude_excludes_a_local_source() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/add-exclude-base:latest",
+        &busybox,
+        &["sh", "find"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(context_dir.path().join("keep.txt"), "keep\n").unwrap();
+    std::fs::write(context_dir.path().join("excluded.txt"), "excluded\n").unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/add-exclude-base:latest\n\
+         ADD --exclude=excluded.txt . /app\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/add-exclude-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/add-exclude-result:latest",
+            "--",
+            "/bin/sh",
+            "-c",
+            "find /app -type f | sort",
+        ],
+    );
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "/app/Containerfile\n/app/keep.txt\n"
+    );
+}
+
 /// `.containerignore` alone (no `.dockerignore` at all) works exactly
 /// like `.dockerignore` does -- confirmed directly against real
 /// `podman build`.
