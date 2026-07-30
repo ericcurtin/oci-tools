@@ -545,3 +545,111 @@ fn inspect_format_of_an_unknown_field_is_a_clear_error() {
         String::from_utf8_lossy(&format.stderr)
     );
 }
+
+/// `ociman inspect -s`/`--size` (0352), matching real `podman inspect
+/// -s`/`--size` exactly (`~/git/podman/cmd/podman/inspect/
+/// inspect.go`): a plain `inspect` shows no size information at all
+/// (opt-in, matching real podman's own identical on-demand-only
+/// computation); `--size` adds a real, nested `size` object with
+/// `rw_size`/`root_fs_size`, `root_fs_size` always at least `rw_size`
+/// (image size + rw size, `0342`'s own already-established formula).
+#[test]
+fn inspect_size_flag_reports_a_real_size_object_for_a_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-size:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "inspect-size-test",
+            "ociman-test/inspect-size:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let without_size = ociman(storage_dir.path(), &["inspect", "inspect-size-test"]);
+    assert!(without_size.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&without_size.stdout).unwrap();
+    assert!(
+        view.get("size").is_none(),
+        "a plain inspect must show no size information at all: {view:?}"
+    );
+
+    let with_size = ociman(storage_dir.path(), &["inspect", "-s", "inspect-size-test"]);
+    assert!(
+        with_size.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_size.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&with_size.stdout).unwrap();
+    let size = &view["size"];
+    assert!(size["rw_size"].as_u64().is_some(), "{view:?}");
+    assert!(
+        size["root_fs_size"].as_u64().unwrap() >= size["rw_size"].as_u64().unwrap(),
+        "root_fs_size (image + rw) must be at least as large as rw_size alone: {view:?}"
+    );
+
+    // `--size`/`--format` compose the same way `ps --size`'s own
+    // `render_format_template` reuse already does (0342) -- no
+    // special-casing needed at all.
+    let format = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "--size",
+            "--format",
+            "{{.size.rw_size}}",
+            "inspect-size-test",
+        ],
+    );
+    assert!(
+        format.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&format.stderr)
+    );
+}
+
+/// `--size` is a real, immediate error for an image, matching real
+/// `podman inspect -s`'s own identical, checked-directly restriction
+/// exactly (`"size is not supported for type"`).
+#[test]
+fn inspect_size_flag_is_a_clear_error_for_an_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-size-image:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman(
+        storage_dir.path(),
+        &["inspect", "-s", "ociman-test/inspect-size-image:latest"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not supported"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

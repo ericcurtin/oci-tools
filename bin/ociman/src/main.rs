@@ -1414,6 +1414,20 @@ enum Command {
         /// typo'd one rather than a silent empty string.
         #[arg(long = "format", short = 'f', value_name = "TEMPLATE")]
         format: Option<String>,
+        /// Also report the container's own writable-layer size and
+        /// total (virtual) rootfs size — matching real `podman
+        /// inspect -s`/`--size` exactly (`~/git/podman/cmd/podman/
+        /// inspect/inspect.go`): a real, immediate error for an image
+        /// (or, real podman's own second, checked-directly case, a
+        /// pod — this project has no pod concept at all, so only the
+        /// image case is reachable here), matching real podman's own
+        /// identical `"size is not supported for type %q"` refusal.
+        /// Reuses [`compute_container_size`] verbatim, the exact same
+        /// on-demand-only computation `ociman ps --size` (`0342`)
+        /// already established — a plain `ociman inspect` pays none
+        /// of this cost.
+        #[arg(short, long)]
+        size: bool,
     },
     /// Pull (if not already present), extract, and run an image's
     /// container — rootless, foreground. Kept (listable via `ps`,
@@ -2871,9 +2885,11 @@ fn main() -> std::process::ExitCode {
             Some(Command::System { command }) => match command {
                 SystemCommand::Df { verbose } => cmd_system_df(cli.global.json, verbose),
             },
-            Some(Command::Inspect { reference, format }) => {
-                cmd_inspect(&reference, cli.global.json, format.as_deref())
-            }
+            Some(Command::Inspect {
+                reference,
+                format,
+                size,
+            }) => cmd_inspect(&reference, cli.global.json, format.as_deref(), size),
             Some(Command::Run {
                 args,
                 rm,
@@ -5765,14 +5781,30 @@ fn print_system_df_row(label: &str, row: &SystemDfRow) {
 /// matches this project's own established preference for the clearer
 /// of two plausible error messages over a technically-more-complete
 /// one.
-fn cmd_inspect(reference_str: &str, json: bool, format: Option<&str>) -> anyhow::Result<()> {
+fn cmd_inspect(
+    reference_str: &str,
+    json: bool,
+    format: Option<&str>,
+    size: bool,
+) -> anyhow::Result<()> {
     if let Ok(containers) = open_container_store()
         && let Ok(id) = resolve_container_id(&containers, reference_str)
         && let Ok(state) = containers.load(&id)
     {
-        let view = ContainerInspectView::from_state(&state);
+        let mut view = ContainerInspectView::from_state(&state);
+        if size {
+            let store = open_store()?;
+            view.size = Some(compute_container_size(&store, &state));
+        }
         return print_inspect_result(&view, json, format);
     }
+
+    // Matches real `podman inspect`'s own identical restriction
+    // exactly (`~/git/podman/cmd/podman/inspect/inspect.go`'s own
+    // checked-directly `"size is not supported for type %q"`) --
+    // checked before ever reading the image's own config, matching
+    // real podman's own eager validation.
+    anyhow::ensure!(!size, "size is not supported for images");
 
     let store = open_store()?;
     let resolved = resolve_image_by_reference_or_id(&store, reference_str)?.ok_or_else(|| {
@@ -7098,6 +7130,11 @@ struct ContainerInspectView {
     /// comment for the exact, full precedence order (`run`/`create
     /// --stop-timeout` override, else `10`).
     stop_timeout: u64,
+    /// Only ever populated when `--size` was given -- see
+    /// [`ContainerView::size`]'s own identical doc comment (`0342`)
+    /// for exactly why this stays opt-in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<ContainerSizeView>,
 }
 
 impl ContainerInspectView {
@@ -7136,6 +7173,7 @@ impl ContainerInspectView {
                 .unwrap_or_default(),
             stop_signal: resolve_stop_signal(state, None),
             stop_timeout: resolve_stop_timeout(state, None),
+            size: None,
         }
     }
 }
