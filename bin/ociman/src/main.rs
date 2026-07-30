@@ -817,6 +817,46 @@ enum Command {
         #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         tls_verify: bool,
     },
+    /// Search a registry — matching real `podman search`'s own
+    /// `--list-tags` mode exactly (checked directly,
+    /// `~/git/podman/cmd/podman/images/search.go`): `GET /v2/<name>/
+    /// tags/list`, the real distribution-spec v2 tag-listing endpoint,
+    /// against `TERM`'s own repository (any tag/digest `TERM` itself
+    /// carries is ignored, matching real podman's own identical
+    /// behavior). Plain `NAME`\t`TAG` output (one row per real tag),
+    /// or `--json` for a plain array of tag strings — a real,
+    /// deliberate narrowing of real podman's own richer per-entry
+    /// JSON shape (`{"Name": ..., "Tag": ...}` for every single
+    /// entry, `Name` never actually varying across them for this
+    /// project's own single-registry-repository case), not worth
+    /// reproducing here.
+    ///
+    /// Real `podman search` *without* `--list-tags` is a
+    /// fundamentally different, free-text search across every
+    /// configured registry (Docker Hub's own separate, largely-
+    /// deprecated v1 search API, `GET https://index.docker.io/v1/
+    /// search?q=...`) this project deliberately doesn't implement at
+    /// all yet — a genuinely different protocol from the v2
+    /// distribution spec this crate already speaks, plus a
+    /// "configured search registries" (`registries.conf`-style)
+    /// concept this project has no equivalent of. A clear,
+    /// honest error instead of a silently wrong/empty result.
+    Search {
+        /// A repository reference (`ubuntu`, `quay.io/foo/bar`, ...);
+        /// any tag/digest it carries is ignored (see this command's
+        /// own doc comment).
+        term: String,
+        /// List every real tag in `TERM`'s own repository — the only
+        /// mode this command implements so far (see this command's
+        /// own doc comment for why a bare, free-text search isn't).
+        #[arg(long = "list-tags")]
+        list_tags: bool,
+        /// Require HTTPS and verify certificates when contacting the
+        /// registry — see `Command::Pull`'s own identical flag for the
+        /// exact same syntax/semantics.
+        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        tls_verify: bool,
+    },
     /// Log in to a container registry, matching real `docker login`/
     /// `podman login`'s own auth-file format exactly (`--username`/
     /// `--password` write straight through to the same
@@ -3029,6 +3069,11 @@ fn main() -> std::process::ExitCode {
                 reference,
                 tls_verify,
             }) => cmd_push(&reference, tls_verify, cli.global.json),
+            Some(Command::Search {
+                term,
+                list_tags,
+                tls_verify,
+            }) => cmd_search(&term, list_tags, tls_verify, cli.global.json),
             Some(Command::Login {
                 registry,
                 username,
@@ -3466,6 +3511,34 @@ fn cmd_push(reference_str: &str, tls_verify: bool, json: bool) -> anyhow::Result
         })?;
     } else {
         println!("{}", record.manifest_digest);
+    }
+    Ok(())
+}
+
+/// `ociman search --list-tags` — see [`Command::Search`]'s own doc
+/// comment for the exact real scope this implements and the free-text
+/// search mode it deliberately doesn't.
+fn cmd_search(term: &str, list_tags: bool, tls_verify: bool, json: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        list_tags,
+        "ociman search: free-text registry search isn't supported yet -- pass --list-tags to \
+         list every tag in a specific repository instead"
+    );
+    let reference =
+        Reference::parse(term).with_context(|| format!("parsing image reference {term:?}"))?;
+    let mut client = oci_registry::client_for(reference.registry_host(), tls_verify);
+    let tags = client
+        .list_tags(&reference)
+        .with_context(|| format!("listing tags for {}", reference.familiar_repository()))?;
+
+    if json {
+        oci_cli_common::output::print_json(&tags)?;
+        return Ok(());
+    }
+    println!("NAME\tTAG");
+    let name = reference.familiar_repository();
+    for tag in &tags {
+        println!("{name}\t{tag}");
     }
     Ok(())
 }

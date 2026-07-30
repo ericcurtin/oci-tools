@@ -153,7 +153,22 @@ impl Reference {
     /// `docker.io/` where they were implied), e.g. `ubuntu:24.04` or
     /// `myuser/myrepo:latest`.
     pub fn familiar(&self) -> String {
-        let repo = if self.registry == DEFAULT_REGISTRY {
+        let repo = self.familiar_repository();
+        match &self.digest {
+            Some(d) => format!("{repo}@{d}"),
+            None => format!("{repo}:{}", self.tag.as_deref().unwrap_or(DEFAULT_TAG)),
+        }
+    }
+
+    /// [`Self::familiar`]'s own repository half alone, with no
+    /// `:tag`/`@digest` suffix at all — useful for a caller that has
+    /// its own separate, per-tag/per-digest data to print alongside a
+    /// repository name (`ociman search --list-tags`, one row per real
+    /// tag: real podman's own checked-directly output shows the bare
+    /// repository name once per row, never `repo:latest` implied-tag
+    /// noise a plain `familiar()` would add).
+    pub fn familiar_repository(&self) -> String {
+        if self.registry == DEFAULT_REGISTRY {
             self.repository
                 .strip_prefix(OFFICIAL_REPO_PREFIX)
                 .filter(|rest| !rest.contains('/'))
@@ -161,10 +176,6 @@ impl Reference {
                 .to_string()
         } else {
             format!("{}/{}", self.registry, self.repository)
-        };
-        match &self.digest {
-            Some(d) => format!("{repo}@{d}"),
-            None => format!("{repo}:{}", self.tag.as_deref().unwrap_or(DEFAULT_TAG)),
         }
     }
 }
@@ -261,6 +272,28 @@ mod tests {
         assert_eq!(r.registry(), "docker.io");
         assert_eq!(r.repository(), "myuser/myrepo");
         assert_eq!(r.familiar(), "myuser/myrepo:latest");
+    }
+
+    #[test]
+    fn familiar_repository_drops_any_tag_or_digest_suffix() {
+        assert_eq!(
+            Reference::parse("ubuntu:24.04")
+                .unwrap()
+                .familiar_repository(),
+            "ubuntu"
+        );
+        assert_eq!(
+            Reference::parse("myuser/myrepo")
+                .unwrap()
+                .familiar_repository(),
+            "myuser/myrepo"
+        );
+        assert_eq!(
+            Reference::parse("quay.io/foo/bar:v1")
+                .unwrap()
+                .familiar_repository(),
+            "quay.io/foo/bar"
+        );
     }
 
     #[test]

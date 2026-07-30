@@ -225,6 +225,88 @@ impl Client {
         })
     }
 
+    /// Every tag in `reference`'s own repository — any tag/digest
+    /// `reference` itself carries is ignored, matching real podman/
+    /// skopeo's own `GetRepositoryTags` exactly (checked directly,
+    /// `~/git/container-libs/image/docker/docker_image.go`): a plain
+    /// `GET /v2/<name>/tags/list` (the real distribution-spec v2 tags
+    /// endpoint, `docs/design/0371`), following a real `Link`-header
+    /// pagination chain (RFC 5988) until the registry stops sending
+    /// one — a large repository's own tag list is never silently
+    /// truncated to just the first page. Tolerates the same two real,
+    /// checked-directly-documented registry quirks that reference
+    /// client's own code specifically works around: a JSON `null`
+    /// entry in the `tags` array (some Sonatype Nexus versions) and a
+    /// bare digest string standing in for a tag (some Artifactory
+    /// versions) are both silently skipped rather than surfaced as
+    /// parse errors, matching that exact real tolerance.
+    pub fn list_tags(&mut self, reference: &Reference) -> Result<Vec<String>, RegistryError> {
+        #[derive(serde::Deserialize)]
+        struct TagsResponse {
+            tags: Vec<Option<String>>,
+        }
+
+        let mut tags = Vec::new();
+        let mut path = format!("/v2/{}/tags/list", reference.repository());
+        loop {
+            let url = format!(
+                "{}://{}{}",
+                self.scheme(reference.registry_host()),
+                reference.registry_host(),
+                path
+            );
+            let mut resp = self.request_with_auth(
+                reference.registry_host(),
+                reference.repository(),
+                "pull",
+                |client, bearer| {
+                    let mut req = client.agent.get(&url);
+                    if let Some(bearer) = bearer {
+                        req = req.header("Authorization", format!("Bearer {bearer}"));
+                    }
+                    req.call()
+                        .map_err(|e| RegistryError::Transport(e.to_string()))
+                },
+            )?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.body_mut().read_to_string().unwrap_or_default();
+                return Err(RegistryError::UnexpectedStatus {
+                    url,
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+
+            // Read the `Link` header before consuming the body (both
+            // borrow `resp`, and reading the body needs `&mut`).
+            let next_path = resp
+                .headers()
+                .get("link")
+                .and_then(|v| v.to_str().ok())
+                .and_then(next_tags_page_path);
+
+            let body = resp
+                .body_mut()
+                .read_to_vec()
+                .map_err(|e| RegistryError::Transport(e.to_string()))?;
+            let parsed: TagsResponse = serde_json::from_slice(&body)?;
+            for tag in parsed.tags.into_iter().flatten() {
+                if tag.is_empty() || Digest::parse(&tag).is_ok() {
+                    continue;
+                }
+                tags.push(tag);
+            }
+
+            match next_path {
+                Some(next) => path = next,
+                None => break,
+            }
+        }
+        Ok(tags)
+    }
+
     /// Open a streaming reader for the blob `digest` in `reference`'s
     /// repository (works for layers and config blobs alike).
     pub fn pull_blob(
@@ -523,6 +605,34 @@ fn append_digest_query(url: &str, digest: &Digest) -> String {
     format!("{url}{separator}digest={digest}")
 }
 
+/// Extract the next tags page's own path+query out of a `Link`
+/// response header — matching real skopeo's own identical, RFC-5988-
+/// adjacent but deliberately simple parsing exactly (`~/git/
+/// container-libs/image/docker/docker_image.go`'s own `GetRepositoryTags`):
+/// no `rel="next"` check at all, just whatever URL the first `<...>`
+/// segment (before the first `;`) names — an absolute URL is reduced
+/// down to just its own path+query (this client, like that real one,
+/// always resolves the next page against the *same* host the first
+/// request already used, never switching hosts mid-pagination); a
+/// bare path (no scheme) is returned as-is. `None` for anything this
+/// can't make sense of at all (no `<`/`>` delimiters found).
+fn next_tags_page_path(link_header: &str) -> Option<String> {
+    let first_segment = link_header.split(';').next()?.trim();
+    let url_part = first_segment.strip_prefix('<')?.strip_suffix('>')?;
+    match url_part.split_once("://") {
+        Some((_scheme, rest)) => {
+            // `rest` is `host[:port]/path?query` -- keep only the part
+            // from the first `/` onward, so a differing host in the
+            // header (which this client deliberately never follows,
+            // matching the real reference client's own identical
+            // choice) has no effect either way.
+            let (_host, path_and_query) = rest.split_once('/')?;
+            Some(format!("/{path_and_query}"))
+        }
+        None => Some(url_part.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,5 +760,104 @@ mod tests {
             .request_with_auth(&mock.addr.to_string(), "testrepo", "pull", get)
             .unwrap();
         assert!(resp2.status().is_success());
+    }
+
+    #[test]
+    fn next_tags_page_path_reduces_an_absolute_url_to_just_path_and_query() {
+        assert_eq!(
+            next_tags_page_path(
+                "<https://registry-1.docker.io/v2/library/ubuntu/tags/list?n=50&last=v1>; rel=\"next\""
+            ),
+            Some("/v2/library/ubuntu/tags/list?n=50&last=v1".to_string())
+        );
+    }
+
+    #[test]
+    fn next_tags_page_path_keeps_a_bare_path_as_is() {
+        assert_eq!(
+            next_tags_page_path("</v2/testrepo/tags/list?n=50&last=v1>; rel=\"next\""),
+            Some("/v2/testrepo/tags/list?n=50&last=v1".to_string())
+        );
+    }
+
+    #[test]
+    fn next_tags_page_path_is_none_for_a_malformed_header() {
+        assert_eq!(next_tags_page_path("not a link header at all"), None);
+    }
+
+    /// A minimal, unauthenticated mock serving a real two-page `tags/
+    /// list` response: page 1 (`/v2/testrepo/tags/list`) carries a
+    /// `Link` header pointing at page 2
+    /// (`/v2/testrepo/tags/list?n=2&last=v1.0`), which has none —
+    /// ending pagination there. Page 1's own tags array also includes
+    /// a JSON `null`, an empty string, and a bare digest standing in
+    /// for a tag — the two real, checked-directly registry quirks
+    /// [`Client::list_tags`]'s own doc comment names, plus the trivial
+    /// empty-string case, all of which must be silently filtered out.
+    fn start_tags_mock() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                handle_tags_request(stream, addr);
+            }
+        });
+        addr
+    }
+
+    fn handle_tags_request(mut stream: TcpStream, addr: std::net::SocketAddr) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        let path = request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("")
+            .to_string();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line.trim().is_empty() {
+                break;
+            }
+        }
+
+        if path == "/v2/testrepo/tags/list" {
+            let body = r#"{"tags":["latest","","sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",null,"v1.0"]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Link: </v2/testrepo/tags/list?n=2&last=v1.0>; rel=\"next\"\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        } else if path == "/v2/testrepo/tags/list?n=2&last=v1.0" {
+            write_response(&mut stream, 200, "application/json", r#"{"tags":["v2.0"]}"#);
+        } else {
+            panic!("unexpected request path in tags mock: {path:?} (addr {addr})");
+        }
+    }
+
+    #[test]
+    fn list_tags_follows_link_header_pagination_and_filters_bad_entries() {
+        let addr = start_tags_mock();
+        // The mock speaks plain HTTP, not HTTPS -- `with_options`'
+        // own insecure-host list is exactly the real, already-
+        // established escape hatch for a real local test/CI registry
+        // like this one (see `Client::scheme`'s own doc comment).
+        let mut client = Client::with_options(Credentials::empty(), [addr.to_string()]);
+        // The mock never challenges (no `WWW-Authenticate` at all), so
+        // `request_with_auth`'s own first, credential-less attempt
+        // already succeeds -- this test is entirely about pagination
+        // and entry-filtering, not the auth dance (already covered by
+        // `request_with_auth_retries_after_401_challenge` above).
+        let reference =
+            Reference::parse(&format!("{addr}/testrepo:ignored-tag")).expect("valid reference");
+
+        let tags = client.list_tags(&reference).unwrap();
+        assert_eq!(
+            tags,
+            vec!["latest".to_string(), "v1.0".to_string(), "v2.0".to_string()]
+        );
     }
 }
