@@ -102,29 +102,35 @@ enum Command {
     /// `pkg/commands/list.go`).
     #[command(alias = "ls")]
     List,
-    /// Remove a box entirely (its own rootfs and persisted record) —
-    /// matching real `distrobox rm <NAME>`. `--force` is accepted for
-    /// real CLI compatibility but changes nothing: this project has
-    /// no interactive confirmation prompt to skip in the first place
-    /// (the same "nothing to skip" reasoning `create --pull`'s own
-    /// doc comment already gives for `--yes`).
+    /// Remove one or more boxes entirely (each one's own rootfs and
+    /// persisted record) — matching real `distrobox rm NAME
+    /// [NAME...]` (0321: previously a single name only). `--force` is
+    /// accepted for real CLI compatibility but changes nothing: this
+    /// project has no interactive confirmation prompt to skip in the
+    /// first place (the same "nothing to skip" reasoning `create
+    /// --pull`'s own doc comment already gives for `--yes`).
     Rm {
-        /// The box's own name, exactly as given to `ocibox create
-        /// --name`. Required unless `--all` is given instead (matching
-        /// real `distrobox rm`'s own identical either/or requirement).
-        name: Option<String>,
+        /// The box name(s) to remove, exactly as given to `ocibox
+        /// create --name` — ignored entirely if `--all` is also given
+        /// (matching real `distrobox rm`'s own identical behavior:
+        /// checked directly, `~/git/distrobox/pkg/commands/rm.go`'s
+        /// own `getContainersToRemove`, `--all` takes full priority
+        /// over any names also given, rather than the two being
+        /// mutually exclusive). At least one name, or `--all`, is
+        /// required — this project's own narrower stance than real
+        /// `distrobox rm`'s own further fallback to a single
+        /// configured "default container name" with neither, a whole
+        /// separate concept this project doesn't have at all.
+        names: Vec<String>,
         /// Accepted for real CLI compatibility with `distrobox rm
         /// --force`; has no effect (see this command's own doc
         /// comment).
         #[arg(long, short = 'f')]
         force: bool,
         /// Remove every existing box, matching real `distrobox rm
-        /// --all`. Mutually exclusive with a positional `name` (this
-        /// project's own narrower "one or the other, not both"
-        /// requirement rather than real `distrobox rm`'s own richer
-        /// "any combination of explicit names and `--all`" handling —
-        /// not worth replicating for a flag whose whole point is
-        /// "remove literally everything" either way).
+        /// --all` exactly, including its own real "takes priority over
+        /// any names also given, rather than erroring" behavior (see
+        /// this command's own doc comment above).
         #[arg(long, short = 'a')]
         all: bool,
     },
@@ -246,10 +252,10 @@ fn main() -> std::process::ExitCode {
             Some(Command::Create { image, name, pull }) => cmd_create(&image, &name, pull),
             Some(Command::List) => cmd_list(cli.global.json),
             Some(Command::Rm {
-                name,
+                names,
                 force: _,
                 all,
-            }) => cmd_rm(name.as_deref(), all),
+            }) => cmd_rm(&names, all),
             Some(Command::Enter { name, command }) => cmd_enter(&name, &command),
             Some(Command::Ephemeral {
                 image,
@@ -721,44 +727,68 @@ fn remove_one_box(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `ocibox rm <NAME>` / `ocibox rm --all` (matching real `distrobox rm
-/// --all`): removes either exactly the one named box, or every
-/// existing box — mutually exclusive (see [`Command::Rm`]'s own doc
-/// comment for why this project doesn't replicate real `distrobox
-/// rm`'s own richer "any combination of explicit names and `--all`"
-/// handling).
+/// `ocibox rm NAME [NAME...]` / `ocibox rm --all` (0321, real
+/// multi-name support closing a genuine gap: previously exactly one
+/// name only). `--all` takes full priority over any names also given
+/// (matching real `distrobox rm` exactly, `getContainersToRemove`
+/// above) rather than the two being mutually exclusive.
 ///
-/// `--all` on an empty store is a real, silent no-op (nothing to
-/// remove, nothing printed), matching this project's own established
-/// "empty is a valid, unremarkable state" convention (`ocibox list`'s
-/// own `no boxes` message being the one place that *is* worth an
-/// explicit line, since a listing command's whole job is reporting
-/// state — a bulk-removal command has nothing more to say here).
-/// Removal of every box is attempted even if one fails partway through
-/// (matching real `distrobox rm`'s own identical "continue past a
-/// per-container error rather than aborting the whole batch"
-/// behavior) — the first failure's own error is still what this
-/// command ultimately reports and exits nonzero for, once every box
-/// has had its own attempt.
-fn cmd_rm(name: Option<&str>, all: bool) -> anyhow::Result<()> {
-    match (name, all) {
-        (Some(_), true) => anyhow::bail!("cannot give both a box name and --all"),
-        (None, false) => anyhow::bail!("no box name given (try `ocibox rm <NAME>` or `--all`)"),
-        (Some(name), false) => remove_one_box(name),
-        (None, true) => {
-            let mut first_error = None;
-            for record in list_boxes()? {
-                if let Err(e) = remove_one_box(&record.name) {
-                    eprintln!("error removing {}: {e:#}", record.name);
-                    first_error.get_or_insert(e);
-                }
-            }
-            match first_error {
-                Some(e) => Err(e.context("removing every box")),
-                None => Ok(()),
+/// A real, previously-incorrect divergence corrected here, found by
+/// reading real `distrobox`'s own source directly rather than assumed
+/// (`~/git/distrobox/pkg/commands/rm.go`'s own `Execute`, traced all
+/// the way to `cmd/distrobox/main.go`'s own top-level `run()`/
+/// `log.Fatal`): real `distrobox rm` **never** exits non-zero for
+/// anything that happens inside its own per-container removal loop —
+/// an explicitly-named box that doesn't resolve at all only gets a
+/// printed warning (`warnUnknownContainers`), and a genuine removal
+/// failure for one real box only gets a printed error
+/// (`c.printer.PrintErrorln`) — every other name/box is still
+/// attempted regardless, and the command's own final return is
+/// unconditionally successful either way. This project's own previous
+/// implementation instead trusted that "removal of every box is
+/// attempted even if one fails" implied "but still exits non-zero
+/// afterward," which turns out not to match real distrobox at all;
+/// fixed to the same "attempt everything, only ever print, never
+/// fail" tolerance for both a bad name and a genuine removal failure.
+///
+/// `--all`/no names at all, on an empty store, is a real, silent
+/// no-op (nothing to remove, nothing printed), matching this
+/// project's own established "empty is a valid, unremarkable state"
+/// convention (`ocibox list`'s own `no boxes` message being the one
+/// place that *is* worth an explicit line, since a listing command's
+/// whole job is reporting state — a bulk-removal command has nothing
+/// more to say here).
+fn cmd_rm(names: &[String], all: bool) -> anyhow::Result<()> {
+    if all {
+        for record in list_boxes()? {
+            if let Err(e) = remove_one_box(&record.name) {
+                eprintln!("error removing {}: {e:#}", record.name);
             }
         }
+        return Ok(());
     }
+
+    anyhow::ensure!(
+        !names.is_empty(),
+        "no box name given (try `ocibox rm <NAME>` or `--all`)"
+    );
+    // Validate every given name *before* attempting to remove any of
+    // them: a malformed/path-traversal name is this project's own
+    // deliberate, defensive security check (protecting `remove_dir_
+    // all` from ever reaching outside `boxes_root()`), not something
+    // real `distrobox`'s own "does this name match a real container"
+    // check has an equivalent of at all -- it stays a real, immediate,
+    // whole-call-aborting error, never merely warned about and
+    // skipped the way a name that's simply *not found* now is.
+    for name in names {
+        validate_box_name(name)?;
+    }
+    for name in names {
+        if let Err(e) = remove_one_box(name) {
+            eprintln!("{e:#}");
+        }
+    }
+    Ok(())
 }
 
 /// A real, random `ocibox-<12 hex chars>` box name for [`cmd_ephemeral`]

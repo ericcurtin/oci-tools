@@ -180,13 +180,25 @@ fn rm_removes_a_real_box_entirely() {
     assert_eq!(String::from_utf8_lossy(&list.stdout).trim(), "no boxes");
 }
 
+/// `rm` of a name that simply doesn't resolve to any real box is a
+/// warning, not a hard error (0321 — a real correction: previously
+/// this hard-errored, before checking real `distrobox`'s own actual
+/// behavior directly, `~/git/distrobox/pkg/commands/rm.go`'s own
+/// `warnUnknownContainers`/`Execute`, traced all the way to `cmd/
+/// distrobox/main.go`'s own top-level error handling — real
+/// `distrobox rm somename` on a name that doesn't exist prints a
+/// warning and exits `0`, never non-zero).
 #[test]
-fn rm_of_an_unknown_name_is_a_clear_error() {
+fn rm_of_an_unknown_name_prints_a_warning_but_still_succeeds() {
     let storage_dir = tempfile::tempdir().unwrap();
     Store::open(storage_dir.path()).unwrap();
 
     let rm = ocibox(storage_dir.path(), &["rm", "doesnotexist"]);
-    assert!(!rm.status.success());
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
     assert!(
         String::from_utf8_lossy(&rm.stderr).contains("no such box"),
         "{}",
@@ -269,6 +281,64 @@ fn rm_all_removes_every_box() {
     assert!(!storage_dir.path().join("boxes").join("zeta").exists());
 }
 
+/// `rm NAME1 NAME2` (0321, a real, previously-unsupported gap:
+/// `ocibox rm` only ever accepted exactly one name before this, unlike
+/// real `distrobox rm NAME [NAME...]`) removes every one of the real
+/// boxes named, printing each in turn, and tolerates one unresolvable
+/// name among them (a warning only, not an aborting error, matching
+/// real distrobox's own identical tolerance -- see [`cmd_rm`]'s own
+/// doc comment) while still removing every real box that *was* named.
+#[test]
+fn rm_accepts_multiple_names_and_tolerates_an_unresolvable_one() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/rm-multi-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    for name in ["boxone", "boxtwo"] {
+        let create = ocibox(
+            storage_dir.path(),
+            &[
+                "create",
+                "--image",
+                "ocibox-test/rm-multi-base:latest",
+                "--name",
+                name,
+            ],
+        );
+        assert!(create.status.success());
+    }
+
+    let rm = ocibox(
+        storage_dir.path(),
+        &["rm", "boxone", "boxtwo", "does-not-exist"],
+    );
+    assert!(
+        rm.status.success(),
+        "an unresolvable name among several must not abort the whole call, stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&rm.stdout).into_owned();
+    let removed: Vec<&str> = stdout.lines().collect();
+    assert_eq!(removed, vec!["boxone", "boxtwo"]);
+    assert!(
+        String::from_utf8_lossy(&rm.stderr).contains("does-not-exist"),
+        "{}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+
+    assert!(!storage_dir.path().join("boxes").join("boxone").exists());
+    assert!(!storage_dir.path().join("boxes").join("boxtwo").exists());
+}
+
 /// `rm --all` on an already-empty store is a real, silent no-op:
 /// nothing to remove, nothing printed, exit success -- there was
 /// never a box to report a failure or a name for.
@@ -286,10 +356,10 @@ fn rm_all_on_an_empty_store_is_a_silent_success() {
     assert!(rm.stdout.is_empty());
 }
 
-/// `rm` with neither a name nor `--all`, and `rm` with both, are each
-/// a clear, real error rather than an ambiguous silent no-op.
+/// `rm` with neither a name nor `--all` is a clear, real error rather
+/// than an ambiguous silent no-op.
 #[test]
-fn rm_requires_exactly_one_of_name_or_all() {
+fn rm_requires_a_name_or_all() {
     let storage_dir = tempfile::tempdir().unwrap();
     Store::open(storage_dir.path()).unwrap();
 
@@ -300,12 +370,56 @@ fn rm_requires_exactly_one_of_name_or_all() {
         "{}",
         String::from_utf8_lossy(&neither.stderr)
     );
+}
 
-    let both = ocibox(storage_dir.path(), &["rm", "somebox", "--all"]);
-    assert!(!both.status.success());
+/// Giving both a name and `--all` is *not* an error at all (0321 — a
+/// real correction, checked directly against real `distrobox`'s own
+/// `getContainersToRemove`): `--all` simply takes full priority,
+/// silently ignoring whatever names were also given -- proven here
+/// with a real box whose own name doesn't match the (nonexistent) one
+/// given alongside `--all`, yet still gets removed, exactly matching
+/// real `distrobox rm somebox --all`'s own identical behavior (still
+/// removes *every* box, not just `somebox`).
+#[test]
+fn rm_all_takes_priority_over_any_names_also_given() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/rm-all-priority:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/rm-all-priority:latest",
+            "--name",
+            "realbox",
+        ],
+    );
+    assert!(create.status.success());
+    let box_dir = storage_dir.path().join("boxes").join("realbox");
+    assert!(box_dir.is_dir());
+
+    let both = ocibox(
+        storage_dir.path(),
+        &["rm", "somebox-does-not-exist", "--all"],
+    );
     assert!(
-        String::from_utf8_lossy(&both.stderr).contains("cannot give both"),
-        "{}",
+        both.status.success(),
+        "stderr: {}",
         String::from_utf8_lossy(&both.stderr)
+    );
+    assert!(
+        !box_dir.exists(),
+        "--all should have removed the real box despite the unrelated name also given"
     );
 }
