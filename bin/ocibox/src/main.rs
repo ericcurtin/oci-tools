@@ -90,6 +90,24 @@ enum Command {
         /// flag exactly.
         #[arg(long, short = 'p')]
         pull: bool,
+        /// Hostname for the box, set once at `create` time and used
+        /// by every later `ocibox enter` of it — matching real
+        /// `distrobox create --hostname` exactly (checked directly,
+        /// `~/git/distrobox/pkg/commands/create.go`'s own
+        /// `makeContainerHostname`): rejected outright if longer than
+        /// 64 characters (`ErrHostnameTooLong`), no other validation
+        /// (passed straight through to the kernel's own
+        /// `sethostname(2)`, same convention `ociman run --hostname`
+        /// already established). Defaults, when not given, to the
+        /// box's own name — **not** real distrobox's own real-host-
+        /// hostname default (`os.Hostname()`), a divergence this
+        /// project deliberately introduced already (`docs/design/
+        /// 0292`, since this project has no host-hostname-reading
+        /// convention of its own) and is not revisited here: this
+        /// flag's own override behavior is unambiguous and correct
+        /// regardless of what the *default* resolves to.
+        #[arg(long, value_name = "NAME")]
+        hostname: Option<String>,
     },
     /// List real, created boxes — matching real `distrobox list`
     /// (alias `ls`), narrowed to what this project's own boxes
@@ -191,6 +209,12 @@ enum Command {
         /// matching `ocibox create --pull`'s own identical flag.
         #[arg(long, short = 'p')]
         pull: bool,
+        /// Hostname for the ephemeral box — matching `ocibox create
+        /// --hostname`'s own identical flag, which real `distrobox
+        /// ephemeral` also inherits from `distrobox create` (checked
+        /// directly, `~/git/distrobox/internal/cli/ephemeral.go`).
+        #[arg(long, value_name = "NAME")]
+        hostname: Option<String>,
         /// The command to run inside the box, and its own arguments —
         /// defaults to a shell (see `ocibox enter`'s own doc comment)
         /// if empty.
@@ -303,7 +327,12 @@ fn main() -> std::process::ExitCode {
             "ocibox starting"
         );
         match cli.command {
-            Some(Command::Create { image, name, pull }) => cmd_create(&image, &name, pull),
+            Some(Command::Create {
+                image,
+                name,
+                pull,
+                hostname,
+            }) => cmd_create(&image, &name, pull, hostname.as_deref()),
             Some(Command::List) => cmd_list(cli.global.json),
             Some(Command::Rm {
                 names,
@@ -314,8 +343,9 @@ fn main() -> std::process::ExitCode {
             Some(Command::Ephemeral {
                 image,
                 pull,
+                hostname,
                 command,
-            }) => cmd_ephemeral(&image, pull, &command),
+            }) => cmd_ephemeral(&image, pull, hostname.as_deref(), &command),
             Some(Command::Export {
                 box_name,
                 app,
@@ -406,10 +436,40 @@ struct BoxRecord {
     /// (`ContainerConfig::working_dir`), if any.
     #[serde(default)]
     working_dir: Option<String>,
+    /// An explicit `--hostname`, if one was given at `create` time —
+    /// `None` (the common case) means `enter_spec` falls back to the
+    /// box's own name, matching this project's own already-
+    /// established default (`docs/design/0292`). Older `box.json`
+    /// files predating this field deserialize this as `None` via
+    /// `#[serde(default)]`, the same forward-compatible-record
+    /// convention `env`/`working_dir` already use.
+    #[serde(default)]
+    hostname: Option<String>,
 }
 
-fn cmd_create(image: &str, name: &str, pull: bool) -> anyhow::Result<()> {
-    create_box(image, name, pull)?;
+/// The real, checked-directly cap real `distrobox create --hostname`
+/// enforces (`~/git/distrobox/pkg/commands/create.go`'s own
+/// `maxHostnameLength`/`ErrHostnameTooLong`) — a real Linux kernel
+/// limit (`HOST_NAME_MAX`), not an arbitrary choice of either
+/// project's own.
+const MAX_HOSTNAME_LENGTH: usize = 64;
+
+/// Matching real `distrobox create --hostname`'s own identical
+/// validation exactly: no charset restriction at all (passed straight
+/// through to the kernel's own `sethostname(2)`, which rejects a
+/// genuinely invalid value itself — the same "no syntax validation
+/// here" convention `ociman run --hostname`/`--cpuset-cpus` already
+/// established), just a hard length cap.
+fn validate_hostname(hostname: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        hostname.len() <= MAX_HOSTNAME_LENGTH,
+        "hostname too long, must be less than {MAX_HOSTNAME_LENGTH} characters"
+    );
+    Ok(())
+}
+
+fn cmd_create(image: &str, name: &str, pull: bool, hostname: Option<&str>) -> anyhow::Result<()> {
+    create_box(image, name, pull, hostname)?;
     println!("{name}");
     Ok(())
 }
@@ -421,8 +481,11 @@ fn cmd_create(image: &str, name: &str, pull: bool) -> anyhow::Result<()> {
 /// identical "no extra id line before dropping into the shell"
 /// output) can reuse every bit of real resolve/extract/persist logic
 /// without also inheriting `cmd_create`'s own final `println!`.
-fn create_box(image: &str, name: &str, pull: bool) -> anyhow::Result<()> {
+fn create_box(image: &str, name: &str, pull: bool, hostname: Option<&str>) -> anyhow::Result<()> {
     validate_box_name(name)?;
+    if let Some(hostname) = hostname {
+        validate_hostname(hostname)?;
+    }
 
     let box_dir = boxes_root().join(name);
     anyhow::ensure!(
@@ -484,6 +547,7 @@ fn create_box(image: &str, name: &str, pull: bool) -> anyhow::Result<()> {
         created: oci_spec_types::time::format_rfc3339_utc(std::time::SystemTime::now()),
         env: container_config.env,
         working_dir: container_config.working_dir,
+        hostname: hostname.map(str::to_string),
     };
     let box_json_path = box_dir.join("box.json");
     std::fs::write(
@@ -648,8 +712,19 @@ fn enter_spec(
     // hostname = Some(hostname.unwrap_or(id)...)`, 0286) — a real,
     // useful hostname distinguishing one box's own shell prompt from
     // another's, rather than every single box claiming to be
-    // `ocirun`.
-    spec.hostname = Some(record.name.clone());
+    // `ocirun`. An explicit `--hostname` given at `create` time
+    // (`0344`) overrides this default, matching real `distrobox
+    // create --hostname` exactly -- the override itself is
+    // unambiguous and correct regardless of what the *default*
+    // resolves to (this project's own box-name default deliberately
+    // stays diverged from real distrobox's own host-hostname one, per
+    // this comment's own reasoning just above).
+    spec.hostname = Some(
+        record
+            .hostname
+            .clone()
+            .unwrap_or_else(|| record.name.clone()),
+    );
 
     // Only added if `$HOME` resolves to a real, existing host
     // directory — deliberately conditional (unlike real `distrobox
@@ -906,9 +981,15 @@ fn unique_random_box_name() -> anyhow::Result<String> {
 /// [`Command::Ephemeral`]'s own doc comment for the exact real
 /// `distrobox ephemeral` behavior this matches and why no new
 /// namespace/mount/launch code was needed to build it at all.
-fn cmd_ephemeral(image: &str, pull: bool, command: &[String]) -> anyhow::Result<()> {
+fn cmd_ephemeral(
+    image: &str,
+    pull: bool,
+    hostname: Option<&str>,
+    command: &[String],
+) -> anyhow::Result<()> {
     let name = unique_random_box_name()?;
-    create_box(image, &name, pull).with_context(|| format!("creating ephemeral box {name}"))?;
+    create_box(image, &name, pull, hostname)
+        .with_context(|| format!("creating ephemeral box {name}"))?;
 
     let result = enter_and_get_exit_code(&name, command);
 

@@ -150,6 +150,52 @@ fn create_rejects_an_invalid_box_name() {
     );
 }
 
+/// `--hostname` (0344) longer than 64 characters is a clear,
+/// immediate error -- matching real `distrobox create --hostname`'s
+/// own identical `ErrHostnameTooLong` exactly (`~/git/distrobox/pkg/
+/// commands/create.go`'s own `maxHostnameLength`) -- and, same as an
+/// invalid box name, leaves no half-created box directory behind.
+#[test]
+fn create_rejects_a_hostname_over_64_characters() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/badhostname-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let too_long = "a".repeat(65);
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/badhostname-base:latest",
+            "--name",
+            "testbox",
+            "--hostname",
+            &too_long,
+        ],
+    );
+    assert!(!create.status.success());
+    assert!(
+        String::from_utf8_lossy(&create.stderr).contains("hostname too long"),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert!(
+        !storage_dir.path().join("boxes").exists(),
+        "a too-long hostname should never even create the boxes directory"
+    );
+}
+
 /// An unknown reference, with no `--pull` and nothing already stored
 /// (real `distrobox create`'s own default is closer to "pull only if
 /// needed", matching this project's own `PullPolicy::Missing` default

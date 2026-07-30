@@ -225,6 +225,63 @@ fn enter_reports_the_boxs_own_name_as_its_hostname() {
     );
 }
 
+/// `ocibox create --hostname` (0344) overrides the box-name default,
+/// matching real `distrobox create --hostname` exactly (checked
+/// directly, `~/git/distrobox/pkg/commands/create.go`'s own
+/// `makeContainerHostname`) -- the given value is used verbatim by
+/// every later `enter`, even though it's genuinely different from the
+/// box's own real name.
+#[test]
+fn enter_reports_an_explicit_create_hostname_override() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/hostname-override:latest",
+        &busybox_path().unwrap(),
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/hostname-override:latest",
+            "--name",
+            "hostname-box",
+            "--hostname",
+            "totally-different-hostname",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let out = ocibox(
+        storage_dir.path(),
+        &[
+            "enter",
+            "hostname-box",
+            "--",
+            "/bin/cat",
+            "/proc/sys/kernel/hostname",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "totally-different-hostname",
+        "an explicit --hostname at create time must override the box-name default"
+    );
+}
+
 #[test]
 fn enter_of_an_unknown_box_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();
