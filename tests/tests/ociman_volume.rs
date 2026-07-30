@@ -954,3 +954,87 @@ fn volume_mountpoint(storage_root: &Path, name: &str) -> std::path::PathBuf {
     let parsed: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
     std::path::PathBuf::from(parsed["mountpoint"].as_str().unwrap())
 }
+
+/// `ociman volume mount` (`docs/design/0361`) prints exactly the same
+/// real, absolute `_data` directory path `ociman volume inspect`'s
+/// own `mountpoint` field already reports -- and, unlike real
+/// *rootless* `podman volume mount` (checked directly: it refuses
+/// outright, "must execute `podman unshare` first"), never refuses at
+/// all, matching this project's own volumes always being a plain,
+/// already-directly-accessible host directory (the same real case a
+/// rootFUL `podman volume mount`'s own genuine no-op covers).
+#[test]
+fn volume_mount_prints_the_real_data_directory_path() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let create = ociman(storage_dir.path(), &["volume", "create", "mountvol"]);
+    assert!(create.status.success(), "{create:?}");
+
+    let mount = ociman(storage_dir.path(), &["volume", "mount", "mountvol"]);
+    assert!(mount.status.success(), "{mount:?}");
+    let printed = String::from_utf8_lossy(&mount.stdout).trim().to_string();
+    assert_eq!(
+        std::path::PathBuf::from(&printed),
+        volume_mountpoint(storage_dir.path(), "mountvol"),
+        "{mount:?}"
+    );
+    assert!(
+        Path::new(&printed).is_dir(),
+        "the printed path should be a real, already-existing directory"
+    );
+}
+
+/// `ociman volume unmount` is a real no-op: it never actually detaches
+/// anything (there is nothing to), and the volume's own directory is
+/// still fully intact and usable afterward -- matching real `podman
+/// volume unmount`'s own identical "local" driver behavior (checked
+/// directly: `~/git/podman/libpod/volume.go`'s own `unmount` early-
+/// returns whenever `needsMount()` is `false`, this project's own
+/// only real case). Prints the volume's own name on success, matching
+/// a real installed `podman volume unmount`'s own checked-directly
+/// output exactly.
+#[test]
+fn volume_unmount_is_a_real_no_op_that_prints_the_name() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let create = ociman(storage_dir.path(), &["volume", "create", "unmountvol"]);
+    assert!(create.status.success(), "{create:?}");
+    let mountpoint = volume_mountpoint(storage_dir.path(), "unmountvol");
+
+    let unmount = ociman(storage_dir.path(), &["volume", "unmount", "unmountvol"]);
+    assert!(unmount.status.success(), "{unmount:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&unmount.stdout).trim(),
+        "unmountvol"
+    );
+    assert!(
+        mountpoint.is_dir(),
+        "the volume's own directory must survive unmount untouched"
+    );
+}
+
+/// `ociman volume mount`/`unmount` on an unknown volume are clear
+/// errors, matching `ociman volume export`/`import`'s own identical,
+/// already-established convention for the same case.
+#[test]
+fn volume_mount_and_unmount_of_an_unknown_volume_are_clear_errors() {
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let mount = ociman(storage_dir.path(), &["volume", "mount", "never-created"]);
+    assert!(!mount.status.success());
+    assert!(
+        String::from_utf8_lossy(&mount.stderr).contains("no volume"),
+        "{}",
+        String::from_utf8_lossy(&mount.stderr)
+    );
+
+    let unmount = ociman(storage_dir.path(), &["volume", "unmount", "never-created"]);
+    assert!(!unmount.status.success());
+    assert!(
+        String::from_utf8_lossy(&unmount.stderr).contains("no volume"),
+        "{}",
+        String::from_utf8_lossy(&unmount.stderr)
+    );
+}

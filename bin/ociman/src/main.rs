@@ -2783,6 +2783,40 @@ enum VolumeCommand {
         /// (matching real `podman volume import VOLUME -` exactly).
         source: String,
     },
+    /// Print a named volume's own real, absolute host directory path
+    /// — matching real `podman volume mount`'s own checked-directly
+    /// output exactly (a real rootful `sudo podman volume mount NAME`
+    /// prints its own `_data` directory verbatim; this project's own
+    /// [`VolumeStore::data_dir`] already computes the identical path
+    /// [`VolumeInspectView`]'s own `mountpoint` field reports). A real
+    /// deliberate divergence, not an oversight: real *rootless*
+    /// `podman volume mount` instead refuses outright ("cannot run
+    /// command \"podman volume mount\" in rootless mode, must execute
+    /// `podman unshare` first", checked directly against a real
+    /// installed `podman 4.9.3`) — a genuine restriction real
+    /// podman's own pluggable/`image`-driver volumes need a real user
+    /// namespace re-exec for, which simply doesn't apply here at all:
+    /// this project's own volumes are always already a plain,
+    /// directly-accessible host directory, real podman's own "local"
+    /// driver case too (`~/git/podman/libpod/volume_internal.go`'s
+    /// own `needsMount()` returns `false` for it, making even real
+    /// rootFUL `podman volume mount` on one a genuine no-op that just
+    /// returns the existing path, exactly what this command does).
+    Mount {
+        /// The volume's own name.
+        name: String,
+    },
+    /// A real no-op — matching real `podman volume unmount`'s own
+    /// identical "local" driver behavior exactly (checked directly:
+    /// `~/git/podman/libpod/volume.go`'s own `Unmount` -> `unmount`
+    /// early-returns immediately whenever `needsMount()` is `false`,
+    /// this project's own volumes' own only real case). Prints the
+    /// volume's own name on success, matching real podman's own
+    /// checked-directly output.
+    Unmount {
+        /// The volume's own name.
+        name: String,
+    },
 }
 
 /// `ociman container`'s own subcommand family (see
@@ -3109,6 +3143,8 @@ fn main() -> std::process::ExitCode {
                     cmd_volume_export(&name, output.as_deref())
                 }
                 VolumeCommand::Import { name, source } => cmd_volume_import(&name, &source),
+                VolumeCommand::Mount { name } => cmd_volume_mount(&name),
+                VolumeCommand::Unmount { name } => cmd_volume_unmount(&name),
             },
             Some(Command::Container { command }) => match command {
                 ContainerCommand::Exists { name, external: _ } => cmd_container_exists(&name),
@@ -10739,6 +10775,31 @@ fn cmd_volume_import(name: &str, source: &str) -> anyhow::Result<()> {
     let chained = std::io::Cursor::new(peek[..peeked].to_vec()).chain(reader);
     oci_layer::apply(chained, compression, &data_dir)
         .with_context(|| format!("importing into volume {name:?}"))?;
+    println!("{name}");
+    Ok(())
+}
+
+/// `ociman volume mount` — see [`VolumeCommand::Mount`]'s own doc
+/// comment for the exact real, checked-directly semantics and the
+/// deliberate rootless-vs-rootful divergence.
+fn cmd_volume_mount(name: &str) -> anyhow::Result<()> {
+    let store = open_volume_store()?;
+    anyhow::ensure!(
+        store.exists(name),
+        "no volume with name {name:?} found: no such volume"
+    );
+    println!("{}", store.data_dir(name).display());
+    Ok(())
+}
+
+/// `ociman volume unmount` — see [`VolumeCommand::Unmount`]'s own doc
+/// comment for why this is a real no-op.
+fn cmd_volume_unmount(name: &str) -> anyhow::Result<()> {
+    let store = open_volume_store()?;
+    anyhow::ensure!(
+        store.exists(name),
+        "no volume with name {name:?} found: no such volume"
+    );
     println!("{name}");
     Ok(())
 }
