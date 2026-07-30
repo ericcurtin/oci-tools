@@ -754,6 +754,49 @@ struct RunArgs {
     /// container, not a bug specific to `-v`.
     #[arg(short, long = "volume", value_name = "HOST:CONTAINER[:ro]")]
     volume: Vec<String>,
+    /// Mount an anonymous, kernel-managed tmpfs at an arbitrary
+    /// container path (no host source at all, unlike `-v`/
+    /// `--volume`'s own bind-mount form): `DEST[:OPTIONS]`, matching
+    /// real `docker run --tmpfs`/`podman run --tmpfs` exactly
+    /// (checked directly, `~/git/moby`'s own `withMounts`/
+    /// `MergeTmpfsOptions`; `~/git/podman`'s own `getTmpfsMounts`/
+    /// `ProcessOptions`) — repeatable. `OPTIONS` is everything after
+    /// the *first* `:` (matching real docker's own `strings.Cut`, not
+    /// `-v`'s own 3-field `splitn`), a comma-separated list; this
+    /// project's own narrower, deliberately-scoped subset of the two
+    /// real tools' own overlapping-but-not-identical option sets
+    /// (docker alone also has `uid=`/`gid=`/`nr_inodes=`/`nr_blocks=`/
+    /// `mpol=`; podman alone also has `tmpcopyup`/`noswap`/`U`/...,
+    /// none of which this project supports yet, a clear "unsupported
+    /// option" error rather than silently ignored): `size=<bytes-or-
+    /// unit-suffixed>` (reuses [`parse_memory_limit`] verbatim, same
+    /// as `--shm-size` — and, matching that same flag's own already-
+    /// documented deviation, converted to a raw byte count in the
+    /// final mount option rather than real docker's/podman's own
+    /// "forward the user's suffixed string to the kernel verbatim"
+    /// choice), `mode=<octal>` (validated as real octal here, matching
+    /// podman's own stricter behavior over real docker's own
+    /// unchecked pass-through), and the bare flags `ro`/`rw`/`exec`/
+    /// `noexec`/`suid`/`nosuid`/`dev`/`nodev` (each overriding this
+    /// flag's own real, checked-directly default of `noexec,nosuid,
+    /// nodev,rprivate` when no `OPTIONS` at all are given — matching
+    /// both real tools' identical unconditional defaults). A
+    /// destination already used by `-v`/`--volume`, or one of this
+    /// project's own existing default mounts (`/proc`, `/dev`, `/dev/
+    /// pts`, `/dev/shm`, `/dev/mqueue`, `/sys`, `/sys/fs/cgroup`), is
+    /// a clear, immediate error — a real, deliberate narrowing of
+    /// real docker's own "the user's mount silently replaces the
+    /// default" behavior (which this project's `/dev`'s own
+    /// `PopulateDev` step, among others, specifically depends on the
+    /// shape of): a genuine, if rare, real-world use case
+    /// (`--tmpfs /dev/shm:size=...` as an alternative to `--shm-size`)
+    /// deliberately deferred rather than silently risking breaking an
+    /// internal invariant this increment didn't audit for. The exact
+    /// same destination given twice via `--tmpfs` is silently deduped
+    /// if the two option sets are byte-identical, matching real
+    /// podman's own identical rule, or a clear error otherwise.
+    #[arg(long = "tmpfs", value_name = "DEST[:OPTIONS]")]
+    tmpfs: Vec<String>,
     /// Require HTTPS and verify certificates when pulling `image`
     /// (only consulted if it isn't already present in local
     /// storage) — see `Command::Pull`'s own identical flag for the
@@ -6462,6 +6505,42 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    // `--tmpfs`, validated eagerly, right here, alongside `--stop-
+    // signal`'s own identical "fail fast, not deep inside spec
+    // synthesis" reasoning (see its own doc comment above): a
+    // destination colliding with `-v`/`--volume` or one of this
+    // project's own existing default mounts is a real, immediate
+    // error, matching real docker's/podman's own identical
+    // duplicate-destination rejection (`--tmpfs`'s own doc comment
+    // explains exactly why a default-mount destination is rejected
+    // here rather than silently overridden, unlike real docker).
+    let mut tmpfs_mounts: Vec<ParsedTmpfs> = Vec::new();
+    for spec in &args.tmpfs {
+        let parsed = parse_tmpfs_mount(spec)?;
+        anyhow::ensure!(
+            !DEFAULT_MOUNT_DESTINATIONS.contains(&parsed.destination.as_str()),
+            "--tmpfs {spec:?}: {:?} is one of this project's own existing default mounts, not \
+             supported as a --tmpfs destination yet",
+            parsed.destination
+        );
+        anyhow::ensure!(
+            !volumes.iter().any(|v| v.container == parsed.destination),
+            "--tmpfs {spec:?}: destination {:?} is already used by -v/--volume",
+            parsed.destination
+        );
+        if let Some(existing) = tmpfs_mounts
+            .iter()
+            .find(|t| t.destination == parsed.destination)
+        {
+            anyhow::ensure!(
+                existing.options == parsed.options,
+                "--tmpfs {spec:?}: destination {:?} already given with different options",
+                parsed.destination
+            );
+            continue;
+        }
+        tmpfs_mounts.push(parsed);
+    }
     let (seccomp, no_new_privileges) = resolve_security_opts(&args.security_opt, args.privileged)?;
     let base_capabilities = if args.privileged {
         oci_runtime_core::identity::ALL_CAPABILITY_NAMES
@@ -6728,6 +6807,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             args.user.as_deref(),
             &rlimits,
             shm_size_bytes,
+            &tmpfs_mounts,
         )?;
         // Prepended, not appended: `spec.mounts`' own already-present
         // entries (`/proc`, `/dev`, ...) are all subdirectories of the
@@ -11748,6 +11828,7 @@ fn synthesize_spec(
     user: Option<&str>,
     rlimits: &[oci_spec_types::runtime::PosixRlimit],
     shm_size_bytes: Option<i64>,
+    tmpfs_mounts: &[ParsedTmpfs],
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -11952,6 +12033,22 @@ fn synthesize_spec(
             source: Some(volume.host.clone()),
             kind: Some("bind".to_string()),
             options,
+        });
+    }
+
+    // `--tmpfs`, matching real `docker run --tmpfs`/`podman run
+    // --tmpfs` exactly — an anonymous, kernel-managed tmpfs, no host
+    // source at all, unlike `-v`/`--volume`'s own bind mounts just
+    // above. `prepare_container` has already rejected any destination
+    // colliding with `-v`/`--volume` or an existing default mount, so
+    // this is always a genuinely new entry, never a conflicting
+    // second mount for the same destination.
+    for t in tmpfs_mounts {
+        spec.mounts.push(oci_spec_types::runtime::Mount {
+            destination: t.destination.clone(),
+            source: Some("tmpfs".to_string()),
+            kind: Some("tmpfs".to_string()),
+            options: t.options.clone(),
         });
     }
 
@@ -12681,6 +12778,98 @@ fn parse_volume(spec: &str) -> anyhow::Result<VolumeSpec> {
         host,
         container: container.to_string(),
         read_only,
+    })
+}
+
+/// A parsed `--tmpfs` mount, ready for `synthesize_spec` to push
+/// verbatim — unlike [`ParsedVolume`], there is no host side to
+/// resolve at all: a tmpfs mount is entirely kernel-managed, no
+/// `resolve_volume_host`-equivalent step exists or is needed.
+struct ParsedTmpfs {
+    destination: String,
+    /// The final, real OCI-runtime-spec mount options — already
+    /// includes this flag's own checked-directly defaults
+    /// (`noexec,nosuid,nodev,rprivate`), with any user-given
+    /// overrides already applied and de-duplicated (see
+    /// [`parse_tmpfs_mount`]'s own doc comment).
+    options: Vec<String>,
+}
+
+/// Parse a `--tmpfs` value: `DEST[:OPTIONS]`, matching real `docker
+/// run --tmpfs`/`podman run --tmpfs` exactly — checked directly
+/// against `~/git/moby`'s own `withMounts`/`MergeTmpfsOptions` and
+/// `~/git/podman`'s own `getTmpfsMounts`/`ProcessOptions`.
+///
+/// `OPTIONS` is everything after the *first* `:` (matching real
+/// docker's own `strings.Cut`, unlike `--volume`'s own 3-field
+/// `splitn`), a comma-separated list. This project's own deliberately
+/// narrower subset of the two real tools' own overlapping-but-not-
+/// identical option sets (docker alone also has `uid=`/`gid=`/
+/// `nr_inodes=`/`nr_blocks=`/`mpol=`; podman alone also has
+/// `tmpcopyup`/`noswap`/`U`/`noatime`/...), an unsupported option is a
+/// clear, named error rather than silently ignored:
+/// * `size=<bytes-or-unit-suffixed>` — reuses [`parse_memory_limit`]
+///   verbatim, same as `--shm-size`'s own identical choice, and —
+///   matching that same flag's own already-documented deviation from
+///   real docker's/podman's own "forward the user's suffixed string
+///   to the kernel verbatim" behavior — converted to a plain byte
+///   count in the final mount option here too.
+/// * `mode=<octal>` — validated as real octal here (matching real
+///   podman's own stricter behavior; real docker never validates the
+///   value at all, only that `mode` is a recognized key).
+/// * The bare flags `ro`/`rw`/`exec`/`noexec`/`suid`/`nosuid`/`dev`/
+///   `nodev`, each overriding this flag's own real, checked-directly
+///   default of `noexec,nosuid,nodev,rprivate` (present unconditionally
+///   when no `OPTIONS` at all are given — matching both real tools'
+///   own identical unconditional defaults, confirmed directly: a bare
+///   `docker run --tmpfs /tmp` gets no `size=`/`mode=` of its own, but
+///   always gets these four).
+fn parse_tmpfs_mount(spec: &str) -> anyhow::Result<ParsedTmpfs> {
+    let (destination, opts) = spec.split_once(':').unwrap_or((spec, ""));
+    anyhow::ensure!(
+        destination.starts_with('/'),
+        "--tmpfs {spec:?}: the destination must be absolute"
+    );
+    let mut options = vec![
+        "noexec".to_string(),
+        "nosuid".to_string(),
+        "nodev".to_string(),
+        "rprivate".to_string(),
+    ];
+    for opt in opts.split(',').filter(|o| !o.is_empty()) {
+        match opt.split_once('=') {
+            Some(("size", value)) => {
+                let bytes = parse_memory_limit(value)
+                    .with_context(|| format!("--tmpfs {spec:?}: invalid size {value:?}"))?;
+                options.retain(|o| !o.starts_with("size="));
+                options.push(format!("size={bytes}"));
+            }
+            Some(("mode", value)) => {
+                u32::from_str_radix(value, 8).with_context(|| {
+                    format!("--tmpfs {spec:?}: invalid mode {value:?} (expected octal)")
+                })?;
+                options.retain(|o| !o.starts_with("mode="));
+                options.push(format!("mode={value}"));
+            }
+            Some((key, _)) => anyhow::bail!("--tmpfs {spec:?}: unsupported option {key:?}"),
+            None => {
+                let (positive, negative) = match opt {
+                    "exec" | "noexec" => ("exec", "noexec"),
+                    "suid" | "nosuid" => ("suid", "nosuid"),
+                    "dev" | "nodev" => ("dev", "nodev"),
+                    "ro" | "rw" => ("", ""),
+                    other => anyhow::bail!("--tmpfs {spec:?}: unsupported option {other:?}"),
+                };
+                if !positive.is_empty() {
+                    options.retain(|o| o != positive && o != negative);
+                }
+                options.push(opt.to_string());
+            }
+        }
+    }
+    Ok(ParsedTmpfs {
+        destination: destination.to_string(),
+        options,
     })
 }
 

@@ -700,6 +700,301 @@ fn run_shm_size_rejects_a_negative_value() {
     assert!(!out.status.success(), "{out:?}");
 }
 
+/// `--tmpfs DEST:size=...` (checked directly against real `docker run
+/// --tmpfs`/`podman run --tmpfs`): a real, kernel-enforced write-size
+/// limit and a real `mode=` on a fresh, anonymous tmpfs at an
+/// arbitrary destination -- not just a persisted-JSON check.
+#[test]
+fn run_tmpfs_mounts_a_real_sized_tmpfs_with_the_given_mode() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/tmpfs:latest",
+        &busybox,
+        &["sh", "dd", "stat"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/tmpfs:latest",
+        &[
+            "--tmpfs",
+            "/mytmp:size=1m,mode=1770",
+            "/bin/sh",
+            "-c",
+            "stat -c %a /mytmp && dd if=/dev/zero of=/mytmp/f bs=1M count=4",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1770"),
+        "expected the real mode=1770 to be visible via stat: {stdout:?}"
+    );
+    assert!(
+        !out.status.success(),
+        "a 4 MiB write into a real 1 MiB --tmpfs must fail: {out:?}"
+    );
+}
+
+/// A bare `--tmpfs DEST` (no `OPTIONS` at all) still gets this
+/// project's own real, checked-directly default options
+/// (`noexec,nosuid,nodev,rprivate`) -- matching both real docker's and
+/// podman's own identical unconditional defaults -- and no `size=`/
+/// `mode=` of its own (real docker's own `TestRunTmpfsMountsWithOptions`
+/// confirms a bare `--tmpfs` gets no size default either).
+#[test]
+fn run_tmpfs_with_no_options_gets_the_real_default_options_only() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/tmpfs-default:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/tmpfs-default:latest",
+        &["--tmpfs", "/mytmp", "/bin/sh", "-c", "exit 0"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    let config_path = storage_dir
+        .path()
+        .join("containers")
+        .join(&container_id)
+        .join("config.json");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    let mytmp = config["mounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["destination"] == "/mytmp")
+        .expect("a /mytmp mount must be present");
+    assert_eq!(mytmp["type"], "tmpfs");
+    assert_eq!(mytmp["source"], "tmpfs");
+    let options: Vec<&str> = mytmp["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o.as_str().unwrap())
+        .collect();
+    for expected in ["noexec", "nosuid", "nodev", "rprivate"] {
+        assert!(
+            options.contains(&expected),
+            "missing {expected:?}: {options:?}"
+        );
+    }
+    assert!(
+        !options
+            .iter()
+            .any(|o| o.starts_with("size=") || o.starts_with("mode=")),
+        "a bare --tmpfs must get no size=/mode= default of its own: {options:?}"
+    );
+}
+
+/// `exec` overrides this flag's own `noexec` default -- a real,
+/// kernel-enforced verification: a script written into the tmpfs is
+/// genuinely executable only when `exec` was given.
+#[test]
+fn run_tmpfs_exec_option_overrides_the_default_noexec() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/tmpfs-exec:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let script = "printf '#!/bin/sh\\necho ran\\n' > /mytmp/s && chmod +x /mytmp/s && /mytmp/s";
+
+    let default_out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/tmpfs-exec:latest",
+        &["--tmpfs", "/mytmp", "/bin/sh", "-c", script],
+    );
+    assert!(
+        !default_out.status.success(),
+        "the default noexec must refuse to run a script from the tmpfs: {default_out:?}"
+    );
+
+    let exec_out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/tmpfs-exec:latest",
+        &["--tmpfs", "/mytmp:exec", "/bin/sh", "-c", script],
+    );
+    assert!(
+        exec_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exec_out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&exec_out.stdout).contains("ran"));
+}
+
+/// A `--tmpfs` destination already used by `-v`/`--volume` is a clear,
+/// immediate error -- matching real docker's/podman's own identical
+/// duplicate-destination rejection.
+#[test]
+fn run_tmpfs_rejects_a_destination_already_used_by_volume() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/tmpfs-volume-conflict:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let host_dir = tempfile::tempdir().unwrap();
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/tmpfs-volume-conflict:latest",
+        &[
+            "-v",
+            &format!("{}:/conflict", host_dir.path().display()),
+            "--tmpfs",
+            "/conflict",
+            "/bin/true",
+        ],
+    );
+    assert!(!out.status.success(), "{out:?}");
+}
+
+/// A `--tmpfs` destination matching one of this project's own existing
+/// default mounts is a clear, immediate "not supported yet" error --
+/// a deliberate narrowing of real docker's own "silently replaces the
+/// default" behavior (see `--tmpfs`'s own doc comment for exactly
+/// why).
+#[test]
+fn run_tmpfs_rejects_a_destination_matching_an_existing_default_mount() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/tmpfs-default-mount-conflict:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/tmpfs-default-mount-conflict:latest",
+        &["--tmpfs", "/proc", "/bin/true"],
+    );
+    assert!(!out.status.success(), "{out:?}");
+}
+
+/// An unrecognized `--tmpfs` option is a clear, immediate error rather
+/// than silently ignored.
+#[test]
+fn run_tmpfs_rejects_an_unsupported_option() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/tmpfs-bad-option:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/tmpfs-bad-option:latest",
+        &["--tmpfs", "/mytmp:uid=1000", "/bin/true"],
+    );
+    assert!(!out.status.success(), "{out:?}");
+}
+
+/// The same destination given twice via `--tmpfs`: identical options
+/// silently dedupe (matching real podman's own identical rule), but
+/// different options are a real, clear error.
+#[test]
+fn run_tmpfs_duplicate_destination_dedupes_or_errors() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/tmpfs-duplicate:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let same = ociman_run(
+        storage_dir.path(),
+        "ociman-test/tmpfs-duplicate:latest",
+        &[
+            "--tmpfs",
+            "/mytmp:size=1m",
+            "--tmpfs",
+            "/mytmp:size=1m",
+            "/bin/true",
+        ],
+    );
+    assert!(
+        same.status.success(),
+        "identical duplicate --tmpfs specs for the same destination should be deduped, not \
+         an error: stderr: {}",
+        String::from_utf8_lossy(&same.stderr)
+    );
+
+    let different = ociman_run(
+        storage_dir.path(),
+        "ociman-test/tmpfs-duplicate:latest",
+        &[
+            "--tmpfs",
+            "/mytmp:size=1m",
+            "--tmpfs",
+            "/mytmp:size=2m",
+            "/bin/true",
+        ],
+    );
+    assert!(!different.status.success(), "{different:?}");
+}
+
 /// `--group-add` (0278): a numeric GID is used as-is in the real
 /// synthesized spec's own `process.user.additionalGids`, matching
 /// real `podman run --group-add`'s own checked-directly resolution
