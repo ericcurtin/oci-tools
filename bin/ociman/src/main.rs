@@ -2420,7 +2420,21 @@ enum VolumeCommand {
     },
     /// List every real, currently-existing volume — matching real
     /// `docker volume ls`/`podman volume ls`.
-    Ls,
+    Ls {
+        /// Render one line per listed volume via a Go-template-*lite*
+        /// string (`--format`, matching real `podman volume ls
+        /// --format`/`docker volume ls --format`) — same engine and
+        /// scope as `ociman inspect`/`ps`/`images --format`
+        /// (`0332`-`0334`): `{{.field}}`/`{{.nested.field}}`
+        /// placeholders only, no pipelines/functions/control flow,
+        /// field names this project's own JSON output field names
+        /// directly (`{{.name}}`, `{{.driver}}`, `{{.mountpoint}}`,
+        /// `{{.created_at}}`). Takes priority over `--json`/the
+        /// default table when given; an unresolvable field path is a
+        /// real, immediate error.
+        #[arg(long = "format", value_name = "TEMPLATE")]
+        format: Option<String>,
+    },
     /// Print low-level JSON for a named volume — matching real
     /// `docker volume inspect`/`podman volume inspect`'s own general
     /// shape, deliberately narrower (see `VolumeInspectView`'s own
@@ -2744,7 +2758,7 @@ fn main() -> std::process::ExitCode {
                 VolumeCommand::Create { name } => {
                     cmd_volume_create(name.as_deref(), cli.global.json)
                 }
-                VolumeCommand::Ls => cmd_volume_ls(cli.global.json),
+                VolumeCommand::Ls { format } => cmd_volume_ls(cli.global.json, format.as_deref()),
                 VolumeCommand::Inspect { name } => cmd_volume_inspect(&name, cli.global.json),
                 VolumeCommand::Rm { name, force } => cmd_volume_rm(&name, force),
                 VolumeCommand::Prune => cmd_volume_prune(cli.global.json),
@@ -9598,9 +9612,17 @@ fn cmd_volume_create(name: Option<&str>, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_volume_ls(json: bool) -> anyhow::Result<()> {
+fn cmd_volume_ls(json: bool, format: Option<&str>) -> anyhow::Result<()> {
     let store = open_volume_store()?;
     let records = store.list().context("listing volumes")?;
+    if let Some(template) = format {
+        for record in &records {
+            let view = VolumeView::from_record(&store, record);
+            let json_value = serde_json::to_value(&view)?;
+            println!("{}", render_format_template(template, &json_value)?);
+        }
+        return Ok(());
+    }
     if json {
         let views: Vec<_> = records
             .iter()

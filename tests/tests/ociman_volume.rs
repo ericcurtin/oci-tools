@@ -131,6 +131,64 @@ fn volume_ls_reports_no_volumes_when_empty_and_lists_real_ones_once_created() {
     assert!(stdout.contains("vol-b"), "{stdout}");
 }
 
+/// `volume ls --format` (0335) renders one line per listed volume,
+/// reusing the exact same Go-template-*lite* engine `ociman
+/// inspect`/`ps`/`images --format` (`0332`-`0334`) already
+/// established.
+#[test]
+fn volume_ls_format_renders_one_line_per_volume() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    ociman(storage_dir.path(), &["volume", "create", "fmt-vol-a"]);
+    ociman(storage_dir.path(), &["volume", "create", "fmt-vol-b"]);
+
+    let format = ociman(
+        storage_dir.path(),
+        &["volume", "ls", "--format", "{{.name}}={{.driver}}"],
+    );
+    assert!(
+        format.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&format.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&format.stdout).into_owned();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines.contains(&"fmt-vol-a=local"), "{lines:?}");
+    assert!(lines.contains(&"fmt-vol-b=local"), "{lines:?}");
+}
+
+/// `--format`, when given, takes priority over `--json`/the default
+/// table, and an unresolvable field path is a real, immediate error --
+/// same precedence and error behavior `inspect`/`ps`/`images --format`
+/// already established.
+#[test]
+fn volume_ls_format_takes_priority_and_errors_on_an_unknown_field() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    ociman(storage_dir.path(), &["volume", "create", "fmt-priority"]);
+
+    let format = ociman(
+        storage_dir.path(),
+        &["volume", "ls", "--json", "--format", "{{.name}}"],
+    );
+    assert!(format.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&format.stdout).trim(),
+        "fmt-priority",
+        "the format template's own plain name, not --json's own array, should have won"
+    );
+
+    let bad = ociman(
+        storage_dir.path(),
+        &["volume", "ls", "--format", "{{.nosuchfield}}"],
+    );
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("no field"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
 #[test]
 fn volume_inspect_reports_the_real_mountpoint() {
     let storage_dir = tempfile::tempdir().unwrap();
