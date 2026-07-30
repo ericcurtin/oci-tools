@@ -1571,6 +1571,24 @@ enum Command {
         /// field path is a real, immediate error.
         #[arg(long = "format", value_name = "TEMPLATE")]
         format: Option<String>,
+        /// Display each container's own writable-layer size and total
+        /// (virtual) rootfs size — matching real `docker ps -s`/
+        /// `podman ps --size` exactly (`~/git/podman/cmd/podman/
+        /// containers/ps.go`'s own `Size()`: `<rw size> (virtual <rw
+        /// size + resolved image size>)`, using real go-units'
+        /// `HumanSizeWithPrecision(_, 3)` — a genuinely different,
+        /// coarser precision than this project's own `human_size`'s
+        /// existing 4-significant-digit default already used
+        /// elsewhere, e.g. `ociman stats`/`system df`). Computing this
+        /// needs a real directory walk plus an image-store lookup per
+        /// container, so it's deliberately opt-in, same as real
+        /// podman's own identical on-demand computation — a plain
+        /// `ociman ps` pays none of this cost. Conflicts with
+        /// `--quiet` (matching real podman's own identical
+        /// restriction; this project has no `--namespace` flag of its
+        /// own to conflict with too).
+        #[arg(short = 's', long)]
+        size: bool,
     },
     /// Start an already-`Stopped` container again, reusing its own
     /// existing rootfs/config exactly as `run` originally left it —
@@ -2756,6 +2774,7 @@ fn main() -> std::process::ExitCode {
                 no_trunc,
                 noheading,
                 format,
+                size,
             }) => cmd_ps(
                 all,
                 quiet,
@@ -2765,6 +2784,7 @@ fn main() -> std::process::ExitCode {
                 no_trunc,
                 noheading,
                 format.as_deref(),
+                size,
             ),
             Some(Command::Start { id, attach }) => cmd_start(&id, attach),
             Some(Command::Attach { id }) => cmd_attach(&id),
@@ -5053,6 +5073,64 @@ struct SystemDfVerboseView {
     volumes: Vec<SystemDfVolumeRow>,
 }
 
+/// A container's own writable-layer directory size, in bytes —
+/// factored out of `cmd_system_df`'s own two, previously-duplicated
+/// inline copies of this exact same computation the moment a third
+/// caller (`ociman ps --size`) needed it too. Same "check `upper/`'s
+/// own presence first (this project's own rootless-overlay
+/// optimization, `docs/design/0108`-`0110`), else fall back to
+/// `rootfs/` itself (a plain-`Extract`-mode container's writable
+/// content really does live there directly)" rule `cmd_system_df`'s
+/// own doc comment already documents.
+///
+/// **Honest simplification, not a new one**: for a plain-`Extract`
+/// container, `rootfs/` is its *entire* merged tree (image content
+/// plus any writes since), not a true copy-on-write diff the way real
+/// podman's `RWSize` (or this project's own `Overlay`-mode `upper/`)
+/// is — so this over-reports relative to real podman's own leaner
+/// number for that one mode specifically. Already accepted for
+/// `system df`; reused here rather than a second, narrower
+/// computation invented just for `ps --size`.
+fn container_writable_layer_size(bundle_dir: &Path) -> u64 {
+    let upper = rootfs_setup::upper_dir(bundle_dir);
+    let writable_layer = if upper.is_dir() {
+        upper
+    } else {
+        bundle_dir.join("rootfs")
+    };
+    oci_store::dir_size(&writable_layer).unwrap_or(0)
+}
+
+/// `ociman ps --size`'s own per-container size pair, matching real
+/// podman's own `RootFsSize`/`RwSize` formula exactly (`~/git/podman/
+/// libpod/container_internal.go`'s own `rootFsSize`/`rwSize`:
+/// `rootFsSize = imageSize + layerSize`, `rwSize = layerSize` — the
+/// *same* underlying number used for both, not two independent
+/// measurements). `rw_size` reuses [`container_writable_layer_size`]
+/// (see its own doc comment for exactly what it measures per rootfs
+/// mode); `root_fs_size` adds the container's own resolved image's
+/// total stored size on top, or `0` if the image reference is missing
+/// or no longer resolves (an already-`rmi`'d image, say) — never a
+/// hard error, matching real podman's own "log and continue with
+/// whatever's available" behavior for this same, deliberately
+/// best-effort display feature.
+fn compute_container_size(
+    store: &Store,
+    state: &oci_runtime_core::PersistedState,
+) -> ContainerSizeView {
+    let rw_size = container_writable_layer_size(Path::new(&state.bundle));
+    let image_size = state
+        .annotations
+        .get(ANNOTATION_IMAGE)
+        .and_then(|image_ref| store.resolve_image(image_ref).ok().flatten())
+        .and_then(|record| store.image_summary(&record).ok())
+        .map_or(0, |summary| summary.size);
+    ContainerSizeView {
+        rw_size,
+        root_fs_size: image_size + rw_size,
+    }
+}
+
 /// Real disk usage across images, containers, and local volumes —
 /// matching real `podman system df`'s own default (no `-v`, no
 /// `--format`) summary table, checked directly against
@@ -5141,24 +5219,7 @@ fn cmd_system_df(json: bool, verbose: bool) -> anyhow::Result<()> {
         reclaimable_bytes: 0,
     };
     for state in containers.list().context("listing containers")? {
-        // A container using this project's own rootless-overlay
-        // optimization (`docs/design/0108`-`0110`) leaves its own
-        // `rootfs/` directory genuinely empty on disk — the real,
-        // persisted writable delta lives in a separate `upper/`
-        // directory instead (the overlay mount is what populates
-        // `rootfs/`, only while the container's own mount namespace
-        // is alive) — the same directory `resolve_container_root`
-        // already checks for this exact reason. Falls back to
-        // `rootfs/` itself for a plain-`Extract` container, where the
-        // writable content really does live there directly.
-        let bundle_dir = Path::new(&state.bundle);
-        let upper = rootfs_setup::upper_dir(bundle_dir);
-        let writable_layer = if upper.is_dir() {
-            upper
-        } else {
-            bundle_dir.join("rootfs")
-        };
-        let size = oci_store::dir_size(&writable_layer).unwrap_or(0);
+        let size = container_writable_layer_size(Path::new(&state.bundle));
         container_rows.total += 1;
         container_rows.size_bytes += size;
         if state.effective_status() == Status::Running {
@@ -5360,13 +5421,7 @@ fn cmd_system_df_verbose(
     let mut container_rows = Vec::with_capacity(container_states.len());
     for state in &container_states {
         let bundle_dir = Path::new(&state.bundle);
-        let upper = rootfs_setup::upper_dir(bundle_dir);
-        let writable_layer = if upper.is_dir() {
-            upper
-        } else {
-            bundle_dir.join("rootfs")
-        };
-        let size = oci_store::dir_size(&writable_layer).unwrap_or(0);
+        let size = container_writable_layer_size(bundle_dir);
         let local_volumes = oci_runtime_core::Bundle::load(bundle_dir).map_or(0, |bundle| {
             bundle
                 .spec
@@ -6660,6 +6715,16 @@ fn cmd_volume_exists(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `ociman ps --size`'s own per-container size pair — see
+/// [`compute_container_size`]'s own doc comment for exactly what each
+/// field measures and how it maps onto real podman's own
+/// `RwSize`/`RootFsSize`.
+#[derive(Debug, Serialize)]
+struct ContainerSizeView {
+    rw_size: u64,
+    root_fs_size: u64,
+}
+
 /// `docker ps`/`podman ps`-style view of one container record.
 #[derive(Debug, Serialize)]
 struct ContainerView {
@@ -6671,6 +6736,12 @@ struct ContainerView {
     status: String,
     created: String,
     exit_code: Option<i32>,
+    /// Only ever populated when `--size` was given (matching real
+    /// podman's own identical on-demand-only computation, `~/git/
+    /// podman/pkg/ps/ps.go`) — a plain `ociman ps` never pays for the
+    /// directory walk/image lookup this needs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<ContainerSizeView>,
 }
 
 impl ContainerView {
@@ -6695,6 +6766,7 @@ impl ContainerView {
                 .annotations
                 .get(ANNOTATION_EXIT_CODE)
                 .and_then(|s| s.parse().ok()),
+            size: None,
         }
     }
 }
@@ -7019,9 +7091,20 @@ fn cmd_ps(
     no_trunc: bool,
     noheading: bool,
     format: Option<&str>,
+    size: bool,
 ) -> anyhow::Result<()> {
+    // Matches real `podman ps`'s own identical restriction exactly
+    // (`~/git/podman/cmd/podman/containers/ps.go`'s own `checkFlags`)
+    // -- real podman's own error also names `--namespace`, which this
+    // project has no equivalent of to conflict with.
+    anyhow::ensure!(!(quiet && size), "--quiet conflicts with --size");
     let filters = parse_ps_filters(filter)?;
     let containers = open_container_store()?;
+    // Only opened when actually needed -- `--size` is the only reason
+    // `ps` would ever need the image store at all, and real podman's
+    // own identical on-demand-only computation (`~/git/podman/pkg/ps/
+    // ps.go`) is the whole reason this is opt-in in the first place.
+    let store = size.then(open_store).transpose()?;
     // A positive `--last`/`-n` overrides the default running-only
     // visibility rule too, matching real podman's own identical
     // `all := options.All || options.Last > 0` exactly (checked
@@ -7156,7 +7239,13 @@ fn cmd_ps(
             }
             true
         })
-        .map(ContainerView::from_state)
+        .map(|s| {
+            let mut view = ContainerView::from_state(s);
+            if let Some(store) = &store {
+                view.size = Some(compute_container_size(store, s));
+            }
+            view
+        })
         .collect();
     views.sort_by(|a, b| a.created.cmp(&b.created));
     // `--last`/`-n`: keep only the `n` most-recently-created --
@@ -7195,10 +7284,14 @@ fn cmd_ps(
         return Ok(());
     }
     if !noheading {
-        println!(
+        print!(
             "{:<14} {:<40} {:<30} {:<9} {:<20} CREATED",
             "CONTAINER ID", "IMAGE", "COMMAND", "STATUS", "NAMES"
         );
+        if size {
+            print!(" SIZE");
+        }
+        println!();
     }
     // Real `podman ps`'s own default `Command()` formatter truncates
     // to 17 characters plus `...` (`~/git/podman/cmd/podman/
@@ -7214,7 +7307,7 @@ fn cmd_ps(
         }
     };
     for view in &views {
-        println!(
+        print!(
             "{:<14} {:<40} {:<30} {:<9} {:<20} {}",
             view.id,
             view.image,
@@ -7223,8 +7316,27 @@ fn cmd_ps(
             view.name.as_deref().unwrap_or(""),
             view.created
         );
+        if let Some(size) = &view.size {
+            print!(" {}", format_container_size(size));
+        }
+        println!();
     }
     Ok(())
+}
+
+/// `<rw size> (virtual <root fs size>)`, matching real `podman ps
+/// --size`'s own `psReporter.Size()` exactly (`~/git/podman/cmd/
+/// podman/containers/ps.go`), including its own genuinely coarser
+/// 3-significant-digit precision (`units.HumanSizeWithPrecision(_,
+/// 3)`) — a real, deliberate difference from this project's own
+/// `human_size`'s existing 4-digit default already used elsewhere
+/// (`ociman stats`/`system df`), not an inconsistency.
+fn format_container_size(size: &ContainerSizeView) -> String {
+    format!(
+        "{} (virtual {})",
+        human_size_with_precision(size.rw_size, 3),
+        human_size_with_precision(size.root_fs_size, 3)
+    )
 }
 
 /// `ociman rm <ID>` / `ociman rm --all` (matching real `podman rm
@@ -10167,8 +10279,22 @@ fn print_stats_sample(
 /// `~/git/moby/vendor/github.com/docker/go-units/size.go`), though not
 /// byte-for-byte identical to Go's own `%.4g` float formatting in
 /// every edge case (see `docs/design/0145`'s own "what this doesn't do
-/// yet").
+/// yet"). `HumanSize` itself is just `HumanSizeWithPrecision(_, 4)`;
+/// [`human_size_with_precision`] is the general form, this the
+/// convenience default every existing caller (`ociman stats`/`system
+/// df`) already relies on.
 fn human_size(bytes: u64) -> String {
+    human_size_with_precision(bytes, 4)
+}
+
+/// The general form of [`human_size`], parameterized on significant-
+/// digit precision — needed because real go-units' own
+/// `HumanSizeWithPrecision` is genuinely called with *different*
+/// precisions by different real callers (`HumanSize` itself uses `4`;
+/// `podman ps --size`'s own `psReporter.Size()` uses `3` directly,
+/// checked against `~/git/podman/cmd/podman/containers/ps.go`) — not
+/// a single fixed constant this project could hardcode once.
+fn human_size_with_precision(bytes: u64, precision: usize) -> String {
     const UNITS: &[&str] = &["B", "kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
     let mut size = bytes as f64;
     let mut unit = 0;
@@ -10177,7 +10303,7 @@ fn human_size(bytes: u64) -> String {
         unit += 1;
     }
     let integer_digits = format!("{}", size.trunc() as u64).len();
-    let decimals = 4usize.saturating_sub(integer_digits);
+    let decimals = precision.saturating_sub(integer_digits);
     let mut formatted = format!("{size:.decimals$}");
     if formatted.contains('.') {
         formatted = formatted
@@ -12083,6 +12209,27 @@ mod tests {
     #[test]
     fn human_size_handles_a_realistic_128_5_gb_physical_ram_figure() {
         assert_eq!(human_size(128_548_953_600), "128.5GB");
+    }
+
+    // `human_size_with_precision`'s own `3`-significant-digit form,
+    // matching real `podman ps --size`'s own checked-directly
+    // `units.HumanSizeWithPrecision(_, 3)` call
+    // (`~/git/podman/cmd/podman/containers/ps.go`) -- genuinely fewer
+    // significant digits than `human_size`'s own default `4`, so the
+    // same input renders differently at each precision (128.5486GB
+    // rounds to 3 significant digits, "129GB", not "128.5GB").
+    #[test]
+    fn human_size_with_precision_3_matches_real_podman_ps_sizes_own_precision() {
+        assert_eq!(human_size_with_precision(128_548_953_600, 3), "129GB");
+        assert_eq!(human_size_with_precision(1_500, 3), "1.5kB");
+        assert_eq!(human_size_with_precision(100, 3), "100B");
+    }
+
+    #[test]
+    fn human_size_with_precision_4_matches_human_size_exactly() {
+        for bytes in [0, 100, 999, 1_500, 128_548_953_600] {
+            assert_eq!(human_size_with_precision(bytes, 4), human_size(bytes));
+        }
     }
 
     // `parse_user_input` checked directly against real podman's own

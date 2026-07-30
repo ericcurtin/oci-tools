@@ -1581,6 +1581,143 @@ fn ps_no_trunc_and_noheading_control_the_real_table_output() {
     );
 }
 
+/// `-s`/`--size` shows a real writable-layer size plus a real
+/// `(virtual <total>)` figure per container, matching real `docker
+/// ps -s`/`podman ps --size` exactly (`~/git/podman/cmd/podman/
+/// containers/ps.go`'s own `psReporter.Size()`); a plain `ociman ps`
+/// (no `-s`) shows neither a `SIZE` header nor any size figures at
+/// all.
+#[test]
+fn ps_size_flag_shows_a_real_size_and_virtual_total() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-size:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "ps-size-test",
+            "ociman-test/ps-size:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let without_size = ociman(storage_dir.path(), &["ps", "-a"]);
+    assert!(without_size.status.success());
+    let stdout = String::from_utf8_lossy(&without_size.stdout);
+    assert!(
+        !stdout.contains("SIZE") && !stdout.contains("virtual"),
+        "a plain `ps` must show no size information at all: {stdout:?}"
+    );
+
+    let with_size = ociman(storage_dir.path(), &["ps", "-a", "--size"]);
+    assert!(with_size.status.success(), "{with_size:?}");
+    let stdout = String::from_utf8_lossy(&with_size.stdout);
+    assert!(
+        stdout.contains("SIZE") && stdout.contains("(virtual "),
+        "`--size` must show a SIZE column with a virtual total: {stdout:?}"
+    );
+}
+
+/// `-s` is the short form of `--size`, matching real `docker ps -s`/
+/// `podman ps -s` exactly.
+#[test]
+fn ps_size_short_flag_behaves_identically_to_the_long_form() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-size-short:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/ps-size-short:latest", "true"],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let out = ociman(storage_dir.path(), &["ps", "-a", "-s"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("(virtual "));
+}
+
+/// `--quiet`/`-q` and `--size`/`-s` together is a clear, immediate
+/// error, matching real `podman ps`'s own identical restriction
+/// exactly (`~/git/podman/cmd/podman/containers/ps.go`'s own
+/// `checkFlags`).
+#[test]
+fn ps_quiet_and_size_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let _store = Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["ps", "-a", "-q", "-s"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("conflicts"),
+        "{out:?}"
+    );
+}
+
+/// `--json` only ever includes a `size` object per container when
+/// `--size` was actually given -- matching real podman's own
+/// identical on-demand-only computation (`~/git/podman/pkg/ps/ps.go`:
+/// `ListContainer.Size` stays `nil`, omitted from JSON, unless
+/// `opts.Size` was set).
+#[test]
+fn ps_json_only_includes_size_when_the_size_flag_is_given() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-size-json:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/ps-size-json:latest", "true"],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let without_size = ociman(storage_dir.path(), &["--json", "ps", "-a"]);
+    assert!(without_size.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&without_size.stdout).unwrap();
+    assert!(json[0].get("size").is_none(), "{json:?}");
+
+    let with_size = ociman(storage_dir.path(), &["--json", "ps", "-a", "--size"]);
+    assert!(with_size.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&with_size.stdout).unwrap();
+    let size = &json[0]["size"];
+    assert!(size["rw_size"].as_u64().is_some(), "{json:?}");
+    assert!(
+        size["root_fs_size"].as_u64().unwrap() >= size["rw_size"].as_u64().unwrap(),
+        "root_fs_size (image + rw) must be at least as large as rw_size alone: {json:?}"
+    );
+}
+
 /// `ociman rm --cidfile` (0310), matching real `docker rm --cidfile`/
 /// `podman rm --cidfile` exactly (checked directly against real
 /// podman's own `cmd/podman/containers/rm.go`): reads the container id
@@ -1981,6 +2118,67 @@ fn ps_format_renders_one_line_per_container() {
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert!(lines.contains(&"fmt-one=created"), "{lines:?}");
     assert!(lines.contains(&"fmt-two=created"), "{lines:?}");
+}
+
+/// `--format` can reach into `--size`'s own nested `size.rw_size`/
+/// `size.root_fs_size` fields directly, the same way it already
+/// reaches into any other nested field -- but only when `--size` was
+/// also given (otherwise `size` is absent from the underlying JSON
+/// entirely and the path is a real, immediate error, same as any
+/// other unresolvable field).
+#[test]
+fn ps_format_can_reach_the_nested_size_fields_when_size_flag_given() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-format-size:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/ps-format-size:latest", "true"],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let without_size = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--format", "{{.size.rw_size}}"],
+    );
+    assert!(
+        !without_size.status.success(),
+        "size.rw_size should be unresolvable without --size: {without_size:?}"
+    );
+
+    let with_size = ociman(
+        storage_dir.path(),
+        &[
+            "ps",
+            "-a",
+            "--size",
+            "--format",
+            "{{.size.rw_size}} {{.size.root_fs_size}}",
+        ],
+    );
+    assert!(
+        with_size.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_size.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&with_size.stdout);
+    let mut parts = stdout.trim().split(' ');
+    let rw_size: u64 = parts.next().unwrap().parse().unwrap();
+    let root_fs_size: u64 = parts.next().unwrap().parse().unwrap();
+    assert!(
+        root_fs_size >= rw_size,
+        "root_fs_size (image + rw) must be at least rw_size alone: {stdout:?}"
+    );
 }
 
 /// `--format`, when given, takes priority over `--quiet`/`--json` and
