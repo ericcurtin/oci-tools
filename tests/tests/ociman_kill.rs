@@ -695,3 +695,173 @@ fn kill_on_a_still_paused_container_actually_terminates_it() {
 
     ociman(storage_dir.path(), &["rm", "-a", "-f"]);
 }
+
+/// Real `podman kill`'s own `--cidfile` and `--all` are mutually
+/// exclusive, matching `rm`/`stop`/`restart`/`pause`/`unpause`'s own
+/// identical rule.
+#[test]
+fn kill_all_and_cidfile_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let cidfile = storage_dir.path().join("cid.txt");
+    std::fs::write(&cidfile, "some-id").unwrap();
+    let kill = ociman(
+        storage_dir.path(),
+        &["kill", "--all", "--cidfile", cidfile.to_str().unwrap()],
+    );
+    assert!(!kill.status.success());
+}
+
+/// `--cidfile` (0354) matches real `podman kill --cidfile` exactly:
+/// the file's own first line only, trailing content ignored, merged
+/// into the same target list an explicit `ID`/`--name` argument
+/// already builds -- same technique `ociman_pause.rs`'s own
+/// established `--cidfile` test uses.
+#[test]
+fn kill_cidfile_reads_the_container_id_from_a_file_and_ignores_trailing_content() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/kill-cidfile:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/kill-cidfile:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let cidfile = storage_dir.path().join("cid.txt");
+    std::fs::write(&cidfile, format!("{id}\ngarbage second line")).unwrap();
+
+    let kill = ociman(
+        storage_dir.path(),
+        &["kill", "--cidfile", cidfile.to_str().unwrap()],
+    );
+    assert!(
+        kill.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&kill.stderr)
+    );
+
+    run.wait().unwrap();
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "stopped", Duration::from_secs(20)),
+        "stopped"
+    );
+}
+
+/// Multiple `--cidfile` flags merge into one target list, the same
+/// way multiple explicit `ID` arguments already do -- same technique
+/// `ociman_rm.rs`'s own established multi-cidfile test uses.
+#[test]
+fn kill_multiple_cidfiles_are_all_merged_into_the_same_target_list() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/kill-multi-cidfile:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run_a = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/kill-multi-cidfile:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id_a = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id_a.is_empty());
+    assert_eq!(
+        wait_for_container_status(
+            storage_dir.path(),
+            &id_a,
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let mut run_b = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/kill-multi-cidfile:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id_b = loop {
+        let ps = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+        let stdout = String::from_utf8_lossy(&ps.stdout).into_owned();
+        if let Some(found) = stdout.lines().find(|l| *l != id_a) {
+            break found.to_string();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        wait_for_container_status(
+            storage_dir.path(),
+            &id_b,
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let cidfile_a = storage_dir.path().join("cid-a.txt");
+    let cidfile_b = storage_dir.path().join("cid-b.txt");
+    std::fs::write(&cidfile_a, &id_a).unwrap();
+    std::fs::write(&cidfile_b, &id_b).unwrap();
+
+    let kill = ociman(
+        storage_dir.path(),
+        &[
+            "kill",
+            "--cidfile",
+            cidfile_a.to_str().unwrap(),
+            "--cidfile",
+            cidfile_b.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        kill.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&kill.stderr)
+    );
+
+    run_a.wait().unwrap();
+    run_b.wait().unwrap();
+    assert_eq!(
+        wait_for_container_status(
+            storage_dir.path(),
+            &id_a,
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped"
+    );
+    assert_eq!(
+        wait_for_container_status(
+            storage_dir.path(),
+            &id_b,
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped"
+    );
+}

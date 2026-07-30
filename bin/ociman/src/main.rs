@@ -2082,6 +2082,21 @@ enum Command {
         /// `docker kill` has no such flag at all.
         #[arg(short, long)]
         all: bool,
+        /// Read a container ID from `FILE` (repeatable) — matching
+        /// real `podman kill --cidfile` exactly (checked directly,
+        /// `~/git/podman/cmd/podman/containers/kill.go`): the file's
+        /// own first line only, merged into the same target list an
+        /// explicit `ID`/`--name` argument already builds — the same
+        /// real semantics/shape `ociman stop`/`rm`/`restart`/`pause`/
+        /// `unpause --cidfile` already established (`0310`/`0316`/
+        /// `0318`/`0320`); `kill` itself had genuinely never gotten
+        /// this even while every one of those siblings did. No
+        /// `--ignore` exists for real `podman kill` at all (unlike
+        /// `rm`/`stop`), so an unreadable cidfile is always a hard
+        /// error, the same convention `pause`/`unpause --cidfile`
+        /// already use. Mutually exclusive with `--all`.
+        #[arg(long = "cidfile", value_name = "FILE")]
+        cidfile: Vec<PathBuf>,
     },
     /// Pause all processes in one or more running containers via the
     /// real cgroup v2 freezer — matching real `podman pause` exactly,
@@ -2972,7 +2987,12 @@ fn main() -> std::process::ExitCode {
                 cidfile,
                 ignore,
             }) => cmd_stop(&ids, time, signal.as_deref(), all, &cidfile, ignore),
-            Some(Command::Kill { ids, signal, all }) => cmd_kill(&ids, &signal, all),
+            Some(Command::Kill {
+                ids,
+                signal,
+                all,
+                cidfile,
+            }) => cmd_kill(&ids, &signal, all, &cidfile),
             Some(Command::Pause { ids, all, cidfile }) => cmd_pause(&ids, all, &cidfile),
             Some(Command::Unpause { ids, all, cidfile }) => cmd_unpause(&ids, all, &cidfile),
             Some(Command::Update {
@@ -9464,7 +9484,26 @@ fn restart_one(
 /// command's own existing single-target convention: `RawInput`, not
 /// the resolved canonical id, same as real podman's own CLI-level
 /// `fmt.Println(r.RawInput)`).
-fn cmd_kill(ids: &[String], signal: &str, all: bool) -> anyhow::Result<()> {
+fn cmd_kill(ids: &[String], signal: &str, all: bool, cidfiles: &[PathBuf]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        cidfiles.is_empty() || !all,
+        "--all and --cidfile cannot be used together"
+    );
+    // Real podman's own exact semantics (`~/git/podman/cmd/podman/
+    // containers/kill.go`): the file's own first line only, merged
+    // into the same target list an explicit `ID`/`--name` argument
+    // already builds. No `--ignore` exists for real `podman kill` at
+    // all, so an unreadable cidfile is always a hard error -- the
+    // same convention `pause`/`unpause --cidfile` already established
+    // (0320).
+    let mut ids: Vec<String> = ids.to_vec();
+    for path in cidfiles {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --cidfile {}", path.display()))?;
+        ids.push(content.split('\n').next().unwrap_or("").to_string());
+    }
+    let ids: &[String] = &ids;
+
     anyhow::ensure!(
         ids.is_empty() || !all,
         "cannot give both a container ID/name and --all"
