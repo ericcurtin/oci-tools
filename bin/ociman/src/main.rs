@@ -1890,6 +1890,21 @@ enum Command {
     Diff {
         /// The container's ID or `--name`.
         id: String,
+        /// Change the output format — matching real `podman
+        /// diff`/`docker diff --format` exactly: checked directly
+        /// (`~/git/podman/cmd/podman/diff/diff.go`), the *only* real
+        /// accepted value is the literal `json` (any other value is
+        /// a real, immediate error there too, `"only supported value
+        /// for '--format' is 'json'"`, reused verbatim here) — unlike
+        /// `ociman ps`/`images`/`inspect --format`'s own much richer
+        /// Go-template-*lite* engine (`0332`-`0339`), which real
+        /// `podman diff` simply doesn't have at all for this specific
+        /// command. `--format json` and this project's own global
+        /// `--json` flag produce the exact same output; given
+        /// together, `--format` wins, matching real podman's own
+        /// identical per-command-flag-over-global precedence.
+        #[arg(long = "format", value_name = "FORMAT")]
+        format: Option<String>,
     },
     /// Print a container's own real, absolute host root-filesystem
     /// path — matching real `podman mount CONTAINER`'s own checked-
@@ -3151,7 +3166,7 @@ fn main() -> std::process::ExitCode {
                 dest,
                 overwrite,
             }) => cmd_cp(&src, &dest, overwrite),
-            Some(Command::Diff { id }) => cmd_diff(&id, cli.global.json),
+            Some(Command::Diff { id, format }) => cmd_diff(&id, cli.global.json, format.as_deref()),
             Some(Command::Mount { container }) => cmd_mount(&container),
             Some(Command::Unmount { container }) => cmd_unmount(&container),
             Some(Command::Export { id, output }) => cmd_export(&id, output.as_deref()),
@@ -8457,7 +8472,19 @@ const BASE_SNAPSHOT_FILENAME: &str = "base-snapshot.json";
 /// of it would ever show anything real at all — `resolve_container_
 /// root` already rejects this case before `cmd_diff` ever gets this
 /// far).
-fn cmd_diff(id: &str, json: bool) -> anyhow::Result<()> {
+fn cmd_diff(id: &str, json: bool, format: Option<&str>) -> anyhow::Result<()> {
+    // `--format`, when given, wins outright over the global `--json`
+    // flag -- matching real podman's own identical per-command-flag-
+    // over-global precedence. Only the literal `json` is ever
+    // accepted (checked directly, `~/git/podman/cmd/podman/diff/
+    // diff.go`); anything else is a real, immediate error, real
+    // podman's own exact message reused verbatim.
+    let json = match format {
+        Some("json") => true,
+        Some(_) => anyhow::bail!("only supported value for '--format' is 'json'"),
+        None => json,
+    };
+
     let (root, state) = resolve_container_root(id, "diff")?;
     let snapshot_path = Path::new(&state.bundle).join(BASE_SNAPSHOT_FILENAME);
     let snapshot_bytes = std::fs::read(&snapshot_path).with_context(|| {

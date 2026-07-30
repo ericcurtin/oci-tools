@@ -154,6 +154,85 @@ fn diff_json_reports_the_same_three_arrays_real_podman_diff_format_json_uses() {
     );
 }
 
+/// `ociman diff --format json` (`docs/design/0368`) produces the
+/// exact same output as the global `--json` flag.
+#[test]
+fn diff_format_json_matches_the_global_json_flags_own_output() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/diff-format-json:latest",
+        "echo hi > /new-file.txt; rm /bin/sh",
+        true,
+    );
+
+    let via_format = ociman(storage_dir.path(), &["diff", &id, "--format", "json"]);
+    assert!(
+        via_format.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&via_format.stderr)
+    );
+    let via_global_json = ociman(storage_dir.path(), &["diff", &id, "--json"]);
+    assert!(via_global_json.status.success());
+    assert_eq!(via_format.stdout, via_global_json.stdout);
+}
+
+/// `--format`, when given, wins outright over the global `--json`
+/// flag even when they'd otherwise disagree — matching real podman's
+/// own identical per-command-flag-over-global precedence.
+#[test]
+fn diff_format_json_wins_over_a_conflicting_global_json_false() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/diff-format-json-wins:latest",
+        "echo hi > /new-file.txt",
+        true,
+    );
+
+    let diff = ociman(storage_dir.path(), &["diff", &id, "--format", "json"]);
+    assert!(diff.status.success(), "{diff:?}");
+    let view: serde_json::Value = serde_json::from_slice(&diff.stdout).unwrap();
+    assert!(view.is_object(), "expected real JSON output: {view:?}");
+}
+
+/// Any `--format` value other than the literal `json` is a real,
+/// immediate error — matching real `podman diff --format`'s own
+/// checked-directly identical restriction exactly (it has no rich
+/// Go-template engine at all for this specific command, unlike
+/// `ociman ps`/`images`/`inspect --format`).
+#[test]
+fn diff_format_rejects_anything_other_than_json() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/diff-format-invalid:latest",
+        "exit 0",
+        true,
+    );
+
+    let diff = ociman(storage_dir.path(), &["diff", &id, "--format", "{{.added}}"]);
+    assert!(!diff.status.success());
+    assert!(
+        String::from_utf8_lossy(&diff.stderr)
+            .contains("only supported value for '--format' is 'json'"),
+        "{}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+}
+
 #[test]
 fn diff_with_no_deliberate_changes_at_all_reports_no_base_image_files_as_changed() {
     let Some(_busybox) = busybox_path() else {
