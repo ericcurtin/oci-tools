@@ -374,3 +374,130 @@ fn stats_on_an_unknown_container_is_a_clear_error() {
     );
     assert!(!stats.status.success());
 }
+
+/// `stats --format` (0339) renders one line for the `--no-stream`
+/// sample, reusing the exact same Go-template-*lite* engine `ociman
+/// inspect`/`ps`/`images`/`volume ls`/`info`/`history --format`
+/// (`0332`-`0338`) already established.
+#[test]
+fn stats_format_renders_a_single_field_for_the_no_stream_sample() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stats-format:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/stats-format:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let stats = ociman(
+        storage_dir.path(),
+        &["stats", &id, "--no-stream", "--format", "{{.id}}"],
+    );
+    assert!(
+        stats.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stats.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&stats.stdout).trim(), id);
+
+    let kill = ociman(storage_dir.path(), &["kill", &id]);
+    assert!(kill.status.success());
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", &id]);
+}
+
+/// `--format`, when given, takes priority over `--json`/the default
+/// table, and an unresolvable field path is a real, immediate error --
+/// same precedence and error behavior the whole `--format` family
+/// already established.
+#[test]
+fn stats_format_takes_priority_and_errors_on_an_unknown_field() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stats-format-priority:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/stats-format-priority:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let stats = ociman(
+        storage_dir.path(),
+        &[
+            "stats",
+            &id,
+            "--no-stream",
+            "--json",
+            "--format",
+            "{{.pids}}",
+        ],
+    );
+    assert!(stats.status.success());
+    assert!(
+        String::from_utf8_lossy(&stats.stdout)
+            .trim()
+            .parse::<u64>()
+            .is_ok(),
+        "the format template's own plain number, not --json's own object, should have won: {:?}",
+        stats.stdout
+    );
+
+    let bad = ociman(
+        storage_dir.path(),
+        &["stats", &id, "--no-stream", "--format", "{{.nosuchfield}}"],
+    );
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("no field"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    let kill = ociman(storage_dir.path(), &["kill", &id]);
+    assert!(kill.status.success());
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", &id]);
+}

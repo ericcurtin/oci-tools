@@ -2102,6 +2102,22 @@ enum Command {
         /// exactly.
         #[arg(long)]
         no_reset: bool,
+        /// Render each sample via a Go-template-*lite* string
+        /// (`--format`, matching real `podman stats --format`/`docker
+        /// stats --format`) — same engine and scope as `ociman
+        /// inspect`/`ps`/`images`/`volume ls`/`info`/`history
+        /// --format` (`0332`-`0338`): `{{.field}}` placeholders only,
+        /// no pipelines/functions/control flow, field names this
+        /// project's own JSON output field names directly
+        /// (`{{.cpu_percent}}`, `{{.mem_usage}}`, `{{.pids}}`, ...).
+        /// Applies to every sample, both `--no-stream`'s single one
+        /// and the default streaming mode's own repeated ones (real
+        /// `podman stats --format` also re-renders the template each
+        /// interval, not just once). Takes priority over `--json`/the
+        /// default table when given; an unresolvable field path is a
+        /// real, immediate error.
+        #[arg(long = "format", value_name = "TEMPLATE")]
+        format: Option<String>,
     },
     /// Block until one or more containers stop, then print each one's
     /// own real exit code, one per line, in the order given — matching
@@ -2808,7 +2824,15 @@ fn main() -> std::process::ExitCode {
                 no_stream,
                 interval,
                 no_reset,
-            }) => cmd_stats(&id, no_stream, interval, no_reset, cli.global.json),
+                format,
+            }) => cmd_stats(
+                &id,
+                no_stream,
+                interval,
+                no_reset,
+                cli.global.json,
+                format.as_deref(),
+            ),
             Some(Command::Wait {
                 ids,
                 interval,
@@ -10010,17 +10034,14 @@ fn cmd_stats(
     interval: u64,
     no_reset: bool,
     json: bool,
+    format: Option<&str>,
 ) -> anyhow::Result<()> {
     let containers = open_container_store()?;
 
     if no_stream {
         let view = sample_container_stats(&containers, id)?
             .ok_or_else(|| anyhow::anyhow!("container {id:?} is not running"))?;
-        if json {
-            oci_cli_common::output::print_json(&view)?;
-        } else {
-            print_stats_table(&view);
-        }
+        print_stats_sample(&view, json, format)?;
         return Ok(());
     }
 
@@ -10033,13 +10054,32 @@ fn cmd_stats(
         if !no_reset && is_terminal {
             print!("\x1b[2J\x1b[1;1H");
         }
-        if json {
-            oci_cli_common::output::print_json(&view)?;
-        } else {
-            print_stats_table(&view);
-        }
+        print_stats_sample(&view, json, format)?;
         std::thread::sleep(std::time::Duration::from_secs(interval));
     }
+}
+
+/// Print one `ContainerStatsView` sample — `--format`, when given,
+/// takes priority over `--json`/the default table (matching real
+/// `podman stats`'s own identical precedence); shared by both
+/// `cmd_stats`'s own `--no-stream` and streaming-loop call sites so
+/// neither has to duplicate this same three-way branch.
+fn print_stats_sample(
+    view: &ContainerStatsView,
+    json: bool,
+    format: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(template) = format {
+        let json_value = serde_json::to_value(view)?;
+        println!("{}", render_format_template(template, &json_value)?);
+        return Ok(());
+    }
+    if json {
+        oci_cli_common::output::print_json(view)?;
+    } else {
+        print_stats_table(view);
+    }
+    Ok(())
 }
 
 /// A human-readable, decimal-SI byte size (`"65.54kB"`, `"128.5GB"`,
