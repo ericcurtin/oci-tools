@@ -241,6 +241,51 @@ enum Command {
         /// on `exec`, not just `run`/`create` (`docs/design/0294`).
         #[arg(long = "preserve-fds", default_value_t = 0)]
         preserve_fds: u32,
+        /// Add a capability to the exec'd process's own bounding/
+        /// effective/permitted sets, on top of whatever the target
+        /// container's own `process.capabilities` already grants —
+        /// matching real `runc exec --cap`/`-c` exactly (checked
+        /// directly, `~/git/runc/exec.go`'s own handling: appended,
+        /// never replacing what's already there; also appended to
+        /// `ambient`, but only when the container's own process
+        /// already has a non-empty `inheritable` set — ambient
+        /// capabilities can't be set without inheritable ones). Takes
+        /// the raw runtime-spec capability string (`CAP_NET_ADMIN`),
+        /// exactly as real `runc`/`crun exec --cap` both do — no
+        /// `docker`/`podman`-style case-insensitive normalization or
+        /// bare-name (`net_admin`) shorthand at all: that's a real,
+        /// checked-directly *higher-level-tool* convention
+        /// (`ociman run --cap-add`'s own `normalize_capability`),
+        /// this project's own primary references for this exact flag
+        /// don't have. A real, checked-directly *divergence* from
+        /// real `crun exec --cap`, which instead *replaces* the
+        /// process's entire capability set with only the given names
+        /// (`~/git/crun/src/exec.c`'s own `append_cap`/its use) —
+        /// this project follows runc's own strictly additive, less
+        /// destructive reading here, matching the flag's own literal
+        /// "add a capability" wording in both tools' own help text.
+        #[arg(short = 'c', long = "cap", value_name = "CAP")]
+        cap: Vec<String>,
+        /// Allow `exec` into a container this project's own state
+        /// already reports as `Paused` (`docs/design/0144`) instead
+        /// of refusing outright — matching real `runc exec
+        /// --ignore-paused` exactly (checked directly,
+        /// `~/git/runc/exec.go`; real `crun exec` has no equivalent
+        /// flag at all, always refusing a paused container). Wiring
+        /// this up surfaced a real, previously-existing gap: `cmd_
+        /// exec`'s own status check used plain `PersistedState::
+        /// effective_status()`, which can never report `Paused` at
+        /// all (`Status::Paused`'s own doc comment) — before this
+        /// change, `ocirun exec` always let a real, genuinely-frozen
+        /// container's `exec` straight through regardless, with no
+        /// way to refuse it in the first place. Fixed as part of this
+        /// same change (`is_frozen`/`to_view_with_frozen`, the same
+        /// real cgroup-freezer-aware status `state`/`list` already
+        /// compute, reused here for the first time), so the default
+        /// (no `--ignore-paused`) now genuinely refuses, matching
+        /// real runc's own default at last.
+        #[arg(long = "ignore-paused")]
+        ignore_paused: bool,
         /// Command and arguments to run inside the container.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
@@ -530,6 +575,8 @@ fn main() -> std::process::ExitCode {
                 cwd,
                 env,
                 preserve_fds,
+                cap,
+                ignore_paused,
                 args,
             }) => cmd_exec(
                 &root,
@@ -540,6 +587,8 @@ fn main() -> std::process::ExitCode {
                 &env,
                 &args,
                 preserve_fds,
+                &cap,
+                ignore_paused,
             ),
             Some(Command::Features) => oci_cli_common::output::print_json(&features::features()),
             Some(Command::Ps {
@@ -1455,6 +1504,32 @@ fn cmd_events(root: &Path, id: &str, stats: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Append `cap`'s own raw capability strings onto `capabilities`'s
+/// `bounding`/`effective`/`permitted` sets — see [`Command::Exec::cap`]'s
+/// own doc comment for the exact real, checked-directly semantics
+/// this ports from `~/git/runc/exec.go`, including its own real
+/// `ambient`-only-if-`inheritable`-already-set-non-empty rule. A
+/// no-op if `cap` is empty, matching `--cap` never having been given
+/// at all.
+fn apply_exec_cap_flags(
+    capabilities: &mut Option<oci_spec_types::runtime::LinuxCapabilities>,
+    cap: &[String],
+) {
+    if cap.is_empty() {
+        return;
+    }
+    let caps = capabilities.get_or_insert_with(Default::default);
+    let ambient_eligible = !caps.inheritable.is_empty();
+    for c in cap {
+        caps.bounding.push(c.clone());
+        caps.effective.push(c.clone());
+        caps.permitted.push(c.clone());
+        if ambient_eligible {
+            caps.ambient.push(c.clone());
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_exec(
     root: &Path,
@@ -1465,13 +1540,28 @@ fn cmd_exec(
     extra_env: &[String],
     args: &[String],
     preserve_fds: u32,
+    cap: &[String],
+    ignore_paused: bool,
 ) -> anyhow::Result<()> {
     verify_preserve_fds(preserve_fds)?;
     let store = StateStore::open(root)
         .with_context(|| format!("opening container state root {}", root.display()))?;
     let state = store.load(id)?;
-    let status = state.effective_status();
-    if status != Status::Running {
+    // The same real, cgroup-freezer-aware status `state`/`list` (`is_
+    // frozen`) already compute -- a real, previously-existing gap
+    // found while wiring `--ignore-paused` (below): plain `effective_
+    // status()` alone can never report `Paused` at all (see its own
+    // doc comment), so `exec` had no way to actually distinguish a
+    // frozen container from a running one until now -- it always let
+    // `exec` straight through regardless, unlike real runc's own
+    // checked-directly default refusal.
+    let status = state.to_view_with_frozen(is_frozen(&state)).status;
+    // `--ignore-paused` (real `runc exec --ignore-paused`, checked
+    // directly, `~/git/runc/exec.go`; real `crun exec` has no
+    // equivalent, always refusing): the one other status this
+    // project's own exec is ever allowed to proceed from, given the
+    // flag.
+    if status != Status::Running && !(ignore_paused && status == Status::Paused) {
         anyhow::bail!("cannot exec in a container in the {status} state");
     }
     let pid = state
@@ -1520,10 +1610,13 @@ fn cmd_exec(
     let mut effective_env = process_spec.env.clone();
     effective_env.extend(extra_env.iter().cloned());
 
+    let mut effective_capabilities = process_spec.capabilities.clone();
+    apply_exec_cap_flags(&mut effective_capabilities, cap);
+
     let request = oci_runtime_core::exec::ExecRequest {
         namespaces,
         user: effective_user,
-        capabilities: process_spec.capabilities.clone(),
+        capabilities: effective_capabilities,
         no_new_privileges: process_spec.no_new_privileges,
         cwd: cwd
             .map(str::to_string)

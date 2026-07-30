@@ -569,3 +569,215 @@ fn exec_preserve_fds_rejects_a_claim_with_no_matching_open_fd() {
         &["delete", "--force", "exec-preserve-fds-reject-test"],
     );
 }
+
+/// `ocirun exec --cap`/`-c` (`docs/design/0363`): additive on top of
+/// the container's own already-granted capability set, matching real
+/// `runc exec --cap` exactly (see `Command::Exec::cap`'s own doc
+/// comment for the exact real, checked-directly bit math this
+/// mirrors). `ocirun spec`'s own default bounding/effective/permitted
+/// set is exactly `CAP_KILL` (bit 5) | `CAP_NET_BIND_SERVICE` (bit
+/// 10) | `CAP_AUDIT_WRITE` (bit 29) = `0x20000420` (the same real
+/// bitmask `run_applies_the_default_capability_set_and_no_new_
+/// privileges` in `ocirun_run.rs` already established); adding
+/// `CAP_NET_ADMIN` (bit 12 = `0x1000`) via `--cap` must set exactly
+/// that one extra bit, on all three sets, while `CapAmb` stays `0`
+/// (the container's own default `inheritable` is empty, so ambient
+/// stays ineligible — see the same doc comment).
+#[test]
+fn exec_cap_adds_a_capability_on_top_of_the_containers_own_default_set() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let create = ocirun_create(root_dir.path(), bundle_dir.path(), "exec-cap-test");
+    assert!(create.status.success(), "{create:?}");
+    let start = ocirun(root_dir.path(), &["start", "exec-cap-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-cap-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let grep_caps = r#"grep -E "^(CapPrm|CapEff|CapBnd|CapAmb):" /proc/self/status"#;
+
+    let without_cap = ocirun(
+        root_dir.path(),
+        &["exec", "exec-cap-test", "/bin/sh", "-c", grep_caps],
+    );
+    assert!(without_cap.status.success(), "{without_cap:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&without_cap.stdout).trim(),
+        "CapPrm:\t0000000020000420\nCapEff:\t0000000020000420\nCapBnd:\t0000000020000420\nCapAmb:\t0000000000000000",
+        "no --cap given should leave the container's own default set untouched"
+    );
+
+    let with_cap = ocirun(
+        root_dir.path(),
+        &[
+            "exec",
+            "--cap",
+            "CAP_NET_ADMIN",
+            "exec-cap-test",
+            "/bin/sh",
+            "-c",
+            grep_caps,
+        ],
+    );
+    assert!(with_cap.status.success(), "{with_cap:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&with_cap.stdout).trim(),
+        "CapPrm:\t0000000020001420\nCapEff:\t0000000020001420\nCapBnd:\t0000000020001420\nCapAmb:\t0000000000000000",
+        "--cap CAP_NET_ADMIN should add exactly bit 12 on top of the default set, ambient \
+         staying 0 since the container's own inheritable set is empty"
+    );
+
+    ocirun(root_dir.path(), &["delete", "--force", "exec-cap-test"]);
+}
+
+/// Same real, reachable-`systemd --user`-session probe
+/// `ocirun_lifecycle.rs`'s own pause/resume test uses (see its own
+/// doc comment for why a real cgroup -- required by `pause`, unlike
+/// this file's other tests -- needs one here too).
+fn systemd_user_scope_available() -> bool {
+    std::process::Command::new("systemd-run")
+        .args(["--user", "--scope", "--", "true"])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// `ocirun exec --ignore-paused` (`docs/design/0363`): a real,
+/// genuinely-`Paused` container refuses `exec` by default, matching
+/// this project's own pre-existing behavior, but `--ignore-paused`
+/// (matching real `runc exec --ignore-paused` exactly) lets it through
+/// anyway. Needs a real cgroup for `pause` to actually act on --
+/// unlike this file's other tests, which never touch one at all --
+/// via the same real, delegated-cgroup carrier-scope setup
+/// `ocirun_lifecycle.rs`'s own `pause_freezes_and_resume_thaws_a_real_
+/// running_containers_own_cpu_usage` already established (see its own
+/// doc comment for exactly why `create` alone needs the carrier).
+#[test]
+fn exec_ignore_paused_allows_exec_into_a_genuinely_paused_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_scope_available() {
+        eprintln!(
+            "skipping: no reachable `systemd --user` session (systemd-run --user --scope failed)"
+        );
+        return;
+    }
+
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let config_path = bundle_dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    let uid = rustix::process::getuid().as_raw();
+    let target = format!(
+        "/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/ocirun-exec-ignore-paused-{}",
+        std::process::id()
+    );
+    config["linux"]["cgroupsPath"] = serde_json::json!(target);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let carrier_unit = format!(
+        "ocirun-exec-ignore-paused-carrier-{}.scope",
+        std::process::id()
+    );
+    let create = std::process::Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--slice=app.slice",
+            &format!("--unit={carrier_unit}"),
+            "--",
+        ])
+        .arg(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args(["create", "exec-ignore-paused-test", "--bundle"])
+        .arg(bundle_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .expect("failed to spawn systemd-run");
+    assert!(
+        create.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let start = ocirun(root_dir.path(), &["start", "exec-ignore-paused-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-ignore-paused-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let pause = ocirun(root_dir.path(), &["pause", "exec-ignore-paused-test"]);
+    assert!(
+        pause.status.success(),
+        "pause failed: {}",
+        String::from_utf8_lossy(&pause.stderr)
+    );
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-ignore-paused-test",
+            "paused",
+            Duration::from_secs(5)
+        ),
+        "paused"
+    );
+
+    let refused = ocirun(
+        root_dir.path(),
+        &["exec", "exec-ignore-paused-test", "/bin/true"],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("paused"),
+        "{refused:?}"
+    );
+
+    let allowed = ocirun(
+        root_dir.path(),
+        &[
+            "exec",
+            "--ignore-paused",
+            "exec-ignore-paused-test",
+            "/bin/true",
+        ],
+    );
+    assert!(
+        allowed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+
+    let resume = ocirun(root_dir.path(), &["resume", "exec-ignore-paused-test"]);
+    assert!(resume.status.success(), "{resume:?}");
+    ocirun(
+        root_dir.path(),
+        &["delete", "--force", "exec-ignore-paused-test"],
+    );
+}
