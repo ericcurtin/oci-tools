@@ -540,14 +540,19 @@ fn cmd_list(root: &Path, format: &str, quiet: bool) -> anyhow::Result<()> {
 
     match format {
         "table" => {
+            // Column order matches real `runc list`/`crun list` exactly
+            // (`ID PID STATUS BUNDLE CREATED OWNER`, checked directly:
+            // `~/git/runc/list.go`, `~/git/crun/src/list.c`) — `OWNER`
+            // (0345) is the last column in both, appended here the
+            // same way.
             println!(
-                "{:<12}{:<8}{:<10}{:<40}CREATED",
-                "ID", "PID", "STATUS", "BUNDLE"
+                "{:<12}{:<8}{:<10}{:<40}{:<32}OWNER",
+                "ID", "PID", "STATUS", "BUNDLE", "CREATED"
             );
             for view in &views {
                 println!(
-                    "{:<12}{:<8}{:<10}{:<40}{}",
-                    view.id, view.pid, view.status, view.bundle, view.created
+                    "{:<12}{:<8}{:<10}{:<40}{:<32}{}",
+                    view.id, view.pid, view.status, view.bundle, view.created, view.owner
                 );
             }
         }

@@ -111,6 +111,24 @@ pub struct PersistedState {
     /// Annotations copied from `config.json`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub annotations: BTreeMap<String, String>,
+    /// The login name of the effective user that created this
+    /// container (`ocirun list`'s own `OWNER` column) — captured once
+    /// here, matching real crun's own identical choice
+    /// (`~/git/crun/src/libcrun/container.c`'s own `get_user_name
+    /// (geteuid())`, persisted into `status.json`) rather than
+    /// re-resolved at `list` time the way real runc's own separate
+    /// `user.LookupId` approach does (`~/git/runc/list.go`): a
+    /// persisted value survives the creating user later being removed
+    /// from `/etc/passwd`, matching crun's own choice. A real, honest
+    /// empty string when the effective uid has no resolvable
+    /// `/etc/passwd` entry at all, matching crun's own identical
+    /// `get_user_name` fallback (`return xstrdup("")`) rather than a
+    /// fabricated placeholder. `#[serde(default)]` so a `state.json`
+    /// written before this field existed deserializes it as an empty
+    /// string too — the same forward-compatible-record convention
+    /// `docs/design/0344`'s `BoxRecord.hostname` already established.
+    #[serde(default)]
+    pub owner: String,
 }
 
 impl PersistedState {
@@ -155,6 +173,7 @@ impl PersistedState {
             rootfs: self.rootfs.clone(),
             created: self.created.clone(),
             annotations: self.annotations.clone(),
+            owner: self.owner.clone(),
         }
     }
 
@@ -202,11 +221,74 @@ pub struct StateView {
     /// Annotations copied from `config.json`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub annotations: BTreeMap<String, String>,
+    /// See [`PersistedState::owner`]'s own doc comment — the same
+    /// value, always present (a real, possibly-empty string, never
+    /// omitted), matching real crun's own `status->owner` always
+    /// being serialized (a non-NULL `xstrdup`, even of `""`) rather
+    /// than an optional field.
+    pub owner: String,
 }
 
 /// Whether a process with this PID currently exists.
 fn process_alive(pid: i32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// The real, current effective user's own login name — matching real
+/// crun's own `get_user_name(geteuid())` exactly (`~/git/crun/src/
+/// libcrun/utils.c`, `~/git/crun/src/libcrun/container.c`'s own call
+/// site), called once here at container-creation time (see
+/// [`PersistedState::owner`]'s own doc comment for why persisting it
+/// rather than re-resolving at `list` time, matching crun's own
+/// choice over runc's).
+///
+/// A real, honest empty string on lookup failure (the effective uid
+/// has no resolvable `/etc/passwd`/NSS entry at all — a real, if
+/// unusual, possibility for a container engine running as some
+/// synthetic/dynamic uid) — matching crun's own identical fallback
+/// exactly (`get_user_name`'s own `return xstrdup("")` branch when
+/// `getpwuid_r` doesn't find a match), never a fabricated placeholder
+/// like `runc`'s own `"#<uid>"` string.
+fn current_user_name() -> String {
+    // `getpwuid_r`'s own buffer must be large enough for every field
+    // NSS might return (name, password hash placeholder, gecos, home,
+    // shell); `sysconf(_SC_GETPW_R_SIZE_MAX)` is the portable way to
+    // ask libc for its own real recommended size rather than guessing
+    // a fixed constant (real crun's own fixed 200-byte buffer, `~/git/
+    // crun/src/libcrun/utils.c`, works in practice but isn't a
+    // documented-safe bound) — falling back to a generous 16KiB (a
+    // real, commonly-cited glibc default) on the rare platform where
+    // `sysconf` itself returns "no defined limit" (`-1`).
+    //
+    // SAFETY: `pwd`/`result` are valid, correctly-sized out-params for
+    // `getpwuid_r`; `buf` is a real, live, correctly-sized buffer.
+    // `getpwuid_r` never retains any of these pointers past its own
+    // return, and `pwd.pw_name`, when non-null, points into `buf`
+    // itself, which is still alive when read just below.
+    #[allow(unsafe_code)]
+    unsafe {
+        let buf_size = match libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) {
+            n if n > 0 => n as usize,
+            _ => 16384,
+        };
+        let mut buf = vec![0_u8; buf_size];
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let ret = libc::getpwuid_r(
+            libc::geteuid(),
+            &mut pwd,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut result,
+        );
+        if ret == 0 && !result.is_null() && !pwd.pw_name.is_null() {
+            std::ffi::CStr::from_ptr(pwd.pw_name)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            String::new()
+        }
+    }
 }
 
 /// Errors from [`StateStore`] operations.
@@ -303,6 +385,7 @@ impl StateStore {
             rootfs: rootfs.to_string_lossy().into_owned(),
             created: format_rfc3339_utc(SystemTime::now()),
             annotations,
+            owner: current_user_name(),
         };
 
         // Best-effort cleanup on write failure: don't leave a
@@ -701,5 +784,49 @@ mod tests {
         assert_eq!(json["bundle"], "/bundle");
         assert_eq!(json["rootfs"], "/bundle/rootfs");
         assert!(json["created"].as_str().unwrap().ends_with('Z'));
+    }
+
+    /// `owner` (0345) matches the real, current effective user's own
+    /// login name -- checked the most direct way available: against a
+    /// real `whoami` subprocess, not just this crate's own
+    /// `current_user_name` called a second time (which would only
+    /// prove self-consistency, not correctness against the real
+    /// system NSS database).
+    #[test]
+    fn create_records_the_real_effective_users_own_login_name_as_owner() {
+        let (_dir, store) = store();
+        let state = store
+            .create(
+                "c1",
+                Path::new("/bundle"),
+                Path::new("/bundle/rootfs"),
+                BTreeMap::new(),
+            )
+            .unwrap();
+        let whoami = std::process::Command::new("whoami")
+            .output()
+            .expect("failed to spawn whoami");
+        assert!(whoami.status.success());
+        let expected = String::from_utf8_lossy(&whoami.stdout).trim().to_string();
+        assert_eq!(state.owner, expected);
+    }
+
+    /// `to_view`/`to_view_with_frozen` both carry `owner` through
+    /// unchanged -- a real, previously-easy-to-miss field to forget
+    /// wiring into the view conversion (unlike `pid`/`status`, it
+    /// needs no transformation at all, just a plain copy).
+    #[test]
+    fn to_view_carries_owner_through_unchanged() {
+        let (_dir, store) = store();
+        let state = store
+            .create(
+                "c1",
+                Path::new("/bundle"),
+                Path::new("/bundle/rootfs"),
+                BTreeMap::new(),
+            )
+            .unwrap();
+        assert_eq!(state.to_view().owner, state.owner);
+        assert_eq!(state.to_view_with_frozen(false).owner, state.owner);
     }
 }

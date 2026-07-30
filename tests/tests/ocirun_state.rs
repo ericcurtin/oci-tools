@@ -91,6 +91,49 @@ fn state_and_list_report_a_container_created_via_the_shared_state_store() {
     assert_eq!(json[0]["id"], "my-container");
 }
 
+/// `ocirun list`'s own `OWNER` column (0345), matching real `runc
+/// list`/`crun list` exactly (`~/git/runc/list.go`,
+/// `~/git/crun/src/list.c`) -- a real, previously-missing column
+/// flagged as deferred all the way back in this project's own design
+/// note 0004 and never actually closed until now. Checked against a
+/// real `whoami` subprocess, the same most-direct-available approach
+/// `oci-runtime-core`'s own unit test for this uses.
+#[test]
+fn list_table_and_json_report_the_real_owner_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("state");
+
+    let store = StateStore::open(&root).unwrap();
+    store
+        .create(
+            "owner-test",
+            Path::new("/bundle"),
+            Path::new("/bundle/rootfs"),
+            BTreeMap::new(),
+        )
+        .unwrap();
+
+    let whoami = Command::new("whoami").output().unwrap();
+    assert!(whoami.status.success());
+    let expected_owner = String::from_utf8_lossy(&whoami.stdout).trim().to_string();
+
+    let out = ocirun(&root, &["list"]);
+    assert!(out.status.success(), "ocirun list failed: {out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let header = stdout.lines().next().unwrap();
+    assert!(header.contains("OWNER"), "got header: {header:?}");
+    let row = stdout.lines().nth(1).unwrap();
+    assert!(
+        row.trim_end().ends_with(&expected_owner),
+        "row should end with the real owner {expected_owner:?}: {row:?}"
+    );
+
+    let out = ocirun(&root, &["list", "--format", "json"]);
+    assert!(out.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json[0]["owner"], expected_owner);
+}
+
 #[test]
 fn list_rejects_unknown_format() {
     let dir = tempfile::tempdir().unwrap();
