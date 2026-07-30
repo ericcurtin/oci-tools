@@ -1891,6 +1891,44 @@ enum Command {
         /// The container's ID or `--name`.
         id: String,
     },
+    /// Print a container's own real, absolute host root-filesystem
+    /// path — matching real `podman mount CONTAINER`'s own checked-
+    /// directly output exactly (a real rootful `sudo podman mount`
+    /// prints its own real merged/overlay mountpoint verbatim; this
+    /// project's own containers already have an equally real,
+    /// directly-accessible root filesystem path the moment they're
+    /// created — [`oci_runtime_core::PersistedState::rootfs`] — with
+    /// no separate mount step of its own to perform at all, the same
+    /// "already there, nothing to actually mount" reasoning `ociman
+    /// volume mount` (`0361`) already established for volumes).
+    /// Works on a running or stopped container alike; shares `cp`/
+    /// `diff`/`export`/`commit`'s own rootless-overlay-rootfs gap
+    /// (`resolve_container_root`'s own doc comment) — a clear error,
+    /// not a silently wrong path, for that one case. Real podman also
+    /// supports a bare `podman mount` (no `CONTAINER`) listing every
+    /// currently-mounted container; deliberately deferred for this
+    /// first slice, the same narrower-first-slice precedent
+    /// `ContainerCommand::Prune`'s own deferred `--filter` already
+    /// used.
+    Mount {
+        /// The container's ID or `--name`.
+        container: String,
+    },
+    /// A real no-op — matching real `podman unmount`'s own identical
+    /// behavior for the one storage-driver case this project's own
+    /// containers actually are: a plain, already-extracted root
+    /// filesystem directory that was never really "mounted" via any
+    /// separate step to begin with, so there is nothing to undo
+    /// (checked directly: a real rootful `sudo podman unmount` on a
+    /// container succeeds and prints its own id either way, real
+    /// podman's own storage layer deciding internally whether an
+    /// actual unmount was even needed). Prints the container's own id
+    /// on success, matching real podman's own checked-directly
+    /// output.
+    Unmount {
+        /// The container's ID or `--name`.
+        container: String,
+    },
     /// Write a container's entire current filesystem out as a real,
     /// flat tar — matching real `docker export`/`podman export`
     /// exactly: the whole current tree, verbatim, no whiteouts, no
@@ -3068,6 +3106,8 @@ fn main() -> std::process::ExitCode {
                 overwrite,
             }) => cmd_cp(&src, &dest, overwrite),
             Some(Command::Diff { id }) => cmd_diff(&id, cli.global.json),
+            Some(Command::Mount { container }) => cmd_mount(&container),
+            Some(Command::Unmount { container }) => cmd_unmount(&container),
             Some(Command::Export { id, output }) => cmd_export(&id, output.as_deref()),
             Some(Command::Commit {
                 container,
@@ -8362,6 +8402,32 @@ fn cmd_diff(id: &str, json: bool) -> anyhow::Result<()> {
         };
         println!("{marker} /{}", change.path.display());
     }
+    Ok(())
+}
+
+/// `ociman mount` — see [`Command::Mount`]'s own doc comment for the
+/// exact real, checked-directly output and the deliberate "already
+/// there, nothing to mount" reasoning. Shares `cp`/`diff`/`export`/
+/// `commit`'s own rootless-overlay-rootfs gap via
+/// [`resolve_container_root`], which also already accepts a running
+/// or stopped container alike.
+fn cmd_mount(container: &str) -> anyhow::Result<()> {
+    let (root, _state) = resolve_container_root(container, "mount")?;
+    println!("{}", root.display());
+    Ok(())
+}
+
+/// `ociman unmount` — see [`Command::Unmount`]'s own doc comment for
+/// why this is a real no-op. Deliberately doesn't call
+/// [`resolve_container_root`] at all (unlike `cmd_mount`): unmounting
+/// a rootless-overlay-rootfs container is just as much a genuine
+/// no-op as any other, so there is no real gap here for that case to
+/// even trip over — only that the container itself must genuinely
+/// exist, [`resolve_container_id`]'s own already-established check.
+fn cmd_unmount(container: &str) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let resolved = resolve_container_id(&containers, container)?;
+    println!("{resolved}");
     Ok(())
 }
 
