@@ -707,3 +707,81 @@ fn images_filter_containers_rejects_an_invalid_value() {
         String::from_utf8_lossy(&external.stderr)
     );
 }
+
+/// `ociman images --format` (0334) renders one line per listed image,
+/// reusing the exact same Go-template-*lite* engine `ociman inspect
+/// --format`/`ps --format` (`0332`/`0333`) already established.
+#[test]
+fn images_format_renders_one_line_per_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/images-format:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let format = ociman(
+        storage_dir.path(),
+        &["images", "--format", "{{.reference}}"],
+    );
+    assert!(
+        format.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&format.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&format.stdout).trim(),
+        "docker.io/ociman-test/images-format:latest"
+    );
+}
+
+/// `--format`, when given, takes priority over `--quiet`/`--json`/the
+/// default table, and an unresolvable field path is a real, immediate
+/// error -- same precedence and error behavior `ps --format` already
+/// established.
+#[test]
+fn images_format_takes_priority_and_errors_on_an_unknown_field() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/images-format-priority:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let format = ociman(
+        storage_dir.path(),
+        &["images", "-q", "--format", "{{.size}}"],
+    );
+    assert!(format.status.success());
+    let stdout = String::from_utf8_lossy(&format.stdout).trim().to_string();
+    assert!(
+        stdout.parse::<u64>().is_ok(),
+        "the format template's own numeric size, not -q's own short-digest behavior, should have \
+         won: {stdout:?}"
+    );
+
+    let bad = ociman(
+        storage_dir.path(),
+        &["images", "--format", "{{.nosuchfield}}"],
+    );
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("no field"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}

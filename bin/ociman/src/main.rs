@@ -1105,6 +1105,20 @@ enum Command {
         /// May be given more than once.
         #[arg(short, long = "filter")]
         filter: Vec<String>,
+        /// Render one line per listed image via a Go-template-*lite*
+        /// string (`--format`, matching real `podman images --format`/
+        /// `docker images --format` — no `-f` short alias, `images`
+        /// already having its own `-f`/`--filter`, the same real
+        /// reason `ociman ps --format` has none either, `0333`) — same
+        /// engine and scope as `inspect --format`/`ps --format`
+        /// (`0332`/`0333`): `{{.field}}`/`{{.nested.field}}`
+        /// placeholders only, no pipelines/functions/control flow,
+        /// field names this project's own JSON output field names
+        /// directly. Takes priority over `--quiet`/`--json`/the
+        /// default table when given; an unresolvable field path is a
+        /// real, immediate error.
+        #[arg(long = "format", value_name = "TEMPLATE")]
+        format: Option<String>,
     },
     /// Remove an image from local storage, matching real `docker
     /// rmi`/`podman rmi`. Resolves by tag reference or by a real or
@@ -2603,7 +2617,11 @@ fn main() -> std::process::ExitCode {
                 cli.global.json,
                 timestamp,
             ),
-            Some(Command::Images { quiet, filter }) => cmd_images(quiet, cli.global.json, &filter),
+            Some(Command::Images {
+                quiet,
+                filter,
+                format,
+            }) => cmd_images(quiet, cli.global.json, &filter, format.as_deref()),
             Some(Command::Rmi {
                 references,
                 force,
@@ -3445,7 +3463,12 @@ fn cmd_info(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_images(quiet: bool, json: bool, filter: &[String]) -> anyhow::Result<()> {
+fn cmd_images(
+    quiet: bool,
+    json: bool,
+    filter: &[String],
+    format: Option<&str>,
+) -> anyhow::Result<()> {
     let store = open_store()?;
     let filters = parse_image_filters(filter)?;
     let records = store.list_images().context("listing local images")?;
@@ -3553,6 +3576,13 @@ fn cmd_images(quiet: bool, json: bool, filter: &[String]) -> anyhow::Result<()> 
         digest[..digest.len().min(12)].to_string()
     };
 
+    if let Some(template) = format {
+        for view in &views {
+            let json_value = serde_json::to_value(view)?;
+            println!("{}", render_format_template(template, &json_value)?);
+        }
+        return Ok(());
+    }
     if quiet {
         for view in &views {
             println!("{}", short_digest(view));
