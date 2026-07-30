@@ -653,3 +653,93 @@ fn inspect_size_flag_is_a_clear_error_for_an_image() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `ociman inspect`'s own `mounts` field (`docs/design/0369`): a real
+/// bind mount and a real named volume are both surfaced, the named
+/// one carrying its own volume name; a container with no extra
+/// mounts at all reports no `mounts` field whatsoever (not an empty
+/// array), matching `ContainerView::size`'s own identical opt-in-field
+/// convention.
+#[test]
+fn inspect_mounts_reports_bind_mounts_and_named_volumes_but_omits_the_field_when_empty() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-mounts:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let host_dir = tempfile::tempdir().unwrap();
+
+    let volume_create = ociman(
+        storage_dir.path(),
+        &["volume", "create", "inspect-mounts-vol"],
+    );
+    assert!(volume_create.status.success(), "{volume_create:?}");
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "-v",
+            &format!("{}:/data", host_dir.path().display()),
+            "-v",
+            "inspect-mounts-vol:/vol",
+            "ociman-test/inspect-mounts:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+    let inspect = ociman(storage_dir.path(), &["inspect", &id, "--json"]);
+    assert!(inspect.status.success(), "{inspect:?}");
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    let mounts = view["mounts"]
+        .as_array()
+        .expect("mounts should be an array");
+    assert_eq!(mounts.len(), 2, "{mounts:?}");
+
+    let bind = mounts
+        .iter()
+        .find(|m| m["destination"] == "/data")
+        .expect("the bind mount should be present");
+    assert_eq!(
+        bind["source"],
+        serde_json::json!(host_dir.path().to_string_lossy())
+    );
+    assert!(bind.get("volume").is_none(), "{bind:?}");
+
+    let volume = mounts
+        .iter()
+        .find(|m| m["destination"] == "/vol")
+        .expect("the named-volume mount should be present");
+    assert_eq!(volume["volume"], "inspect-mounts-vol");
+    assert!(
+        volume["source"]
+            .as_str()
+            .unwrap()
+            .ends_with("/volumes/inspect-mounts-vol/_data"),
+        "{volume:?}"
+    );
+
+    // A plain container with no extra mounts at all reports no
+    // `mounts` field whatsoever, not an empty array.
+    let plain_create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/inspect-mounts:latest", "true"],
+    );
+    assert!(plain_create.status.success(), "{plain_create:?}");
+    let plain_id = String::from_utf8_lossy(&plain_create.stdout)
+        .trim()
+        .to_string();
+    let plain_inspect = ociman(storage_dir.path(), &["inspect", &plain_id, "--json"]);
+    let plain_view: serde_json::Value = serde_json::from_slice(&plain_inspect.stdout).unwrap();
+    assert!(plain_view.get("mounts").is_none(), "{plain_view:?}");
+}

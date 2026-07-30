@@ -7580,6 +7580,80 @@ struct ContainerInspectView {
     /// for exactly why this stays opt-in.
     #[serde(skip_serializing_if = "Option::is_none")]
     size: Option<ContainerSizeView>,
+    /// Every real mount this container's own bundle declares beyond
+    /// the fixed proc/dev/sys/... set every container gets
+    /// unconditionally (`Spec::example`'s own defaults) -- matching
+    /// real `podman inspect`'s own `Mounts` field in spirit (`~/git/
+    /// podman/libpod/define/container_inspect.go`'s own
+    /// `InspectMount`), deliberately narrower: this project's own
+    /// simpler, already-established plain-field convention for this
+    /// whole view (`id`/`image`/... rather than podman's own
+    /// `Id`/`Image`/... PascalCase) rather than a field-for-field
+    /// port of podman's own richer `Type`/`Driver`/`Mode`/`RW` shape.
+    /// See [`ContainerMountView`]'s own doc comment for exactly what's
+    /// modeled.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    mounts: Vec<ContainerMountView>,
+}
+
+/// One extra (non-default) mount a container's own bundle declares --
+/// see [`ContainerInspectView::mounts`]'s own doc comment for why this
+/// is a deliberately narrower shape than real podman's own
+/// `InspectMount`. `options` is the real, raw runtime-spec mount
+/// options list verbatim (already carries e.g. `"ro"` when
+/// read-only -- no separate derived boolean needed); `volume` is
+/// `Some(name)` when `source` resolves to one of this project's own
+/// named-volume `_data` directories ([`volume::VolumeStore::data_dir`]'s
+/// own exact path shape), `None` for a plain bind mount.
+#[derive(Debug, Serialize)]
+struct ContainerMountView {
+    source: String,
+    destination: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    options: Vec<String>,
+}
+
+/// The fixed set of mount destinations every container gets
+/// unconditionally, regardless of any `-v`/named-volume mount --
+/// [`oci_spec_types::runtime::Spec::example`]'s own hardcoded list
+/// (kept here as a small, deliberate duplicate rather than a new
+/// shared-crate export just for this one filtering use), plus `"/"`
+/// itself: a container using this project's own rootless-overlay
+/// rootfs optimization (`rootfs_setup`'s own module doc comment,
+/// `0110`) represents *that* as one ordinary `destination: "/"`
+/// `spec.mounts` entry too -- a real, internal storage-layer
+/// implementation detail specific to this project's own architecture
+/// (real podman/docker's own overlay2 storage driver is never modeled
+/// as a runtime-spec mounts-array entry at all), never a genuine
+/// user-visible mount `ociman inspect`'s own `mounts` field should
+/// ever surface.
+const DEFAULT_MOUNT_DESTINATIONS: &[&str] = &[
+    "/",
+    "/proc",
+    "/dev",
+    "/dev/pts",
+    "/dev/shm",
+    "/dev/mqueue",
+    "/sys",
+    "/sys/fs/cgroup",
+];
+
+/// `source` if it resolves to one of this project's own named-volume
+/// `_data` directories (`<root>/volumes/<name>/_data`, [`volume::
+/// VolumeStore::data_dir`]'s own exact shape) -- the volume's own
+/// name, or `None` for anything else (a plain bind mount).
+fn volume_name_from_mount_source(source: &str) -> Option<String> {
+    let data_dir = Path::new(source);
+    if data_dir.file_name()? != "_data" {
+        return None;
+    }
+    let volume_dir = data_dir.parent()?;
+    if volume_dir.parent()?.file_name()? != "volumes" {
+        return None;
+    }
+    Some(volume_dir.file_name()?.to_string_lossy().into_owned())
 }
 
 impl ContainerInspectView {
@@ -7619,8 +7693,34 @@ impl ContainerInspectView {
             stop_signal: resolve_stop_signal(state, None),
             stop_timeout: resolve_stop_timeout(state, None),
             size: None,
+            mounts: extra_mounts(state),
         }
     }
+}
+
+/// Every mount `state`'s own bundle declares beyond the fixed
+/// proc/dev/sys/... set every container gets unconditionally -- see
+/// [`ContainerInspectView::mounts`]'s own doc comment. Best-effort,
+/// same philosophy as [`display_status`]'s own doc comment right
+/// above: a bundle that (for whatever reason) can't be loaded reports
+/// no extra mounts at all rather than failing `inspect` outright over
+/// what is, after all, just one more optional display field.
+fn extra_mounts(state: &oci_runtime_core::PersistedState) -> Vec<ContainerMountView> {
+    let Ok(bundle) = oci_runtime_core::Bundle::load(&state.bundle) else {
+        return Vec::new();
+    };
+    bundle
+        .spec
+        .mounts
+        .into_iter()
+        .filter(|m| !DEFAULT_MOUNT_DESTINATIONS.contains(&m.destination.as_str()))
+        .map(|m| ContainerMountView {
+            volume: m.source.as_deref().and_then(volume_name_from_mount_source),
+            source: m.source.unwrap_or_default(),
+            destination: m.destination,
+            options: m.options,
+        })
+        .collect()
 }
 
 /// Every `--filter` value `ociman ps` accepts, parsed once up front --
