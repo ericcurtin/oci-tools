@@ -2848,6 +2848,30 @@ enum ImageCommand {
         /// The image's tag reference or real/short ID.
         name: String,
     },
+    /// Real `podman image prune`'s own narrower equivalent of
+    /// [`Command::Prune`] (`ociman prune`) — the exact same image
+    /// removal, blob GC, and rootfs-cache GC passes
+    /// ([`prune_images_and_reclaim`]), but never touches any
+    /// container at all (checked directly against a real installed
+    /// `podman image prune`; unlike `ociman prune`/real `podman
+    /// system prune`, no container is ever pruned as a side effect of
+    /// this one) and never touches `ociman build`'s own abandoned
+    /// build-scratch entries either (real `podman image prune` has no
+    /// such concept at all — that reclaim stays `ociman prune`'s own).
+    Prune {
+        /// Same real, checked-directly meaning as [`Command::Prune::all`]'s
+        /// own `--all`/`-a`: without it, only a dangling (untagged)
+        /// image is reclaimed; with it, every unused image is,
+        /// tagged or not.
+        #[arg(short, long)]
+        all: bool,
+        /// Same real, checked-directly filter grammar and semantics
+        /// as [`Command::Prune::filter`]'s own `--filter` — see its
+        /// own doc comment for the full, exact rules
+        /// (`label=`/`label!=`/`until=`/`dangling=`).
+        #[arg(long = "filter")]
+        filter: Vec<String>,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -3092,6 +3116,9 @@ fn main() -> std::process::ExitCode {
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),
+                ImageCommand::Prune { all, filter } => {
+                    cmd_image_prune(cli.global.json, all, &filter)
+                }
             },
             Some(Command::Stats {
                 id,
@@ -5171,10 +5198,27 @@ fn image_matches_reference_filter(value: &ReferenceFilterValue, record: &ImageRe
         })
 }
 
-fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
-    let store = open_store()?;
-    let filters = parse_prune_filters(filter)?;
+/// The real, checked-directly image-removal-plus-storage-reclaim pass
+/// shared by [`cmd_prune`] (`ociman prune`, real `podman system
+/// prune`'s own equivalent) and [`cmd_image_prune`] (`ociman image
+/// prune`, real `podman image prune`'s own narrower equivalent —
+/// checked directly, it never touches containers at all, only images
+/// and the blob/rootfs-cache storage they alone were keeping alive).
+/// `containers` is only ever *read* here (via [`images_in_use_digests`]),
+/// never pruned itself — [`cmd_prune`]'s own caller prunes it
+/// separately, first, before calling this.
+struct ImagePruneOutcome {
+    images_removed: Vec<String>,
+    blob_report: oci_store::GcReport,
+    cache_report: oci_store::CachePruneReport,
+}
 
+fn prune_images_and_reclaim(
+    store: &Store,
+    containers: &StateStore,
+    all: bool,
+    filters: &PruneFilters,
+) -> anyhow::Result<ImagePruneOutcome> {
     // A dangling (untagged, `is_untagged_reference`, 0179) image not
     // currently in use by any container is reclaimed even *without*
     // `--all` — matching real `docker system prune`/`podman system
@@ -5195,26 +5239,10 @@ fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
     // Either pass runs *before* the blob/cache GC below so that an
     // image either one just untags immediately makes its own now-
     // unreferenced blobs/cache entries eligible for the same GC run,
-    // rather than needing a second `ociman prune` invocation to
-    // actually reclaim them.
+    // rather than needing a second invocation to actually reclaim
+    // them.
     let dangling_only = filters.dangling.unwrap_or(!all);
-    let containers = open_container_store()?;
-
-    // Every `Created`/`Stopped` container is reclaimed too, matching
-    // real `podman system prune`'s own checked-directly default
-    // exactly (a real installed `podman system prune -f`, no `--all`,
-    // removes a real stopped container unconditionally — see
-    // `prune_eligible_containers`'s own doc comment). Runs *before*
-    // `images_in_use_digests` below so an image only a container just
-    // removed here still referenced becomes eligible for the very
-    // same image-removal pass, rather than needing a second `ociman
-    // prune` invocation to actually reclaim it — the same real,
-    // checked-directly ordering `~/git/podman/pkg/domain/infra/abi/
-    // system.go`'s own `SystemPrune` uses (containers pruned strictly
-    // before images).
-    let containers_removed = prune_eligible_containers(&containers)?;
-
-    let in_use_digests = images_in_use_digests(&store, &containers)?;
+    let in_use_digests = images_in_use_digests(store, containers)?;
     let mut images_removed = Vec::new();
     for record in store.list_images().context("listing images")? {
         if in_use_digests.contains(&record.manifest_digest) {
@@ -5264,8 +5292,39 @@ fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
     let blob_report = store
         .gc()
         .context("garbage-collecting unreferenced blobs")?;
-    let cache_report = oci_store::prune(&store, &rootfs_setup::cache_root(&store))
+    let cache_report = oci_store::prune(store, &rootfs_setup::cache_root(store))
         .context("pruning unreferenced rootfs-cache entries")?;
+    Ok(ImagePruneOutcome {
+        images_removed,
+        blob_report,
+        cache_report,
+    })
+}
+
+fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
+    let store = open_store()?;
+    let filters = parse_prune_filters(filter)?;
+    let containers = open_container_store()?;
+
+    // Every `Created`/`Stopped` container is reclaimed too, matching
+    // real `podman system prune`'s own checked-directly default
+    // exactly (a real installed `podman system prune -f`, no `--all`,
+    // removes a real stopped container unconditionally — see
+    // `prune_eligible_containers`'s own doc comment). Runs *before*
+    // [`prune_images_and_reclaim`] below so an image only a container
+    // just removed here still referenced becomes eligible for the
+    // very same image-removal pass, rather than needing a second
+    // `ociman prune` invocation to actually reclaim it — the same
+    // real, checked-directly ordering `~/git/podman/pkg/domain/infra/
+    // abi/system.go`'s own `SystemPrune` uses (containers pruned
+    // strictly before images).
+    let containers_removed = prune_eligible_containers(&containers)?;
+
+    let ImagePruneOutcome {
+        images_removed,
+        blob_report,
+        cache_report,
+    } = prune_images_and_reclaim(&store, &containers, all, &filters)?;
     let (build_scratch_entries_removed, build_scratch_reclaimed_bytes) =
         prune_build_scratch(&store).context("pruning abandoned build-scratch entries")?;
 
@@ -7125,6 +7184,61 @@ fn cmd_image_exists(name: &str) -> anyhow::Result<()> {
     let store = open_store()?;
     if resolve_image_by_reference_or_id(&store, name)?.is_none() {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `ociman image prune`'s own `--json` output — the same fields
+/// [`PruneResult`] uses for its own identical passes, minus
+/// `containers_removed`/`build_scratch_*` (see [`ImageCommand::Prune`]'s
+/// own doc comment for why: neither is ever touched by this narrower
+/// command at all).
+#[derive(Debug, Serialize)]
+struct ImagePruneResult {
+    images_removed: Vec<String>,
+    blobs_removed: usize,
+    blobs_reclaimed_bytes: u64,
+    rootfs_cache_entries_removed: usize,
+    rootfs_cache_reclaimed_bytes: u64,
+}
+
+/// `ociman image prune` — see [`ImageCommand::Prune`]'s own doc
+/// comment for the exact real, checked-directly scope (never touches
+/// any container, unlike `ociman prune`/real `podman system prune`).
+fn cmd_image_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
+    let store = open_store()?;
+    let filters = parse_prune_filters(filter)?;
+    let containers = open_container_store()?;
+    let ImagePruneOutcome {
+        images_removed,
+        blob_report,
+        cache_report,
+    } = prune_images_and_reclaim(&store, &containers, all, &filters)?;
+
+    if json {
+        oci_cli_common::output::print_json(&ImagePruneResult {
+            images_removed,
+            blobs_removed: blob_report.removed.len(),
+            blobs_reclaimed_bytes: blob_report.reclaimed_bytes,
+            rootfs_cache_entries_removed: cache_report.removed.len(),
+            rootfs_cache_reclaimed_bytes: cache_report.reclaimed_bytes,
+        })?;
+    } else {
+        println!(
+            "images: removed {} ({})",
+            images_removed.len(),
+            images_removed.join(", ")
+        );
+        println!(
+            "blobs: removed {}, reclaimed {} bytes",
+            blob_report.removed.len(),
+            blob_report.reclaimed_bytes
+        );
+        println!(
+            "rootfs cache: removed {}, reclaimed {} bytes",
+            cache_report.removed.len(),
+            cache_report.reclaimed_bytes
+        );
     }
     Ok(())
 }
