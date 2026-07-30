@@ -366,3 +366,182 @@ fn create_label_merges_with_and_overrides_the_image_own_inherited_labels() {
         "{view:?}"
     );
 }
+
+/// `inspect --format` (0332) renders a single scalar field with no
+/// surrounding JSON quoting -- matching real `podman inspect --format
+/// '{{.Field}}'`'s own default scalar-rendering exactly, just against
+/// this project's own (lowercase) field names.
+#[test]
+fn inspect_format_renders_a_single_scalar_field() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-format:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "format-me",
+            "ociman-test/inspect-format:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let format = ociman(
+        storage_dir.path(),
+        &["inspect", "format-me", "--format", "{{.status}}"],
+    );
+    assert!(
+        format.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&format.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&format.stdout).trim(),
+        "created",
+        "a scalar string field must render with no surrounding JSON quotes"
+    );
+}
+
+/// Multiple `{{.field}}` placeholders in one template, mixed with
+/// literal text, all get substituted -- and a numeric field (`pid`)
+/// renders as a plain number, matching Go's own default numeric
+/// scalar rendering.
+#[test]
+fn inspect_format_supports_multiple_placeholders_and_literal_text() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-format-multi:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "format-multi",
+            "ociman-test/inspect-format-multi:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let format = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "format-multi",
+            "--format",
+            "status={{.status}} pid={{.pid}}",
+        ],
+    );
+    assert!(format.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&format.stdout).trim(),
+        "status=created pid=0"
+    );
+}
+
+/// A nested field (dot-path navigation through a JSON object) resolves
+/// correctly, and an array field renders as its own compact JSON
+/// representation -- matching real image-config inspection's own
+/// nested `Config`/`RootFS` shape.
+#[test]
+fn inspect_format_navigates_a_nested_field_on_an_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-format-nested:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec!["/bin/sh".to_string()]),
+            ..Default::default()
+        },
+    );
+
+    let format = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "ociman-test/inspect-format-nested:latest",
+            "--format",
+            "{{.config.Cmd}}",
+        ],
+    );
+    assert!(
+        format.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&format.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&format.stdout).trim(),
+        "[\"/bin/sh\"]"
+    );
+}
+
+/// An unresolvable field path is a real, immediate error, matching
+/// real Go templates' own "can't evaluate field" failure for a typo'd
+/// field name rather than a silent empty string.
+#[test]
+fn inspect_format_of_an_unknown_field_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-format-error:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "format-error",
+            "ociman-test/inspect-format-error:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let format = ociman(
+        storage_dir.path(),
+        &["inspect", "format-error", "--format", "{{.nosuchfield}}"],
+    );
+    assert!(!format.status.success());
+    assert!(
+        String::from_utf8_lossy(&format.stderr).contains("no field"),
+        "{}",
+        String::from_utf8_lossy(&format.stderr)
+    );
+}

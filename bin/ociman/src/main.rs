@@ -1304,6 +1304,25 @@ enum Command {
     Inspect {
         /// A container's ID/`--name`, or an image reference.
         reference: String,
+        /// Render a single field via a Go-template-*lite* string
+        /// instead of printing the full JSON (`--format`/`-f`,
+        /// matching real `podman inspect --format`/`docker inspect
+        /// --format`'s own identical flag): exactly one or more
+        /// `{{.field}}`/`{{.nested.field}}` placeholders, dot-
+        /// separated JSON field lookups — no pipelines, functions, or
+        /// control flow, a deliberately narrow first slice. Field
+        /// names are this project's own JSON output field names
+        /// directly (lowercase, e.g. `{{.pid}}`, `{{.stop_signal}}`),
+        /// not real podman's own Go-struct-field-name casing
+        /// (`{{.State.Pid}}`) — this project's own JSON schema is
+        /// already deliberately narrower and differently shaped, so
+        /// promising byte-for-byte template compatibility with real
+        /// podman would be misleading regardless. An unresolvable
+        /// field path is a real, immediate error, matching real Go
+        /// templates' own "can't evaluate field" failure for a
+        /// typo'd one rather than a silent empty string.
+        #[arg(long = "format", short = 'f', value_name = "TEMPLATE")]
+        format: Option<String>,
     },
     /// Pull (if not already present), extract, and run an image's
     /// container — rootless, foreground. Kept (listable via `ps`,
@@ -2582,7 +2601,9 @@ fn main() -> std::process::ExitCode {
             Some(Command::System { command }) => match command {
                 SystemCommand::Df { verbose } => cmd_system_df(cli.global.json, verbose),
             },
-            Some(Command::Inspect { reference }) => cmd_inspect(&reference, cli.global.json),
+            Some(Command::Inspect { reference, format }) => {
+                cmd_inspect(&reference, cli.global.json, format.as_deref())
+            }
             Some(Command::Run {
                 args,
                 rm,
@@ -5296,18 +5317,13 @@ fn print_system_df_row(label: &str, row: &SystemDfRow) {
 /// matches this project's own established preference for the clearer
 /// of two plausible error messages over a technically-more-complete
 /// one.
-fn cmd_inspect(reference_str: &str, json: bool) -> anyhow::Result<()> {
+fn cmd_inspect(reference_str: &str, json: bool, format: Option<&str>) -> anyhow::Result<()> {
     if let Ok(containers) = open_container_store()
         && let Ok(id) = resolve_container_id(&containers, reference_str)
         && let Ok(state) = containers.load(&id)
     {
         let view = ContainerInspectView::from_state(&state);
-        if json {
-            oci_cli_common::output::print_json(&view)?;
-        } else {
-            println!("{}", oci_cli_common::output::json_string(&view)?);
-        }
-        return Ok(());
+        return print_inspect_result(&view, json, format);
     }
 
     let store = open_store()?;
@@ -5319,12 +5335,99 @@ fn cmd_inspect(reference_str: &str, json: bool) -> anyhow::Result<()> {
         .image_config(record)
         .with_context(|| format!("reading config for {}", record.reference))?;
 
+    print_inspect_result(&config, json, format)
+}
+
+/// Shared by both of `cmd_inspect`'s own two resolution branches
+/// (container, then image): `--format`, if given, takes priority over
+/// `--json` (matching real `podman inspect`'s own identical
+/// precedence) and renders `value` via [`render_format_template`];
+/// otherwise the existing pretty-JSON-either-way behavior is
+/// unchanged (`--json` and no-`--json` currently print identically —
+/// a pre-existing quirk this note doesn't touch).
+fn print_inspect_result<T: Serialize>(
+    value: &T,
+    json: bool,
+    format: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(template) = format {
+        let json_value = serde_json::to_value(value)?;
+        println!("{}", render_format_template(template, &json_value)?);
+        return Ok(());
+    }
     if json {
-        oci_cli_common::output::print_json(&config)?;
+        oci_cli_common::output::print_json(value)?;
     } else {
-        println!("{}", oci_cli_common::output::json_string(&config)?);
+        println!("{}", oci_cli_common::output::json_string(value)?);
     }
     Ok(())
+}
+
+/// Render `template` (a Go-template-*lite* string — see
+/// [`Command::Inspect`]'s own `format` field doc comment for the exact
+/// scope) by substituting each `{{.path.to.field}}` placeholder with
+/// its resolved value looked up in `value` (a JSON object, dot-path
+/// navigated one segment at a time via [`serde_json::Value::get`]).
+fn render_format_template(template: &str, value: &serde_json::Value) -> anyhow::Result<String> {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        let end = after_open
+            .find("}}")
+            .ok_or_else(|| anyhow::anyhow!("unterminated {{{{ in format template {template:?}"))?;
+        let path = after_open[..end].trim();
+        let path = path.strip_prefix('.').ok_or_else(|| {
+            anyhow::anyhow!(
+                "format template field {path:?} must start with '.' (e.g. \"{{{{.pid}}}}\")"
+            )
+        })?;
+        anyhow::ensure!(
+            !path.is_empty(),
+            "format template has an empty {{{{.}}}} placeholder"
+        );
+        let resolved = resolve_json_path(value, path)?;
+        out.push_str(&format_json_scalar(resolved));
+        rest = &after_open[end + 2..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Dot-path-navigate `value` one segment at a time (e.g. `"a.b.c"` ->
+/// `value["a"]["b"]["c"]`) — a real, immediate error the moment any
+/// segment doesn't resolve to an existing field, matching real Go
+/// templates' own "can't evaluate field" failure for a typo'd field
+/// name rather than silently producing an empty value.
+fn resolve_json_path<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> anyhow::Result<&'a serde_json::Value> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = current
+            .get(segment)
+            .ok_or_else(|| anyhow::anyhow!("format template: no field {segment:?} in {path:?}"))?;
+    }
+    Ok(current)
+}
+
+/// Render one resolved JSON value the way Go's own `text/template`
+/// renders a scalar by default (`fmt.Sprint`): a string prints with no
+/// surrounding quotes, a number/bool prints its own natural
+/// representation, `null` prints as an empty string (matching Go's
+/// own `<nil>`-avoiding convention for a typed nil-equivalent), and —
+/// a real, deliberate narrowing since this project's own template
+/// engine has no object/array-specific formatting verb at all yet —
+/// an object or array prints as its own compact JSON representation
+/// instead of Go's own `map[k:v]`/`[a b c]` syntax.
+fn format_json_scalar(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
