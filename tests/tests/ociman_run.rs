@@ -938,6 +938,234 @@ fn run_env_flag_wildcard_prefix_pulls_every_matching_host_variable() {
     );
 }
 
+/// `--env-host` layers this process's own entire live environment
+/// into the container, matching real `podman run --env-host` exactly
+/// -- including that it genuinely *wins* over the image's own
+/// declared value for a shared key (checked directly against
+/// `~/git/podman/pkg/specgen/generate/container.go`'s own
+/// `CompleteSpec`, not the more intuitive-seeming "image always
+/// wins").
+#[test]
+fn run_env_host_flag_layers_in_the_live_environment_and_wins_over_the_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/env-host:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            env: vec!["PATH=/image-declared/bin".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .env("PATH", "/from-the-live-host/bin")
+        .env("OCIMAN_ENV_HOST_TEST_PROBE", "from-host")
+        .args(["run", "--rm", "--env-host"])
+        .args(["ociman-test/env-host:latest"])
+        .args([
+            "/bin/sh",
+            "-c",
+            "echo \"$PATH\" \"$OCIMAN_ENV_HOST_TEST_PROBE\"",
+        ])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "/from-the-live-host/bin from-host\n",
+        "--env-host must win over the image's own declared PATH and add every other live \
+         host variable too"
+    );
+}
+
+/// Without `--env-host`, the image's own declared env is completely
+/// unaffected by this process's own live environment -- a plain
+/// control proving the previous test's win is really `--env-host`'s
+/// own effect, not some other leak.
+#[test]
+fn run_without_env_host_flag_the_images_own_env_is_untouched_by_the_live_host() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/no-env-host:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            env: vec!["PATH=/image-declared/bin".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .env("PATH", "/from-the-live-host/bin")
+        .args(["run", "--rm"])
+        .args(["ociman-test/no-env-host:latest"])
+        .args(["/bin/sh", "-c", "echo \"$PATH\""])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "/image-declared/bin\n",
+        "without --env-host, the image's own declared PATH must win"
+    );
+}
+
+/// `--unsetenv NAME` removes a named variable the image would
+/// otherwise declare, matching real `podman run --unsetenv` exactly.
+/// Repeatable.
+#[test]
+fn run_unsetenv_flag_removes_a_named_variable_the_image_declared() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/unsetenv:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            env: vec!["FOO=bar".to_string(), "KEEP=me".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--unsetenv", "FOO"])
+        .args(["ociman-test/unsetenv:latest"])
+        .args(["/bin/sh", "-c", "echo \"FOO=[$FOO]\" \"KEEP=[$KEEP]\""])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "FOO=[] KEEP=[me]\n",
+        "--unsetenv should remove only the named variable"
+    );
+}
+
+/// `--unsetenv-all` removes every default/image-declared environment
+/// variable at once, matching real `podman run --unsetenv-all`
+/// exactly -- but an explicit `-e`/`--env` still wins, applied after.
+///
+/// Doesn't check `PATH` specifically: real shells (busybox's own
+/// `ash` included, confirmed directly) auto-populate their own
+/// fallback `PATH` internally whenever it's genuinely absent from
+/// their process environment at all -- a real property of the shell
+/// itself, not of this container's own spec, that would make a
+/// `PATH=[]` assertion here a false negative regardless of whether
+/// `--unsetenv-all` actually worked.
+#[test]
+fn run_unsetenv_all_flag_clears_every_default_but_explicit_env_still_wins() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/unsetenv-all:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            env: vec!["FOO=bar".to_string(), "BAZ=qux".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--unsetenv-all", "-e", "EXPLICIT=still-here"])
+        .args(["ociman-test/unsetenv-all:latest"])
+        .args([
+            "/bin/sh",
+            "-c",
+            "echo \"FOO=[$FOO]\" \"BAZ=[$BAZ]\" \"EXPLICIT=[$EXPLICIT]\"",
+        ])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "FOO=[] BAZ=[] EXPLICIT=[still-here]\n",
+        "--unsetenv-all should clear every default, but an explicit -e must still win"
+    );
+}
+
+/// A real, checked-directly upstream quirk (`~/git/podman/pkg/
+/// specgen/generate/container.go`'s own `CompleteSpec`): `--env-host`
+/// is applied *after* `--unsetenv-all` clears everything, so
+/// `--unsetenv-all --env-host` together do **not** end up with an
+/// empty environment -- the live host environment fully repopulates
+/// it. Deliberately ported verbatim rather than "fixed".
+#[test]
+fn run_unsetenv_all_does_not_defeat_env_host_applied_after_it() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/unsetenv-all-env-host:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            env: vec!["PATH=/image/bin".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .env("OCIMAN_UNSETENV_ALL_ENV_HOST_PROBE", "revived")
+        .args(["run", "--rm", "--unsetenv-all", "--env-host"])
+        .args(["ociman-test/unsetenv-all-env-host:latest"])
+        .args([
+            "/bin/sh",
+            "-c",
+            "echo \"$OCIMAN_UNSETENV_ALL_ENV_HOST_PROBE\"",
+        ])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "revived\n",
+        "--env-host, applied after --unsetenv-all, should still repopulate the environment \
+         from the live host"
+    );
+}
+
 /// `--hostname` really does set the container's own UTS hostname,
 /// matching real `docker run --hostname`/`podman run --hostname`
 /// exactly -- checked the most direct way available: printing the

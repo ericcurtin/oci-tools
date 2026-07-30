@@ -509,6 +509,45 @@ struct RunArgs {
     /// precedence).
     #[arg(long = "env-file", value_name = "PATH")]
     env_file: Vec<PathBuf>,
+    /// Layer this process's own entire live environment into the
+    /// container, matching real `podman run --env-host` exactly
+    /// (checked directly against `~/git/podman/pkg/specgen/generate/
+    /// container.go`'s own `CompleteSpec`, not guessed from the help
+    /// text — a real, surprising precedence, ported verbatim rather
+    /// than "fixed": this **wins** over the image's own declared
+    /// value for a shared key, applied *after* `--unsetenv`/
+    /// `--unsetenv-all`, so it genuinely revives a variable either of
+    /// those just removed if this process's own live environment
+    /// happens to have it set). Still loses to an explicit `-e`/
+    /// `--env`/`--env-file`, applied last, unconditionally. Hidden on
+    /// real podman's own remote clients — no equivalent concept
+    /// here, so always available.
+    #[arg(long = "env-host")]
+    env_host: bool,
+    /// Remove a named environment variable the container would
+    /// otherwise get (from the image's own declared default, or a
+    /// prior `--env-host`) before the container ever starts —
+    /// matching real `podman run --unsetenv` exactly. Repeatable;
+    /// still loses to an explicit `-e NAME=value`/`--env-file`
+    /// re-declaring the same name, and to `--env-host` itself if the
+    /// named variable also happens to be set in this process's own
+    /// live environment (see `--env-host`'s own doc comment for
+    /// exactly why).
+    #[arg(long = "unsetenv", value_name = "NAME")]
+    unsetenv: Vec<String>,
+    /// Remove *every* environment variable the container would
+    /// otherwise get by default (the built-in fallback, and the
+    /// image's own declared env alike) before the container ever
+    /// starts, matching real `podman run --unsetenv-all` exactly.
+    /// Still loses to an explicit `-e`/`--env`/`--env-file`, and —
+    /// checked directly, a real, easy-to-miss upstream quirk — to
+    /// `--env-host` too, which is applied *after* this clears
+    /// everything and so still fully repopulates the container's
+    /// environment from this process's own live one if both are
+    /// given together (`podman run --unsetenv-all --env-host` does
+    /// **not** end up with an empty environment).
+    #[arg(long = "unsetenv-all")]
+    unsetenv_all: bool,
     /// Set the container's own UTS hostname, matching real
     /// `docker run --hostname`/`podman run --hostname` exactly.
     /// Defaults to the container's own generated id (real
@@ -6006,6 +6045,9 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             capabilities,
             args.read_only,
             &combined_env,
+            args.env_host,
+            &args.unsetenv,
+            args.unsetenv_all,
             args.hostname.as_deref(),
             args.workdir.as_deref(),
             entrypoint.as_deref(),
@@ -10553,6 +10595,9 @@ fn synthesize_spec(
     capabilities: Vec<String>,
     read_only: bool,
     env: &[String],
+    env_host: bool,
+    unsetenv: &[String],
+    unsetenv_all: bool,
     hostname: Option<&str>,
     workdir: Option<&str>,
     entrypoint: Option<&[String]>,
@@ -10642,6 +10687,49 @@ fn synthesize_spec(
     } else {
         container_config.env
     };
+    // `--unsetenv`/`--unsetenv-all`/`--env-host`, in that real, exact
+    // order -- checked directly against real podman's own
+    // `CompleteSpec` (`~/git/podman/pkg/specgen/generate/
+    // container.go`): `--unsetenv NAME` deletes a named variable from
+    // whatever's accumulated so far (the built-in default or the
+    // image's own declared env, from just above); `--unsetenv-all`
+    // then clears everything left, unconditionally; and `--env-host`
+    // is applied **last**, unconditionally layering in this process's
+    // own entire live environment -- which genuinely *wins* a shared
+    // key over the image's own declared value (not just "fills in
+    // what's missing"), and genuinely *revives* a variable
+    // `--unsetenv`/`--unsetenv-all` just removed, if the host process
+    // happens to have it set. Checked directly, not assumed: real
+    // podman's own `Join(defaultEnvs, osEnv)` runs *after* both
+    // deletion steps, and `Join(base, override)` always lets
+    // `override` win -- so `podman run --unsetenv-all --env-host`
+    // genuinely still gets the *entire* host environment back, and
+    // `podman run --env-host` genuinely overrides even an image's own
+    // declared `PATH` with this process's own live one. A real,
+    // easy-to-get-backwards interaction, deliberately ported exactly
+    // rather than "fixed" into the more intuitive-seeming "image
+    // always wins" — matching this project's own established
+    // precedent for preserving a real, even-surprising upstream
+    // behavior rather than silently improving on it (e.g.
+    // `docs/design/0330`).
+    if !unsetenv.is_empty() {
+        process.env.retain(|entry| {
+            let key = entry.split('=').next().unwrap_or(entry.as_str());
+            !unsetenv.iter().any(|name| name == key)
+        });
+    }
+    if unsetenv_all {
+        process.env.clear();
+    }
+    if env_host {
+        for (key, value) in std::env::vars() {
+            build::set_env_var(&mut process.env, &key, &value);
+        }
+    }
+    // `-e`/`--env`/`--env-file` (already combined by the caller, see
+    // `prepare_container`'s own doc comment) always wins last,
+    // regardless of any of the above -- unchanged, matching real
+    // podman's own final `Join(defaultEnvs, s.Env)` exactly (0341).
     build::apply_env_overrides(&mut process.env, env);
     // `Spec::example()`'s own capability set is real `runc spec`'s own
     // bare-scaffold default (3 capabilities) -- correct for `ocirun`
