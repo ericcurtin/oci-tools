@@ -2652,11 +2652,21 @@ enum HealthcheckCommand {
 }
 
 /// `ociman system`'s own subcommands — matching real `podman system`'s
-/// own real subset this project implements so far: just `df`. Real
-/// podman's own further subcommands (`connection`/`events`/`migrate`/
-/// `renumber`/`reset`/`service`/`prune`) are out of scope for now —
-/// `info` already exists as this project's own top-level `ociman info`
-/// (matching real podman's own identical top-level alias for it).
+/// own real subset this project implements so far: `df`, `reset`.
+/// Real podman's own remaining subcommands (`connection`/`events`/
+/// `migrate`/`renumber`/`service`) are out of scope for now (no
+/// daemon, no remote API, no lock-numbering/storage-migration concept
+/// at all). `info` already exists as this project's own top-level
+/// `ociman info` (matching real podman's own identical top-level alias
+/// for it), and `prune` (real `podman system prune`) already exists as
+/// this project's own top-level `ociman prune` instead — a real,
+/// deliberate divergence, not a port of an identical real alias:
+/// checked directly, real podman has *no* bare top-level `podman
+/// prune` at all (`podman prune` itself is an "unrecognized command"
+/// error) — this project's own flat-top-level convention for it
+/// predates `system` even having a subcommand family of its own
+/// (`ociman prune` since `0111`/`0117`, well before this enum's own
+/// first member, `system df`, `0263`).
 #[derive(Debug, clap::Subcommand)]
 enum SystemCommand {
     /// Real disk usage across images, containers, and local volumes —
@@ -2680,6 +2690,41 @@ enum SystemCommand {
         /// divergence, not an oversight.
         #[arg(short, long)]
         verbose: bool,
+    },
+    /// Wipe this project's own real storage back to a pristine, empty
+    /// state in one call — matching real `podman system reset`'s own
+    /// core effect exactly (checked directly, `~/git/podman/libpod/
+    /// reset.go`'s own `Runtime::Reset`: force-removes every
+    /// container, volume, and image, regardless of status). Real
+    /// podman's own version goes on to delete its own `graphRoot`/
+    /// `runRoot` directories entirely afterward, a real, deliberate
+    /// divergence this project doesn't follow as literally: this
+    /// project's own storage root is *shared* across every binary
+    /// (`ociman`/`ocirun`/`ocicri`/`ocibox`/`ociboot`, this repo's own
+    /// established "one root, not five" design choice) — `ociman
+    /// system reset` only ever clears what `ociman` itself actually
+    /// owns (`images`/`blobs` via [`oci_store::Store`], `containers`,
+    /// `volumes`, `rootfs-cache`, `build-scratch`), leaving `ocibox`'s
+    /// own `boxes/` and `ocicri`'s own `cri-containers/`/
+    /// `cri-sandboxes/`/`cri-bundles/` completely untouched — a
+    /// genuinely different tool's own separate state that just
+    /// happens to share a disk should never be silently destroyed by
+    /// this one's own reset.
+    ///
+    /// Prints nothing at all on success, matching a real installed
+    /// `podman system reset -f`'s own checked-directly identical
+    /// silent completion (`reset.go`'s own CLI layer has no success
+    /// message of its own either, only the pre-confirmation warning
+    /// this project has no equivalent of in the first place).
+    Reset {
+        /// Accepted for real CLI compatibility with `podman system
+        /// reset --force`/`-f`; has no effect (this project has no
+        /// interactive confirmation prompt anywhere to skip in the
+        /// first place, the same "nothing to skip" reasoning
+        /// `ContainerCommand::Prune::force`'s own doc comment already
+        /// gives).
+        #[arg(long, short = 'f')]
+        force: bool,
     },
 }
 
@@ -3046,6 +3091,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Prune { all, filter }) => cmd_prune(cli.global.json, all, &filter),
             Some(Command::System { command }) => match command {
                 SystemCommand::Df { verbose } => cmd_system_df(cli.global.json, verbose),
+                SystemCommand::Reset { force: _ } => cmd_system_reset(),
             },
             Some(Command::Inspect {
                 reference,
@@ -5630,6 +5676,53 @@ fn compute_container_size(
 ///   every volume with zero such dependents — matching real podman's
 ///   own identical `VolumeInUse`-gated rule.
 ///
+/// `ociman system reset` — see [`SystemCommand::Reset`]'s own doc
+/// comment for the exact real, checked-directly scope and the
+/// deliberate "only what `ociman` itself owns" divergence from real
+/// podman's own literal `graphRoot`/`runRoot` deletion. Order matters,
+/// same reasoning `ociman prune`'s own container-before-image
+/// ordering already established (`0358`): containers first (so no
+/// volume/image is ever still "in use" by the time each is reached),
+/// then volumes, then images (freeing their own blobs/rootfs-cache
+/// entries in the same pass), then the build-scratch directory —
+/// wiped unconditionally here, unlike `ociman prune`'s own age-gated
+/// `prune_build_scratch` pass, matching real podman's own "all build
+/// cache" reset scope exactly (a reset has no reason to keep anything
+/// at all, fresh or not).
+fn cmd_system_reset() -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    for state in containers.list().context("listing containers")? {
+        remove_container(&containers, &state.id, true, None)
+            .with_context(|| format!("removing container {}", state.id))?;
+    }
+
+    let volumes = open_volume_store()?;
+    for record in volumes.list().context("listing volumes")? {
+        volumes
+            .remove(&record.name)
+            .with_context(|| format!("removing volume {:?}", record.name))?;
+    }
+
+    let store = open_store()?;
+    for record in store.list_images().context("listing images")? {
+        store
+            .remove_image(&record.reference)
+            .with_context(|| format!("removing image {}", record.reference))?;
+    }
+    store
+        .gc()
+        .context("garbage-collecting unreferenced blobs")?;
+    oci_store::prune(&store, &rootfs_setup::cache_root(&store))
+        .context("pruning the rootfs cache")?;
+
+    let scratch_root = build::build_scratch_root(&store);
+    if scratch_root.is_dir() {
+        std::fs::remove_dir_all(&scratch_root)
+            .with_context(|| format!("removing {}", scratch_root.display()))?;
+    }
+    Ok(())
+}
+
 /// `-v`/`--verbose` (the real per-image/per-container/per-volume
 /// breakdown table) and `--format` are still ahead — this is
 /// deliberately just the summary real `podman system df` prints with
