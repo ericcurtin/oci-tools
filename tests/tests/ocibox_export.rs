@@ -1105,3 +1105,232 @@ fn export_app_label_only_touches_lines_starting_with_name() {
         "a Comment= merely containing the substring \"Name\" must be left untouched: {contents:?}"
     );
 }
+
+/// `--list-apps` (0329) shows every real, previously-exported
+/// application from `--box`, with its own default label stripped back
+/// off for a clean display -- matching real `distrobox export
+/// --list-apps`'s own identical cosmetic convention.
+#[test]
+fn export_list_apps_shows_a_previously_exported_app_with_a_clean_name() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(&storage_dir, "testbox", SAMPLE_DESKTOP_FILE);
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(export.status.success());
+
+    let list = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--list-apps",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        list.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&list.stdout).into_owned();
+    let dest = export_dir.path().join("testbox-myapp.desktop");
+    assert!(
+        stdout.contains("My App") && stdout.contains(dest.to_str().unwrap()),
+        "{stdout:?}"
+    );
+    assert!(
+        !stdout.contains("(on testbox)"),
+        "the default label should be stripped back off for display: {stdout:?}"
+    );
+}
+
+/// `--list-apps` on a box with nothing exported at all is a real,
+/// silent, empty success -- not an error -- matching real distrobox's
+/// own identical tolerance for a search directory with no matches (or
+/// not existing at all yet).
+#[test]
+fn export_list_apps_on_a_box_with_nothing_exported_is_empty() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let list = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--list-apps",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        list.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.stdout.is_empty());
+}
+
+/// `--list-binaries` (0329) shows every real, previously-exported
+/// binary from `--box`, named after the exported file's own basename
+/// (this project's own established `--bin` destination-naming
+/// convention already makes that exactly the original binary's own
+/// name).
+#[test]
+fn export_list_binaries_shows_a_previously_exported_binary() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--bin",
+            "/bin/echo",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(export.status.success());
+
+    let list = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--list-binaries",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        list.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&list.stdout).into_owned();
+    let dest = export_dir.path().join("echo");
+    assert!(
+        stdout.contains("echo") && stdout.contains(dest.to_str().unwrap()),
+        "{stdout:?}"
+    );
+}
+
+/// `--list-binaries`/`--list-apps` only ever shows exports belonging
+/// to the given `--box`, never a different one's -- even when both
+/// share the exact same `--export-path`.
+#[test]
+fn export_list_binaries_only_shows_exports_from_the_given_box() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "boxone");
+    make_box(&storage_dir, "boxtwo");
+    let export_dir = tempfile::tempdir().unwrap();
+
+    // Different basenames (`echo`/`sh`) so the two boxes' own exports
+    // don't collide at the same destination filename (`--bin` exports
+    // are never box-name-prefixed, matching real distrobox exactly).
+    for (box_name, bin) in [("boxone", "/bin/echo"), ("boxtwo", "/bin/sh")] {
+        let export = ocibox(
+            storage_dir.path(),
+            &[
+                "export",
+                "--box",
+                box_name,
+                "--bin",
+                bin,
+                "--export-path",
+                export_dir.path().to_str().unwrap(),
+            ],
+        );
+        assert!(export.status.success());
+    }
+
+    let list = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "boxone",
+            "--list-binaries",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(list.status.success());
+    let stdout = String::from_utf8_lossy(&list.stdout).into_owned();
+    assert!(stdout.contains("echo"), "{stdout:?}");
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "only boxone's own single exported binary should be listed, not boxtwo's too: {stdout:?}"
+    );
+}
+
+/// `--list-apps`/`--list-binaries` cannot be combined with each other,
+/// or with `--app`/`--bin`/`--delete`/`--export-label`.
+#[test]
+fn export_list_apps_and_list_binaries_are_mutually_exclusive_with_other_actions() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let both_lists = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--list-apps",
+            "--list-binaries",
+        ],
+    );
+    assert!(!both_lists.status.success());
+    assert!(
+        String::from_utf8_lossy(&both_lists.stderr).contains("choose only one"),
+        "{}",
+        String::from_utf8_lossy(&both_lists.stderr)
+    );
+
+    let list_and_app = ocibox(
+        storage_dir.path(),
+        &["export", "--box", "testbox", "--list-apps", "--app", "foo"],
+    );
+    assert!(!list_and_app.status.success());
+    assert!(
+        String::from_utf8_lossy(&list_and_app.stderr).contains("cannot be combined"),
+        "{}",
+        String::from_utf8_lossy(&list_and_app.stderr)
+    );
+}

@@ -262,6 +262,21 @@ enum Command {
         /// to).
         #[arg(long = "export-label", value_name = "LABEL")]
         export_label: Option<String>,
+        /// List every application already exported from `--box`
+        /// (`--list-apps`, matching real `distrobox export`'s own
+        /// identical flag), instead of exporting/deleting anything —
+        /// mutually exclusive with `--app`/`--bin`/`--delete`/
+        /// `--export-label`.
+        #[arg(long = "list-apps")]
+        list_apps: bool,
+        /// List every binary already exported from `--box`
+        /// (`--list-binaries`, matching real `distrobox export`'s own
+        /// identical flag; `--export-path` selects a non-default
+        /// search directory the same way it does for exporting),
+        /// instead of exporting/deleting anything — mutually exclusive
+        /// with `--app`/`--bin`/`--delete`/`--export-label`.
+        #[arg(long = "list-binaries")]
+        list_binaries: bool,
     },
 }
 
@@ -294,13 +309,19 @@ fn main() -> std::process::ExitCode {
                 export_path,
                 delete,
                 export_label,
+                list_apps,
+                list_binaries,
             }) => cmd_export(
                 &box_name,
-                app.as_deref(),
-                bin.as_deref(),
-                export_path.as_deref(),
-                delete,
-                export_label.as_deref(),
+                ExportArgs {
+                    app: app.as_deref(),
+                    bin: bin.as_deref(),
+                    export_path: export_path.as_deref(),
+                    delete,
+                    export_label: export_label.as_deref(),
+                    list_apps,
+                    list_binaries,
+                },
             ),
             None => anyhow::bail!(
                 "no subcommand given (try `ocibox create --image ... --name ...`); \
@@ -938,14 +959,46 @@ fn home_dir() -> anyhow::Result<PathBuf> {
 /// `distrobox export`'s own identical "choose only one action" rule
 /// (checked directly, `distrobox-export`'s own `if [ -n
 /// "${exported_app}" ] && [ -n "${exported_bin}" ]` guard).
-fn cmd_export(
-    box_name: &str,
-    app: Option<&str>,
-    bin: Option<&str>,
-    export_path: Option<&Path>,
+/// Bundles `ocibox export`'s own many, mostly-mutually-exclusive CLI
+/// flags into one value — kept here purely to stay under clippy's own
+/// `too_many_arguments` threshold on [`cmd_export`] itself; every
+/// field is still just a plain, direct pass-through of its own
+/// `Command::Export` variant field.
+struct ExportArgs<'a> {
+    app: Option<&'a str>,
+    bin: Option<&'a str>,
+    export_path: Option<&'a Path>,
     delete: bool,
-    export_label: Option<&str>,
-) -> anyhow::Result<()> {
+    export_label: Option<&'a str>,
+    list_apps: bool,
+    list_binaries: bool,
+}
+
+fn cmd_export(box_name: &str, args: ExportArgs) -> anyhow::Result<()> {
+    let ExportArgs {
+        app,
+        bin,
+        export_path,
+        delete,
+        export_label,
+        list_apps,
+        list_binaries,
+    } = args;
+    if list_apps || list_binaries {
+        anyhow::ensure!(
+            !list_apps || !list_binaries,
+            "choose only one of --list-apps or --list-binaries"
+        );
+        anyhow::ensure!(
+            app.is_none() && bin.is_none() && !delete && export_label.is_none(),
+            "--list-apps/--list-binaries cannot be combined with --app/--bin/--delete/--export-label"
+        );
+        return if list_apps {
+            cmd_export_list_apps(box_name, export_path)
+        } else {
+            cmd_export_list_binaries(box_name, export_path)
+        };
+    }
     match (app, bin) {
         (Some(_), Some(_)) => anyhow::bail!("choose only one of --app or --bin"),
         (None, None) => anyhow::bail!("either --app or --bin is required"),
@@ -1044,6 +1097,73 @@ fn cmd_export_bin(
         export_dir.display()
     );
     Ok(())
+}
+
+/// `ocibox export --box <NAME> --list-binaries`: every file directly
+/// under `--export-path` (or [`default_export_path`]) that's genuinely
+/// one of `box_name`'s own exported wrappers — matching real
+/// `distrobox export --list-binaries` exactly in spirit, though its
+/// own name-extraction logic (`grep -B1 "fi" | grep exec | cut -d'
+/// ' -f2`) is too tightly coupled to real distrobox's own, much more
+/// elaborate wrapper-script template to reuse here at all: this
+/// project's own wrapper is simpler (one `exec` line, no `fi`
+/// anywhere), and its own destination *filename* already is exactly
+/// the exported binary's own basename (`cmd_export_bin`'s own `let
+/// dest_file = export_dir.join(bin_name)`), so the file name itself is
+/// used as the displayed name instead — equivalent information, no
+/// fragile re-parsing needed. Printed `%-20s | %-30s` (name, path),
+/// matching real distrobox's own identical column format.
+fn cmd_export_list_binaries(box_name: &str, export_path: Option<&Path>) -> anyhow::Result<()> {
+    validate_box_name(box_name)?;
+    let export_dir = match export_path {
+        Some(dir) => dir.to_path_buf(),
+        None => default_export_path()?,
+    };
+    for (name, path) in exported_files_for_box(&export_dir, box_name, EXPORT_MARKER)? {
+        println!("{name:<20} | {}", path.display());
+    }
+    Ok(())
+}
+
+/// Every real, plain (non-directory) file directly under `export_dir`
+/// whose own content contains both `marker` and `box_name`'s own
+/// `# box: <box_name>` line (this project's own established
+/// marker/box-name comment convention, reused here as a real, more
+/// precise per-box filter than real distrobox's own path-substring
+/// check against `$CONTAINER_ID`) — `(display_name, path)` pairs,
+/// sorted by name. `display_name` is the file's own name; callers that
+/// need something else (a `.desktop` file's own `Name=` value) compute
+/// it themselves.
+fn exported_files_for_box(
+    export_dir: &Path,
+    box_name: &str,
+    marker: &str,
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let Ok(entries) = std::fs::read_dir(export_dir) else {
+        return Ok(Vec::new());
+    };
+    let box_line = format!("# box: {box_name}");
+    let mut found = Vec::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("reading {}", export_dir.display()))?
+            .path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if content.contains(marker) && content.lines().any(|l| l == box_line) {
+            let name = path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            found.push((name, path));
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 /// The two canonical `.desktop`-file directories real `distrobox-
@@ -1376,6 +1496,54 @@ fn resolve_export_label(export_label: Option<&str>, box_name: &str) -> String {
         None => format!(" (on {box_name})"),
         Some("none") => String::new(),
         Some(label) => format!(" {label}"),
+    }
+}
+
+/// `ocibox export --box <NAME> --list-apps`: every `.desktop` file
+/// directly under `--export-path` (or [`default_app_export_path`])
+/// that's genuinely one of `box_name`'s own exported launchers,
+/// printed as `%-20s | %-30s` (app name, path) — matching real
+/// `distrobox export --list-apps` exactly in shape, using this
+/// project's own already-established marker/box-name comment
+/// convention (see [`exported_files_for_box`]) as a real, more precise
+/// per-box filter than real distrobox's own path-substring check
+/// against `$CONTAINER_ID`.
+fn cmd_export_list_apps(box_name: &str, export_path: Option<&Path>) -> anyhow::Result<()> {
+    validate_box_name(box_name)?;
+    let export_dir = match export_path {
+        Some(dir) => dir.to_path_buf(),
+        None => default_app_export_path()?,
+    };
+    for (_, path) in exported_files_for_box(&export_dir, box_name, APP_EXPORT_MARKER)? {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let name = desktop_file_display_name(&content);
+        println!("{name:<20} | {}", path.display());
+    }
+    Ok(())
+}
+
+/// A `.desktop` file's own `Name=` value, with any `--export-label`
+/// this project's own `rewrite_desktop_file` may have appended
+/// stripped back off for a clean display — matching real distrobox's
+/// own identical `list_exported_applications` cosmetic convention
+/// exactly (`cut -d'=' -f2- | sed 's|(.*)||g'`): everything from the
+/// first `(` onward is dropped, which is simple and matches the
+/// default `" (on <box_name>)"` label shape exactly, but (a real,
+/// minor imprecision this project deliberately doesn't go further
+/// than, matching real distrobox's own identical one) would also
+/// truncate a real application name that itself genuinely contains a
+/// `(` character (e.g. `"GIMP (2.10)"` as an app's own real, unlabeled
+/// `Name=`). Falls back to the raw, unstripped line if there's no
+/// `Name=` line at all (should never happen for a real, valid
+/// `.desktop` file, but never worth a panic over).
+fn desktop_file_display_name(content: &str) -> String {
+    let Some(raw) = content.lines().find_map(|l| l.strip_prefix("Name=")) else {
+        return String::new();
+    };
+    match raw.find('(') {
+        Some(idx) => raw[..idx].trim_end().to_string(),
+        None => raw.to_string(),
     }
 }
 
