@@ -1925,6 +1925,15 @@ enum Command {
         /// why the two paths diverge this early.
         #[arg(short = 's', long)]
         squash: bool,
+        /// Write the resulting image's own digest (`sha256:<hex>`, no
+        /// trailing newline) to this file after a successful commit —
+        /// matching real `podman commit --iidfile` exactly (checked
+        /// directly, `~/git/podman/cmd/podman/containers/commit.go`:
+        /// `os.WriteFile(iidFile, []byte(response.Id), 0o644)`, the
+        /// same bare-digest-no-newline shape `ociman build --iidfile`
+        /// already established for the identical reason).
+        #[arg(long = "iidfile", value_name = "PATH")]
+        iidfile: Option<PathBuf>,
     },
     /// Gracefully stop a running container: send it a signal (`TERM`
     /// by default) and wait up to `--time` seconds for it to exit on
@@ -2855,6 +2864,7 @@ fn main() -> std::process::ExitCode {
                 pause,
                 change,
                 squash,
+                iidfile,
             }) => cmd_commit(
                 &container,
                 image.as_deref(),
@@ -2863,6 +2873,7 @@ fn main() -> std::process::ExitCode {
                 pause,
                 &change,
                 squash,
+                iidfile.as_deref(),
                 cli.global.json,
             ),
             Some(Command::Stop {
@@ -7892,6 +7903,7 @@ fn cmd_commit(
     pause: bool,
     change: &[String],
     squash: bool,
+    iidfile: Option<&Path>,
     json: bool,
 ) -> anyhow::Result<()> {
     // Parsed and validated *before* ever resolving the container or
@@ -7926,6 +7938,7 @@ fn cmd_commit(
         message,
         &change_instructions,
         squash,
+        iidfile,
         json,
         &root,
         &state,
@@ -7964,6 +7977,7 @@ fn commit_inner(
     message: Option<&str>,
     change: &[oci_dockerfile::Instruction],
     squash: bool,
+    iidfile: Option<&Path>,
     json: bool,
     root: &Path,
     state: &oci_runtime_core::PersistedState,
@@ -8094,6 +8108,15 @@ fn commit_inner(
             manifest_digest: manifest_ingested.digest.clone(),
         })
         .context("recording committed image")?;
+
+    if let Some(path) = iidfile {
+        // No trailing newline -- matches real `podman commit
+        // --iidfile` exactly (checked directly,
+        // `~/git/podman/cmd/podman/containers/commit.go`), the same
+        // bare-digest shape `ociman build --iidfile` already writes.
+        std::fs::write(path, manifest_ingested.digest.to_string())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
 
     if json {
         oci_cli_common::output::print_json(&CommitResult {

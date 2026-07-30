@@ -313,6 +313,52 @@ fn commit_with_no_image_argument_records_an_untagged_image() {
     assert_eq!(untagged["reference"], serde_json::Value::Null);
 }
 
+/// `--iidfile <path>` writes the committed image's own digest
+/// (`sha256:<hex>`, no trailing newline) to that file after a
+/// successful commit -- matching real `podman commit --iidfile`
+/// exactly, the same bare-digest shape `ociman build --iidfile`
+/// already established and tests for.
+#[test]
+fn commit_iidfile_flag_writes_the_committed_images_own_digest_with_no_trailing_newline() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/commit-iidfile-base:latest",
+        "echo hi > /new-file.txt; exit 0",
+    );
+
+    let iidfile_dir = tempfile::tempdir().unwrap();
+    let iidfile_path = iidfile_dir.path().join("iid.txt");
+    let commit = ociman(
+        storage_dir.path(),
+        &["commit", &id, "--iidfile", iidfile_path.to_str().unwrap()],
+    );
+    assert!(
+        commit.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let stdout_digest = String::from_utf8_lossy(&commit.stdout).trim().to_string();
+
+    let written = std::fs::read_to_string(&iidfile_path).unwrap();
+    assert!(
+        !written.ends_with('\n') && !written.ends_with(' '),
+        "iidfile content must have no trailing whitespace, got {written:?}"
+    );
+    assert!(
+        written.starts_with("sha256:") && written.len() == "sha256:".len() + 64,
+        "iidfile content must be a bare sha256 digest, got {written:?}"
+    );
+    assert_eq!(
+        written, stdout_digest,
+        "iidfile content must match the digest printed to stdout"
+    );
+}
+
 #[test]
 fn commit_of_an_unknown_container_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();
