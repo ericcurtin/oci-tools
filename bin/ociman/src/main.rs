@@ -2804,6 +2804,29 @@ enum ContainerCommand {
         #[arg(long)]
         external: bool,
     },
+    /// Remove every real, non-running container (`Created` or
+    /// `Stopped`, this project's own vocabulary — never `Running`/
+    /// `Paused`, and never `Creating`, matching real `podman
+    /// container prune` exactly: `~/git/podman/libpod/runtime_ctr.go`'s
+    /// own `PruneContainers` keeps only `Stopped`/`Exited`/`Created`/
+    /// `Configured`, the real states this project's own two names
+    /// already map onto). `-f`/`--force` is accepted for real CLI
+    /// compatibility but changes nothing at all — this project has no
+    /// interactive "are you sure?" confirmation prompt anywhere to
+    /// skip in the first place (real `podman container prune`'s own
+    /// *only* real effect for `--force`, checked directly,
+    /// `~/git/podman/cmd/podman/containers/prune.go`), the same
+    /// "nothing to skip" reasoning `ocibox create --pull`'s own
+    /// `--yes` doc comment already gives. Prints one line per removed
+    /// container id, no heading, matching real podman's own identical
+    /// `PrintContainerPruneResults(responses, false)` call exactly.
+    Prune {
+        /// Accepted for real CLI compatibility with `podman container
+        /// prune --force`/`-f`; has no effect (see this command's own
+        /// doc comment above).
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -3061,6 +3084,7 @@ fn main() -> std::process::ExitCode {
             },
             Some(Command::Container { command }) => match command {
                 ContainerCommand::Exists { name, external: _ } => cmd_container_exists(&name),
+                ContainerCommand::Prune { force: _ } => cmd_container_prune(cli.global.json),
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),
@@ -7017,6 +7041,38 @@ fn cmd_container_exists(name: &str) -> anyhow::Result<()> {
     let containers = open_container_store()?;
     if !container_exists(&containers, name)? {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `ociman container prune` — see [`ContainerCommand::Prune`]'s own
+/// doc comment for the exact real `Created`/`Stopped`-only removal
+/// scope and the `--force` no-op note. Reuses [`remove_container`]
+/// (the exact same primitive `ociman rm` already uses, no new
+/// removal logic of any kind), passing its own `force: true`
+/// unconditionally: unlike real podman's own model, [`remove_container`]'s
+/// own `force` parameter doubles as "skip the *any* non-`Stopped`
+/// refusal", which a merely-`Created` (never-started, no live
+/// process) container would otherwise trip on too — forcing is still
+/// perfectly safe here since eligibility above already excludes
+/// `Running`/`Paused` (the only statuses `force` genuinely changes
+/// anything real for, by actually signaling a live process).
+fn cmd_container_prune(json: bool) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let mut removed = Vec::new();
+    for state in containers.list().context("listing containers")? {
+        if matches!(state.effective_status(), Status::Created | Status::Stopped) {
+            remove_container(&containers, &state.id, true, None)
+                .with_context(|| format!("removing container {}", state.id))?;
+            removed.push(state.id);
+        }
+    }
+    if json {
+        oci_cli_common::output::print_json(&removed)?;
+    } else {
+        for id in &removed {
+            println!("{id}");
+        }
     }
     Ok(())
 }
