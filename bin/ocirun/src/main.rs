@@ -103,11 +103,9 @@ enum Command {
         /// foreground, now sees something real, the same real gap
         /// `ociman run`'s own `record_running` already closed for
         /// itself (`0023`). Automatically removed once the container
-        /// exits — matching real `runc run`'s own checked-directly
-        /// default (`r.shouldDestroy`, real runc's own `--keep`,
-        /// "do not delete the container after it exits" flag isn't
-        /// implemented here yet, a real, honest, deliberately
-        /// narrower first slice).
+        /// exits, unless `--keep` is given (see its own doc comment
+        /// below) — matching real `runc run`'s own checked-directly
+        /// default exactly (`r.shouldDestroy`).
         id: String,
         /// Path to the root of the bundle directory (defaults to the
         /// current directory).
@@ -161,6 +159,18 @@ enum Command {
         /// something an ordinary invocation needs.
         #[arg(long = "no-pivot")]
         no_pivot: bool,
+        /// Do not delete the container's own state after it exits —
+        /// matching real `runc run --keep`/`crun run --keep` exactly
+        /// (checked directly, `~/git/runc/utils_linux.go`'s own
+        /// `shouldDestroy: !cmd.Bool("keep")`; `~/git/crun/src/
+        /// libcrun/container.c`'s own identical `LIBCRUN_RUN_OPTIONS_
+        /// KEEP` gate): the container's own final `Stopped` state
+        /// (real exit code included) stays queryable via `ocirun
+        /// state`/`list` afterward, exactly as if it had been
+        /// `create`d/`start`ed and left un-`delete`d — a later
+        /// `ocirun delete` is needed to actually clean it up.
+        #[arg(long)]
+        keep: bool,
     },
     /// Create a container: set up namespaces/mounts/cgroups and leave
     /// its process blocked, waiting for `start`. Returns once setup
@@ -573,6 +583,7 @@ fn main() -> std::process::ExitCode {
                 pid_file,
                 preserve_fds,
                 no_pivot,
+                keep,
             }) => cmd_run(
                 &root,
                 &id,
@@ -580,6 +591,7 @@ fn main() -> std::process::ExitCode {
                 pid_file.as_deref(),
                 preserve_fds,
                 no_pivot,
+                keep,
             ),
             Some(Command::Create {
                 id,
@@ -788,6 +800,7 @@ fn cmd_list(root: &Path, format: &str, quiet: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_run(
     root: &Path,
     id: &str,
@@ -795,6 +808,7 @@ fn cmd_run(
     pid_file: Option<&Path>,
     preserve_fds: u32,
     no_pivot: bool,
+    keep: bool,
 ) -> anyhow::Result<()> {
     let dir = bundle.unwrap_or_else(|| Path::new("."));
     tracing::debug!(container_id = id, bundle = %dir.display(), "run starting");
@@ -866,14 +880,22 @@ fn cmd_run(
 
     // Matching real `runc run`'s own checked-directly default
     // (`~/git/runc/utils_linux.go`'s own `shouldDestroy`/`runner.
-    // destroy`): a plain, foreground `ocirun run` always removes its
-    // own state once it's done, whether the container actually ran
-    // (any exit code) or the launch itself failed partway through —
-    // there is nothing left for a later `ocirun state`/`list`/
-    // `delete` to ever need to see afterward. Real runc's own
-    // `--keep` (skip this) isn't implemented here yet — a real,
-    // honest, deliberately narrower first slice.
-    let _ = store.remove(id);
+    // destroy`): a plain, foreground `ocirun run` removes its own
+    // state once it's done, whether the container actually ran (any
+    // exit code) or the launch itself failed partway through — unless
+    // `--keep` was given, matching real `runc run --keep`/`crun run
+    // --keep` exactly (`Command::Run::keep`'s own doc comment). No
+    // separate "write Stopped" step is needed for the `--keep` case:
+    // `state` was last written `Running` with the container's own
+    // real pid inside the callback above, and `effective_status`
+    // already re-derives `Stopped` lazily from that pid no longer
+    // being alive the next time anything queries it — the same
+    // "process death is the only signal that matters" convention this
+    // whole state store already established, not a new one invented
+    // here.
+    if !keep {
+        let _ = store.remove(id);
+    }
 
     let exit_code = result?;
 

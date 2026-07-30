@@ -900,3 +900,80 @@ fn run_of_an_id_already_in_use_is_a_clear_error() {
     assert!(kill.status.success(), "{kill:?}");
     let _ = first.wait();
 }
+
+/// `ocirun run --keep` (`docs/design/0373`) leaves the container's own
+/// state queryable afterward, matching real `runc run --keep`/`crun
+/// run --keep` exactly (checked directly,
+/// `~/git/runc/utils_linux.go`'s own `shouldDestroy: !cmd.Bool
+/// ("keep")`) — a later `ocirun delete` is still needed to actually
+/// clean it up, matching real runc's own identical two-step
+/// expectation.
+#[test]
+fn run_keep_leaves_a_real_stopped_state_behind_for_a_later_delete() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "exit 7"]);
+
+    let out = Command::new(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args(["run", "run-keep-test", "--bundle"])
+        .arg(bundle_dir.path())
+        .args(["--keep"])
+        .env_remove("OCI_TOOLS_LOG")
+        .output()
+        .expect("failed to spawn ocirun run --keep");
+    assert_eq!(out.status.code(), Some(7), "{out:?}");
+
+    assert_eq!(
+        state_status(root_dir.path(), "run-keep-test"),
+        "stopped",
+        "the container's own state must still be queryable after a --keep run"
+    );
+
+    let delete = ocirun(root_dir.path(), &["delete", "run-keep-test"]);
+    assert!(delete.status.success(), "{delete:?}");
+    let state = Command::new(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args(["state", "run-keep-test"])
+        .env_remove("OCI_TOOLS_LOG")
+        .output()
+        .expect("failed to spawn ocirun state");
+    assert!(
+        !state.status.success(),
+        "a later `ocirun delete` should still be needed, and actually work: {state:?}"
+    );
+}
+
+/// Without `--keep` (the default), nothing is left behind at all —
+/// same real assertion `run_is_visible_to_a_concurrent_state_query_
+/// then_fully_removed_after_exit` already makes, kept here too as a
+/// direct, explicit contrast right next to the `--keep` test above.
+#[test]
+fn run_without_keep_removes_the_state_entirely() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "exit 0"]);
+
+    let out = ocirun_run(bundle_dir.path(), "run-no-keep-test");
+    assert!(out.status.success(), "{out:?}");
+
+    let state = Command::new(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(bundle_dir.path().join("state-root"))
+        .args(["state", "run-no-keep-test"])
+        .env_remove("OCI_TOOLS_LOG")
+        .output()
+        .expect("failed to spawn ocirun state");
+    assert!(!state.status.success(), "{state:?}");
+    let _ = root_dir;
+}
