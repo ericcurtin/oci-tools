@@ -1334,3 +1334,140 @@ fn export_list_apps_and_list_binaries_are_mutually_exclusive_with_other_actions(
         String::from_utf8_lossy(&list_and_app.stderr)
     );
 }
+
+/// `export --bin --extra-flags` (0330) inserts the given flags right
+/// after the exported binary's own path in the generated wrapper
+/// script, before its own forwarded `"$@"` -- matching real
+/// `distrobox export --bin --extra-flags` exactly.
+#[test]
+fn export_bin_extra_flags_are_inserted_before_the_forwarded_args() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--bin",
+            "/bin/echo",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+            "--extra-flags",
+            "-n",
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let contents = std::fs::read_to_string(export_dir.path().join("echo")).unwrap();
+    assert!(
+        contents.contains("exec ocibox enter testbox -- '/bin/echo' -n \"$@\""),
+        "{contents:?}"
+    );
+}
+
+/// `export --app --extra-flags` (0330) is inserted right before a
+/// real desktop-entry field code (`%f`/`%u`/...) in the `Exec=` line
+/// -- matching real `distrobox export --app --extra-flags`'s own
+/// identical, narrower `sed`-based rule exactly.
+#[test]
+fn export_app_extra_flags_are_inserted_before_a_field_code() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(
+        &storage_dir,
+        "testbox",
+        "[Desktop Entry]\nType=Application\nName=My App\nExec=/usr/bin/myapp %f\n",
+    );
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+            "--extra-flags",
+            "--no-remote",
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let contents =
+        std::fs::read_to_string(export_dir.path().join("testbox-myapp.desktop")).unwrap();
+    assert!(
+        contents
+            .lines()
+            .any(|l| l == "Exec=ocibox enter testbox -- /usr/bin/myapp --no-remote %f"),
+        "{contents:?}"
+    );
+}
+
+/// `export --app --extra-flags` has no effect at all when the
+/// `Exec=` line has no field code to insert before -- a real, crude
+/// limitation of real distrobox's own `sed`-based implementation this
+/// project deliberately matches rather than "fixes" into always
+/// appending unconditionally.
+#[test]
+fn export_app_extra_flags_have_no_effect_without_a_field_code() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(&storage_dir, "testbox", SAMPLE_DESKTOP_FILE);
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+            "--extra-flags",
+            "--no-remote",
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let contents =
+        std::fs::read_to_string(export_dir.path().join("testbox-myapp.desktop")).unwrap();
+    assert!(
+        contents
+            .lines()
+            .any(|l| l == "Exec=ocibox enter testbox -- /usr/bin/myapp --flag"),
+        "no field code in Exec= means --extra-flags has no effect: {contents:?}"
+    );
+    assert!(!contents.contains("--no-remote"), "{contents:?}");
+}

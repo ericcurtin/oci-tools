@@ -277,6 +277,20 @@ enum Command {
         /// with `--app`/`--bin`/`--delete`/`--export-label`.
         #[arg(long = "list-binaries")]
         list_binaries: bool,
+        /// Extra flags to add to the exported command itself
+        /// (`--extra-flags`, matching real `distrobox export`'s own
+        /// identical flag): for `--bin`, always appended right after
+        /// the exported binary's own path, before the wrapper's own
+        /// forwarded `"$@"`. For `--app`, only inserted into the
+        /// `Exec=` line if it already contains a real desktop-entry
+        /// field code (`%f`/`%F`/`%u`/`%U`/...) — matching real
+        /// `distrobox export`'s own identical, narrower `sed`-based
+        /// rule exactly (a real, if crude, limitation of the real
+        /// tool's own implementation: an `Exec=` with no field code at
+        /// all has nowhere the real `sed` inserts anything, so
+        /// `--extra-flags` silently has no effect there either).
+        #[arg(long = "extra-flags", value_name = "FLAGS", allow_hyphen_values = true)]
+        extra_flags: Option<String>,
     },
 }
 
@@ -311,6 +325,7 @@ fn main() -> std::process::ExitCode {
                 export_label,
                 list_apps,
                 list_binaries,
+                extra_flags,
             }) => cmd_export(
                 &box_name,
                 ExportArgs {
@@ -321,6 +336,7 @@ fn main() -> std::process::ExitCode {
                     export_label: export_label.as_deref(),
                     list_apps,
                     list_binaries,
+                    extra_flags: extra_flags.as_deref(),
                 },
             ),
             None => anyhow::bail!(
@@ -972,6 +988,7 @@ struct ExportArgs<'a> {
     export_label: Option<&'a str>,
     list_apps: bool,
     list_binaries: bool,
+    extra_flags: Option<&'a str>,
 }
 
 fn cmd_export(box_name: &str, args: ExportArgs) -> anyhow::Result<()> {
@@ -983,6 +1000,7 @@ fn cmd_export(box_name: &str, args: ExportArgs) -> anyhow::Result<()> {
         export_label,
         list_apps,
         list_binaries,
+        extra_flags,
     } = args;
     if list_apps || list_binaries {
         anyhow::ensure!(
@@ -1002,8 +1020,15 @@ fn cmd_export(box_name: &str, args: ExportArgs) -> anyhow::Result<()> {
     match (app, bin) {
         (Some(_), Some(_)) => anyhow::bail!("choose only one of --app or --bin"),
         (None, None) => anyhow::bail!("either --app or --bin is required"),
-        (Some(app), None) => cmd_export_app(box_name, app, export_path, delete, export_label),
-        (None, Some(bin)) => cmd_export_bin(box_name, bin, export_path, delete),
+        (Some(app), None) => cmd_export_app(
+            box_name,
+            app,
+            export_path,
+            delete,
+            export_label,
+            extra_flags,
+        ),
+        (None, Some(bin)) => cmd_export_bin(box_name, bin, export_path, delete, extra_flags),
     }
 }
 
@@ -1020,6 +1045,7 @@ fn cmd_export_bin(
     bin: &str,
     export_path: Option<&Path>,
     delete: bool,
+    extra_flags: Option<&str>,
 ) -> anyhow::Result<()> {
     validate_box_name(box_name)?;
     let box_dir = boxes_root().join(box_name);
@@ -1073,12 +1099,18 @@ fn cmd_export_bin(
         .with_context(|| format!("creating {}", export_dir.display()))?;
 
     // Single-quoted, matching real `distrobox-export`'s own template
-    // (`generate_script`'s `'${exported_bin}'`) -- `bin`/`box_name`
-    // are administrator-supplied CLI input, not untrusted data this
-    // project defends against embedding a stray `'` in, the same
-    // level of care the real script itself applies.
+    // (`generate_script`'s `'${exported_bin}'`) -- `bin`/`box_name`/
+    // `extra_flags` are administrator-supplied CLI input, not
+    // untrusted data this project defends against embedding a stray
+    // `'` in, the same level of care the real script itself applies.
+    // `--extra-flags`, if given, is always inserted right after the
+    // binary's own path and before the wrapper's own forwarded
+    // `"$@"` -- matching real distrobox's own identical `--bin`
+    // template exactly (`container_command_suffix="'${exported_bin}'
+    // ${extra_flags} \"\$@\""`).
+    let extra = extra_flags.map(|f| format!(" {f}")).unwrap_or_default();
     let script = format!(
-        "#!/bin/sh\n# {EXPORT_MARKER}\n# box: {box_name}\nexec ocibox enter {box_name} -- '{bin}' \"$@\"\n"
+        "#!/bin/sh\n# {EXPORT_MARKER}\n# box: {box_name}\nexec ocibox enter {box_name} -- '{bin}'{extra} \"$@\"\n"
     );
     std::fs::write(&dest_file, script)
         .with_context(|| format!("writing {}", dest_file.display()))?;
@@ -1414,6 +1446,7 @@ fn rewrite_desktop_file(
     icon_rewrite: Option<&str>,
     home: &Path,
     label: &str,
+    extra_flags: Option<&str>,
 ) -> String {
     let mut out = format!("# {APP_EXPORT_MARKER}\n# box: {box_name}\n");
     for line in content.lines() {
@@ -1421,6 +1454,22 @@ fn rewrite_desktop_file(
             continue;
         }
         if let Some(rest) = line.strip_prefix("Exec=") {
+            // `--extra-flags`, if given, is only ever inserted right
+            // before a real desktop-entry field code (`%f`/`%u`/...)
+            // -- matching real distrobox's own identical, narrower
+            // `sed "s|\(%.*\)|${extra_flags:+${extra_flags} }\1|g"`
+            // rule exactly: an `Exec=` with no field code at all has
+            // nowhere the real `sed` inserts anything, so
+            // `--extra-flags` silently has no effect there either, a
+            // real, if crude, limitation of the real tool's own
+            // implementation this project deliberately matches rather
+            // than "fixes" into always appending unconditionally.
+            let rest = match (extra_flags, rest.find('%')) {
+                (Some(flags), Some(idx)) => {
+                    format!("{}{flags} {}", &rest[..idx], &rest[idx..])
+                }
+                _ => rest.to_string(),
+            };
             out.push_str(&format!("Exec=ocibox enter {box_name} -- {rest}\n"));
             continue;
         }
@@ -1570,6 +1619,7 @@ fn cmd_export_app(
     export_path: Option<&Path>,
     delete: bool,
     export_label: Option<&str>,
+    extra_flags: Option<&str>,
 ) -> anyhow::Result<()> {
     validate_box_name(box_name)?;
     let box_dir = boxes_root().join(box_name);
@@ -1650,8 +1700,14 @@ fn cmd_export_app(
             }
         }
 
-        let rewritten =
-            rewrite_desktop_file(&content, box_name, icon_rewrite.as_deref(), &home, &label);
+        let rewritten = rewrite_desktop_file(
+            &content,
+            box_name,
+            icon_rewrite.as_deref(),
+            &home,
+            &label,
+            extra_flags,
+        );
         let dest_name = exported_desktop_file_name(box_name, src)?;
         let dest_file = export_dir.join(&dest_name);
         std::fs::write(&dest_file, rewritten)
