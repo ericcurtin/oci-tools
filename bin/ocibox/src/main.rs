@@ -903,18 +903,23 @@ const APP_EXPORT_MARKER: &str = "ocibox_app_export";
 /// `$HOME/.local/bin`, real `distrobox export --bin`'s own documented
 /// default destination when `--export-path` isn't given.
 fn default_export_path() -> anyhow::Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| anyhow::anyhow!("--export-path was not given and $HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".local/bin"))
+    Ok(home_dir()?.join(".local/bin"))
 }
 
 /// `$HOME/.local/share/applications`, real `distrobox export --app`'s
 /// own documented default destination when `--export-path` isn't
 /// given — a real, separate default from `--bin`'s own.
 fn default_app_export_path() -> anyhow::Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| anyhow::anyhow!("--export-path was not given and $HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".local/share/applications"))
+    Ok(home_dir()?.join(".local/share/applications"))
+}
+
+/// The real, resolved `$HOME` — shared by every default-export-path
+/// helper above and, since `0327`, `--app`'s own icon-export
+/// destination computation ([`icon_export_destination`]).
+fn home_dir() -> anyhow::Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("$HOME is not set"))
 }
 
 /// `ocibox export --box <NAME> --app <NAME_OR_PATH>` / `--bin <PATH>`
@@ -1095,6 +1100,157 @@ fn find_desktop_files(rootfs: &Path, app: &str) -> anyhow::Result<Vec<PathBuf>> 
     Ok(matches)
 }
 
+/// The three canonical icon directories real `distrobox-export`'s own
+/// `export_application` searches for a bare (non-path) `Icon=` name,
+/// checked directly (`~/git/distrobox/internal/inside-distrobox/
+/// assets/distrobox-export:495-499`).
+const ICON_SEARCH_DIRS: &[&str] = &[
+    "usr/share/icons",
+    "usr/share/pixmaps",
+    "var/lib/flatpak/exports/share/icons",
+];
+
+/// How a `.desktop` file's own `Icon=` value resolves to real file(s)
+/// inside the box's rootfs, matching real `distrobox-export`'s own
+/// two-branch logic exactly (`export_application`'s own `icon_name`/
+/// `icon_files` loop): a bare name is searched for under
+/// [`ICON_SEARCH_DIRS`] (0 or more real matches, e.g. one per icon
+/// theme/size); an already-absolute path is used as-is, but only if it
+/// genuinely exists inside the box's own rootfs (never the host's).
+enum IconResolution {
+    /// A bare icon name: every real match found under
+    /// [`ICON_SEARCH_DIRS`] (possibly none, if the app has no icon
+    /// installed at all, or it isn't found — never an error either
+    /// way, matching real distrobox's own tolerant `find ... || :`).
+    Named(Vec<PathBuf>),
+    /// `Icon=` was itself an absolute path that exists inside the
+    /// box's own rootfs: exactly one file.
+    Hard(PathBuf),
+}
+
+/// Resolve one `.desktop` file's own `Icon=` value (if it has one) to
+/// real file(s) inside `rootfs` — see [`IconResolution`].
+fn resolve_icon(rootfs: &Path, icon_value: &str) -> IconResolution {
+    if let Some(rest) = icon_value.strip_prefix('/') {
+        let candidate = rootfs.join(rest);
+        if candidate.is_file() {
+            return IconResolution::Hard(candidate);
+        }
+        // An absolute value that doesn't actually exist inside the
+        // box: nothing to export, matching real distrobox's own
+        // silent no-op for a dangling `Icon=` path (its own `find`
+        // over the literal value would likewise turn up nothing).
+        return IconResolution::Named(Vec::new());
+    }
+    let mut matches = Vec::new();
+    for dir in ICON_SEARCH_DIRS {
+        find_icon_files_recursive(&rootfs.join(dir), icon_value, &mut matches);
+    }
+    matches.sort();
+    IconResolution::Named(matches)
+}
+
+/// Flattened form of [`resolve_icon`] for callers (`--delete`) that
+/// don't need to distinguish [`IconResolution::Named`] from
+/// [`IconResolution::Hard`] — every real icon file resolved, 0 or
+/// more.
+fn resolve_icon_files(rootfs: &Path, icon_value: &str) -> Vec<PathBuf> {
+    match resolve_icon(rootfs, icon_value) {
+        IconResolution::Named(files) => files,
+        IconResolution::Hard(file) => vec![file],
+    }
+}
+
+/// Recursively walk `dir` (already known to be one of
+/// [`ICON_SEARCH_DIRS`], real icon themes nest several levels deep,
+/// e.g. `hicolor/48x48/apps/`) collecting every real file whose own
+/// name contains `name`, case-insensitively — matching real
+/// distrobox's own `find <dir> -iname "*${icon}*"` exactly. Silently
+/// does nothing for a directory that doesn't exist at all (most boxes
+/// have at most one or two of the three canonical dirs), the same
+/// tolerance `find_desktop_files` already established for its own
+/// search dirs.
+fn find_icon_files_recursive(dir: &Path, name: &str, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let needle = name.to_ascii_lowercase();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            find_icon_files_recursive(&path, name, out);
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let matches = path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_ascii_lowercase().contains(&needle))
+            .unwrap_or(false);
+        if matches {
+            out.push(path);
+        }
+    }
+}
+
+/// Map `icon_src` (a real file inside the box's own rootfs, already
+/// resolved via [`resolve_icon`]) to its real, on-host destination
+/// path under `home` — matching real distrobox's own path-mapping
+/// rule exactly: a path under `usr/share/` or
+/// `var/lib/flatpak/exports/share/` maps to the equivalent path under
+/// `.local/share/`, with any `pixmaps` path component additionally
+/// renamed to `icons` (`.local/share/pixmaps` isn't a real XDG
+/// icon-theme search location at all, unlike `.local/share/icons`,
+/// checked directly). A path outside both canonical prefixes (a real,
+/// if rare, vendor-specific icon location) falls back to a flat
+/// `.local/share/icons/<basename>` destination instead.
+fn icon_export_destination(rootfs: &Path, icon_src: &Path, home: &Path) -> PathBuf {
+    let relative = icon_src.strip_prefix(rootfs).unwrap_or(icon_src);
+    let relative = relative.to_string_lossy();
+    let mapped = relative
+        .strip_prefix("usr/share/")
+        .or_else(|| relative.strip_prefix("var/lib/flatpak/exports/share/"))
+        .map(|rest| format!(".local/share/{rest}").replace("pixmaps", "icons"));
+    match mapped {
+        Some(mapped) => home.join(mapped),
+        None => home
+            .join(".local/share/icons")
+            .join(icon_src.file_name().unwrap_or_default()),
+    }
+}
+
+/// Copy `icon_src` to `dest`, creating any missing parent directories
+/// — a no-op if `dest` already exists, matching real distrobox's own
+/// identical `[ ! -e "${dest}" ]` "don't clobber an existing copy"
+/// check.
+fn export_icon_file(icon_src: &Path, dest: &Path) -> anyhow::Result<()> {
+    if dest.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::copy(icon_src, dest)
+        .with_context(|| format!("copying {} to {}", icon_src.display(), dest.display()))?;
+    Ok(())
+}
+
+/// Remove `dest` if it exists — the `--delete` counterpart to
+/// [`export_icon_file`], tolerant of it already being gone (matching
+/// real distrobox's own identical unconditional-but-tolerant `rm -rf`
+/// there); never removes a directory (an icon destination is always a
+/// single file).
+fn remove_exported_icon_file(dest: &Path) {
+    if dest.is_file() {
+        let _ = std::fs::remove_file(dest);
+    }
+}
+
 /// Rewrite one real `.desktop` file's own content for export: prefix
 /// its own `Exec=` line with `ocibox enter <box_name> --` (matching
 /// real `distrobox-export`'s own identical `sed "s|^Exec=\(.*\)|
@@ -1102,10 +1258,31 @@ fn find_desktop_files(rootfs: &Path, app: &str) -> anyhow::Result<Vec<PathBuf>> 
 /// extra `--extra-flags`/`--enter-flags` support, out of scope here);
 /// drops any `TryExec=` line entirely (it would check for the
 /// *host's* own binary, not the box's, so real distrobox drops it
-/// too — checked directly). `Icon=` is left completely untouched —
-/// see [`Command::Export`]'s own doc comment for why icon handling
-/// itself is a real, separate, deferred increment.
-fn rewrite_desktop_file(content: &str, box_name: &str) -> String {
+/// too — checked directly).
+///
+/// `icon_rewrite`, if given, is the new, real, on-host absolute path
+/// an `Icon=` line pointing at a non-canonical hard path must be
+/// rewritten to (see [`icon_export_destination`]) — a bare icon name
+/// is deliberately left exactly as it already was: it resolves via
+/// the icon theme's own normal lookup once its file exists at the
+/// mapped destination (`cmd_export_app` already copies it there).
+///
+/// `home`, the real, resolved `$HOME`, is only needed for the one
+/// remaining case real distrobox's own `sed` also specifically
+/// handles: an already-absolute `Icon=/usr/share/...` line gets that
+/// prefix rewritten to `$HOME/.local/share/...` (plus the same
+/// `pixmaps`->`icons` rename `icon_export_destination` already applies
+/// to the copy destination) — matching real distrobox's own literal,
+/// narrower rewrite rule exactly (only ever rewrites that one specific
+/// prefix, never an already-canonical *flatpak*-prefixed absolute
+/// path, a real, minor gap in real distrobox itself this project
+/// deliberately doesn't go further than).
+fn rewrite_desktop_file(
+    content: &str,
+    box_name: &str,
+    icon_rewrite: Option<&str>,
+    home: &Path,
+) -> String {
     let mut out = format!("# {APP_EXPORT_MARKER}\n# box: {box_name}\n");
     for line in content.lines() {
         if line.starts_with("TryExec=") {
@@ -1113,6 +1290,20 @@ fn rewrite_desktop_file(content: &str, box_name: &str) -> String {
         }
         if let Some(rest) = line.strip_prefix("Exec=") {
             out.push_str(&format!("Exec=ocibox enter {box_name} -- {rest}\n"));
+            continue;
+        }
+        if let Some(new_icon) = icon_rewrite
+            && line.starts_with("Icon=")
+        {
+            out.push_str(&format!("Icon={new_icon}\n"));
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Icon=/usr/share/") {
+            out.push_str(&format!(
+                "Icon={}/.local/share/{}\n",
+                home.display(),
+                rest.replace("pixmaps", "icons")
+            ));
             continue;
         }
         out.push_str(line);
@@ -1134,18 +1325,34 @@ fn exported_desktop_file_name(box_name: &str, src: &Path) -> anyhow::Result<Stri
     Ok(format!("{box_name}-{base}"))
 }
 
+/// The `Icon=` value of a real `.desktop` file's content, if it has
+/// one at all (real distrobox's own `grep Icon=` tolerates a missing
+/// one identically — not every application declares an icon).
+fn desktop_file_icon_value(content: &str) -> Option<&str> {
+    content
+        .lines()
+        .find_map(|l| l.strip_prefix("Icon="))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
 /// `ocibox export --box <NAME> --app <NAME_OR_PATH>`: finds every
 /// real, matching `.desktop` file inside the box's own rootfs (see
-/// [`find_desktop_files`]) and writes a rewritten copy of each at
+/// [`find_desktop_files`]), copies its own icon(s) to the real host
+/// (see [`resolve_icon`]/[`icon_export_destination`], `0327`), and
+/// writes a rewritten copy of the `.desktop` file itself at
 /// `--export-path` (or [`default_app_export_path`]) whose own
 /// `Exec=` routes through `ocibox enter <box_name>` — see
 /// [`Command::Export`]'s own doc comment for exactly how this scopes
-/// down real `distrobox export --app` and why (no icon handling yet).
-/// `--delete` reverses it: re-resolves the same matching `.desktop`
-/// file(s) and removes whichever of their own real, corresponding
-/// exported copies actually exist, refusing to touch anything that
+/// down real `distrobox export --app` and why. `--delete` reverses
+/// it: re-resolves the same matching `.desktop` file(s) and icon(s),
+/// removing whichever of their own real, corresponding exported
+/// copies actually exist, refusing to touch a `.desktop` file that
 /// isn't actually one of this project's own exported launchers (the
-/// same marker/safety-check convention `--bin` already established).
+/// same marker/safety-check convention `--bin` already established;
+/// an icon file has no equivalent marker of its own — matching real
+/// distrobox's own identical, unconditional-but-tolerant removal
+/// there, see [`remove_exported_icon_file`]).
 fn cmd_export_app(
     box_name: &str,
     app: &str,
@@ -1156,6 +1363,7 @@ fn cmd_export_app(
     let box_dir = boxes_root().join(box_name);
     anyhow::ensure!(box_dir.is_dir(), "{box_name}: no such box");
     let rootfs = box_dir.join("rootfs");
+    let home = home_dir()?;
 
     let export_dir = match export_path {
         Some(dir) => dir.to_path_buf(),
@@ -1171,6 +1379,14 @@ fn cmd_export_app(
     if delete {
         let mut removed_any = false;
         for src in &desktop_files {
+            let content = std::fs::read_to_string(src)
+                .with_context(|| format!("reading {}", src.display()))?;
+            if let Some(icon_value) = desktop_file_icon_value(&content) {
+                for icon_src in resolve_icon_files(&rootfs, icon_value) {
+                    remove_exported_icon_file(&icon_export_destination(&rootfs, &icon_src, &home));
+                }
+            }
+
             let dest_name = exported_desktop_file_name(box_name, src)?;
             let dest_file = export_dir.join(&dest_name);
             if !dest_file.is_file() {
@@ -1200,7 +1416,28 @@ fn cmd_export_app(
     for src in &desktop_files {
         let content =
             std::fs::read_to_string(src).with_context(|| format!("reading {}", src.display()))?;
-        let rewritten = rewrite_desktop_file(&content, box_name);
+
+        let mut icon_rewrite = None;
+        if let Some(icon_value) = desktop_file_icon_value(&content) {
+            match resolve_icon(&rootfs, icon_value) {
+                IconResolution::Named(icon_srcs) => {
+                    for icon_src in &icon_srcs {
+                        let dest = icon_export_destination(&rootfs, icon_src, &home);
+                        export_icon_file(icon_src, &dest)?;
+                    }
+                }
+                IconResolution::Hard(icon_src) => {
+                    let dest = icon_export_destination(&rootfs, &icon_src, &home);
+                    export_icon_file(&icon_src, &dest)?;
+                    let relative = icon_src.strip_prefix(&rootfs).unwrap_or(&icon_src);
+                    if !relative.starts_with("usr/share") {
+                        icon_rewrite = Some(dest.display().to_string());
+                    }
+                }
+            }
+        }
+
+        let rewritten = rewrite_desktop_file(&content, box_name, icon_rewrite.as_deref(), &home);
         let dest_name = exported_desktop_file_name(box_name, src)?;
         let dest_file = export_dir.join(&dest_name);
         std::fs::write(&dest_file, rewritten)

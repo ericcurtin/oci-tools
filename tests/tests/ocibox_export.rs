@@ -1,14 +1,13 @@
 //! `ocibox export --bin`/`--app` integration tests (`docs/design/
-//! 0252`, `0322`): exercises the actual built `ocibox` binary writing
-//! (and removing) a real wrapper script/`.desktop` launcher that
-//! routes an exported binary/application's own invocations through
-//! `ocibox enter` — checked directly against real `distrobox
-//! export`'s own actual shell implementation (`~/git/distrobox/
-//! internal/inside-distrobox/assets/distrobox-export`), deliberately
-//! without `--app`'s own icon-copying half (see `Command::Export`'s
-//! own doc comment for exactly why not, and how the explicit `--box`
-//! flag here diverges from real `distrobox export`'s own "detect
-//! which box I'm running in" model).
+//! 0252`, `0322`, `0327`): exercises the actual built `ocibox` binary
+//! writing (and removing) a real wrapper script/`.desktop` launcher
+//! (and, since `0327`, a real copied icon file) that routes an
+//! exported binary/application's own invocations through `ocibox
+//! enter` — checked directly against real `distrobox export`'s own
+//! actual shell implementation (`~/git/distrobox/internal/inside-
+//! distrobox/assets/distrobox-export`), including how the explicit
+//! `--box` flag here diverges from real `distrobox export`'s own
+//! "detect which box I'm running in" model.
 
 use std::path::Path;
 use std::process::Command;
@@ -22,6 +21,21 @@ fn ocibox(storage_root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin_path("ocibox"))
         .env("OCI_TOOLS_STORAGE_ROOT", storage_root)
         .env_remove("OCI_TOOLS_LOG")
+        .args(args)
+        .output()
+        .expect("failed to spawn ocibox")
+}
+
+/// Same as [`ocibox`], but with `$HOME` overridden to `home` — every
+/// icon-export test below needs this (icon destinations are always
+/// computed from `$HOME`, matching real distrobox exactly, regardless
+/// of `--export-path`) so it never actually touches the real test
+/// runner's own home directory.
+fn ocibox_with_home(storage_root: &Path, home: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(bin_path("ocibox"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_root)
+        .env_remove("OCI_TOOLS_LOG")
+        .env("HOME", home)
         .args(args)
         .output()
         .expect("failed to spawn ocibox")
@@ -313,11 +327,15 @@ Exec=/usr/bin/myapp --flag\nTryExec=/usr/bin/myapp\nIcon=myapp-icon\n";
 /// `export --app` (0322) writes a rewritten `.desktop` launcher whose
 /// own `Exec=` routes through `ocibox enter`, strips `TryExec=`
 /// entirely (it would check for the host's own binary, not the
-/// box's), and leaves `Icon=` completely untouched (icon handling is
-/// a real, separate, deferred increment — see `Command::Export`'s own
-/// doc comment) — matching real `distrobox export --app`'s own core
+/// box's) — matching real `distrobox export --app`'s own core
 /// `Exec=`-rewriting mechanism, checked directly against
-/// `~/git/distrobox`'s own real shell implementation.
+/// `~/git/distrobox`'s own real shell implementation. This particular
+/// fixture's own `Icon=myapp-icon` (a bare name with no matching real
+/// icon file anywhere in the box's own rootfs) is left completely
+/// untouched here for a genuine reason (see `0327`): nothing was
+/// actually found to copy at all, not because icon handling itself is
+/// unimplemented — `export_app_copies_a_bare_named_icon_to_the_real_
+/// host_icon_directory` below covers the real, positive case.
 #[test]
 fn export_app_writes_a_rewritten_desktop_file() {
     if busybox_path().is_none() {
@@ -579,5 +597,332 @@ fn export_requires_exactly_one_of_app_or_bin() {
         String::from_utf8_lossy(&both.stderr).contains("choose only one"),
         "{}",
         String::from_utf8_lossy(&both.stderr)
+    );
+}
+
+/// Writes a real file into a box's own rootfs at `relative` (parent
+/// directories created as needed) — the icon-export tests' own
+/// equivalent of [`write_desktop_file`], for real icon files that
+/// need to exist under specific search directories.
+fn write_box_file(
+    storage_dir: &tempfile::TempDir,
+    box_name: &str,
+    relative: &str,
+    contents: &[u8],
+) {
+    let path = storage_dir
+        .path()
+        .join("boxes")
+        .join(box_name)
+        .join("rootfs")
+        .join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, contents).unwrap();
+}
+
+/// A bare `Icon=` name found under a themed `usr/share/icons/.../
+/// apps/` subdirectory (0327) is copied to the exact same relative
+/// path under `$HOME/.local/share/icons/...`, and the `.desktop`
+/// file's own `Icon=` line is left completely untouched (a bare name
+/// resolves via the icon theme's own normal lookup once the file
+/// exists there) — matching real `distrobox-export`'s own identical
+/// path-mapping rule, checked directly.
+#[test]
+fn export_app_copies_a_themed_icon_and_leaves_a_bare_icon_name_untouched() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(&storage_dir, "testbox", SAMPLE_DESKTOP_FILE);
+    write_box_file(
+        &storage_dir,
+        "testbox",
+        "usr/share/icons/hicolor/48x48/apps/myapp-icon.png",
+        b"fake png bytes",
+    );
+    let export_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox_with_home(
+        storage_dir.path(),
+        home_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let copied_icon = home_dir
+        .path()
+        .join(".local/share/icons/hicolor/48x48/apps/myapp-icon.png");
+    assert!(
+        copied_icon.is_file(),
+        "icon should have been copied to {copied_icon:?}"
+    );
+    assert_eq!(std::fs::read(&copied_icon).unwrap(), b"fake png bytes");
+
+    let contents =
+        std::fs::read_to_string(export_dir.path().join("testbox-myapp.desktop")).unwrap();
+    assert!(
+        contents.contains("Icon=myapp-icon"),
+        "a bare icon name must stay untouched: {contents:?}"
+    );
+}
+
+/// A bare `Icon=` name found under `usr/share/pixmaps/` (the other
+/// real, checked-directly canonical search directory) is copied to
+/// `$HOME/.local/share/icons/...` — not `.../pixmaps/...` — matching
+/// real distrobox's own identical `pixmaps`->`icons` rename (`.local/
+/// share/pixmaps` isn't a real XDG icon-theme search location at all).
+#[test]
+fn export_app_copies_a_pixmaps_icon_renaming_the_directory_to_icons() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(&storage_dir, "testbox", SAMPLE_DESKTOP_FILE);
+    write_box_file(
+        &storage_dir,
+        "testbox",
+        "usr/share/pixmaps/myapp-icon.xpm",
+        b"fake xpm bytes",
+    );
+    let export_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox_with_home(
+        storage_dir.path(),
+        home_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let copied_icon = home_dir.path().join(".local/share/icons/myapp-icon.xpm");
+    assert!(
+        copied_icon.is_file(),
+        "icon should have been copied (with pixmaps renamed to icons) to {copied_icon:?}"
+    );
+    assert!(
+        !home_dir.path().join(".local/share/pixmaps").exists(),
+        "a `.local/share/pixmaps` directory should never be created at all"
+    );
+}
+
+/// An `Icon=` value that's already an absolute path pointing *outside*
+/// any canonical icon directory (a real, if rare, vendor-specific
+/// location) falls back to a flat `$HOME/.local/share/icons/
+/// <basename>` destination, and — unlike the bare-name cases above —
+/// the `.desktop` file's own `Icon=` line genuinely must be rewritten
+/// to that new absolute host path, since the original path only ever
+/// existed inside the box's own rootfs, never on the real host.
+#[test]
+fn export_app_rewrites_icon_for_a_non_canonical_absolute_path() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(
+        &storage_dir,
+        "testbox",
+        "[Desktop Entry]\nType=Application\nName=My App\n\
+         Exec=/usr/bin/myapp --flag\nIcon=/opt/myapp/icon.png\n",
+    );
+    write_box_file(
+        &storage_dir,
+        "testbox",
+        "opt/myapp/icon.png",
+        b"vendor icon",
+    );
+    let export_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox_with_home(
+        storage_dir.path(),
+        home_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let copied_icon = home_dir.path().join(".local/share/icons/icon.png");
+    assert!(copied_icon.is_file(), "expected {copied_icon:?} to exist");
+    assert_eq!(std::fs::read(&copied_icon).unwrap(), b"vendor icon");
+
+    let contents =
+        std::fs::read_to_string(export_dir.path().join("testbox-myapp.desktop")).unwrap();
+    let expected_icon_line = format!("Icon={}", copied_icon.display());
+    assert!(
+        contents.contains(&expected_icon_line),
+        "Icon= must be rewritten to the new absolute host path: {contents:?}"
+    );
+    assert!(
+        !contents.contains("Icon=/opt/myapp/icon.png"),
+        "the original, host-unreachable path must not survive: {contents:?}"
+    );
+}
+
+/// An `Icon=` value that's already an absolute path under the
+/// canonical `/usr/share/` prefix gets that prefix rewritten to
+/// `$HOME/.local/share/` in the exported `.desktop` file itself,
+/// matching real distrobox's own identical (if narrow — see
+/// `rewrite_desktop_file`'s own doc comment) `sed` rule.
+#[test]
+fn export_app_rewrites_icon_for_a_canonical_absolute_usr_share_path() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(
+        &storage_dir,
+        "testbox",
+        "[Desktop Entry]\nType=Application\nName=My App\n\
+         Exec=/usr/bin/myapp --flag\nIcon=/usr/share/pixmaps/myapp.png\n",
+    );
+    write_box_file(
+        &storage_dir,
+        "testbox",
+        "usr/share/pixmaps/myapp.png",
+        b"canonical hard path icon",
+    );
+    let export_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox_with_home(
+        storage_dir.path(),
+        home_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let copied_icon = home_dir.path().join(".local/share/icons/myapp.png");
+    assert!(copied_icon.is_file(), "expected {copied_icon:?} to exist");
+
+    let contents =
+        std::fs::read_to_string(export_dir.path().join("testbox-myapp.desktop")).unwrap();
+    let expected_icon_line = format!(
+        "Icon={}/.local/share/icons/myapp.png",
+        home_dir.path().display()
+    );
+    assert!(
+        contents.contains(&expected_icon_line),
+        "Icon=/usr/share/... must be rewritten to $HOME/.local/share/...: {contents:?}"
+    );
+}
+
+/// `export --app --delete` also removes the real, previously-copied
+/// icon file, tolerant of it already being gone -- matching real
+/// distrobox's own identical unconditional-but-tolerant icon removal.
+#[test]
+fn export_app_delete_also_removes_the_copied_icon() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(&storage_dir, "testbox", SAMPLE_DESKTOP_FILE);
+    write_box_file(
+        &storage_dir,
+        "testbox",
+        "usr/share/icons/hicolor/48x48/apps/myapp-icon.png",
+        b"fake png bytes",
+    );
+    let export_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox_with_home(
+        storage_dir.path(),
+        home_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(export.status.success());
+    let copied_icon = home_dir
+        .path()
+        .join(".local/share/icons/hicolor/48x48/apps/myapp-icon.png");
+    assert!(copied_icon.is_file());
+
+    let delete = ocibox_with_home(
+        storage_dir.path(),
+        home_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+            "--delete",
+        ],
+    );
+    assert!(
+        delete.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&delete.stderr)
+    );
+    assert!(
+        !copied_icon.exists(),
+        "the copied icon should really be gone now"
     );
 }
