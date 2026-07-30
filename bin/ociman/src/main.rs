@@ -3759,6 +3759,19 @@ fn cmd_images(
         {
             continue;
         }
+        // Same AND-not-OR rule as `id=` (see `ImageFilters::digest`'s
+        // own doc comment) -- this project's own single `manifest_
+        // digest` per image is the only real "known digest" to check
+        // against, matching real podman's own multi-digest check
+        // exactly for the common, single-platform case.
+        if !filters.digest.iter().all(|prefix| {
+            record
+                .manifest_digest
+                .to_string()
+                .starts_with(prefix.as_str())
+        }) {
+            continue;
+        }
         // `reference!=` excludes on any match; `reference=` (if given
         // at all) requires at least one match -- matching real
         // podman's own exact combination rule (see
@@ -4717,6 +4730,30 @@ struct ImageFilters {
     /// different prefixes matches nothing at all (no single ID can
     /// start with two different strings), not an OR of the two.
     id: Vec<String>,
+    /// `digest=sha256:<prefix>` -- matches an image whose own full
+    /// `sha256:<hex>` manifest digest string starts with `<prefix>`,
+    /// matching real `podman images --filter digest=` exactly
+    /// (`~/git/container-libs/common/libimage/filters.go`'s own
+    /// `filterDigest`/`containsDigestPrefix`). Real podman's own
+    /// version checks every digest an image is "known by" (its own
+    /// canonical one *and* any additional per-platform manifest
+    /// digest recorded from a multi-arch fat-manifest-list pull) --
+    /// this project's own images are always resolved to exactly one
+    /// platform at pull/build time (`0307`), with no fat-manifest-
+    /// list storage concept at all, so its own single `manifest_
+    /// digest` genuinely is the *only* digest an image here could
+    /// ever be "known by," matching real podman's own common,
+    /// single-platform case exactly (the multi-digest case only ever
+    /// arises there for a genuinely different image shape this
+    /// project doesn't store). Same AND-not-OR combination rule as
+    /// `id=` (see its own doc comment) -- also not one of the
+    /// explicit, checked-directly OR exceptions. Unlike `id=`, real
+    /// podman requires the value to start with `sha256:` outright (a
+    /// real, checked-directly parse-time error otherwise, not a
+    /// silently-ignored malformed filter) -- `id=` has no such
+    /// requirement since it's matching a bare hex ID, never a full
+    /// algorithm-prefixed digest string.
+    digest: Vec<String>,
 }
 
 /// Every real image (identified by manifest digest, not one exact
@@ -4825,13 +4862,23 @@ fn parse_image_filters(filters: &[String]) -> anyhow::Result<ImageFilters> {
                 "ociman images: --filter {f:?} is missing a value"
             );
             parsed.id.push(value.to_string());
+        } else if let Some(value) = f.strip_prefix("digest=") {
+            // Matches real podman's own checked-directly `filterDigest`
+            // validation exactly: a value not starting with `sha256:`
+            // is a real, immediate parse-time error, not a silently-
+            // accepted-but-never-matching filter.
+            anyhow::ensure!(
+                value.starts_with("sha256:"),
+                "ociman images: --filter {f:?}: invalid value (must start with \"sha256:\")"
+            );
+            parsed.digest.push(value.to_string());
         } else {
             anyhow::bail!(
                 "ociman images: --filter {f:?} is not yet supported (only \
                  label=<key>[=<value>], label!=<key>[=<value>], dangling=true|false, \
                  before=<image>, since=<image>/after=<image>, \
-                 reference=<pattern>/reference!=<pattern>, containers=true|false, or \
-                 id=<prefix> are)"
+                 reference=<pattern>/reference!=<pattern>, containers=true|false, \
+                 id=<prefix>, or digest=sha256:<prefix> are)"
             );
         }
     }

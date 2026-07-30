@@ -846,6 +846,159 @@ fn images_filter_id_missing_a_value_is_a_clear_error() {
     );
 }
 
+/// `ociman images --filter digest=sha256:<prefix>` (0350), matching
+/// real `podman images --filter digest=` exactly (checked directly,
+/// `~/git/container-libs/common/libimage/filters.go`'s own
+/// `filterDigest`/`containsDigestPrefix`): matches a prefix of the
+/// image's own full `sha256:<hex>` manifest digest string -- the same
+/// value `--format {{.digest}}` itself prints, so filtering by that
+/// exact string should select precisely the one image it came from.
+#[test]
+fn images_filter_digest_matches_by_full_digest_string_prefix() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/filter-digest-a:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/filter-digest-b:latest",
+        &busybox,
+        &["sh", "echo"],
+        ContainerConfig::default(),
+    );
+
+    let format = ociman(storage_dir.path(), &["images", "--format", "{{.digest}}"]);
+    assert!(format.status.success());
+    let digests: Vec<String> = String::from_utf8_lossy(&format.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(digests.len(), 2, "{digests:?}");
+    for digest in &digests {
+        assert!(digest.starts_with("sha256:"), "{digest:?}");
+    }
+
+    // The exact full digest string matches only its own image.
+    let filtered = ociman(
+        storage_dir.path(),
+        &[
+            "images",
+            "--format",
+            "{{.digest}}",
+            "--filter",
+            &format!("digest={}", digests[0]),
+        ],
+    );
+    assert!(
+        filtered.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+    let filtered_stdout = String::from_utf8_lossy(&filtered.stdout);
+    let matched: Vec<&str> = filtered_stdout.trim().lines().collect();
+    assert_eq!(matched, vec![digests[0].as_str()], "{matched:?}");
+
+    // A shorter, genuine prefix (still including the "sha256:" part)
+    // also matches -- a real prefix match, not an exact-string one.
+    let short_prefix = &digests[0][.."sha256:".len() + 4];
+    let prefix_filtered = ociman(
+        storage_dir.path(),
+        &[
+            "images",
+            "-q",
+            "--filter",
+            &format!("digest={short_prefix}"),
+        ],
+    );
+    assert!(prefix_filtered.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&prefix_filtered.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "{prefix_filtered:?}"
+    );
+}
+
+/// A real, checked-directly consequence of real podman's own generic
+/// per-key filter combinator, same reasoning `id=`'s own identical
+/// test already establishes: two different `digest=` values for two
+/// genuinely different images match nothing at all, not their union.
+#[test]
+fn images_filter_digest_with_two_different_values_matches_nothing() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/filter-digest-and-a:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/filter-digest-and-b:latest",
+        &busybox,
+        &["sh", "echo"],
+        ContainerConfig::default(),
+    );
+
+    let format = ociman(storage_dir.path(), &["images", "--format", "{{.digest}}"]);
+    assert!(format.status.success());
+    let digests: Vec<String> = String::from_utf8_lossy(&format.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(digests.len(), 2, "{digests:?}");
+
+    let both = ociman(
+        storage_dir.path(),
+        &[
+            "images",
+            "-q",
+            "--filter",
+            &format!("digest={}", digests[0]),
+            "--filter",
+            &format!("digest={}", digests[1]),
+        ],
+    );
+    assert!(both.status.success());
+    assert!(
+        both.stdout.is_empty(),
+        "ANDed, genuinely conflicting digest= values should match nothing: {both:?}"
+    );
+}
+
+/// A `digest=` value that doesn't start with `sha256:` is a real,
+/// immediate parse-time error, matching real podman's own identical
+/// `filterDigest` validation exactly.
+#[test]
+fn images_filter_digest_without_sha256_prefix_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["images", "--filter", "digest=abc123"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("sha256:"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `ociman images --format` (0334) renders one line per listed image,
 /// reusing the exact same Go-template-*lite* engine `ociman inspect
 /// --format`/`ps --format` (`0332`/`0333`) already established.
