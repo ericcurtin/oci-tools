@@ -2395,6 +2395,145 @@ async fn create_container_rejects_unsupported_mount_fields_clearly() {
     assert_eq!(id_mapped.code(), tonic::Code::Unimplemented);
 }
 
+/// `ContainerConfig.linux.security_context`'s own `run_as_user`/
+/// `run_as_group`/`run_as_username` (`docs/design/0365`): a real,
+/// explicit `run_as_user: 0`/`run_as_group: 0` request (a legitimate
+/// case many real pods make explicitly) already matches this
+/// project's own existing default and must succeed exactly like a
+/// request with no security context at all.
+#[tokio::test]
+async fn create_container_run_as_user_and_group_zero_succeeds() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let mut config = container_config("run-as-root", 0);
+    config.linux = Some(oci_cri_types::LinuxContainerConfig {
+        security_context: Some(oci_cri_types::LinuxContainerSecurityContext {
+            run_as_user: Some(oci_cri_types::Int64Value { value: 0 }),
+            run_as_group: Some(oci_cri_types::Int64Value { value: 0 }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let created = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await;
+    assert!(created.is_ok(), "{created:?}");
+}
+
+/// A non-root `run_as_user`/`run_as_group`, `run_as_username` at all,
+/// and `run_as_group` given without `run_as_user`/`run_as_username`
+/// are each a real, clear error — see `validate_run_as_user`'s own
+/// doc comment (in `runtime_service.rs`) for exactly why each one is.
+#[tokio::test]
+async fn create_container_rejects_unsupported_run_as_user_fields_clearly() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    async fn expect_status(
+        client: &mut RuntimeServiceClient<tonic::transport::Channel>,
+        sandbox_id: &str,
+        sandbox_config: &PodSandboxConfig,
+        name: &str,
+        security_context: oci_cri_types::LinuxContainerSecurityContext,
+    ) -> tonic::Status {
+        let mut config = container_config(name, 0);
+        config.linux = Some(oci_cri_types::LinuxContainerConfig {
+            security_context: Some(security_context),
+            ..Default::default()
+        });
+        client
+            .create_container(CreateContainerRequest {
+                pod_sandbox_id: sandbox_id.to_string(),
+                config: Some(config),
+                sandbox_config: Some(sandbox_config.clone()),
+            })
+            .await
+            .expect_err("should have been rejected")
+    }
+
+    let nonzero_user = expect_status(
+        &mut client,
+        &sandbox_id,
+        &sandbox_config,
+        "run-as-user-1000",
+        oci_cri_types::LinuxContainerSecurityContext {
+            run_as_user: Some(oci_cri_types::Int64Value { value: 1000 }),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(nonzero_user.code(), tonic::Code::Unimplemented);
+    assert!(
+        nonzero_user.message().contains("run_as_user 1000"),
+        "{nonzero_user:?}"
+    );
+
+    let nonzero_group = expect_status(
+        &mut client,
+        &sandbox_id,
+        &sandbox_config,
+        "run-as-group-1000",
+        oci_cri_types::LinuxContainerSecurityContext {
+            run_as_user: Some(oci_cri_types::Int64Value { value: 0 }),
+            run_as_group: Some(oci_cri_types::Int64Value { value: 1000 }),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(nonzero_group.code(), tonic::Code::Unimplemented);
+    assert!(
+        nonzero_group.message().contains("run_as_group 1000"),
+        "{nonzero_group:?}"
+    );
+
+    let username = expect_status(
+        &mut client,
+        &sandbox_id,
+        &sandbox_config,
+        "run-as-username",
+        oci_cri_types::LinuxContainerSecurityContext {
+            run_as_username: "nobody".to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(username.code(), tonic::Code::Unimplemented);
+    assert!(
+        username.message().contains("run_as_username"),
+        "{username:?}"
+    );
+
+    let group_without_user = expect_status(
+        &mut client,
+        &sandbox_id,
+        &sandbox_config,
+        "group-without-user",
+        oci_cri_types::LinuxContainerSecurityContext {
+            run_as_group: Some(oci_cri_types::Int64Value { value: 0 }),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(group_without_user.code(), tonic::Code::InvalidArgument);
+    assert!(
+        group_without_user
+            .message()
+            .contains("user group is specified without user or username"),
+        "{group_without_user:?}"
+    );
+}
+
 /// End-to-end proof the bind mount is genuinely live at runtime, not
 /// just declared in `config.json`: a real file written on the host
 /// side of the mount is readable from *inside* the running container

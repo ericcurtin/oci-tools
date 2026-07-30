@@ -583,6 +583,80 @@ fn container_metadata_to_proto(metadata: &container::ContainerMetadata) -> cri::
     }
 }
 
+/// `ContainerConfig.linux.security_context`'s own `run_as_user`/
+/// `run_as_group`/`run_as_username` (0365, closing part of `0237`'s
+/// own deferred "per-container run_as_user/security-context mapping"
+/// gap): a container this project creates is always rootless with
+/// exactly one real uid/gid mapped -- container `0`, to this
+/// process's own euid/egid (`Spec::into_rootless`'s own single-entry
+/// mapping) -- the exact same constraint `ociman run --user`'s own
+/// `resolve_user` already established and gives a clear, immediate
+/// error for instead of a confusing, much-later kernel `EINVAL`. This
+/// closes the identical real gap for `ocicri`: before this, a pod's
+/// own explicit `securityContext.runAsUser: 1000` was silently
+/// ignored entirely, and the container quietly ran as uid `0` anyway
+/// -- a real, previously-undetected divergence from the pod spec's
+/// own explicit intent, now a clear, loud error instead of a silent
+/// no-op. `run_as_user: 0`/`run_as_group: 0` (a real, common,
+/// legitimate request many pods make explicitly) already matches
+/// this project's own existing default, so it needs no new spec
+/// field at all -- only this validation was ever missing.
+///
+/// `run_as_username` (name-resolved against the image's own real
+/// `/etc/passwd`, matching real cri-o's own `GetUserInfo`) is
+/// deliberately not supported at all yet, the same "numeric only, a
+/// higher-level-tool concern" scope `ocirun exec --user`'s own doc
+/// comment already established -- a clear `Status::unimplemented`
+/// rather than silently ignored too. `run_as_group` given without
+/// `run_as_user`/`run_as_username` is a real, immediate error,
+/// reusing real cri-o's own exact message verbatim (checked directly,
+/// `~/git/cri-o/server/container_create.go`'s own `setupContainerUser`).
+///
+/// Still deliberately out of scope: an image's own declared `USER`
+/// (real cri-o's own `imageUser` fallback) is never read or applied
+/// here either -- a separate, pre-existing gap this note doesn't
+/// close, unrelated to the CRI-requested `run_as_user`/`run_as_group`
+/// this note is actually about.
+fn validate_run_as_user(
+    security_context: Option<&cri::LinuxContainerSecurityContext>,
+) -> Result<(), Status> {
+    let Some(sc) = security_context else {
+        return Ok(());
+    };
+    if !sc.run_as_username.is_empty() {
+        return Err(Status::unimplemented(
+            "run_as_username is not yet supported (numeric run_as_user/run_as_group only)",
+        ));
+    }
+    if sc.run_as_group.is_some() && sc.run_as_user.is_none() {
+        // Real cri-o's own exact message.
+        return Err(Status::invalid_argument(
+            "user group is specified without user or username",
+        ));
+    }
+    if let Some(uid) = sc.run_as_user.as_ref()
+        && uid.value != 0
+    {
+        return Err(Status::unimplemented(format!(
+            "run_as_user {} resolves to a non-root container uid, which this rootless \
+             runtime cannot map yet (only container uid 0 is mapped, to this process's own \
+             euid; a subordinate uid range via /etc/subuid would be needed for anything else)",
+            uid.value
+        )));
+    }
+    if let Some(gid) = sc.run_as_group.as_ref()
+        && gid.value != 0
+    {
+        return Err(Status::unimplemented(format!(
+            "run_as_group {} resolves to a non-root container gid, which this rootless \
+             runtime cannot map yet (only container gid 0 is mapped, to this process's own \
+             egid; a subordinate gid range via /etc/subgid would be needed for anything else)",
+            gid.value
+        )));
+    }
+    Ok(())
+}
+
 /// `ContainerConfig.mounts` (0304, closing part of `0237`'s own
 /// deferred "CRI mounts" gap) -- a real, deliberately narrow first
 /// slice: an ordinary bind mount (`container_path`/`host_path`/
@@ -1304,6 +1378,16 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             Some(dns) => (&dns.servers, &dns.searches, &dns.options),
             None => (&empty_dns, &empty_dns, &empty_dns),
         };
+        // `ContainerConfig.linux.security_context`'s own `run_as_user`/
+        // `run_as_group`/`run_as_username` (0365) -- validated for the
+        // exact same "before any real work happens" reason as the
+        // mounts check just below.
+        validate_run_as_user(
+            config
+                .linux
+                .as_ref()
+                .and_then(|l| l.security_context.as_ref()),
+        )?;
         // `ContainerConfig.mounts` (0304): validated and translated to
         // plain bind mounts *before* `bundle::prepare` ever extracts a
         // single layer -- a config-shaped client error here should
