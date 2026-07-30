@@ -327,6 +327,36 @@ struct RunArgs {
     /// doc comment for why this matters.
     #[arg(long = "memory-swap", allow_hyphen_values = true)]
     memory_swap: Option<String>,
+    /// Size of `/dev/shm`, matching real `docker run --shm-size`/
+    /// `podman run --shm-size` exactly: a byte count, or one
+    /// suffixed with `b`/`k`/`m`/`g`/`t` (same binary-unit grammar as
+    /// `--memory`, reusing [`parse_memory_limit`] verbatim — checked
+    /// directly, both flags are backed by the identical real
+    /// `go-units.RAMInBytes` upstream). Defaults to this project's
+    /// own already-correct real default (`Spec::example`'s own
+    /// hardcoded `size=65536k`, i.e. 64 MiB, matching real docker's/
+    /// podman's own identical default) when not given at all — an
+    /// explicit `0` is a real, literal `size=0` tmpfs (checked
+    /// directly: unlike real `docker run --shm-size 0`'s own
+    /// Go-zero-value quirk of silently falling back to the default
+    /// instead, matching real podman's own simpler, non-quirky
+    /// behavior here). A negative value is a clear, immediate error
+    /// (`allow_hyphen_values` so `-1` reaches this flag's own
+    /// validation instead of being misread as an unrecognized flag —
+    /// see `--pids-limit`'s own doc comment for why this matters),
+    /// matching real docker's own explicit rejection
+    /// (`daemon/daemon_unix.go`'s "SHM size can not be less than 0")
+    /// — unlike `--memory-swap`'s own unrelated `-1`-means-unlimited
+    /// convention, `--shm-size` has no "unlimited" sentinel value at
+    /// all in either real tool. This project has no `--ipc` flag of
+    /// its own at all yet, so the real `--shm-size`/`--ipc=host`
+    /// (bind-mounts the host's own real `/dev/shm` instead, checked
+    /// directly against `~/git/moby`) and `--ipc=none` (drops the
+    /// mount entirely) interactions both documented in real docker/
+    /// podman are out of scope here — every container always gets
+    /// its own private, sized `/dev/shm` tmpfs.
+    #[arg(long = "shm-size", allow_hyphen_values = true)]
+    shm_size: Option<String>,
     /// Maximum number of CPUs the container's own cgroup may use
     /// (may be fractional, e.g. `1.5`), matching real `docker run
     /// --cpus`/`podman run --cpus`. Translated to a CPU-time quota
@@ -6447,6 +6477,18 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         args.memory_swap.as_deref(),
         args.cpus,
     )?;
+    // `parse_memory_limit` verbatim, no dedicated wrapper -- same
+    // real, identical `go-units.RAMInBytes` grammar backs both real
+    // `--memory` and `--shm-size` (see `--shm-size`'s own doc comment
+    // for the confirmation), and `parse_memory_swap_limit` already
+    // established the precedent of reusing it directly rather than
+    // introducing a same-shaped wrapper purely to rename its own
+    // error-message text.
+    let shm_size_bytes = args
+        .shm_size
+        .as_deref()
+        .map(parse_memory_limit)
+        .transpose()?;
     let store = open_store()?;
     // Real or short image ID (0122's own convention, extended to
     // `run`/`create` here — 0179/0180/0181 all separately named this
@@ -6685,6 +6727,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             &args.group_add,
             args.user.as_deref(),
             &rlimits,
+            shm_size_bytes,
         )?;
         // Prepended, not appended: `spec.mounts`' own already-present
         // entries (`/proc`, `/dev`, ...) are all subdirectories of the
@@ -11697,6 +11740,7 @@ fn synthesize_spec(
     group_add: &[String],
     user: Option<&str>,
     rlimits: &[oci_spec_types::runtime::PosixRlimit],
+    shm_size_bytes: Option<i64>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -11902,6 +11946,24 @@ fn synthesize_spec(
             kind: Some("bind".to_string()),
             options,
         });
+    }
+
+    // `--shm-size`, matching real `docker run --shm-size`/`podman run
+    // --shm-size` exactly — rewrites `Spec::example()`'s own already-
+    // present `/dev/shm` tmpfs entry's own `size=` option in place
+    // rather than pushing a second, conflicting mount for the same
+    // destination. Real docker's/podman's own literal mount-option
+    // format is a plain byte count with no unit suffix (checked
+    // directly, `~/git/moby/daemon/oci_linux.go`'s own `"size=" +
+    // strconv.FormatInt(...)`/`~/git/podman/libpod/container_internal.
+    // go`'s own `fmt.Sprintf("mode=1777,size=%d", ...)`), not this
+    // project's own default's pre-existing `size=65536k` shorthand —
+    // matched here for the same reason.
+    if let Some(bytes) = shm_size_bytes
+        && let Some(shm) = spec.mounts.iter_mut().find(|m| m.destination == "/dev/shm")
+    {
+        shm.options.retain(|o| !o.starts_with("size="));
+        shm.options.push(format!("size={bytes}"));
     }
 
     Ok(spec)

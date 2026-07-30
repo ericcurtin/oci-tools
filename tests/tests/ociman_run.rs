@@ -518,6 +518,188 @@ fn run_without_read_only_keeps_a_writable_rootfs() {
     );
 }
 
+/// `--shm-size` (checked directly against real `docker run --shm-size`/
+/// `podman run --shm-size`, both backed by the identical real
+/// `go-units.RAMInBytes`): rewrites the real, persisted spec's own
+/// `/dev/shm` tmpfs mount `size=` option to the given, plain byte
+/// count -- matching real docker's/podman's own literal mount-option
+/// format exactly (`size=<bytes>`, no unit suffix, unlike this
+/// project's own pre-existing `size=65536k`-shorthand default).
+#[test]
+fn run_shm_size_sets_the_real_mount_size_in_the_persisted_spec() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/shm-size:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/shm-size:latest",
+        &["--shm-size", "16m", "/bin/sh", "-c", "exit 0"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    let config_path = storage_dir
+        .path()
+        .join("containers")
+        .join(&container_id)
+        .join("config.json");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    let shm_mount = config["mounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["destination"] == "/dev/shm")
+        .expect("a /dev/shm mount must still be present");
+    let options = shm_mount["options"].as_array().unwrap();
+    assert!(
+        options
+            .iter()
+            .any(|o| o.as_str() == Some(&format!("size={}", 16 * 1024 * 1024))),
+        "expected a real, plain-byte-count size= option (16 MiB): {options:?}"
+    );
+    assert!(
+        !options.iter().any(|o| o.as_str() == Some("size=65536k")),
+        "the default's own size= option must be replaced, not left alongside the new one: \
+         {options:?}"
+    );
+}
+
+/// The default (no `--shm-size` at all) leaves `Spec::example()`'s own
+/// existing 64 MiB `/dev/shm` default completely untouched -- a real
+/// regression guard against `synthesize_spec`'s own `--shm-size`
+/// rewrite accidentally firing (or losing the default string) when
+/// the flag isn't given at all.
+#[test]
+fn run_without_shm_size_keeps_the_default_mount_untouched() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/shm-size-default:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/shm-size-default:latest",
+        &["/bin/sh", "-c", "exit 0"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    let config_path = storage_dir
+        .path()
+        .join("containers")
+        .join(&container_id)
+        .join("config.json");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    let shm_mount = config["mounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["destination"] == "/dev/shm")
+        .expect("a /dev/shm mount must still be present");
+    let options = shm_mount["options"].as_array().unwrap();
+    assert!(
+        options.iter().any(|o| o.as_str() == Some("size=65536k")),
+        "expected the default's own size= option, untouched: {options:?}"
+    );
+}
+
+/// A real, kernel-enforced verification, not just a persisted-JSON
+/// check: a small `--shm-size` genuinely caps how much can actually be
+/// written into `/dev/shm`, the real tmpfs itself refusing a write
+/// past it with `ENOSPC` -- matching this project's own established
+/// "prove the kernel enforces it" pattern for `--pids-limit`/
+/// `--memory`.
+#[test]
+fn run_shm_size_actually_enforces_a_real_kernel_tmpfs_limit() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/shm-size-enforced:latest",
+        &busybox,
+        &["sh", "dd"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/shm-size-enforced:latest",
+        &[
+            "--shm-size",
+            "1m",
+            "/bin/sh",
+            "-c",
+            "dd if=/dev/zero of=/dev/shm/f bs=1M count=4",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "a 4 MiB write into a real 1 MiB /dev/shm must fail: {out:?}"
+    );
+}
+
+/// A negative `--shm-size` is a clear, immediate error, matching real
+/// `docker run --shm-size`'s own explicit rejection ("SHM size can not
+/// be less than 0") -- unlike `--memory-swap`'s own unrelated `-1`
+/// convention, `--shm-size` has no "unlimited" sentinel at all.
+#[test]
+fn run_shm_size_rejects_a_negative_value() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/shm-size-negative:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/shm-size-negative:latest",
+        &["--shm-size", "-1", "/bin/true"],
+    );
+    assert!(!out.status.success(), "{out:?}");
+}
+
 /// `--group-add` (0278): a numeric GID is used as-is in the real
 /// synthesized spec's own `process.user.additionalGids`, matching
 /// real `podman run --group-add`'s own checked-directly resolution
