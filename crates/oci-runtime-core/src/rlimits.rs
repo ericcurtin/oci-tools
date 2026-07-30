@@ -44,7 +44,14 @@ fn as_limit(value: u64) -> Option<u64> {
     (value != libc::RLIM_INFINITY).then_some(value)
 }
 
-fn resource_named(name: &str) -> Option<Resource> {
+/// The [`Resource`] a `config.json`-style `RLIMIT_*` name maps onto —
+/// `pub` so a caller that needs to reason about a specific rlimit
+/// *before* actually applying it (e.g. `ociman`'s own `--ulimit`
+/// rootless-hard-limit clamping, which needs a real `getrlimit(2)`
+/// against the exact same [`Resource`] this module would otherwise
+/// apply) can reuse this single source of truth instead of
+/// duplicating the name table.
+pub fn resource_named(name: &str) -> Option<Resource> {
     Some(match name {
         "RLIMIT_AS" => Resource::As,
         "RLIMIT_CORE" => Resource::Core,

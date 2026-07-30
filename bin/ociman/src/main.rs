@@ -381,6 +381,17 @@ struct RunArgs {
     /// and the same rootless delegation caveat, as `--cpuset-cpus`.
     #[arg(long = "cpuset-mems")]
     cpuset_mems: Option<String>,
+    /// Set a resource limit for the container's own process,
+    /// repeatable — matching real `docker run --ulimit`/`podman run
+    /// --ulimit` exactly: `NAME=soft[:hard]`, `-1` for either value
+    /// meaning unlimited (a bare `NAME=value` sets both soft and hard
+    /// to the same value, matching real docker's own
+    /// `go-units.ParseUlimit` default). See [`parse_ulimit`]'s own
+    /// doc comment for the exact, checked-directly set of supported
+    /// `NAME`s and the real soft-must-not-exceed-hard validation this
+    /// shares with real docker/podman.
+    #[arg(long, value_name = "NAME=SOFT[:HARD]")]
+    ulimit: Vec<String>,
     /// Override the container's own seccomp confinement, matching
     /// real `docker run --security-opt seccomp=<value>`/`podman
     /// run --security-opt seccomp=<value>` (repeatable, like real
@@ -6385,6 +6396,11 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         oci_runtime_core::signal::parse(stop_signal)
             .map_err(|e| anyhow::anyhow!("invalid --stop-signal {stop_signal:?}: {e}"))?;
     }
+    let rlimits = args
+        .ulimit
+        .iter()
+        .map(|u| parse_ulimit(u).map(clamp_ulimit_to_host))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let platform = args
         .platform
         .as_deref()
@@ -6668,6 +6684,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             &volumes,
             &args.group_add,
             args.user.as_deref(),
+            &rlimits,
         )?;
         // Prepended, not appended: `spec.mounts`' own already-present
         // entries (`/proc`, `/dev`, ...) are all subdirectories of the
@@ -11679,6 +11696,7 @@ fn synthesize_spec(
     volumes: &[ParsedVolume],
     group_add: &[String],
     user: Option<&str>,
+    rlimits: &[oci_spec_types::runtime::PosixRlimit],
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -11757,6 +11775,14 @@ fn synthesize_spec(
     // create` container reported `NoNewPrivs: 1` unconditionally
     // before this, regardless of any flag at all.
     process.no_new_privileges = no_new_privileges;
+    // `--ulimit`, matching real `docker run --ulimit`/`podman run
+    // --ulimit` exactly -- already-parsed/validated by
+    // `prepare_container` (see `parse_ulimit`'s own doc comment).
+    // `oci_runtime_core::rlimits::apply` (already fully implemented
+    // and unit-tested, wired into `launch::run_reporting_pid`'s own
+    // `ChildSetup` unconditionally) needed no changes at all: this is
+    // purely the missing CLI-to-`config.json` plumbing.
+    process.rlimits = rlimits.to_vec();
     process.env = if container_config.env.is_empty() {
         vec![DEFAULT_ENV_WHEN_IMAGE_DECLARES_NONE.to_string()]
     } else {
@@ -12294,6 +12320,144 @@ fn parse_memory_swap_limit(value: &str) -> anyhow::Result<i64> {
         return Ok(-1);
     }
     parse_memory_limit(value)
+}
+
+/// The `RLIMIT_*` constant name (already fully supported by
+/// [`oci_runtime_core::rlimits::apply`]) a real `docker run --ulimit`/
+/// `podman run --ulimit`-style CLI name maps onto — checked directly
+/// against `~/git/moby/vendor/github.com/docker/go-units/ulimit.go`'s
+/// own `ulimitNameMapping`: all 15 of its entries, deliberately
+/// excluding `as` (real docker's own table has it commented out —
+/// "doesn't seem usable with the way Docker inits a container" — even
+/// though `RLIMIT_AS` is otherwise supported by this project's own
+/// backend, matching real docker's own restriction rather than being
+/// more permissive than it for no reason).
+fn ulimit_rlimit_name(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "core" => "RLIMIT_CORE",
+        "cpu" => "RLIMIT_CPU",
+        "data" => "RLIMIT_DATA",
+        "fsize" => "RLIMIT_FSIZE",
+        "locks" => "RLIMIT_LOCKS",
+        "memlock" => "RLIMIT_MEMLOCK",
+        "msgqueue" => "RLIMIT_MSGQUEUE",
+        "nice" => "RLIMIT_NICE",
+        "nofile" => "RLIMIT_NOFILE",
+        "nproc" => "RLIMIT_NPROC",
+        "rss" => "RLIMIT_RSS",
+        "rtprio" => "RLIMIT_RTPRIO",
+        "rttime" => "RLIMIT_RTTIME",
+        "sigpending" => "RLIMIT_SIGPENDING",
+        "stack" => "RLIMIT_STACK",
+        _ => return None,
+    })
+}
+
+/// `-1` (real docker/podman's own "unlimited" convention for either
+/// side of a `--ulimit NAME=soft[:hard]`) becomes the runtime-spec's
+/// own `RLIM_INFINITY` sentinel — the same representation
+/// [`oci_runtime_core::rlimits::apply`] already expects (see its own
+/// `as_limit` for the inverse conversion back to `None`/`setrlimit`'s
+/// own "no limit" at the point it's actually applied).
+fn parse_ulimit_value(value: &str) -> anyhow::Result<u64> {
+    if value.trim() == "-1" {
+        return Ok(libc::RLIM_INFINITY);
+    }
+    value
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid ulimit value {value:?}"))
+}
+
+/// `NAME=soft[:hard]`, matching real `docker run --ulimit`/`podman
+/// run --ulimit` exactly — checked directly against
+/// `~/git/moby/vendor/github.com/docker/go-units/ulimit.go`'s own
+/// `ParseUlimit`: a bare `NAME=value` (no `:hard`) sets both soft and
+/// hard to the same value (real docker's own `hard = &soft` default
+/// before ever seeing a second, colon-separated field); giving more
+/// than two colon-separated values is a clear, immediate error,
+/// matching real docker's own identical rejection. A soft limit
+/// exceeding a *given* (non-unlimited) hard limit is also a clear,
+/// immediate error here — matching real docker's own validation
+/// exactly (an unlimited, `-1` hard limit can never be exceeded by
+/// anything, soft `-1` included).
+fn parse_ulimit(value: &str) -> anyhow::Result<oci_spec_types::runtime::PosixRlimit> {
+    let (name, limits) = value.split_once('=').with_context(|| {
+        format!("invalid ulimit argument {value:?} (expected NAME=soft[:hard])")
+    })?;
+    let rlimit_name =
+        ulimit_rlimit_name(name).with_context(|| format!("invalid ulimit type: {name}"))?;
+
+    let fields: Vec<&str> = limits.split(':').collect();
+    anyhow::ensure!(
+        fields.len() <= 2 && !fields.iter().any(|f| f.is_empty()),
+        "invalid ulimit argument {value:?}: too many limit value arguments - {limits}, can only \
+         have up to two, `soft[:hard]`"
+    );
+    let soft = parse_ulimit_value(fields[0])?;
+    let hard = match fields.get(1) {
+        Some(h) => parse_ulimit_value(h)?,
+        None => soft,
+    };
+    if hard != libc::RLIM_INFINITY {
+        anyhow::ensure!(
+            soft != libc::RLIM_INFINITY && soft <= hard,
+            "ulimit soft limit must be less than or equal to hard limit: soft: {}, hard: {hard}",
+            fields[0]
+        );
+    }
+    Ok(oci_spec_types::runtime::PosixRlimit {
+        kind: rlimit_name.to_string(),
+        hard,
+        soft,
+    })
+}
+
+/// A `-1` (`RLIM_INFINITY`) soft/hard value from `--ulimit` can't
+/// actually be *set* by an unprivileged process — every `ociman`
+/// container always runs inside a fresh user namespace (`synthesize_
+/// spec`'s own unconditional `into_rootless`), and raising a rlimit's
+/// own hard ceiling past whatever it already is requires
+/// `CAP_SYS_RESOURCE`, which this project's own default (and even
+/// `--privileged`'s wider) capability set doesn't grant — confirmed by
+/// hand: `--ulimit nofile=-1:-1` genuinely failed with a real `EPERM`
+/// from `setrlimit(2)` before this fix. Real, installed `podman run
+/// --ulimit nofile=-1:-1` does *not* fail this way -- checked directly
+/// (`~/git/podman/pkg/util/rlimit.go`'s own `ClampRlimitToHost`,
+/// wired in from `pkg/specgen/generate/oci.go`'s `addRlimits`): in
+/// rootless mode (which every `ociman` container already
+/// unconditionally is, unlike real podman, which only takes this path
+/// when the whole podman process itself is rootless too — a
+/// distinction this project's own always-userns'd design makes moot),
+/// a `-1` on either side is translated to the *calling* process's own
+/// real, current `getrlimit(2)` hard ceiling for that resource instead
+/// of the raw, unachievable `RLIM_INFINITY` sentinel — exactly what a
+/// forked child inherits unchanged anyway, so querying it here (before
+/// ever forking) is equivalent to what the container's own process
+/// could actually achieve. If the calling process's own ceiling is
+/// itself already unbounded (a genuinely privileged invocation), the
+/// raw `RLIM_INFINITY` is left untouched — matching real podman's own
+/// identical fallback (`rlimit.Max` already being its own platform's
+/// "no limit" sentinel).
+fn clamp_ulimit_to_host(
+    mut rlimit: oci_spec_types::runtime::PosixRlimit,
+) -> oci_spec_types::runtime::PosixRlimit {
+    if rlimit.hard != libc::RLIM_INFINITY && rlimit.soft != libc::RLIM_INFINITY {
+        return rlimit;
+    }
+    let Some(resource) = oci_runtime_core::rlimits::resource_named(&rlimit.kind) else {
+        return rlimit;
+    };
+    let ceiling = rustix::process::getrlimit(resource)
+        .maximum
+        .unwrap_or(libc::RLIM_INFINITY);
+    if rlimit.hard == libc::RLIM_INFINITY {
+        rlimit.hard = ceiling;
+    }
+    if rlimit.soft == libc::RLIM_INFINITY {
+        rlimit.soft = ceiling;
+    }
+    rlimit
 }
 
 /// `ENTRYPOINT` (always kept, unless it's real docker/podman's own
@@ -13055,6 +13219,80 @@ mod tests {
         assert_eq!(parse_memory_swap_limit("512m").unwrap(), 512 * 1024 * 1024);
         assert!(parse_memory_swap_limit("not-a-number").is_err());
         assert!(parse_memory_swap_limit("-2").is_err());
+    }
+
+    #[test]
+    fn parse_ulimit_parses_every_real_docker_podman_name() {
+        for name in [
+            "core",
+            "cpu",
+            "data",
+            "fsize",
+            "locks",
+            "memlock",
+            "msgqueue",
+            "nice",
+            "nofile",
+            "nproc",
+            "rss",
+            "rtprio",
+            "rttime",
+            "sigpending",
+            "stack",
+        ] {
+            let rlimit = parse_ulimit(&format!("{name}=10:20")).unwrap();
+            assert_eq!(rlimit.kind, format!("RLIMIT_{}", name.to_uppercase()));
+            assert_eq!(rlimit.soft, 10);
+            assert_eq!(rlimit.hard, 20);
+        }
+    }
+
+    #[test]
+    fn parse_ulimit_rejects_as_matching_real_dockers_own_deliberate_exclusion() {
+        // Real docker's own `ulimitNameMapping` has `as` commented out
+        // entirely ("doesn't seem usable with the way Docker inits a
+        // container") -- even though `RLIMIT_AS` is otherwise fully
+        // supported by this project's own backend
+        // (`oci_runtime_core::rlimits`), matching that restriction
+        // rather than being needlessly more permissive.
+        assert!(parse_ulimit("as=10:20").is_err());
+    }
+
+    #[test]
+    fn parse_ulimit_with_no_hard_value_sets_both_to_the_same_soft_value() {
+        let rlimit = parse_ulimit("nofile=100").unwrap();
+        assert_eq!(rlimit.soft, 100);
+        assert_eq!(rlimit.hard, 100);
+    }
+
+    #[test]
+    fn parse_ulimit_accepts_negative_one_as_rlim_infinity_on_either_side() {
+        assert_eq!(parse_ulimit("nofile=-1").unwrap().soft, libc::RLIM_INFINITY);
+        assert_eq!(parse_ulimit("nofile=-1").unwrap().hard, libc::RLIM_INFINITY);
+        let rlimit = parse_ulimit("nofile=10:-1").unwrap();
+        assert_eq!(rlimit.soft, 10);
+        assert_eq!(rlimit.hard, libc::RLIM_INFINITY);
+    }
+
+    #[test]
+    fn parse_ulimit_rejects_a_soft_value_exceeding_a_bounded_hard_value() {
+        assert!(parse_ulimit("nofile=200:100").is_err());
+        // An unlimited (-1) hard value can never be exceeded.
+        assert!(parse_ulimit("nofile=200:-1").is_ok());
+        // But an unlimited (-1) soft value against a *bounded* hard
+        // value is still rejected -- matching real docker's own
+        // identical validation (an unbounded soft limit is never
+        // "less than or equal to" any real, finite hard limit).
+        assert!(parse_ulimit("nofile=-1:200").is_err());
+    }
+
+    #[test]
+    fn parse_ulimit_rejects_malformed_input() {
+        assert!(parse_ulimit("nofile").is_err()); // no `=`
+        assert!(parse_ulimit("not-a-real-name=10").is_err());
+        assert!(parse_ulimit("nofile=not-a-number").is_err());
+        assert!(parse_ulimit("nofile=10:20:30").is_err()); // too many fields
+        assert!(parse_ulimit("nofile=10:").is_err()); // empty hard field
     }
 
     #[test]

@@ -2369,6 +2369,229 @@ fn run_without_pids_limit_can_fork_far_more_than_five_processes() {
     assert!(stdout.contains("all-forks-succeeded"), "got: {out:?}");
 }
 
+/// `--ulimit NAME=soft[:hard]` (matching real `docker run --ulimit`/
+/// `podman run --ulimit` exactly): a real, kernel-enforced verification
+/// that the container's own soft *and* hard `RLIMIT_NOFILE` genuinely
+/// differ when given differently, read back via busybox `ash`'s own
+/// `ulimit -n`/`ulimit -Hn` builtins (real `getrlimit(2)` calls, not
+/// this project's own bookkeeping).
+#[test]
+fn run_ulimit_sets_distinct_real_soft_and_hard_rlimits() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ulimit:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/ulimit:latest",
+        &[
+            "--ulimit",
+            "nofile=123:456",
+            "/bin/sh",
+            "-c",
+            "ulimit -n; ulimit -Hn",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "123\n456",
+        "the real soft (ulimit -n) and hard (ulimit -Hn) RLIMIT_NOFILE must genuinely differ, \
+         matching what --ulimit nofile=123:456 asked for: {out:?}"
+    );
+}
+
+/// A bare `NAME=value` (no `:hard`) sets *both* soft and hard to the
+/// same value — matching real `docker run --ulimit`'s own documented
+/// default (`go-units.ParseUlimit`'s own `hard = &soft` before ever
+/// seeing a second field).
+#[test]
+fn run_ulimit_with_no_hard_value_sets_both_to_the_same_value() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ulimit-bare:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/ulimit-bare:latest",
+        &[
+            "--ulimit",
+            "nofile=321",
+            "/bin/sh",
+            "-c",
+            "ulimit -n; ulimit -Hn",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.trim(), "321\n321", "{out:?}");
+}
+
+/// An unrecognized `--ulimit` name is a clear, immediate CLI error,
+/// matching real `docker`/`podman`'s own identical rejection — never
+/// silently ignored.
+#[test]
+fn run_ulimit_with_an_unrecognized_name_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ulimit-bad-name:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/ulimit-bad-name:latest",
+        &["--ulimit", "not-a-real-name=10", "/bin/true"],
+    );
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not-a-real-name"),
+        "expected a clear error naming the bad ulimit name: {stderr}"
+    );
+}
+
+/// A soft limit exceeding a given (non-unlimited) hard limit is a
+/// clear, immediate CLI error, matching real `docker`/`podman`'s own
+/// identical validation rather than silently swapping/clamping the
+/// two values.
+#[test]
+fn run_ulimit_with_soft_exceeding_hard_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ulimit-soft-exceeds-hard:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/ulimit-soft-exceeds-hard:latest",
+        &["--ulimit", "nofile=500:100", "/bin/true"],
+    );
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("soft limit must be less than or equal to hard limit"),
+        "expected a clear error explaining why: {stderr}"
+    );
+}
+
+/// `-1` means unlimited for either side of `--ulimit`, matching real
+/// `docker`/`podman`'s own documented convention -- but, checked
+/// directly against a real installed `podman run --ulimit
+/// nofile=-1:-1` (which reports a real, large *number*, not the
+/// literal string `unlimited`), an unprivileged process can never
+/// actually set a real unbounded hard rlimit at all (`EPERM` without
+/// `CAP_SYS_RESOURCE`), so real podman -- and, matching it, `ociman`
+/// too (`clamp_ulimit_to_host`) -- silently translates `-1` into the
+/// *calling* process's own real, current `getrlimit(2)` hard ceiling
+/// for that resource instead. Verified here as exactly that: the
+/// container's own real soft *and* hard `RLIMIT_NOFILE` both end up
+/// equal to whatever this test process's own real ceiling already is
+/// (queried the same way, via a plain host `ulimit -Hn`), not the
+/// literal, unachievable `unlimited`.
+#[test]
+fn run_ulimit_accepts_negative_one_as_the_hosts_own_real_ceiling() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let host_ceiling = String::from_utf8_lossy(
+        &Command::new(&busybox)
+            .args(["sh", "-c", "ulimit -Hn"])
+            .output()
+            .expect("failed to query this host's own real NOFILE ceiling")
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(
+        host_ceiling.parse::<u64>().is_ok(),
+        "expected a real numeric ceiling, not {host_ceiling:?} -- this test's own host must \
+         have a bounded (not already-unlimited) NOFILE hard limit for this assertion to be \
+         meaningful"
+    );
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ulimit-unlimited:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/ulimit-unlimited:latest",
+        &[
+            "--ulimit",
+            "nofile=-1:-1",
+            "/bin/sh",
+            "-c",
+            "ulimit -n; ulimit -Hn",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        format!("{host_ceiling}\n{host_ceiling}"),
+        "-1 must clamp to this host's own real ceiling, not the literal unachievable \
+         \"unlimited\": {out:?}"
+    );
+}
+
 #[test]
 fn run_cpus_flag_sets_the_real_systemd_scopes_own_cpu_quota() {
     // `--cpus` translates to a *rate* limit (how much CPU time is

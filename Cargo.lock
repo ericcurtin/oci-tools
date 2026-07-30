@@ -1259,6 +1259,7 @@ dependencies = [
  "anyhow",
  "clap",
  "flate2",
+ "libc",
  "oci-cli-common",
  "oci-dockerfile",
  "oci-layer",
