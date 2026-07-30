@@ -621,7 +621,8 @@ fn provision_vm(rootfs: &Path, name: &str) -> anyhow::Result<()> {
         let exit_code = unsafe {
             // `preserve_fds: 0` -- `ocivmm` has no `--preserve-fds`
             // flag of its own. `no_pivot: false` -- `ocivmm` has no
-            // `--no-pivot` flag either.
+            // `--no-pivot` flag either. `no_new_keyring: false` --
+            // same reasoning, no equivalent flag at this layer either.
             oci_runtime_core::launch::run(
                 &format!("ocivmm-provision-{name}"),
                 &bundle,
@@ -629,6 +630,7 @@ fn provision_vm(rootfs: &Path, name: &str) -> anyhow::Result<()> {
                 true,
                 false,
                 0,
+                false,
                 false,
             )
         }

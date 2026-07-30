@@ -1097,3 +1097,92 @@ fn run_detach_keep_leaves_a_stopped_state_behind_for_a_later_delete() {
         .expect("failed to spawn ocirun state");
     assert!(!state.status.success(), "{state:?}");
 }
+
+/// Writes a bundle just like [`write_bundle`], plus a `cat` applet
+/// (needed to actually read `/proc/keys` back out) and `/proc/keys`
+/// removed from the default `maskedPaths` list (`docs/design/0376`'s
+/// research confirmed real runc/docker mask it by default for good
+/// reason — a real container should never be able to enumerate every
+/// key on the host — so this is deliberately only done for this one
+/// test bundle's own verification purposes, never the shared default).
+fn write_keyring_test_bundle(dir: &Path, busybox: &Path, args: &[&str]) {
+    write_bundle(dir, busybox, args);
+    let _ = std::os::unix::fs::symlink("busybox", dir.join("rootfs/bin/cat"));
+    let config_path = dir.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    if let Some(masked) = config["linux"]["maskedPaths"].as_array_mut() {
+        masked.retain(|p| p.as_str() != Some("/proc/keys"));
+    }
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+}
+
+/// `ocirun run` joins a fresh, container-scoped session keyring by
+/// default, matching real `runc run`/`crun run`'s own unconditional
+/// default (`docs/design/0378`) — a real, kernel-level verification,
+/// not just "no error was returned": the container's own `/proc/keys`
+/// (masking removed just for this one test, see
+/// `write_keyring_test_bundle`'s own doc comment) must show a real
+/// keyring literally named after the container's own id, proving a
+/// genuinely new, uniquely-named keyring was actually joined rather
+/// than silently inheriting whatever session keyring `ocirun` itself
+/// happened to have (this project's own entire previous behavior,
+/// before this flag/mechanism existed at all).
+#[test]
+fn run_joins_a_new_session_keyring_named_after_the_container_id_by_default() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_keyring_test_bundle(dir.path(), &busybox, &["/bin/sh", "-c", "cat /proc/keys"]);
+
+    let out = ocirun_run(dir.path(), "keyring-default-test-id");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.lines().any(|line| line.contains("keyring")
+            && line.trim_end().ends_with("keyring-default-test-id: empty")),
+        "expected a real keyring named after the container's own id in /proc/keys, got: {stdout:?}"
+    );
+}
+
+/// `ocirun run --no-new-keyring` skips joining a new keyring entirely
+/// — matching real `runc run --no-new-keyring`/`crun run
+/// --no-new-keyring` exactly: no keyring named after the container's
+/// own id ever appears, a direct, real contrast with the default-case
+/// test above.
+#[test]
+fn run_no_new_keyring_skips_joining_a_new_session_keyring() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_keyring_test_bundle(dir.path(), &busybox, &["/bin/sh", "-c", "cat /proc/keys"]);
+
+    let out = Command::new(bin_path("ocirun"))
+        .args(["run", "keyring-no-new-keyring-test-id", "--bundle"])
+        .arg(dir.path())
+        .current_dir(dir.path())
+        .args(["--root"])
+        .arg(dir.path().join("state-root"))
+        .args(["--no-new-keyring"])
+        .env_remove("OCI_TOOLS_LOG")
+        .output()
+        .expect("failed to spawn ocirun run --no-new-keyring");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("keyring-no-new-keyring-test-id"),
+        "--no-new-keyring must not join a keyring named after the container's own id: {stdout:?}"
+    );
+}

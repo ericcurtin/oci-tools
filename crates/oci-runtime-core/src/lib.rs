@@ -81,6 +81,7 @@ pub mod exec;
 pub mod exec_fifo;
 pub mod hooks;
 pub mod identity;
+pub mod keyring;
 pub mod launch;
 pub mod namespaces;
 pub mod nsenter;

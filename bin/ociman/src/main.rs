@@ -7204,6 +7204,13 @@ fn run_and_finalize(
             // a `runc`/`crun`-level escape hatch neither `docker run`/
             // `podman run` expose.
             false,
+            // `no_new_keyring: false` -- same reasoning,
+            // `--no-new-keyring` too is a `runc`/`crun`-level escape
+            // hatch neither `docker run`/`podman run` expose; every
+            // `ociman run`/`ociman create` container gets a fresh
+            // session keyring, matching real `runc`/`crun`'s own
+            // default.
+            false,
             record_running,
         )
     }

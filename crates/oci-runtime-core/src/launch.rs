@@ -29,6 +29,7 @@ use crate::bundle::Bundle;
 use crate::cgroups::{self, CgroupWrite};
 use crate::exec_fifo;
 use crate::identity;
+use crate::keyring;
 use crate::namespaces;
 use crate::process;
 use crate::rlimits;
@@ -94,6 +95,7 @@ pub unsafe fn run(
     discard_output: bool,
     preserve_fds: u32,
     no_pivot: bool,
+    no_new_keyring: bool,
 ) -> io::Result<i32> {
     // SAFETY: forwarded from this function's own contract.
     unsafe {
@@ -107,6 +109,7 @@ pub unsafe fn run(
             discard_output,
             preserve_fds,
             no_pivot,
+            no_new_keyring,
             |_pid| {},
         )
     }
@@ -202,6 +205,9 @@ pub enum CgroupSetup {
 /// `no_pivot`: see [`ChildSetup::no_pivot`]'s own doc comment. `false`
 /// for every caller except `ocirun`'s own CLI.
 ///
+/// `no_new_keyring`: see [`ChildSetup::no_new_keyring`]'s own doc
+/// comment. `false` for every caller except `ocirun`'s own CLI.
+///
 /// # Safety
 ///
 /// Same contract as [`run`].
@@ -217,11 +223,13 @@ pub unsafe fn run_reporting_pid(
     discard_output: bool,
     preserve_fds: u32,
     no_pivot: bool,
+    no_new_keyring: bool,
     on_pid: impl FnOnce(i32),
 ) -> io::Result<i32> {
     let mut child_setup = build_child_setup(bundle, rootfs, id)?;
     child_setup.preserve_fds = preserve_fds;
     child_setup.no_pivot = no_pivot;
+    child_setup.no_new_keyring = no_new_keyring;
     if close_stdin {
         child_setup.stdin_fd = Some(
             std::fs::File::open("/dev/null")
@@ -655,10 +663,12 @@ pub unsafe fn create(
     exec_fifo_path: &Path,
     preserve_fds: u32,
     no_pivot: bool,
+    no_new_keyring: bool,
 ) -> io::Result<i32> {
     let mut child_setup = build_child_setup(bundle, rootfs, id)?;
     child_setup.preserve_fds = preserve_fds;
     child_setup.no_pivot = no_pivot;
+    child_setup.no_new_keyring = no_new_keyring;
     let (read_fd, write_fd) =
         rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)?;
     child_setup.exec_fifo = Some(exec_fifo_path.to_path_buf());
@@ -809,6 +819,7 @@ fn build_child_setup(bundle: &Bundle, rootfs: &Path, id: &str) -> io::Result<Chi
     });
 
     Ok(ChildSetup {
+        id: id.to_string(),
         flags,
         needs_self_mapping,
         uid_mappings,
@@ -834,6 +845,7 @@ fn build_child_setup(bundle: &Bundle, rootfs: &Path, id: &str) -> io::Result<Chi
         cwd: process_spec.cwd.clone(),
         preserve_fds: 0,
         no_pivot: false,
+        no_new_keyring: false,
     })
 }
 
@@ -889,6 +901,17 @@ struct ContainerHooks {
 /// planned rootfs setup, and finally `exec` — bundled into one value so
 /// it can move into the child's closure as a single capture.
 struct ChildSetup {
+    /// The container's own id — used as the new session keyring's own
+    /// name (see [`Self::no_new_keyring`]'s own doc comment), matching
+    /// real crun's own identical choice (`~/git/crun/src/libcrun/
+    /// container.c`'s `setup_container_keyring` uses `container->
+    /// context->id` verbatim, not a `_ses.`-prefixed name the way real
+    /// runc does). Otherwise unused by this struct — every other spot
+    /// that already needed the id (`ContainerHooks::id`) still tracks
+    /// its own separate copy, since that field is only ever populated
+    /// when hooks actually exist while this one is needed
+    /// unconditionally.
+    id: String,
     flags: rustix::thread::UnshareFlags,
     needs_self_mapping: bool,
     uid_mappings: Vec<LinuxIdMapping>,
@@ -1000,6 +1023,30 @@ struct ChildSetup {
     /// `pivot_root` within is the real, narrow case it exists for), so
     /// it's opt-in here too.
     no_pivot: bool,
+    /// `ocirun run/create --no-new-keyring` (matching real `runc`/
+    /// `crun --no-new-keyring` exactly): skip joining a fresh,
+    /// container-scoped session keyring before `exec` — see
+    /// `keyring::join_session_keyring`'s own doc comment for exactly
+    /// what this normally does and why it's real, checked-directly
+    /// isolation, not a cosmetic flag. `false` (the default for every
+    /// caller except `ocirun`'s own CLI) joins the new keyring
+    /// unconditionally, matching both reference runtimes' own
+    /// identical default — a real, previously-missing step this
+    /// project's own `mount_pivot_and_exec` never performed at all
+    /// before this, meaning every container previously silently
+    /// shared the host's own session keyring with no isolation
+    /// whatsoever, regardless of this flag ever existing. Deliberately
+    /// **not** persisted/threaded into `ocirun exec` (joining an
+    /// already-running container) at all — matching real crun's own
+    /// choice exactly (checked directly: crun's `exec.c`/
+    /// `libcrun_container_exec*` never touch the keyring), a
+    /// narrower, simpler scope than real runc's own exec-time rejoin
+    /// of the container's already-existing named ring, which would
+    /// need this project to persist `no_new_keyring` alongside the
+    /// rest of a container's on-disk state for a later, separate
+    /// `ocirun exec` invocation to read back — a real capability this
+    /// project's architecture doesn't have today.
+    no_new_keyring: bool,
 }
 
 impl ChildSetup {
@@ -1191,6 +1238,21 @@ impl ChildSetup {
                     &format!("waiting for pre-pivot hooks: {e}"),
                 );
             }
+        }
+        // `--no-new-keyring` (see `Self::no_new_keyring`'s own doc
+        // comment): matching both real runc's own "absolute first
+        // thing in the child's own `Init()`" and real crun's own
+        // "before rootfs/pivot_root, before capability drop/seccomp"
+        // placement — strictly before the `pivot_root` planning loop
+        // and `identity::apply` call further down in this same
+        // function.
+        if !self.no_new_keyring
+            && let Err(e) = keyring::join_session_keyring(&self.id)
+        {
+            fail(
+                SETUP_FAILURE_EXIT_CODE,
+                &format!("joining a new session keyring: {e}"),
+            );
         }
         // Must happen *before* `pivot_root` below (part of the plan
         // loop) — see `exec_fifo`'s own doc comment on why an ordinary

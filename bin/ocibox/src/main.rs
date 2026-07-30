@@ -937,7 +937,20 @@ fn enter_and_get_exit_code(name: &str, command: &[String]) -> anyhow::Result<i32
         // its own (real `distrobox` has no equivalent either).
         // `no_pivot: false` -- `ocibox enter` has no `--no-pivot` flag
         // of its own either (real `distrobox` has no equivalent).
-        oci_runtime_core::launch::run(name, &bundle, &validated_rootfs, false, false, 0, false)
+        // `no_new_keyring: false` -- same reasoning, `--no-new-keyring`
+        // too is a `runc`/`crun`-level escape hatch this layer has no
+        // equivalent of; every `ocibox enter` session gets a fresh
+        // session keyring, matching real `runc`/`crun`'s own default.
+        oci_runtime_core::launch::run(
+            name,
+            &bundle,
+            &validated_rootfs,
+            false,
+            false,
+            0,
+            false,
+            false,
+        )
     }
     .with_context(|| format!("running inside box {name}"))?;
     Ok(exit_code)

@@ -283,6 +283,13 @@ fn run(args: &[String]) -> anyhow::Result<()> {
             // a `runc`/`crun`-level escape hatch this layer has no
             // equivalent of.
             false,
+            // `no_new_keyring: false` -- same reasoning, no equivalent
+            // flag at this layer either; every CRI container gets a
+            // fresh session keyring, matching real `runc`/`crun`'s own
+            // default (and matching real `cri-o`, which always
+            // launches through a real `runc`/`crun` that does this
+            // unconditionally too).
+            false,
             |pid| {
                 let _ = write_atomic(&dir_for_pid, PID_FILENAME, pid.to_string().as_bytes());
             },

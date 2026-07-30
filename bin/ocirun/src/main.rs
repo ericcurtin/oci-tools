@@ -193,6 +193,24 @@ enum Command {
         /// running inside the detached process instead of this one.
         #[arg(short = 'd', long)]
         detach: bool,
+        /// Do not join a fresh, container-scoped session keyring —
+        /// matching real `runc run --no-new-keyring`/`crun run
+        /// --no-new-keyring` exactly (checked directly,
+        /// `~/git/runc/libcontainer/standard_init_linux.go`'s own
+        /// `keys.JoinSessionKeyring`; `~/git/crun/src/libcrun/
+        /// linux.c`'s own `syscall_keyctl_join`): without this, the
+        /// container's process shares whatever session keyring
+        /// `ocirun` itself happened to have, with no isolation of its
+        /// own at all — this project's own previous, sole behavior,
+        /// for every container, before this flag existed. Only
+        /// affects `run`/`create` — deliberately not `ocirun exec`
+        /// (joining an already-running container), matching real
+        /// crun's own identical choice (checked directly: crun's own
+        /// `exec.c` never touches the keyring at all), a narrower
+        /// scope than real runc's own exec-time rejoin of the
+        /// container's already-existing named ring.
+        #[arg(long = "no-new-keyring")]
+        no_new_keyring: bool,
     },
     /// Create a container: set up namespaces/mounts/cgroups and leave
     /// its process blocked, waiting for `start`. Returns once setup
@@ -214,6 +232,9 @@ enum Command {
         /// Same as `run --no-pivot` — see its own doc comment.
         #[arg(long = "no-pivot")]
         no_pivot: bool,
+        /// Same as `run --no-new-keyring` — see its own doc comment.
+        #[arg(long = "no-new-keyring")]
+        no_new_keyring: bool,
     },
     /// Start a previously `create`d container's process running.
     Start {
@@ -607,6 +628,7 @@ fn main() -> std::process::ExitCode {
                 no_pivot,
                 keep,
                 detach,
+                no_new_keyring,
             }) => cmd_run(
                 &root,
                 &id,
@@ -616,6 +638,7 @@ fn main() -> std::process::ExitCode {
                 no_pivot,
                 keep,
                 detach,
+                no_new_keyring,
             ),
             Some(Command::Create {
                 id,
@@ -623,6 +646,7 @@ fn main() -> std::process::ExitCode {
                 pid_file,
                 preserve_fds,
                 no_pivot,
+                no_new_keyring,
             }) => cmd_create(
                 &root,
                 &id,
@@ -630,6 +654,7 @@ fn main() -> std::process::ExitCode {
                 pid_file.as_deref(),
                 preserve_fds,
                 no_pivot,
+                no_new_keyring,
             ),
             Some(Command::Start { id }) => cmd_start(&root, &id),
             Some(Command::Kill { id, signal, all }) => cmd_kill(&root, &id, signal.as_deref(), all),
@@ -834,6 +859,7 @@ fn cmd_run(
     no_pivot: bool,
     keep: bool,
     detach: bool,
+    no_new_keyring: bool,
 ) -> anyhow::Result<()> {
     let dir = bundle.unwrap_or_else(|| Path::new(".")).to_path_buf();
     tracing::debug!(container_id = id, bundle = %dir.display(), "run starting");
@@ -919,6 +945,7 @@ fn cmd_run(
                     preserve_fds,
                     no_pivot,
                     keep,
+                    no_new_keyring,
                 ) {
                     Ok(code) => code,
                     Err(_) => oci_runtime_core::launch::SETUP_FAILURE_EXIT_CODE,
@@ -942,6 +969,7 @@ fn cmd_run(
         preserve_fds,
         no_pivot,
         keep,
+        no_new_keyring,
     )?;
 
     // The container's own exit code becomes ours, matching runc/crun's
@@ -983,6 +1011,7 @@ fn run_and_finalize(
     preserve_fds: u32,
     no_pivot: bool,
     keep: bool,
+    no_new_keyring: bool,
 ) -> anyhow::Result<i32> {
     // `launch::run` itself is just `run_reporting_pid` with a no-op
     // callback (see its own doc comment) — called directly here
@@ -1016,6 +1045,7 @@ fn run_and_finalize(
             false,
             preserve_fds,
             no_pivot,
+            no_new_keyring,
             |pid| {
                 if let Some(path) = pid_file {
                     write_pid_file(path, pid);
@@ -1104,6 +1134,7 @@ fn cmd_create(
     pid_file: Option<&Path>,
     preserve_fds: u32,
     no_pivot: bool,
+    no_new_keyring: bool,
 ) -> anyhow::Result<()> {
     let dir = bundle.unwrap_or_else(|| Path::new("."));
     tracing::debug!(container_id = id, bundle = %dir.display(), "create starting");
@@ -1134,6 +1165,7 @@ fn cmd_create(
                 &fifo_path,
                 preserve_fds,
                 no_pivot,
+                no_new_keyring,
             )
         }
         .context("creating container")?;

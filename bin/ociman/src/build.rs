@@ -1752,9 +1752,11 @@ fn run_instruction(
     // completely ordinary build is the one final digest line.
     #[allow(unsafe_code)]
     let exit_code = unsafe {
-        // `preserve_fds: 0`/`no_pivot: false` -- `ociman build`'s own
-        // `RUN` steps have no equivalent flags (real `docker build`/
-        // `podman build` don't either).
+        // `preserve_fds: 0`/`no_pivot: false`/`no_new_keyring: false`
+        // -- `ociman build`'s own `RUN` steps have no equivalent flags
+        // (real `docker build`/`podman build` don't either); every
+        // `RUN` step gets a fresh session keyring, matching real
+        // `runc`/`crun`'s own default.
         oci_runtime_core::launch::run(
             "ociman-build",
             &bundle,
@@ -1762,6 +1764,7 @@ fn run_instruction(
             true,
             quiet,
             0,
+            false,
             false,
         )
     }
