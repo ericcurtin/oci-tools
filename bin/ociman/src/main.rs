@@ -3750,6 +3750,15 @@ fn cmd_images(
         {
             continue;
         }
+        // Every given `id=` value must match (AND, not OR -- see
+        // `ImageFilters::id`'s own doc comment for exactly why).
+        if !filters
+            .id
+            .iter()
+            .all(|prefix| record.manifest_digest.hex().starts_with(prefix.as_str()))
+        {
+            continue;
+        }
         // `reference!=` excludes on any match; `reference=` (if given
         // at all) requires at least one match -- matching real
         // podman's own exact combination rule (see
@@ -4693,6 +4702,21 @@ struct ImageFilters {
     /// error instead of silently accepting it, matching this
     /// project's own "no fabricated behavior" convention.
     containers: Option<bool>,
+    /// `id=<prefix>` -- matches an image whose own full manifest
+    /// digest (hex, no `sha256:` prefix -- real podman's own
+    /// `img.ID()`) starts with `<prefix>`. Unlike `labels`/
+    /// `reference_wanted`/`reference_unwanted` (all deliberately
+    /// OR'd, see their own doc comments), multiple `id=` values are
+    /// ANDed together -- real podman's own generic per-key
+    /// combinator (`~/git/container-libs/common/libimage/
+    /// filters.go`'s own `applyFilters`: "All filters of each key
+    /// must apply") applies here unmodified, since `id=` isn't one of
+    /// the explicit, checked-directly exceptions that override it. A
+    /// real, if unusual, consequence, checked directly rather than
+    /// assumed: `--filter id=a --filter id=b` for two genuinely
+    /// different prefixes matches nothing at all (no single ID can
+    /// start with two different strings), not an OR of the two.
+    id: Vec<String>,
 }
 
 /// Every real image (identified by manifest digest, not one exact
@@ -4795,12 +4819,19 @@ fn parse_image_filters(filters: &[String]) -> anyhow::Result<ImageFilters> {
                 "ociman images: conflicting containers filter values specified"
             );
             parsed.containers = Some(value);
+        } else if let Some(value) = f.strip_prefix("id=") {
+            anyhow::ensure!(
+                !value.is_empty(),
+                "ociman images: --filter {f:?} is missing a value"
+            );
+            parsed.id.push(value.to_string());
         } else {
             anyhow::bail!(
                 "ociman images: --filter {f:?} is not yet supported (only \
                  label=<key>[=<value>], label!=<key>[=<value>], dangling=true|false, \
                  before=<image>, since=<image>/after=<image>, \
-                 reference=<pattern>/reference!=<pattern>, or containers=true|false are)"
+                 reference=<pattern>/reference!=<pattern>, containers=true|false, or \
+                 id=<prefix> are)"
             );
         }
     }

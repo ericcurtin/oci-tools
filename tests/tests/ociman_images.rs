@@ -708,6 +708,144 @@ fn images_filter_containers_rejects_an_invalid_value() {
     );
 }
 
+/// `ociman images --filter id=<prefix>` (0349), matching real `podman
+/// images --filter id=<id>` exactly (checked directly, `~/git/
+/// container-libs/common/libimage/filters.go`'s own `filterID`):
+/// matches a prefix of the image's own full manifest digest (hex, no
+/// `sha256:` prefix) -- the same short digest `-q` itself prints, so
+/// filtering by that exact string should select precisely the one
+/// image it came from.
+#[test]
+fn images_filter_id_matches_by_manifest_digest_prefix() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/filter-id-a:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/filter-id-b:latest",
+        &busybox,
+        &["sh", "echo"],
+        ContainerConfig::default(),
+    );
+
+    let quiet = ociman(storage_dir.path(), &["images", "-q"]);
+    assert!(quiet.status.success());
+    let short_ids: Vec<String> = String::from_utf8_lossy(&quiet.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(short_ids.len(), 2, "{short_ids:?}");
+
+    let filtered = ociman(
+        storage_dir.path(),
+        &["images", "-q", "--filter", &format!("id={}", short_ids[0])],
+    );
+    assert!(
+        filtered.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+    let filtered_stdout = String::from_utf8_lossy(&filtered.stdout);
+    let matched: Vec<&str> = filtered_stdout.trim().lines().collect();
+    assert_eq!(matched, vec![short_ids[0].as_str()], "{matched:?}");
+
+    // A short, real prefix of that same id also matches -- `id=` is a
+    // genuine prefix match, not an exact-string one.
+    let short_prefix = &short_ids[0][..4];
+    let prefix_filtered = ociman(
+        storage_dir.path(),
+        &["images", "-q", "--filter", &format!("id={short_prefix}")],
+    );
+    assert!(prefix_filtered.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&prefix_filtered.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "{prefix_filtered:?}"
+    );
+}
+
+/// A real, checked-directly consequence of real podman's own generic
+/// per-key filter combinator (`~/git/container-libs/common/libimage/
+/// filters.go`'s own `applyFilters`): unlike `label=`/`reference=`
+/// (both deliberately OR'd), multiple `id=` values for two genuinely
+/// different images are ANDed together -- since no single image's id
+/// can start with two different prefixes at once, this matches
+/// nothing at all, not the union of the two.
+#[test]
+fn images_filter_id_with_two_different_values_matches_nothing() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/filter-id-and-a:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/filter-id-and-b:latest",
+        &busybox,
+        &["sh", "echo"],
+        ContainerConfig::default(),
+    );
+
+    let quiet = ociman(storage_dir.path(), &["images", "-q"]);
+    assert!(quiet.status.success());
+    let short_ids: Vec<String> = String::from_utf8_lossy(&quiet.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(short_ids.len(), 2, "{short_ids:?}");
+
+    let both = ociman(
+        storage_dir.path(),
+        &[
+            "images",
+            "-q",
+            "--filter",
+            &format!("id={}", short_ids[0]),
+            "--filter",
+            &format!("id={}", short_ids[1]),
+        ],
+    );
+    assert!(both.status.success());
+    assert!(
+        both.stdout.is_empty(),
+        "ANDed, genuinely conflicting id= values should match nothing: {both:?}"
+    );
+}
+
+#[test]
+fn images_filter_id_missing_a_value_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["images", "--filter", "id="]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("missing a value"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `ociman images --format` (0334) renders one line per listed image,
 /// reusing the exact same Go-template-*lite* engine `ociman inspect
 /// --format`/`ps --format` (`0332`/`0333`) already established.
