@@ -269,6 +269,37 @@ enum SaveFormat {
     DockerArchive,
 }
 
+/// `ociman ps --sort`'s own sort key, matching real `podman ps --sort`
+/// exactly — checked directly against `~/git/podman/cmd/podman/
+/// containers/ps.go`'s own `validate.Value` choice list and a real
+/// installed `podman ps --sort <key>`, not assumed: all eight of these
+/// are the only real, valid values (a ninth, `"pod"`, exists in
+/// podman's own internal switch but isn't in its CLI's own choice
+/// list, so it's unreachable from `podman ps` itself and has no
+/// equivalent here either). An unrecognized value is a real, immediate
+/// clap parse error (this project's own `value_enum` derive already
+/// produces the same "not a valid value, choose from: ..." shape real
+/// podman's own cobra-validated flag does), matching real podman's own
+/// checked-directly behavior exactly (its own internal `default:
+/// return error` case in `SortPsOutput` is dead code for the CLI path
+/// for the same reason). Every key sorts ascending — checked directly,
+/// no key (not even `size`) sorts descending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum PsSortKey {
+    Command,
+    Created,
+    Id,
+    Image,
+    Names,
+    /// Deliberately spelled as one word, not `RunningFor` — clap's own
+    /// kebab-case-on-word-boundary derive would otherwise turn that
+    /// into `running-for`, not real podman's own actual, hyphen-less
+    /// `runningfor` (checked directly against its own `--help`).
+    Runningfor,
+    Size,
+    Status,
+}
+
 /// Shared by [`Command::Run`] and [`Command::Create`] (0157) -- every
 /// flag `run` itself understands beyond `--rm`/`--detach` (which only
 /// `run` has: `create` never launches at all, so "detach" is
@@ -1811,6 +1842,21 @@ enum Command {
         /// own to conflict with too).
         #[arg(short = 's', long)]
         size: bool,
+        /// Sort the listed containers by this key instead of the
+        /// default creation-time order, matching real `podman ps
+        /// --sort` exactly — see [`PsSortKey`]'s own doc comment for
+        /// the exact, checked-directly valid key list/behavior.
+        /// Applied *after* `--all`/`--filter`/`--last` have already
+        /// selected which containers to show (checked directly: real
+        /// podman's own `--last`/`-n` selection is always based on
+        /// creation-time recency, independent of `--sort` — giving
+        /// both together still keeps the *N most recently created*
+        /// containers, merely displaying that same set in the
+        /// requested order, not the N that would sort last), and
+        /// composes fully with both `--quiet` and `--format` (checked
+        /// directly: neither overrides or ignores it).
+        #[arg(long, value_enum)]
+        sort: Option<PsSortKey>,
     },
     /// Start an already-`Stopped` container again, reusing its own
     /// existing rootfs/config exactly as `run` originally left it —
@@ -3298,6 +3344,7 @@ fn main() -> std::process::ExitCode {
                 noheading,
                 format,
                 size,
+                sort,
             }) => cmd_ps(
                 all,
                 quiet,
@@ -3308,6 +3355,7 @@ fn main() -> std::process::ExitCode {
                 noheading,
                 format.as_deref(),
                 size,
+                sort,
             ),
             Some(Command::Start { id, attach }) => cmd_start(&id, attach),
             Some(Command::Attach { id }) => cmd_attach(&id),
@@ -7817,6 +7865,18 @@ struct ContainerView {
     /// directory walk/image lookup this needs.
     #[serde(skip_serializing_if = "Option::is_none")]
     size: Option<ContainerSizeView>,
+    /// `--sort runningfor`'s own real sort key (`PersistedState::
+    /// started_at`, mirroring real podman's own `StartedAt` field) —
+    /// a genuinely *different* timestamp than `created`, not an alias
+    /// for it (checked directly, real podman's own `container_ps.go`:
+    /// `psSortedRunningFor.Less` compares `StartedAt`, not `Created`
+    /// — a never-started container's own zero-value `StartedAt` sorts
+    /// before any started one, which `None < Some(_)`'s own default
+    /// `Ord` on this field already gives for free). Deliberately never
+    /// serialized (`#[serde(skip)]`) — purely an internal sort key,
+    /// not a new public output field this increment set out to add.
+    #[serde(skip)]
+    started_at: Option<String>,
 }
 
 impl ContainerView {
@@ -7842,6 +7902,7 @@ impl ContainerView {
                 .get(ANNOTATION_EXIT_CODE)
                 .and_then(|s| s.parse().ok()),
             size: None,
+            started_at: state.started_at.clone(),
         }
     }
 }
@@ -8289,6 +8350,7 @@ fn cmd_ps(
     noheading: bool,
     format: Option<&str>,
     size: bool,
+    sort: Option<PsSortKey>,
 ) -> anyhow::Result<()> {
     // Matches real `podman ps`'s own identical restriction exactly
     // (`~/git/podman/cmd/podman/containers/ps.go`'s own `checkFlags`)
@@ -8455,6 +8517,53 @@ fn cmd_ps(
         let last = last as usize;
         if last < views.len() {
             views = views.split_off(views.len() - last);
+        }
+    }
+
+    // `--sort` (matching real `podman ps --sort` exactly, see
+    // `PsSortKey`'s own doc comment): applied *after* `--last`'s own
+    // trim above, never in place of the default creation-time sort
+    // that trim itself depends on -- re-sorting `views` in place here
+    // only ever changes the *display* order of whichever containers
+    // `--all`/`--filter`/`--last` already selected, matching real
+    // podman's own checked-directly behavior exactly (confirmed
+    // directly: `podman ps -a -n 2 --sort names` still keeps the 2
+    // most-recently-*created* containers, merely displaying that same
+    // set alphabetically). Every key sorts ascending, matching real
+    // podman's own identical convention for all eight.
+    if let Some(sort) = sort {
+        match sort {
+            PsSortKey::Command => views.sort_by(|a, b| a.command.cmp(&b.command)),
+            PsSortKey::Created => views.sort_by(|a, b| a.created.cmp(&b.created)),
+            PsSortKey::Id => views.sort_by(|a, b| a.id.cmp(&b.id)),
+            PsSortKey::Image => views.sort_by(|a, b| a.image.cmp(&b.image)),
+            PsSortKey::Names => views.sort_by(|a, b| a.name.cmp(&b.name)),
+            // `None` (never started) sorts before any `Some(_)`
+            // (started) — the exact same real behavior real podman's
+            // own Go zero-time comparison gives it, for free from
+            // `Option`'s own default `Ord` (see `ContainerView::
+            // started_at`'s own doc comment).
+            PsSortKey::Runningfor => views.sort_by(|a, b| a.started_at.cmp(&b.started_at)),
+            // Real podman's own checked-directly behavior when
+            // `--size` wasn't also given: every `size` is `None`, so
+            // every pair compares as "not less" -- a real, semantic
+            // no-op that leaves the existing order untouched, not an
+            // error. `Option<ContainerSizeView>` has no `Ord` of its
+            // own (it's not `PartialOrd`), so this compares
+            // `root_fs_size` directly, treating an absent size as
+            // equal to any other -- matching that same real "no-op
+            // without --size" behavior, while still sorting
+            // meaningfully by real `RootFsSize` (not `RwSize`) when
+            // `--size` was given, exactly like real podman.
+            PsSortKey::Size => views.sort_by(|a, b| {
+                let a = a.size.as_ref().map(|s| s.root_fs_size);
+                let b = b.size.as_ref().map(|s| s.root_fs_size);
+                match (a, b) {
+                    (Some(a), Some(b)) => a.cmp(&b),
+                    _ => std::cmp::Ordering::Equal,
+                }
+            }),
+            PsSortKey::Status => views.sort_by(|a, b| a.status.cmp(&b.status)),
         }
     }
 

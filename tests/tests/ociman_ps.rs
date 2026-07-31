@@ -1729,6 +1729,324 @@ fn ps_last_overrides_visibility_and_keeps_only_the_n_most_recently_created() {
     assert!(String::from_utf8_lossy(&zero.stdout).trim().is_empty());
 }
 
+/// `ociman ps --sort` (matching real `podman ps --sort` exactly):
+/// `--sort names` orders alphabetically, a real, direct contrast with
+/// the default creation-time order.
+#[test]
+fn ps_sort_names_orders_alphabetically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-sort-names:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = |name: &str| {
+        let out = ociman(
+            storage_dir.path(),
+            &[
+                "create",
+                "--name",
+                name,
+                "ociman-test/ps-sort-names:latest",
+                "true",
+            ],
+        );
+        assert!(out.status.success(), "{out:?}");
+        std::thread::sleep(Duration::from_millis(1200));
+    };
+    // Created in this order -- the default view would show zzz-first
+    // before aaa-second (creation order).
+    create("zzz-first");
+    create("aaa-second");
+
+    let default_order = ociman(storage_dir.path(), &["ps", "-a", "--noheading"]);
+    assert!(default_order.status.success());
+    let stdout = String::from_utf8_lossy(&default_order.stdout);
+    assert!(
+        stdout.find("zzz-first").unwrap() < stdout.find("aaa-second").unwrap(),
+        "default order should be creation order: {stdout:?}"
+    );
+
+    let sorted = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--noheading", "--sort", "names"],
+    );
+    assert!(sorted.status.success(), "{sorted:?}");
+    let stdout = String::from_utf8_lossy(&sorted.stdout);
+    assert!(
+        stdout.find("aaa-second").unwrap() < stdout.find("zzz-first").unwrap(),
+        "--sort names should order alphabetically: {stdout:?}"
+    );
+}
+
+/// `--sort runningfor` sorts by real `PersistedState::started_at`, a
+/// genuinely *different* timestamp than `created` (matching real
+/// podman's own checked-directly `container_ps.go` behavior, not an
+/// alias for `--sort created`): a container created *second* but
+/// started *first* must sort before one created first but started
+/// second.
+#[test]
+fn ps_sort_runningfor_differs_from_created_order() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-sort-runningfor:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let create = |name: &str| {
+        let out = ociman(
+            storage_dir.path(),
+            &[
+                "create",
+                "--name",
+                name,
+                "ociman-test/ps-sort-runningfor:latest",
+                "sleep",
+                "30",
+            ],
+        );
+        assert!(out.status.success(), "{out:?}");
+        std::thread::sleep(Duration::from_millis(1200));
+    };
+    create("created-first");
+    create("created-second");
+
+    // Started in the *opposite* order from creation.
+    let start_second = ociman(storage_dir.path(), &["start", "created-second"]);
+    assert!(start_second.status.success(), "{start_second:?}");
+    std::thread::sleep(Duration::from_millis(1200));
+    let start_first = ociman(storage_dir.path(), &["start", "created-first"]);
+    assert!(start_first.status.success(), "{start_first:?}");
+
+    let by_created = ociman(storage_dir.path(), &["ps", "-a", "--noheading"]);
+    assert!(by_created.status.success());
+    let stdout = String::from_utf8_lossy(&by_created.stdout);
+    assert!(
+        stdout.find("created-first").unwrap() < stdout.find("created-second").unwrap(),
+        "default order is still creation order: {stdout:?}"
+    );
+
+    let by_runningfor = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--noheading", "--sort", "runningfor"],
+    );
+    assert!(by_runningfor.status.success(), "{by_runningfor:?}");
+    let stdout = String::from_utf8_lossy(&by_runningfor.stdout);
+    assert!(
+        stdout.find("created-second").unwrap() < stdout.find("created-first").unwrap(),
+        "--sort runningfor must order by when each was actually started, not created: {stdout:?}"
+    );
+
+    ociman(storage_dir.path(), &["kill", "created-first"]);
+    ociman(storage_dir.path(), &["kill", "created-second"]);
+}
+
+/// `--sort` composes with `--last`/`-n`: the same *set* of containers
+/// `--last` would otherwise select (by creation-time recency) is still
+/// selected, only their *display* order changes -- matching real
+/// podman's own checked-directly behavior exactly (confirmed directly
+/// against a real installed `podman ps -a -n 2 --sort names`).
+#[test]
+fn ps_sort_composes_with_last_without_changing_which_containers_are_selected() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-sort-last:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = |name: &str| {
+        let out = ociman(
+            storage_dir.path(),
+            &[
+                "create",
+                "--name",
+                name,
+                "ociman-test/ps-sort-last:latest",
+                "true",
+            ],
+        );
+        assert!(out.status.success(), "{out:?}");
+        std::thread::sleep(Duration::from_millis(1200));
+    };
+    // Alphabetically, "zzz-oldest" would sort last -- proving `--sort`
+    // doesn't change *which* 2 containers `-n 2` selects.
+    create("zzz-oldest");
+    create("mmm-middle");
+    create("aaa-newest");
+
+    let out = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "-n", "2", "--noheading", "--sort", "names"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("zzz-oldest"),
+        "the oldest container must still be excluded by --last, regardless of --sort: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("mmm-middle") && stdout.contains("aaa-newest"),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.find("aaa-newest").unwrap() < stdout.find("mmm-middle").unwrap(),
+        "the 2 selected containers must still be displayed alphabetically: {stdout:?}"
+    );
+}
+
+/// An unrecognized `--sort` value is a real, immediate clap parse
+/// error naming the valid choices, matching real podman's own
+/// checked-directly cobra-validated-flag rejection exactly.
+#[test]
+fn ps_sort_rejects_an_invalid_value() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let out = ociman(storage_dir.path(), &["ps", "--sort", "bogus"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid value"), "{stderr}");
+    assert!(stderr.contains("runningfor"), "{stderr}");
+}
+
+/// `--sort size` without `--size` is a real, semantic no-op (matching
+/// real podman's own checked-directly behavior exactly: every size is
+/// absent, so every pair compares as "not less", leaving the existing
+/// order untouched) rather than an error.
+#[test]
+fn ps_sort_size_without_size_flag_is_a_no_op() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-sort-size-noop:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = |name: &str| {
+        let out = ociman(
+            storage_dir.path(),
+            &[
+                "create",
+                "--name",
+                name,
+                "ociman-test/ps-sort-size-noop:latest",
+                "true",
+            ],
+        );
+        assert!(out.status.success(), "{out:?}");
+        std::thread::sleep(Duration::from_millis(1200));
+    };
+    create("zzz-first");
+    create("aaa-second");
+
+    let out = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--noheading", "--sort", "size"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.find("zzz-first").unwrap() < stdout.find("aaa-second").unwrap(),
+        "without --size, --sort size must leave the default creation-time order untouched: \
+         {stdout:?}"
+    );
+}
+
+/// `--sort size` combined with `--size`: orders by real
+/// `root_fs_size` (image + writable layer), matching real podman's
+/// own identical `RootFsSize`-based comparison exactly -- a real,
+/// kernel-measured difference (one container writes a real file into
+/// its own writable layer, inflating its own `root_fs_size` past the
+/// other's, which never writes anything).
+#[test]
+fn ps_sort_size_with_size_flag_orders_by_real_root_fs_size() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-sort-size:latest",
+        &busybox,
+        &["sh", "dd", "true"],
+        ContainerConfig::default(),
+    );
+
+    let empty = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "empty-writable-layer",
+            "ociman-test/ps-sort-size:latest",
+            "true",
+        ],
+    );
+    assert!(empty.status.success(), "{empty:?}");
+
+    let grown = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "grown-writable-layer",
+            "ociman-test/ps-sort-size:latest",
+            "/bin/sh",
+            "-c",
+            "dd if=/dev/zero of=/bigfile bs=1M count=4",
+        ],
+    );
+    assert!(
+        grown.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&grown.stderr)
+    );
+
+    let out = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--noheading", "--size", "--sort", "size"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.find("empty-writable-layer").unwrap() < stdout.find("grown-writable-layer").unwrap(),
+        "the smaller (empty writable layer) container must sort before the larger one: {stdout:?}"
+    );
+}
+
 /// `ociman ps --no-trunc`/`--noheading` (0290): the real default
 /// 17-character-plus-`...` command truncation (matching real
 /// `podman ps`'s own `Command()` formatter exactly) is disabled by
