@@ -657,6 +657,39 @@ fn validate_run_as_user(
     Ok(())
 }
 
+/// `ContainerConfig.linux.security_context.privileged` (0389): unlike
+/// every other field this function's own sibling (`validate_run_as_
+/// user`) already checks, `privileged` was previously read *nowhere
+/// at all* -- not honored, not rejected, a real, silent divergence
+/// from a pod's own explicit intent (worse than a merely-unsupported
+/// field: a workload asking for privileged access got an ordinary,
+/// confined container instead, with no error telling it so).
+///
+/// Real cri-o's own `privileged` support is a large, many-part
+/// feature (checked directly, `~/git/cri-o/server/container_create_
+/// linux.go`'s own `getSpecGen`/`specSetDevices`/`addSysfsMounts` and
+/// friends): every capability added, sensitive paths left unmasked,
+/// `/sys`+cgroupfs mounted read-write, every host device passed
+/// through, seccomp/AppArmor/SELinux confinement all dropped at once
+/// -- a materially bigger increment than this project's own
+/// established "one field, one existing OCI spec knob" shape (e.g.
+/// `readonly_rootfs`, `0388`) and not attempted here. Matching this
+/// project's own established convention instead (every other
+/// unsupported request elsewhere in this codebase gets a loud,
+/// specific `Status::unimplemented`, never a silent no-op): a clear,
+/// honest rejection rather than a confined container masquerading as
+/// a privileged one.
+fn validate_privileged(
+    security_context: Option<&cri::LinuxContainerSecurityContext>,
+) -> Result<(), Status> {
+    if security_context.is_some_and(|sc| sc.privileged) {
+        return Err(Status::unimplemented(
+            "privileged containers are not yet supported",
+        ));
+    }
+    Ok(())
+}
+
 /// `ContainerConfig.mounts` (0304, closing part of `0237`'s own
 /// deferred "CRI mounts" gap) -- a real, deliberately narrow first
 /// slice: an ordinary bind mount (`container_path`/`host_path`/
@@ -1383,6 +1416,14 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         // exact same "before any real work happens" reason as the
         // mounts check just below.
         validate_run_as_user(
+            config
+                .linux
+                .as_ref()
+                .and_then(|l| l.security_context.as_ref()),
+        )?;
+        // `security_context.privileged` (0389) -- checked right next
+        // to `validate_run_as_user`, for the exact same reason.
+        validate_privileged(
             config
                 .linux
                 .as_ref()
@@ -2723,5 +2764,34 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// `validate_privileged` (0389): no security context at all, or
+    /// one with `privileged: false` (the common, unconfigured
+    /// default), must succeed; an explicit `privileged: true` request
+    /// must be a clear, honest `Status::unimplemented` rather than a
+    /// silent no-op.
+    #[test]
+    fn validate_privileged_rejects_an_explicit_true_but_allows_everything_else() {
+        assert!(validate_privileged(None).is_ok());
+        assert!(
+            validate_privileged(Some(&cri::LinuxContainerSecurityContext {
+                privileged: false,
+                ..Default::default()
+            }))
+            .is_ok()
+        );
+        let status = validate_privileged(Some(&cri::LinuxContainerSecurityContext {
+            privileged: true,
+            ..Default::default()
+        }))
+        .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+        assert!(
+            status
+                .message()
+                .contains("privileged containers are not yet supported"),
+            "{status:?}"
+        );
     }
 }

@@ -2637,6 +2637,64 @@ async fn create_container_rejects_unsupported_run_as_user_fields_clearly() {
     );
 }
 
+/// `security_context.privileged` (`docs/design/0389`): a real,
+/// explicit `privileged: true` request must be a clear, honest
+/// `Status::unimplemented` -- previously silently ignored entirely
+/// (not read anywhere at all), so a workload asking for privileged
+/// access used to get an ordinary, confined container instead with no
+/// error telling it so. `privileged: false` (the common, unconfigured
+/// default) must still succeed exactly like a request with no
+/// security context at all.
+#[tokio::test]
+async fn create_container_rejects_privileged_clearly_but_allows_the_default() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let mut privileged_config = container_config("privileged-test", 0);
+    privileged_config.linux = Some(oci_cri_types::LinuxContainerConfig {
+        security_context: Some(oci_cri_types::LinuxContainerSecurityContext {
+            privileged: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let rejected = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(privileged_config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .expect_err("privileged: true should be rejected");
+    assert_eq!(rejected.code(), tonic::Code::Unimplemented);
+    assert!(
+        rejected
+            .message()
+            .contains("privileged containers are not yet supported"),
+        "{rejected:?}"
+    );
+
+    let mut unprivileged_config = container_config("unprivileged-test", 0);
+    unprivileged_config.linux = Some(oci_cri_types::LinuxContainerConfig {
+        security_context: Some(oci_cri_types::LinuxContainerSecurityContext {
+            privileged: false,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let allowed = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(unprivileged_config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await;
+    assert!(allowed.is_ok(), "{allowed:?}");
+}
+
 /// End-to-end proof the bind mount is genuinely live at runtime, not
 /// just declared in `config.json`: a real file written on the host
 /// side of the mount is readable from *inside* the running container
