@@ -162,10 +162,26 @@ pub fn features() -> Features {
         // "1.0.0 through the current spec module" claim.
         oci_version_min: oci_spec_types::runtime::VERSION,
         oci_version_max: oci_spec_types::runtime::VERSION,
-        // Execution order, matching real runc's own `KnownHookNames`
-        // ordering — `createContainer`/`startContainer` deliberately
-        // excluded (see this module's own top doc comment).
-        hooks: vec!["prestart", "createRuntime", "poststart", "poststop"],
+        // All six real hook points, in real runc's own `KnownHookNames`
+        // order (checked directly, `runc features`'s own installed
+        // output) — `createContainer`/`startContainer` genuinely are
+        // executed today (`crates/oci-runtime-core/src/launch.rs`'s
+        // `ContainerHooks`/`run_container_hooks`, exercised end to end
+        // by `tests/tests/ocirun_hooks.rs`), a real, previously-stale
+        // claim otherwise: this list originally excluded both (design
+        // note 0077, written before either was implemented at all),
+        // and was simply never revisited once design note 0088 landed
+        // real execution for them — a genuine drift this module's own
+        // top doc comment says it exists specifically to prevent (see
+        // `docs/design/0380`).
+        hooks: vec![
+            "prestart",
+            "createRuntime",
+            "createContainer",
+            "startContainer",
+            "poststart",
+            "poststop",
+        ],
         mount_options,
         linux: Linux {
             namespaces: namespace_names(),
@@ -251,11 +267,22 @@ mod tests {
                 .unwrap()
                 .contains(&serde_json::json!("poststart"))
         );
+        // `createContainer`/`startContainer` genuinely are executed
+        // (`docs/design/0380`, fixing a real, previously-stale claim
+        // here that predated design note 0088's own real
+        // implementation of both) — must be reported present, not
+        // absent.
         assert!(
-            !json["hooks"]
+            json["hooks"]
                 .as_array()
                 .unwrap()
                 .contains(&serde_json::json!("createContainer"))
+        );
+        assert!(
+            json["hooks"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("startContainer"))
         );
         assert!(
             json["mountOptions"]
