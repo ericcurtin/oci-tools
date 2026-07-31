@@ -269,6 +269,162 @@ fn enter_uses_a_custom_home_directory_given_at_create_time() {
     );
 }
 
+/// `--volume HOST-DIR:CONTAINER-DIR` (`docs/design/0397`), matching
+/// real `distrobox create --volume` exactly — a real, previously-
+/// missing bind mount, given once at `create` time and applied by
+/// every later `enter`: a write from inside the box genuinely lands
+/// on the real host directory.
+#[test]
+fn enter_bind_mounts_a_real_extra_volume_given_at_create_time() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/volume-base:latest",
+        &busybox,
+        &["sh", "touch"],
+        ContainerConfig::default(),
+    );
+
+    let host_dir = tempfile::tempdir().unwrap();
+
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/volume-base:latest",
+            "--name",
+            "volumebox",
+            "--volume",
+            &format!("{}:/mnt/data", host_dir.path().to_str().unwrap()),
+        ],
+    );
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let out = ocibox(
+        storage_dir.path(),
+        &[
+            "enter",
+            "volumebox",
+            "--",
+            "/bin/sh",
+            "-c",
+            "touch /mnt/data/marker",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        host_dir.path().join("marker").exists(),
+        "a write inside /mnt/data must genuinely land on the real host directory"
+    );
+}
+
+/// `--volume ...:ro` genuinely rejects a write from inside the box,
+/// matching real `docker run -v`/`podman run -v ...:ro` exactly.
+#[test]
+fn enter_read_only_volume_rejects_a_write_from_inside_the_box() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/volume-ro-base:latest",
+        &busybox,
+        &["sh", "touch"],
+        ContainerConfig::default(),
+    );
+
+    let host_dir = tempfile::tempdir().unwrap();
+
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/volume-ro-base:latest",
+            "--name",
+            "volumerobox",
+            "--volume",
+            &format!("{}:/mnt/data:ro", host_dir.path().to_str().unwrap()),
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let out = ocibox(
+        storage_dir.path(),
+        &[
+            "enter",
+            "volumerobox",
+            "--",
+            "/bin/sh",
+            "-c",
+            "touch /mnt/data/marker",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "a write to a :ro volume must be rejected"
+    );
+    assert!(!host_dir.path().join("marker").exists());
+}
+
+/// An invalid `--volume` value is a real, immediate CLI error at
+/// `create` time -- the box never even gets created.
+#[test]
+fn create_rejects_an_invalid_volume_value() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/volume-invalid-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/volume-invalid-base:latest",
+            "--name",
+            "volumeinvalidbox",
+            "--volume",
+            "not-absolute:/mnt/data",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("absolute"),
+        "{out:?}"
+    );
+    assert!(
+        !storage_dir.path().join("boxes/volumeinvalidbox").exists(),
+        "an invalid --volume must leave no half-created box behind"
+    );
+}
+
 /// A real, previously-unnoticed bug this fixes (0292): every box,
 /// regardless of its own real name, used to report the literal
 /// hostname `ocirun` -- a copy-paste artifact of `Spec::example()`'s

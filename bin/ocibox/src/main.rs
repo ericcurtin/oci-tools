@@ -133,6 +133,26 @@ enum Command {
         /// `--home` was even given at all).
         #[arg(long, short = 'H', value_name = "PATH")]
         home: Option<PathBuf>,
+        /// Extra host directory to bind-mount into the box, set once
+        /// at `create` time and applied by every later `ocibox enter`
+        /// of it — matching real `distrobox create --volume`'s own
+        /// identical flag exactly (checked directly,
+        /// `~/git/distrobox/internal/cli/create.go`'s own
+        /// `AdditionalVolumes`, passed straight through as a real
+        /// `podman create --volume` underneath). Repeatable.
+        /// `HOST-DIR:CONTAINER-DIR[:ro]`, matching real `docker run
+        /// -v`/`podman run -v`'s own plain bind-mount shape exactly —
+        /// **narrower than `ociman run --volume`**: only an already-
+        /// absolute host path is accepted, no named-volume shorthand
+        /// at all (`ocibox` has no volume-store concept of its own to
+        /// resolve one against), a real, deliberate scope narrowing
+        /// documented here rather than half-implemented.
+        #[arg(
+            long = "volume",
+            short = 'v',
+            value_name = "HOST-DIR:CONTAINER-DIR[:ro]"
+        )]
+        volume: Vec<String>,
     },
     /// List real, created boxes — matching real `distrobox list`
     /// (alias `ls`), narrowed to what this project's own boxes
@@ -247,6 +267,17 @@ enum Command {
         /// `-H` included).
         #[arg(long, short = 'H', value_name = "PATH")]
         home: Option<PathBuf>,
+        /// Same as `ocibox create --volume` — matching `distrobox
+        /// ephemeral`'s own identical inherited flag (checked
+        /// directly: `~/git/distrobox/internal/cli/ephemeral.go`
+        /// copies every flag from its own `create` command, `--volume`
+        /// included). Repeatable.
+        #[arg(
+            long = "volume",
+            short = 'v',
+            value_name = "HOST-DIR:CONTAINER-DIR[:ro]"
+        )]
+        volume: Vec<String>,
         /// The command to run inside the box, and its own arguments —
         /// defaults to a shell (see `ocibox enter`'s own doc comment)
         /// if empty.
@@ -447,7 +478,15 @@ fn main() -> std::process::ExitCode {
                 pull,
                 hostname,
                 home,
-            }) => cmd_create(&image, &name, pull, hostname.as_deref(), home.as_deref()),
+                volume,
+            }) => cmd_create(
+                &image,
+                &name,
+                pull,
+                hostname.as_deref(),
+                home.as_deref(),
+                &volume,
+            ),
             Some(Command::List) => cmd_list(cli.global.json),
             Some(Command::Rm {
                 names,
@@ -460,8 +499,16 @@ fn main() -> std::process::ExitCode {
                 pull,
                 hostname,
                 home,
+                volume,
                 command,
-            }) => cmd_ephemeral(&image, pull, hostname.as_deref(), home.as_deref(), &command),
+            }) => cmd_ephemeral(
+                &image,
+                pull,
+                hostname.as_deref(),
+                home.as_deref(),
+                &volume,
+                &command,
+            ),
             Some(Command::Export {
                 box_name,
                 app,
@@ -576,6 +623,67 @@ struct BoxRecord {
     /// already uses.
     #[serde(default)]
     custom_home: Option<PathBuf>,
+    /// Extra `--volume` bind mounts given at `create` time, applied by
+    /// every later `ocibox enter` of it (0397) — matching real
+    /// `distrobox create --volume` exactly. Empty (the common case)
+    /// for a box created before this field existed, the same forward-
+    /// compatible-record convention `hostname`/`custom_home` already
+    /// use.
+    #[serde(default)]
+    volumes: Vec<BoxVolume>,
+}
+
+/// A parsed, real `--volume HOST-DIR:CONTAINER-DIR[:ro]` bind mount —
+/// see [`Command::Create::volume`]'s own doc comment for exactly why
+/// this is deliberately narrower than `ociman run --volume` (no
+/// named-volume shorthand at all).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BoxVolume {
+    host: String,
+    container: String,
+    #[serde(default)]
+    read_only: bool,
+}
+
+/// Parse one `--volume` value: `HOST-DIR:CONTAINER-DIR[:ro]`. Both
+/// sides must be absolute paths — matching real `docker run -v`/
+/// `podman run -v`'s own plain bind-mount shape, but, unlike
+/// `ociman run --volume`'s own `parse_volume`, never falling back to
+/// a named-volume interpretation for a non-absolute first field (this
+/// project's own boxes have no volume-store concept to resolve one
+/// against at all) — a relative or otherwise non-absolute host path
+/// is always a clear, immediate error here instead. The only
+/// supported third field is `ro` (or, explicitly, `rw`, the default),
+/// matching `ociman run --volume`'s own identical narrow option set.
+fn parse_box_volume(spec: &str) -> anyhow::Result<BoxVolume> {
+    let mut parts = spec.splitn(3, ':');
+    let host = parts.next().filter(|s| !s.is_empty());
+    let container = parts.next().filter(|s| !s.is_empty());
+    let (host, container) = match (host, container) {
+        (Some(host), Some(container)) => (host, container),
+        _ => anyhow::bail!("--volume {spec:?}: expected HOST-DIR:CONTAINER-DIR[:ro]"),
+    };
+    anyhow::ensure!(
+        host.starts_with('/'),
+        "--volume {spec:?}: the host path must be absolute (ocibox has no named-volume \
+         shorthand, unlike ociman run --volume)"
+    );
+    anyhow::ensure!(
+        container.starts_with('/'),
+        "--volume {spec:?}: the container path must be absolute"
+    );
+    let read_only = match parts.next() {
+        None | Some("rw") => false,
+        Some("ro") => true,
+        Some(other) => anyhow::bail!(
+            "--volume {spec:?}: unsupported option {other:?} (only \"ro\"/\"rw\" are supported)"
+        ),
+    };
+    Ok(BoxVolume {
+        host: host.to_string(),
+        container: container.to_string(),
+        read_only,
+    })
 }
 
 /// The real, checked-directly cap real `distrobox create --hostname`
@@ -605,8 +713,9 @@ fn cmd_create(
     pull: bool,
     hostname: Option<&str>,
     home: Option<&Path>,
+    volumes: &[String],
 ) -> anyhow::Result<()> {
-    create_box(image, name, pull, hostname, home)?;
+    create_box(image, name, pull, hostname, home, volumes)?;
     println!("{name}");
     Ok(())
 }
@@ -624,11 +733,16 @@ fn create_box(
     pull: bool,
     hostname: Option<&str>,
     home: Option<&Path>,
+    volumes: &[String],
 ) -> anyhow::Result<()> {
     validate_box_name(name)?;
     if let Some(hostname) = hostname {
         validate_hostname(hostname)?;
     }
+    let volumes = volumes
+        .iter()
+        .map(|v| parse_box_volume(v))
+        .collect::<anyhow::Result<Vec<BoxVolume>>>()?;
 
     let box_dir = boxes_root().join(name);
     anyhow::ensure!(
@@ -692,6 +806,7 @@ fn create_box(
         working_dir: container_config.working_dir,
         hostname: hostname.map(str::to_string),
         custom_home: home.map(Path::to_path_buf),
+        volumes,
     };
     let box_json_path = box_dir.join("box.json");
     std::fs::write(
@@ -934,6 +1049,23 @@ fn enter_spec(
         });
     }
 
+    // `--volume` (0397), appended after `$HOME` -- matching real
+    // `docker`/`podman`'s own `Mount{..., Type: "bind"}` shape exactly
+    // (the same `ociman run -v`'s own `synthesize_spec` already uses),
+    // `rbind` plus `"ro"` when read-only.
+    for volume in &record.volumes {
+        let mut options = vec!["rbind".to_string()];
+        if volume.read_only {
+            options.push("ro".to_string());
+        }
+        spec.mounts.push(oci_spec_types::runtime::Mount {
+            destination: volume.container.clone(),
+            source: Some(volume.host.clone()),
+            kind: Some("bind".to_string()),
+            options,
+        });
+    }
+
     let linux = spec
         .linux
         .as_mut()
@@ -1162,10 +1294,11 @@ fn cmd_ephemeral(
     pull: bool,
     hostname: Option<&str>,
     home: Option<&Path>,
+    volumes: &[String],
     command: &[String],
 ) -> anyhow::Result<()> {
     let name = unique_random_box_name()?;
-    create_box(image, &name, pull, hostname, home)
+    create_box(image, &name, pull, hostname, home, volumes)
         .with_context(|| format!("creating ephemeral box {name}"))?;
 
     let result = enter_and_get_exit_code(&name, command);
@@ -2107,5 +2240,53 @@ mod tests {
     #[test]
     fn validate_box_name_rejects_empty() {
         assert!(validate_box_name("").is_err());
+    }
+
+    #[test]
+    fn parse_box_volume_accepts_a_plain_absolute_bind_mount() {
+        let volume = parse_box_volume("/host/dir:/container/dir").unwrap();
+        assert_eq!(volume.host, "/host/dir");
+        assert_eq!(volume.container, "/container/dir");
+        assert!(!volume.read_only);
+    }
+
+    #[test]
+    fn parse_box_volume_accepts_an_explicit_ro_and_rw() {
+        let ro = parse_box_volume("/host:/container:ro").unwrap();
+        assert!(ro.read_only);
+        let rw = parse_box_volume("/host:/container:rw").unwrap();
+        assert!(!rw.read_only);
+    }
+
+    #[test]
+    fn parse_box_volume_rejects_a_non_absolute_host_path() {
+        let err = parse_box_volume("relative:/container").unwrap_err();
+        assert!(err.to_string().contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn parse_box_volume_rejects_a_non_absolute_container_path() {
+        let err = parse_box_volume("/host:relative").unwrap_err();
+        assert!(err.to_string().contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn parse_box_volume_rejects_a_named_volume_shorthand() {
+        // Unlike `ociman run --volume`, a non-absolute first field is
+        // never interpreted as a named volume here at all -- ocibox
+        // has no volume-store concept to resolve one against.
+        let err = parse_box_volume("myvolume:/container").unwrap_err();
+        assert!(err.to_string().contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn parse_box_volume_rejects_a_missing_colon() {
+        assert!(parse_box_volume("/just-one-path").is_err());
+    }
+
+    #[test]
+    fn parse_box_volume_rejects_an_unsupported_option() {
+        let err = parse_box_volume("/host:/container:Z").unwrap_err();
+        assert!(err.to_string().contains("Z"), "{err}");
     }
 }
