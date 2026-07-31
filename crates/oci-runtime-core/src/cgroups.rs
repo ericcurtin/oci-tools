@@ -135,6 +135,29 @@ fn plan_cpu(cpu: &oci_spec_types::runtime::LinuxCpu, writes: &mut Vec<CgroupWrit
     if let Some(burst) = cpu.burst {
         writes.push(("cpu.max.burst", burst.to_string()));
     }
+    // `cpu.idle`, a plain decimal (`0`/`1`, kernel-enforced — see
+    // `LinuxCpu::idle`'s own doc comment), written verbatim — no
+    // `num_to_cgroup_str`/`"max"`-style conversion applies here,
+    // unlike `cpu.max`'s own quota field. Deliberately written
+    // *after* `cpu.weight` above, matching real crun's own identical
+    // write order (`~/git/crun/src/libcrun/cgroup-resources.c`'s own
+    // `write_cpu_resources`): the real kernel's own `cpu.weight`
+    // setter (`kernel/sched/fair.c`'s `sched_group_set_shares`)
+    // refuses any write at all once `cpu.idle=1` is already in
+    // effect (`-EINVAL`, `if (tg_is_idle(tg))`), while `cpu.idle`'s
+    // own setter has no such restriction and silently resets the
+    // group's own effective weight as a side effect regardless of
+    // what was just written — writing weight first, idle second (this
+    // order) means a caller setting both in the same `ocirun update`
+    // call always succeeds, with `cpu.idle` correctly taking final
+    // effect, exactly matching real crun's own real, checked-directly
+    // (not just assumed) behavior — real runc's own fs2 driver writes
+    // the opposite order and has to defensively suppress its own
+    // `cpu.weight` write whenever `--cpu-idle` is given specifically
+    // to dodge this same kernel restriction (`~/git/runc/update.go`).
+    if let Some(idle) = cpu.idle {
+        writes.push(("cpu.idle", idle.to_string()));
+    }
     // `cpuset.cpus`/`cpuset.mems` take the same range-list string
     // (`"0-3,5"`) the runtime-spec's own `cpus`/`mems` fields already
     // use verbatim, no numeric conversion needed — unlike every other
@@ -1055,6 +1078,46 @@ mod tests {
             vec![
                 ("cpu.weight", convert_cpu_shares_to_weight(512).to_string()),
                 ("cpu.max", "50000 100000".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn cpu_idle_writes_a_plain_decimal_with_no_max_conversion() {
+        let resources = LinuxResources {
+            cpu: Some(LinuxCpu {
+                idle: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_resources(&resources),
+            vec![("cpu.idle", "1".to_string())]
+        );
+    }
+
+    #[test]
+    fn cpu_idle_and_shares_together_write_weight_before_idle() {
+        // Real, checked-directly kernel behavior this order relies on
+        // (see `plan_cpu`'s own doc comment): `cpu.weight`'s own
+        // kernel setter refuses any write at all once `cpu.idle=1` is
+        // already in effect, while `cpu.idle`'s own setter has no such
+        // restriction and always succeeds -- so `cpu.weight` must be
+        // written first for a combined update to succeed cleanly.
+        let resources = LinuxResources {
+            cpu: Some(LinuxCpu {
+                shares: Some(512),
+                idle: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_resources(&resources),
+            vec![
+                ("cpu.weight", convert_cpu_shares_to_weight(512).to_string()),
+                ("cpu.idle", "1".to_string()),
             ]
         );
     }

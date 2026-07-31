@@ -354,7 +354,49 @@ fn resource_properties(resources: &LinuxResources) -> Vec<(&'static str, Value<'
         }
     }
     if let Some(cpu) = &resources.cpu {
-        if let Some(shares) = cpu.shares {
+        if cpu.idle == Some(1) {
+            // Systemd's own documented special value: setting
+            // `CPUWeight` to exactly `0` tells systemd itself to
+            // configure `cpu.idle` on the unit -- confirmed directly
+            // against real runc's own current systemd v2 driver
+            // (`~/git/runc/vendor/github.com/opencontainers/cgroups/
+            // systemd/v2.go`'s own `shouldSetCPUIdle`/its own
+            // `CPUWeight: 0` comment, "tells systemd to set cpu.idle
+            // to 1"), not inferred from crun's own C comment alone.
+            //
+            // Real crun's own systemd translation (`~/git/crun/src/
+            // libcrun/cgroup-systemd.c`'s own `get_cpu_weight`) hard-
+            // errors the whole call if `shares` is *also* given
+            // alongside `idle=1`; real runc's own current systemd v2
+            // driver instead tolerates it -- warns and lets `idle`
+            // win, silently skipping the shares-derived `CPUWeight`
+            // (`v2.go`'s own `logrus.Warn("unable to apply both
+            // cpu.weight and cpu.idle to systemd, ignoring
+            // cpu.weight")`). This project follows runc's tolerant
+            // precedent, matching its own already-established "skip a
+            // conflicting or malformed resource property rather than
+            // fail the whole container launch over it" stance
+            // elsewhere in this same function (the unparseable-
+            // `AllowedCPUs`/combined `--memory`/`--memory-swap` cases
+            // above/below) -- `shares`, if also given, is simply never
+            // translated into its own `CPUWeight` in this case.
+            //
+            // No systemd-version gate: real runc's own driver only
+            // performs this translation on systemd >= 252 (`cpu.idle`
+            // support via `CPUWeight=0` didn't always exist) -- this
+            // project's own documented first-class targets (CentOS
+            // Stream 10, Ubuntu 26.04) both ship well above that; a
+            // deliberate, stated simplification, not an oversight.
+            //
+            // Currently unreachable from any real call site: neither
+            // `ociman run`'s own CLI-driven spec synthesis nor `ociman
+            // update` (which never calls into this module at all --
+            // see `docs/design/0382`) populates `cpu.idle` today; kept
+            // here purely for the shared `LinuxResources`/`LinuxCpu`
+            // type's own internal consistency, the same standard this
+            // crate already holds itself to for every other field.
+            properties.push(("CPUWeight", Value::from(0u64)));
+        } else if let Some(shares) = cpu.shares {
             let weight = convert_cpu_shares_to_weight(shares);
             if weight != 0 {
                 properties.push(("CPUWeight", Value::from(weight)));
@@ -565,6 +607,56 @@ mod tests {
         assert_eq!(*values["CPUQuotaPerSecUSec"], Value::from(500_000u64));
         assert_eq!(*values["CPUQuotaPeriodUSec"], Value::from(100_000u64));
         assert_eq!(*values["TasksMax"], Value::from(64u64));
+    }
+
+    #[test]
+    fn resource_properties_translates_cpu_idle_to_cpu_weight_zero() {
+        let resources = LinuxResources {
+            cpu: Some(oci_spec_types::runtime::LinuxCpu {
+                idle: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let properties = resource_properties(&resources);
+        assert_eq!(properties, vec![("CPUWeight", Value::from(0u64))]);
+    }
+
+    #[test]
+    fn resource_properties_cpu_idle_wins_over_shares_ignoring_its_own_cpu_weight() {
+        // Matching real runc's own tolerant systemd-v2-driver
+        // precedent (not real crun's own hard error) -- see
+        // `resource_properties`'s own doc comment: `shares`, if also
+        // given alongside `idle == Some(1)`, is simply never
+        // translated into its own `CPUWeight` at all.
+        let resources = LinuxResources {
+            cpu: Some(oci_spec_types::runtime::LinuxCpu {
+                shares: Some(1024),
+                idle: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let properties = resource_properties(&resources);
+        assert_eq!(properties, vec![("CPUWeight", Value::from(0u64))]);
+    }
+
+    #[test]
+    fn resource_properties_cpu_idle_zero_does_not_suppress_cpu_weight() {
+        // `idle: Some(0)` means "explicitly normal", not "unset" --
+        // must not trigger the `CPUWeight = 0` special-value
+        // translation at all, matching real runc's own identical
+        // `shouldSetCPUIdle` gate (`value == "1"` specifically).
+        let resources = LinuxResources {
+            cpu: Some(oci_spec_types::runtime::LinuxCpu {
+                shares: Some(1024),
+                idle: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let properties = resource_properties(&resources);
+        assert_eq!(properties, vec![("CPUWeight", Value::from(100u64))]);
     }
 
     #[test]

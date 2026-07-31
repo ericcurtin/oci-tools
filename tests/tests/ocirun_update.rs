@@ -272,6 +272,93 @@ fn update_ad_hoc_cpu_bandwidth_flags_write_the_real_cgroup() {
     cleanup(root_dir.path(), "adhoc-cpu-bandwidth-test", &cgroup_dir);
 }
 
+/// `--cpu-idle` (0382): a real, kernel-enforced verification of the
+/// exact write-order reasoning `oci_runtime_core::cgroups::plan_cpu`'s
+/// own doc comment cites -- `--cpu-share`/`--cpu-idle` given together
+/// in one `ocirun update` call must succeed cleanly (not the real,
+/// kernel-enforced `EINVAL` real runc's own opposite write order
+/// would hit), with `cpu.idle` correctly taking final effect
+/// (`cpu.weight` reads back as the kernel's own internal `SCHED_IDLE`
+/// value, not the value `--cpu-share` asked for -- confirmed by hand
+/// against a real kernel before writing this assertion, not assumed).
+/// Setting `--cpu-idle 0` afterward restores completely ordinary
+/// `cpu.weight` behavior for a later, plain `--cpu-share` update.
+#[test]
+fn update_cpu_idle_combined_with_cpu_share_succeeds_and_idle_wins() {
+    let Some((bundle_dir, root_dir, cgroup_dir)) =
+        create_and_start_with_real_cgroup("adhoc-cpu-idle-test")
+    else {
+        return;
+    };
+    let _ = &bundle_dir;
+
+    let combined = ocirun(
+        root_dir.path(),
+        &[
+            "update",
+            "adhoc-cpu-idle-test",
+            "--cpu-share",
+            "512",
+            "--cpu-idle",
+            "1",
+        ],
+    );
+    assert!(
+        combined.status.success(),
+        "a combined --cpu-share + --cpu-idle update must not fail with EINVAL: stderr: {}",
+        String::from_utf8_lossy(&combined.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("cpu.idle"))
+            .unwrap()
+            .trim(),
+        "1"
+    );
+    // The kernel's own `cpu.idle=1` write silently resets the
+    // group's own effective weight to its internal `SCHED_IDLE`
+    // value -- genuinely different from whatever `--cpu-share 512`
+    // would otherwise have converted to, proving `cpu.idle` took
+    // final effect rather than merely being written without error.
+    let weight_with_idle = std::fs::read_to_string(cgroup_dir.join("cpu.weight"))
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_ne!(
+        weight_with_idle, "59",
+        "cpu.weight must reflect the kernel's own SCHED_IDLE internal weight, not \
+         --cpu-share 512's own ordinary conversion"
+    );
+
+    let restore = ocirun(
+        root_dir.path(),
+        &["update", "adhoc-cpu-idle-test", "--cpu-idle", "0"],
+    );
+    assert!(restore.status.success(), "{restore:?}");
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("cpu.idle"))
+            .unwrap()
+            .trim(),
+        "0"
+    );
+
+    let after_restore = ocirun(
+        root_dir.path(),
+        &["update", "adhoc-cpu-idle-test", "--cpu-share", "512"],
+    );
+    assert!(after_restore.status.success(), "{after_restore:?}");
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("cpu.weight"))
+            .unwrap()
+            .trim(),
+        "59",
+        "once idle is back to 0, an ordinary --cpu-share update must apply the real, normal \
+         weight conversion again (512 shares -> weight 59, the same conversion \
+         oci_runtime_core::cgroups's own unit tests already establish)"
+    );
+
+    cleanup(root_dir.path(), "adhoc-cpu-idle-test", &cgroup_dir);
+}
+
 /// `--cpu-rt-period`/`--cpu-rt-runtime` (0356) are accepted without
 /// error, matching real `runc update`/`crun update`'s own identical
 /// flags -- but genuinely write nothing to any real cgroup file at

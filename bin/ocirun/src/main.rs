@@ -397,17 +397,28 @@ enum Command {
     /// `--cpu-rt-period`/`--cpu-rt-runtime` (0356) — the same set real
     /// `crun update` also supports (checked directly, `~/git/crun/
     /// src/update.c`), except `--cpu-burst`, a real runc-only
-    /// addition crun genuinely has no equivalent of at all. Real
-    /// runc's own remaining, still-unimplemented ad-hoc flags
-    /// (`--blkio-weight`, needing a whole new cgroup v1-to-v2
-    /// `io.weight` translation this project doesn't have yet;
-    /// `--cpu-idle`, needing a new `LinuxCpu` field and a new
-    /// `cpu.idle` cgroup write neither of which exist yet; `--kernel-
-    /// memory`/`--kernel-memory-tcp`, both real runc's own explicitly
-    /// `Hidden`/"obsoleted; do not use"; plus real runc's own Intel
-    /// RDT-only `--l3-cache-schema`/`--mem-bw-schema`) remain a
-    /// separate, still-deferred candidate — each genuinely needing new
-    /// underlying plumbing, unlike this note's own flags.
+    /// addition crun genuinely has no equivalent of at all — and,
+    /// closing 0356's own last remaining candidate on this list,
+    /// `--cpu-idle` (0382), matching real `runc update --cpu-idle`
+    /// exactly (real `crun update` has no CLI flag of its own for
+    /// this either, only honoring it via its own `--resources` JSON
+    /// path — matched here too, since `--resources` already bypasses
+    /// every ad-hoc flag regardless). `--blkio-weight` (0366, see its
+    /// own field's doc comment below) is also already fully
+    /// implemented — this same pass also found and fixed a second,
+    /// previously-stale claim in this very doc comment, which had
+    /// still listed `--blkio-weight` as "needing a whole new cgroup
+    /// v1-to-v2 `io.weight` translation this project doesn't have
+    /// yet" long after 0366 actually built exactly that (the identical
+    /// kind of drift `docs/design/0380` found and fixed in `ocirun
+    /// features`'s own hooks list). Real runc's own remaining,
+    /// genuinely still-unimplemented ad-hoc flags (`--kernel-memory`/
+    /// `--kernel-memory-tcp`, both real runc's own explicitly `Hidden`/
+    /// "obsoleted; do not use"; plus real runc's own Intel RDT-only
+    /// `--l3-cache-schema`/`--mem-bw-schema`) remain a separate,
+    /// still-deferred candidate — each genuinely needing new
+    /// underlying plumbing (or being explicitly obsolete/hardware-
+    /// specific), unlike this note's own flags.
     Update {
         /// The container's ID.
         id: String,
@@ -493,6 +504,32 @@ enum Command {
         /// (checked directly, `~/git/crun/src/update.c`).
         #[arg(long = "cpu-burst")]
         cpu_burst: Option<u64>,
+        /// Set the cgroup's own scheduling policy to `SCHED_IDLE`
+        /// (`1`) or back to normal (`0`), matching real `runc update
+        /// --cpu-idle` exactly (`~/git/runc/update.go`: "set cgroup
+        /// SCHED_IDLE or not, 0: default behavior, 1: SCHED_IDLE") —
+        /// real `crun update` has no CLI flag of its own for this at
+        /// all (only honors it via its own `--resources` JSON path,
+        /// matched here too since `--resources` already bypasses
+        /// every ad-hoc flag regardless, see `--resources`'s own doc
+        /// comment). Passed straight through with no range validation
+        /// of its own, matching real runc's own bare `strconv.
+        /// ParseInt` — any value outside the real kernel's own
+        /// enforced `0`/`1` range is a real, surfaced `EINVAL` from
+        /// the `cpu.idle` write itself (`oci_spec_types::runtime::
+        /// LinuxCpu::idle`'s own doc comment), not validated here.
+        /// Written to the real cgroup v2 `cpu.idle` file *after*
+        /// `cpu.weight`/`cpu.max` in the same update, matching real
+        /// crun's own identical write order — this is what lets a
+        /// single `ocirun update --cpu-share N --cpu-idle 1` combined
+        /// call succeed cleanly with `cpu.idle` correctly taking final
+        /// effect, rather than the real, kernel-enforced `EINVAL`
+        /// real runc's own opposite write order has to separately work
+        /// around (`oci_runtime_core::cgroups::plan_cpu`'s own doc
+        /// comment has the full, checked-directly kernel-source
+        /// citation for why this ordering matters).
+        #[arg(long = "cpu-idle", allow_hyphen_values = true)]
+        cpu_idle: Option<i64>,
         /// Realtime-scheduling period, in microseconds, matching real
         /// `runc update --cpu-rt-period`/`crun update --cpu-rt-
         /// period` exactly. Accepted and stored, matching both real
@@ -699,6 +736,7 @@ fn main() -> std::process::ExitCode {
                 cpu_period,
                 cpu_quota,
                 cpu_burst,
+                cpu_idle,
                 cpu_rt_period,
                 cpu_rt_runtime,
                 blkio_weight,
@@ -716,6 +754,7 @@ fn main() -> std::process::ExitCode {
                     cpu_period,
                     cpu_quota,
                     cpu_burst,
+                    cpu_idle,
                     cpu_rt_period,
                     cpu_rt_runtime,
                     blkio_weight,
@@ -1580,6 +1619,7 @@ struct UpdateFlags<'a> {
     cpu_period: Option<u64>,
     cpu_quota: Option<i64>,
     cpu_burst: Option<u64>,
+    cpu_idle: Option<i64>,
     cpu_rt_period: Option<u64>,
     cpu_rt_runtime: Option<i64>,
     blkio_weight: Option<u16>,
@@ -1617,6 +1657,7 @@ fn resources_from_flags(
         || flags.cpu_period.is_some()
         || flags.cpu_quota.is_some()
         || flags.cpu_burst.is_some()
+        || flags.cpu_idle.is_some()
         || flags.cpu_rt_period.is_some()
         || flags.cpu_rt_runtime.is_some();
     if needs_cpu {
@@ -1631,6 +1672,7 @@ fn resources_from_flags(
         cpu.period = flags.cpu_period;
         cpu.quota = flags.cpu_quota;
         cpu.burst = flags.cpu_burst;
+        cpu.idle = flags.cpu_idle;
         cpu.realtime_period = flags.cpu_rt_period;
         cpu.realtime_runtime = flags.cpu_rt_runtime;
         resources.cpu = Some(cpu);
@@ -2051,6 +2093,7 @@ mod tests {
             cpu_period: Some(100_000),
             cpu_quota: Some(50_000),
             cpu_burst: Some(1_000),
+            cpu_idle: Some(1),
             cpu_rt_period: Some(1_000_000),
             cpu_rt_runtime: Some(950_000),
             ..Default::default()
@@ -2061,8 +2104,19 @@ mod tests {
         assert_eq!(cpu.period, Some(100_000));
         assert_eq!(cpu.quota, Some(50_000));
         assert_eq!(cpu.burst, Some(1_000));
+        assert_eq!(cpu.idle, Some(1));
         assert_eq!(cpu.realtime_period, Some(1_000_000));
         assert_eq!(cpu.realtime_runtime, Some(950_000));
+    }
+
+    #[test]
+    fn resources_from_flags_builds_cpu_idle_alone() {
+        let resources = resources_from_flags(&UpdateFlags {
+            cpu_idle: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(resources.cpu.unwrap().idle, Some(1));
     }
 
     #[test]

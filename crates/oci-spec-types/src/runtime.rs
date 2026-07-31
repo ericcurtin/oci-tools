@@ -488,6 +488,18 @@ pub struct LinuxCpu {
     /// to the real `cpuset.mems` cgroup file.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mems: String,
+    /// Whether the cgroup's own scheduling policy should be
+    /// `SCHED_IDLE` (`1`) or normal (`0`) — the real, current upstream
+    /// runtime-spec field (checked directly, `~/git/runc/vendor/
+    /// github.com/opencontainers/runtime-spec/specs-go/config.go`'s
+    /// own `Idle *int64`), written verbatim to the real `cpu.idle`
+    /// cgroup v2 file (`oci_runtime_core::cgroups::plan_cpu`). The
+    /// real kernel itself enforces exactly `0`/`1`, nothing else
+    /// (`kernel/sched/fair.c`'s own `sched_group_set_idle`: `if (idle
+    /// < 0 || idle > 1) return -EINVAL`) — any other value is a real,
+    /// surfaced `EINVAL` from the write itself, not validated here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<i64>,
 }
 
 /// `pids` cgroup resource limit.
