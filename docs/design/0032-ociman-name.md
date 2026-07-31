@@ -96,6 +96,7 @@ consistent with prior increments that only touched non-hot-path code.
   same as before this increment. Real auto-naming needs a curated word
   list and doesn't change any of the *resolution* machinery this
   increment built, so it's a separable, lower-priority follow-up.
-* `--replace` (real `podman run --replace` automatically removes an
+* ~~`--replace` (real `podman run --replace` automatically removes an
   existing container with a conflicting name rather than erroring) —
-  not implemented; a name conflict is always a hard error here.
+  not implemented; a name conflict is always a hard error here.~~
+  Implemented in `docs/design/0384`.

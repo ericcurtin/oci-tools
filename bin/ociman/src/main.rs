@@ -301,6 +301,25 @@ struct RunArgs {
     /// here").
     #[arg(long)]
     name: Option<String>,
+    /// If a container with the same `--name` already exists, remove
+    /// it first instead of erroring — matching real `podman run
+    /// --replace`/`podman create --replace` exactly (checked
+    /// directly against source, `~/git/podman/cmd/podman/containers/
+    /// create.go`'s own `replaceContainer`: a single, shared
+    /// implementation both `podman run`/`podman create` already call
+    /// identically, exactly mirroring how `RunArgs`/`prepare_
+    /// container` are already shared here). Requires `--name` to
+    /// also be given — a real, immediate error otherwise, matching
+    /// real podman's own exact wording ("cannot replace container
+    /// without --name being set"). Force-stops (an immediate
+    /// `SIGKILL`, no grace period — see `remove_container`'s own doc
+    /// comment for why that's this project's own deliberate,
+    /// already-established divergence from real podman's own slower
+    /// default here) then removes any existing container of that
+    /// name, before the normal name-uniqueness check ever runs —
+    /// closing `docs/design/0032`'s own "what's still not here" gap.
+    #[arg(long)]
+    replace: bool,
     /// Maximum memory the container's own cgroup may use, e.g.
     /// `128m`/`1g` (binary units: `k`/`m`/`g`/`t` mean
     /// 2^10/2^20/2^30/2^40 bytes, matching real `docker run
@@ -4482,7 +4501,7 @@ fn rmi_one(
             // cascade always uses the fast, immediate-`KILL` default
             // (see `Command::Rm::time`'s own doc comment for why
             // that's this project's own deliberate default).
-            remove_container(containers, id, true, None)
+            remove_container(containers, id, true, None, true)
                 .with_context(|| format!("removing dependent container {id} (--force)"))?;
         }
     }
@@ -5864,7 +5883,7 @@ fn compute_container_size(
 fn cmd_system_reset() -> anyhow::Result<()> {
     let containers = open_container_store()?;
     for state in containers.list().context("listing containers")? {
-        remove_container(&containers, &state.id, true, None)
+        remove_container(&containers, &state.id, true, None, true)
             .with_context(|| format!("removing container {}", state.id))?;
     }
 
@@ -6423,6 +6442,15 @@ struct PreparedContainer {
     bundle: oci_runtime_core::Bundle,
     rootfs: PathBuf,
     log_path: PathBuf,
+    /// `--replace`'s own deferred systemd-scope-cleanup handoff (0159's
+    /// established pattern, see `prepare_container`'s own doc comment
+    /// at its `--replace` call site for exactly why this can't be
+    /// done inside `prepare_container` itself): `Some((old_id,
+    /// old_state))` when this call replaced an existing container of
+    /// the same name -- `cmd_run`/`cmd_create` must call
+    /// `reset_failed_systemd_scope` with it themselves, only *after*
+    /// their own next fork has already happened.
+    replaced: Option<(String, oci_runtime_core::PersistedState)>,
 }
 
 /// `--cidfile`'s own write (0309) — a plain create-or-truncate write
@@ -6461,6 +6489,16 @@ fn write_cidfile(path: &Path, container_id: &str) {
 /// failure).
 #[allow(clippy::too_many_arguments)]
 fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
+    // Matching real podman's own exact wording, checked directly
+    // (`~/git/podman/cmd/podman/containers/create.go`'s own
+    // `replaceContainer`): `--replace` with no `--name` at all has
+    // nothing to identify which existing container to replace, so
+    // it's a real, immediate error here too, rather than silently
+    // ignored.
+    anyhow::ensure!(
+        !args.replace || args.name.is_some(),
+        "cannot replace container without --name being set"
+    );
     // Validated eagerly, right here, rather than only at the first
     // real `stop` -- see `ANNOTATION_STOP_SIGNAL`'s own doc comment
     // for why this matches real podman's own checked-directly
@@ -6631,10 +6669,40 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         ANNOTATION_LABELS.to_string(),
         serde_json::to_string(&labels).expect("a string-keyed/valued map always serializes"),
     );
+    let mut replaced = None;
     if let Some(name) = &args.name {
         validate_container_name(name)?;
-        if let Ok(existing) = resolve_container_id(&containers, name) {
-            anyhow::bail!("container name {name:?} is already in use by {existing:?}");
+        match resolve_container_id(&containers, name) {
+            // `--replace` (checked directly against real podman's own
+            // `replaceContainer`, see `RunArgs::replace`'s own doc
+            // comment): force-remove the existing container of this
+            // same name first, then fall straight through into an
+            // ordinary create -- exactly matching real podman's own
+            // "replace runs before the real create path" ordering.
+            //
+            // `reset_scope: false` (0159's own established deferred-
+            // reset pattern, `restart_one`'s own identical shape): this
+            // whole call is about to be followed by a brand new
+            // container's own launch, which forks in the very same
+            // process (`cmd_run`'s detached-keeper fork, or `launch::
+            // run_reporting_pid`/`launch::create`'s own foreground
+            // fork) -- resetting the *old* container's own failed
+            // systemd scope here, before that fork, would risk the
+            // exact same real fork-safety hazard 0159 already found
+            // and fixed for `cmd_restart` (a background D-Bus thread
+            // still alive at the moment of a subsequent `fork()`). The
+            // old state is captured now (before removal) so `cmd_run`/
+            // `cmd_create` can perform this same reset themselves,
+            // safely, only after their own fork has already happened.
+            Ok(existing) if args.replace => {
+                let old_state = containers.load(&existing).ok();
+                remove_container(&containers, &existing, true, None, false)?;
+                replaced = old_state.map(|state| (existing, state));
+            }
+            Ok(existing) => {
+                anyhow::bail!("container name {name:?} is already in use by {existing:?}");
+            }
+            Err(_) => {}
         }
         annotations.insert(ANNOTATION_NAME.to_string(), name.to_string());
     }
@@ -6853,6 +6921,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         bundle,
         rootfs,
         log_path,
+        replaced,
     })
 }
 
@@ -6899,6 +6968,7 @@ fn cmd_run(
         bundle,
         rootfs,
         log_path,
+        replaced,
     } = prepare_container(&args)?;
 
     if rm {
@@ -6949,6 +7019,15 @@ fn cmd_run(
                 preserve_fds,
             )?;
         }
+        // Only now, after the new detached keeper has already been
+        // forked and confirmed running, is it safe to spawn a
+        // background D-Bus thread of our own for the *replaced*
+        // container's own best-effort scope cleanup -- see
+        // `PreparedContainer::replaced`'s own doc comment for exactly
+        // why this can't happen any earlier.
+        if let Some((old_id, old_state)) = replaced {
+            reset_failed_systemd_scope(&old_id, &old_state);
+        }
         return Ok(());
     }
 
@@ -6963,6 +7042,14 @@ fn cmd_run(
         interactive,
         preserve_fds,
     )?;
+
+    // Same deferred-reset reasoning as the `detach` branch above --
+    // `run_and_finalize` has already forked (and, by the time it
+    // returns here, fully waited out) the real container process, so
+    // this is equally safe now.
+    if let Some((old_id, old_state)) = replaced {
+        reset_failed_systemd_scope(&old_id, &old_state);
+    }
 
     // The container's own exit code becomes ours, matching `ocirun
     // run`/real `podman run`: exit code 0 must mean "the container's
@@ -6999,6 +7086,7 @@ fn cmd_create(args: RunArgs, rm: bool, interactive: bool) -> anyhow::Result<()> 
         container_id,
         mut state,
         containers,
+        replaced,
         ..
     } = prepare_container(&args)?;
     state.status = Status::Created;
@@ -7013,6 +7101,17 @@ fn cmd_create(args: RunArgs, rm: bool, interactive: bool) -> anyhow::Result<()> 
             .insert(ANNOTATION_INTERACTIVE.to_string(), "true".to_string());
     }
     containers.write(&state)?;
+    // Safe to perform immediately, unlike `cmd_run`'s own identical
+    // handoff (see `PreparedContainer::replaced`'s own doc comment):
+    // `ociman create` never forks any real process of its own at all
+    // (this project's own deliberately lazy `create`, unlike real
+    // runc/crun's own two-phase lifecycle -- see `stop_container`'s
+    // own doc comment) -- there is no subsequent fork in this same
+    // process a background D-Bus thread spawned here could ever race
+    // against.
+    if let Some((old_id, old_state)) = replaced {
+        reset_failed_systemd_scope(&old_id, &old_state);
+    }
     println!("{container_id}");
     Ok(())
 }
@@ -7586,7 +7685,7 @@ fn prune_eligible_containers(containers: &StateStore) -> anyhow::Result<Vec<Stri
     let mut removed = Vec::new();
     for state in containers.list().context("listing containers")? {
         if matches!(state.effective_status(), Status::Created | Status::Stopped) {
-            remove_container(containers, &state.id, true, None)
+            remove_container(containers, &state.id, true, None, true)
                 .with_context(|| format!("removing container {}", state.id))?;
             removed.push(state.id);
         }
@@ -8525,7 +8624,7 @@ fn cmd_rm(
             }
             let mut first_error = None;
             for id in &targets {
-                if let Err(e) = remove_container(&containers, id, force, time_secs) {
+                if let Err(e) = remove_container(&containers, id, force, time_secs, true) {
                     eprintln!("error removing {id}: {e:#}");
                     first_error.get_or_insert(e);
                     continue;
@@ -8540,7 +8639,7 @@ fn cmd_rm(
         (true, true) => {
             let mut first_error = None;
             for state in containers.list().context("listing containers")? {
-                if let Err(e) = remove_container(&containers, &state.id, force, time_secs) {
+                if let Err(e) = remove_container(&containers, &state.id, force, time_secs, true) {
                     eprintln!("error removing {}: {e:#}", state.id);
                     first_error.get_or_insert(e);
                     continue;
@@ -9305,6 +9404,7 @@ fn remove_container(
     id: &str,
     force: bool,
     time_secs: Option<u64>,
+    reset_scope: bool,
 ) -> anyhow::Result<()> {
     let resolved = resolve_container_id(containers, id)?;
     let state = containers.load(&resolved)?;
@@ -9322,7 +9422,7 @@ fn remove_container(
         // `ociman stop`/`restart` already use, rather than a second,
         // cruder reimplementation of the identical sequence.
         if status != Status::Stopped {
-            stop_container(id, Some(time_secs), None, true)?;
+            stop_container(id, Some(time_secs), None, reset_scope)?;
         }
     } else if let Some(pid) = state.pid
         && status != Status::Stopped
@@ -9345,7 +9445,21 @@ fn remove_container(
         // stop that can leave its own transient systemd scope in a
         // "failed" state rather than the clean, self-removing exit
         // path a container that runs to completion on its own gets.
-        reset_failed_systemd_scope(&resolved, &state);
+        //
+        // `reset_scope` (0159's own established deferred-reset
+        // pattern, mirroring `stop_container`'s own identical
+        // parameter): `false` when the calling process is about to
+        // `fork()` again itself before exiting (`--replace`, see
+        // `prepare_container`'s own call site) -- spawning
+        // `reset_failed_unit`'s own background D-Bus thread here in
+        // that case would risk the exact same real, previously-fixed
+        // fork-safety hazard 0159 already found and fixed for
+        // `cmd_restart`; the caller is responsible for performing this
+        // same reset itself, using its own separately-captured old
+        // state, only *after* its own next fork has already happened.
+        if reset_scope {
+            reset_failed_systemd_scope(&resolved, &state);
+        }
     }
 
     containers.remove(&resolved)?;
