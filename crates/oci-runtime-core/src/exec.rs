@@ -9,6 +9,7 @@
 //! container's own init process, then `exec`ing.
 
 use std::io;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 
@@ -71,6 +72,23 @@ pub struct ExecRequest {
     /// caller of this function already treats as "nonzero, not
     /// healthy" with no code changes needed downstream.
     pub timeout: Option<std::time::Duration>,
+    /// If true, the exec'd process's own stdin is a fresh `/dev/null`
+    /// instead of whatever fd 0 this calling process itself already
+    /// has — matching real `podman exec`'s own checked-directly
+    /// default exactly (`~/git/podman/cmd/podman/containers/exec.go`:
+    /// `AttachInput`/`InputStream` are only ever set when `-i`/
+    /// `--interactive` is given; `AttachOutput`/`AttachError` are
+    /// unconditional either way, so stdout/stderr are deliberately
+    /// *not* gated by this field — matching that same real asymmetry).
+    /// Purely a podman-level concept: neither real `runc exec` nor
+    /// `crun exec` has any `-i`/interactive flag at all (checked
+    /// directly against both installed binaries' own `--help`) —
+    /// `ocirun exec`'s own call site always passes `false` here,
+    /// matching `crate::launch::run`'s own identical "no attach/
+    /// interactive concept, always forward whatever stdio the caller
+    /// already set up verbatim" precedent for `ocirun run`/`create`
+    /// (0187).
+    pub close_stdin: bool,
 }
 
 /// Run `request.args` as a new process inside the already-running
@@ -101,6 +119,18 @@ pub unsafe fn exec(pid: i32, request: ExecRequest) -> io::Result<i32> {
     // own doc comment on why joining anything first would make some
     // of these paths unreadable.
     let opened = nsenter::open_all(pid, &request.namespaces)?;
+    // Opened here too, for the same reason `nsenter::open_all` just
+    // above is: a plain `/dev/null` by-path open must happen before
+    // ever joining any namespace this process doesn't already have
+    // (in particular a mount namespace whose own `/dev/null` might
+    // not even exist, or resolve to something else entirely) — see
+    // `launch::run_reporting_pid`'s own identical "open before the
+    // fork, in the original process" ordering for `close_stdin`.
+    let stdin_fd = if request.close_stdin {
+        Some(std::fs::File::open("/dev/null")?)
+    } else {
+        None
+    };
     // A real `timeout` (0308) also needs the inner-fork relay, even
     // when no PID namespace join is otherwise required: the deadline-
     // aware wait lives entirely inside `ExecSetup::run`'s own relay
@@ -121,6 +151,7 @@ pub unsafe fn exec(pid: i32, request: ExecRequest) -> io::Result<i32> {
         args: request.args,
         preserve_fds: request.preserve_fds,
         timeout: request.timeout,
+        stdin_fd,
     };
 
     // SAFETY: forwarded from this function's own contract.
@@ -140,6 +171,11 @@ struct ExecSetup {
     args: Vec<String>,
     preserve_fds: u32,
     timeout: Option<std::time::Duration>,
+    /// See [`ExecRequest::close_stdin`]'s own doc comment. A real,
+    /// already-open `/dev/null` handle (not just a bool), opened once
+    /// in the original process before any fork — the same reasoning
+    /// `launch::ChildSetup::stdin_fd` already established.
+    stdin_fd: Option<std::fs::File>,
 }
 
 impl ExecSetup {
@@ -205,15 +241,32 @@ impl ExecSetup {
                 command.env(key, value);
             }
         }
+        // `close_stdin` (see `ExecRequest::close_stdin`'s own doc
+        // comment): `self` is only ever a shared reference here, so
+        // the `File` can't be moved out of it directly; reconstructing
+        // a fresh `Stdio` from the same raw fd number is sound for the
+        // exact same reason `launch::ChildSetup::mount_pivot_and_exec`'s
+        // own identical call site already documents -- this process
+        // never uses `self.stdin_fd` again, and always terminates from
+        // here on by either a successful `exec` (replacing the process
+        // image, reclaiming every fd via ordinary kernel process
+        // teardown) or `fail`'s own `std::process::exit` (same
+        // reclaiming).
+        #[allow(unsafe_code)]
+        if let Some(fd) = &self.stdin_fd {
+            command.stdin(unsafe { std::process::Stdio::from_raw_fd(fd.as_raw_fd()) });
+        }
         // Close every fd above stdio (+ any explicitly `--preserve-
         // fds`d ones), matching real runc/crun's own identical
         // default -- see `ExecRequest::preserve_fds`'s own doc
-        // comment. A `pre_exec` closure (not a plain call before this)
-        // for the same reason `launch.rs`'s own identical call site
-        // needs one: it must run after `Command`'s own internal stdio
-        // setup, not before (this call site never redirects stdio at
-        // all today, but a bare call here would still be one `Command`
-        // API change away from silently breaking the moment it does).
+        // comment. A `pre_exec` closure -- not a plain call right here
+        // -- specifically because it must run *after* `Command`'s own
+        // internal stdio `dup2`s (already registered above) but
+        // *before* the real `execve`: the raw source fd behind
+        // `stdin_fd` is itself an ordinary fd `>= 3` that this same
+        // cleanup would otherwise close *before* `Command` ever got a
+        // chance to `dup2` it onto fd 0, breaking `--interactive`
+        // outright the moment both are combined.
         let preserve_fds = self.preserve_fds;
         #[allow(unsafe_code)]
         unsafe {

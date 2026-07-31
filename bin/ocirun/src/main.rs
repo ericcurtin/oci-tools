@@ -1985,6 +1985,14 @@ fn cmd_exec(
         // real `crun exec`/`runc exec`'s own identical lack of one
         // (checked directly).
         timeout: None,
+        // Always forwards whatever stdin this process itself already
+        // has, matching real `runc exec`/`crun exec` exactly (checked
+        // directly, neither has any `-i`/interactive flag at all) --
+        // the same "no attach/interactive concept, always forward
+        // stdio verbatim" precedent `ocirun run`/`create` already
+        // established (0187). See `ExecRequest::close_stdin`'s own
+        // doc comment.
+        close_stdin: false,
     };
 
     // SAFETY: `ocirun`'s own process has not spawned any additional

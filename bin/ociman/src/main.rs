@@ -2598,6 +2598,22 @@ enum Command {
         /// identical here.
         #[arg(long = "env-file", value_name = "PATH")]
         env_file: Vec<PathBuf>,
+        /// Keep the exec'd process's own stdin open and forward this
+        /// process's own real stdin to it, matching real `podman exec
+        /// -i`/`--interactive` exactly (checked directly: real
+        /// podman's own default, `-i` absent, never connects the
+        /// exec'd process's stdin at all — `AttachOutput`/
+        /// `AttachError` are unconditional either way, so stdout/
+        /// stderr are always forwarded regardless of this flag,
+        /// exactly the same real asymmetry `ociman run -i`/
+        /// `--interactive` already established, see its own doc
+        /// comment). A real, previously-unnoticed bug this closes:
+        /// before this flag existed, `ociman exec` always forwarded
+        /// whatever stdin its own caller had, unconditionally,
+        /// regardless of whether the caller actually wanted that —
+        /// unlike real podman's own checked-directly default.
+        #[arg(short, long)]
+        interactive: bool,
         /// Pass `N` additional file descriptors, starting at fd 3
         /// (right after stdio), through to the exec'd process
         /// untouched — matching real `podman exec --preserve-fds`
@@ -3433,6 +3449,7 @@ fn main() -> std::process::ExitCode {
                 workdir,
                 env,
                 env_file,
+                interactive,
                 preserve_fds,
                 args,
             }) => {
@@ -3453,6 +3470,7 @@ fn main() -> std::process::ExitCode {
                     workdir.as_deref(),
                     &combined_env,
                     preserve_fds,
+                    interactive,
                     &args,
                 )
             }
@@ -11110,6 +11128,13 @@ fn cmd_healthcheck_run(id: &str, ignore_result: bool) -> anyhow::Result<()> {
         // run` doesn't either).
         preserve_fds: 0,
         timeout: Some(timeout),
+        // A healthcheck has no real stdin to forward at all -- real
+        // `podman healthcheck run` doesn't attach any stream either,
+        // and this project's own caller (a cron-like internal
+        // scheduler, not an interactive terminal) has no meaningful
+        // stdin of its own to begin with. See `ExecRequest::
+        // close_stdin`'s own doc comment.
+        close_stdin: true,
     };
 
     // SAFETY: `ociman`'s own process has not spawned any additional
@@ -13083,6 +13108,7 @@ fn cmd_exec(
     cwd: Option<&str>,
     extra_env: &[String],
     preserve_fds: u32,
+    interactive: bool,
     args: &[String],
 ) -> anyhow::Result<()> {
     verify_preserve_fds(preserve_fds)?;
@@ -13175,6 +13201,19 @@ fn cmd_exec(
         // real `podman exec`'s own identical lack of one (checked
         // directly).
         timeout: None,
+        // `-i`/`--interactive` (0385): matching real `podman exec -i`
+        // exactly (checked directly, `~/git/podman/cmd/podman/
+        // containers/exec.go`: `AttachInput`/`InputStream` only set
+        // when `-i` is given; `AttachOutput`/`AttachError` are
+        // unconditional either way, so stdout/stderr are deliberately
+        // untouched by this flag, matching that same real asymmetry —
+        // see `Command::Exec::interactive`'s own doc comment). A real,
+        // previously-unnoticed bug this closes: before this flag
+        // existed, `ociman exec` always forwarded whatever stdin its
+        // own caller had, unconditionally -- unlike real podman's own
+        // checked-directly default (`-i` absent) of never connecting
+        // the exec'd process's stdin at all.
+        close_stdin: !interactive,
     };
 
     // SAFETY: `ociman`'s own process has not spawned any additional

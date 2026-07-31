@@ -12,6 +12,7 @@
 //! itself exits) and polled via `ociman ps` until its status is
 //! `running` before `exec` is attempted.
 
+use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -676,6 +677,147 @@ fn exec_preserve_fds_rejects_a_claim_with_no_matching_open_fd() {
         String::from_utf8_lossy(&out.stderr).contains("is not available"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "--force", &id]);
+}
+
+/// A real, previously-unnoticed bug this closes (0385): before `-i`/
+/// `--interactive` existed, `ociman exec` always forwarded whatever
+/// stdin its own caller had, unconditionally -- unlike real `podman
+/// exec`'s own checked-directly default (`-i` absent) of never
+/// connecting the exec'd process's stdin at all (`~/git/podman/cmd/
+/// podman/containers/exec.go`: `AttachInput`/`InputStream` are only
+/// ever set when `-i` is given).
+#[test]
+fn exec_without_interactive_never_forwards_real_stdin() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/exec-stdin-default:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/exec-stdin-default:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "exec",
+            &id,
+            "/bin/sh",
+            "-c",
+            "if read -t 5 line; then echo GOT:$line; else echo NOINPUT; fi",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman exec");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello-from-host-stdin\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "NOINPUT",
+        "without --interactive, ociman exec should never forward real host stdin"
+    );
+
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "--force", &id]);
+}
+
+/// `ociman exec -i`/`--interactive` (0385): the exec'd process's own
+/// stdin must be this process's own real stdin, matching real `podman
+/// exec -i` exactly.
+#[test]
+fn exec_interactive_forwards_real_stdin() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/exec-stdin-interactive:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/exec-stdin-interactive:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "exec",
+            "--interactive",
+            &id,
+            "/bin/sh",
+            "-c",
+            "if read -t 5 line; then echo GOT:$line; else echo NOINPUT; fi",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman exec");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello-from-host-stdin\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "GOT:hello-from-host-stdin",
+        "--interactive should forward this process's own real stdin to the exec'd process"
     );
 
     run.wait().unwrap();

@@ -136,6 +136,13 @@ fn exec_run(args: &[String]) -> anyhow::Result<i32> {
         // timeout") -- a second, inner deadline here would be
         // redundant.
         timeout: None,
+        // Real CRI's own `ExecSyncRequest` has no stdin concept at
+        // all (kubelet's own liveness/readiness probes never provide
+        // one) -- this helper's own caller already captures stdout/
+        // stderr over real pipes regardless, so there is nothing
+        // meaningful to forward here either way. See `ExecRequest::
+        // close_stdin`'s own doc comment.
+        close_stdin: true,
     };
 
     // SAFETY: this process is genuinely single-threaded here -- just

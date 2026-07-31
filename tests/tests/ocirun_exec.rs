@@ -4,6 +4,7 @@
 //! binary and a real busybox rootfs, on top of the `create`/`start`
 //! two-phase lifecycle `ocirun_lifecycle.rs` already covers.
 
+use std::io::Write as _;
 use std::time::Duration;
 
 use oci_tools_tests::{
@@ -780,4 +781,71 @@ fn exec_ignore_paused_allows_exec_into_a_genuinely_paused_container() {
         root_dir.path(),
         &["delete", "--force", "exec-ignore-paused-test"],
     );
+}
+
+/// A regression guard for the "no behavior change for `ocirun`" side
+/// of 0385: `ocirun exec` has no `-i`/interactive concept at all
+/// (matching real `runc exec`/`crun exec` exactly, checked directly
+/// against both installed binaries' own `--help` -- neither has one),
+/// so it must keep forwarding whatever stdin its own caller has
+/// unconditionally, exactly as it always has.
+#[test]
+fn exec_always_forwards_real_stdin_unconditionally() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let create = ocirun_create(root_dir.path(), bundle_dir.path(), "exec-stdin-test");
+    assert!(create.status.success(), "{create:?}");
+    let start = ocirun(root_dir.path(), &["start", "exec-stdin-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-stdin-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let mut child = std::process::Command::new(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args([
+            "exec",
+            "exec-stdin-test",
+            "/bin/sh",
+            "-c",
+            "if read -t 5 line; then echo GOT:$line; else echo NOINPUT; fi",
+        ])
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ocirun exec");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello-from-host-stdin\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "GOT:hello-from-host-stdin",
+        "ocirun exec must always forward real host stdin, unconditionally"
+    );
+
+    ocirun(root_dir.path(), &["delete", "--force", "exec-stdin-test"]);
 }
