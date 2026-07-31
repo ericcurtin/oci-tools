@@ -187,6 +187,65 @@ fn ephemeral_invocations_never_share_state_with_each_other() {
     assert!(!read.status.success());
 }
 
+/// `ocibox ephemeral --home` -- inherited from `ocibox create`'s own
+/// identical flag, matching real `distrobox ephemeral`'s own identical
+/// inheritance of `--home`/`-H` from `distrobox create`.
+#[test]
+fn ephemeral_uses_a_custom_home_directory() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/ephemeral-custom-home:latest",
+        &busybox,
+        &["sh", "touch"],
+        ContainerConfig::default(),
+    );
+
+    let custom_home_parent = tempfile::tempdir().unwrap();
+    let custom_home = custom_home_parent.path().join("not-yet-created");
+    let ambient_home = tempfile::tempdir().unwrap();
+
+    let out = Command::new(bin_path("ocibox"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .env("HOME", ambient_home.path())
+        .args([
+            "ephemeral",
+            "--image",
+            "ocibox-test/ephemeral-custom-home:latest",
+            "--home",
+            custom_home.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo $PWD",
+        ])
+        .output()
+        .expect("failed to spawn ocibox");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The box's own real command output comes first; a second,
+    // trailing line is `remove_one_box`'s own real removed-name
+    // announcement (`cmd_ephemeral`'s always-run cleanup step,
+    // matching real `distrobox rm`'s own identical habit) -- same
+    // reasoning `ephemeral_runs_a_command_and_removes_the_box_
+    // afterward`'s own `.contains` check already accounts for.
+    assert_eq!(
+        stdout.lines().next().unwrap(),
+        custom_home.to_str().unwrap(),
+        "full stdout: {stdout:?}"
+    );
+}
+
 #[test]
 fn ephemeral_of_an_unresolvable_image_is_a_clear_error_and_leaves_no_box_behind() {
     let storage_dir = tempfile::tempdir().unwrap();

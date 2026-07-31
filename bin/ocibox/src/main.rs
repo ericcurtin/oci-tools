@@ -108,6 +108,31 @@ enum Command {
         /// regardless of what the *default* resolves to.
         #[arg(long, value_name = "NAME")]
         hostname: Option<String>,
+        /// Use a custom host directory as the box's own `$HOME`
+        /// instead of this process's own real host `$HOME`, set once
+        /// at `create` time and used by every later `ocibox enter` of
+        /// it — matching real `distrobox create --home`/`-H` exactly
+        /// (checked directly, `~/git/distrobox/pkg/commands/
+        /// providers/{podman,docker}.go`'s own identical handling):
+        /// bind-mounted at the same path inside the box, and the
+        /// box's own process `cwd` is this path instead of the real
+        /// host `$HOME` (matching `ocibox enter`'s own already-
+        /// established default-`$HOME` behavior, just pointed at a
+        /// different real directory). Auto-created (matching real
+        /// distrobox's own `os.MkdirAll(..., 0755)`) if it doesn't
+        /// already exist — a real, immediate error if creation fails,
+        /// never silently ignored (unlike this project's own already-
+        /// established default-`$HOME`-missing case, which silently
+        /// skips the bind mount instead: this path was *explicitly*
+        /// requested, so a typo should be loud, not silently
+        /// swallowed). **Narrower than real distrobox**: does not set
+        /// an explicit `HOME=`/`DISTROBOX_HOST_HOME=` environment
+        /// variable inside the box (a pre-existing gap in `ocibox`'s
+        /// own `$HOME` handling generally, not introduced by this
+        /// flag — real distrobox sets both regardless of whether
+        /// `--home` was even given at all).
+        #[arg(long, short = 'H', value_name = "PATH")]
+        home: Option<PathBuf>,
     },
     /// List real, created boxes — matching real `distrobox list`
     /// (alias `ls`), narrowed to what this project's own boxes
@@ -215,6 +240,13 @@ enum Command {
         /// directly, `~/git/distrobox/internal/cli/ephemeral.go`).
         #[arg(long, value_name = "NAME")]
         hostname: Option<String>,
+        /// Same as `ocibox create --home` — matching `distrobox
+        /// ephemeral`'s own identical inherited flag (checked
+        /// directly: `~/git/distrobox/internal/cli/ephemeral.go`
+        /// copies every flag from its own `create` command, `--home`/
+        /// `-H` included).
+        #[arg(long, short = 'H', value_name = "PATH")]
+        home: Option<PathBuf>,
         /// The command to run inside the box, and its own arguments —
         /// defaults to a shell (see `ocibox enter`'s own doc comment)
         /// if empty.
@@ -414,7 +446,8 @@ fn main() -> std::process::ExitCode {
                 name,
                 pull,
                 hostname,
-            }) => cmd_create(&image, &name, pull, hostname.as_deref()),
+                home,
+            }) => cmd_create(&image, &name, pull, hostname.as_deref(), home.as_deref()),
             Some(Command::List) => cmd_list(cli.global.json),
             Some(Command::Rm {
                 names,
@@ -426,8 +459,9 @@ fn main() -> std::process::ExitCode {
                 image,
                 pull,
                 hostname,
+                home,
                 command,
-            }) => cmd_ephemeral(&image, pull, hostname.as_deref(), &command),
+            }) => cmd_ephemeral(&image, pull, hostname.as_deref(), home.as_deref(), &command),
             Some(Command::Export {
                 box_name,
                 app,
@@ -533,6 +567,15 @@ struct BoxRecord {
     /// convention `env`/`working_dir` already use.
     #[serde(default)]
     hostname: Option<String>,
+    /// An explicit `--home`, if one was given at `create` time — `None`
+    /// (the common case) means `enter_spec` falls back to this
+    /// process's own real host `$HOME`, matching this project's own
+    /// already-established default. Older `box.json` files predating
+    /// this field deserialize this as `None` via `#[serde(default)]`,
+    /// the same forward-compatible-record convention `hostname`
+    /// already uses.
+    #[serde(default)]
+    custom_home: Option<PathBuf>,
 }
 
 /// The real, checked-directly cap real `distrobox create --hostname`
@@ -556,8 +599,14 @@ fn validate_hostname(hostname: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_create(image: &str, name: &str, pull: bool, hostname: Option<&str>) -> anyhow::Result<()> {
-    create_box(image, name, pull, hostname)?;
+fn cmd_create(
+    image: &str,
+    name: &str,
+    pull: bool,
+    hostname: Option<&str>,
+    home: Option<&Path>,
+) -> anyhow::Result<()> {
+    create_box(image, name, pull, hostname, home)?;
     println!("{name}");
     Ok(())
 }
@@ -569,7 +618,13 @@ fn cmd_create(image: &str, name: &str, pull: bool, hostname: Option<&str>) -> an
 /// identical "no extra id line before dropping into the shell"
 /// output) can reuse every bit of real resolve/extract/persist logic
 /// without also inheriting `cmd_create`'s own final `println!`.
-fn create_box(image: &str, name: &str, pull: bool, hostname: Option<&str>) -> anyhow::Result<()> {
+fn create_box(
+    image: &str,
+    name: &str,
+    pull: bool,
+    hostname: Option<&str>,
+    home: Option<&Path>,
+) -> anyhow::Result<()> {
     validate_box_name(name)?;
     if let Some(hostname) = hostname {
         validate_hostname(hostname)?;
@@ -636,6 +691,7 @@ fn create_box(image: &str, name: &str, pull: bool, hostname: Option<&str>) -> an
         env: container_config.env,
         working_dir: container_config.working_dir,
         hostname: hostname.map(str::to_string),
+        custom_home: home.map(Path::to_path_buf),
     };
     let box_json_path = box_dir.join("box.json");
     std::fs::write(
@@ -814,16 +870,35 @@ fn enter_spec(
             .unwrap_or_else(|| record.name.clone()),
     );
 
-    // Only added if `$HOME` resolves to a real, existing host
-    // directory — deliberately conditional (unlike real `distrobox
-    // enter`'s own unconditional host-home bind mount, which also
-    // creates a matching host user account inside the rootfs first;
-    // this project doesn't do that yet), so `ocibox enter` still
-    // works from an environment with no usable `$HOME` at all rather
-    // than failing outright.
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|h| h.is_dir());
+    // An explicit `--home` given at `create` time (matching real
+    // `distrobox create --home`/`-H` exactly) always wins, and is
+    // always auto-created if it doesn't exist yet — matching real
+    // distrobox's own `os.MkdirAll(..., 0755)` exactly: this path was
+    // *explicitly* requested, so a typo (or a directory that
+    // genuinely can't be created) is a real, immediate error here,
+    // never silently ignored, unlike the plain `$HOME`-fallback case
+    // just below. Without `--home`, falls back to `$HOME`, only added
+    // if it resolves to a real, existing host directory —
+    // deliberately conditional there (unlike real `distrobox enter`'s
+    // own unconditional host-home bind mount, which also creates a
+    // matching host user account inside the rootfs first; this
+    // project doesn't do that yet), so `ocibox enter` still works from
+    // an environment with no usable `$HOME` at all rather than failing
+    // outright. **Narrower than real distrobox in both cases**: does
+    // not set an explicit `HOME=`/`DISTROBOX_HOST_HOME=` environment
+    // variable inside the box at all (a pre-existing gap in this
+    // function generally, not introduced by `--home` — real distrobox
+    // sets both regardless of whether a custom home was even given).
+    let home = match &record.custom_home {
+        Some(custom) => {
+            std::fs::create_dir_all(custom)
+                .with_context(|| format!("creating custom home directory {}", custom.display()))?;
+            Some(custom.clone())
+        }
+        None => std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|h| h.is_dir()),
+    };
 
     let process = spec
         .process
@@ -1086,10 +1161,11 @@ fn cmd_ephemeral(
     image: &str,
     pull: bool,
     hostname: Option<&str>,
+    home: Option<&Path>,
     command: &[String],
 ) -> anyhow::Result<()> {
     let name = unique_random_box_name()?;
-    create_box(image, &name, pull, hostname)
+    create_box(image, &name, pull, hostname, home)
         .with_context(|| format!("creating ephemeral box {name}"))?;
 
     let result = enter_and_get_exit_code(&name, command);

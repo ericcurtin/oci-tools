@@ -186,6 +186,89 @@ fn enter_bind_mounts_a_real_existing_home() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "real-host-home");
 }
 
+/// `ocibox create --home` (matching real `distrobox create --home`/
+/// `-H` exactly): a custom home given at `create` time always wins
+/// over the real, ambient `$HOME` -- auto-created if it doesn't exist
+/// yet (matching real distrobox's own `os.MkdirAll`), genuinely
+/// bind-mounted (a write inside the box lands on the *custom* host
+/// path, never the ambient `$HOME`), and used as the box's own
+/// process `cwd`.
+#[test]
+fn enter_uses_a_custom_home_directory_given_at_create_time() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/custom-home-base:latest",
+        &busybox,
+        &["sh", "touch"],
+        ContainerConfig::default(),
+    );
+
+    let custom_home_parent = tempfile::tempdir().unwrap();
+    let custom_home = custom_home_parent.path().join("not-yet-created");
+    assert!(
+        !custom_home.exists(),
+        "the test's own setup must not pre-create this"
+    );
+    let ambient_home = tempfile::tempdir().unwrap();
+
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/custom-home-base:latest",
+            "--name",
+            "customhomebox",
+            "--home",
+            custom_home.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let out = Command::new(bin_path("ocibox"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .env("HOME", ambient_home.path())
+        .args([
+            "enter",
+            "customhomebox",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo $PWD && touch marker",
+        ])
+        .output()
+        .expect("failed to spawn ocibox");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        custom_home.to_str().unwrap(),
+        "the box's own cwd must be the custom home, not the ambient $HOME"
+    );
+    assert!(
+        custom_home.join("marker").exists(),
+        "the custom home must be auto-created and genuinely bind-mounted"
+    );
+    assert!(
+        !ambient_home.path().join("marker").exists(),
+        "the ambient $HOME must never be used once a custom home was given at create time"
+    );
+}
+
 /// A real, previously-unnoticed bug this fixes (0292): every box,
 /// regardless of its own real name, used to report the literal
 /// hostname `ocirun` -- a copy-paste artifact of `Spec::example()`'s
