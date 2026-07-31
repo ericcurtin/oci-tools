@@ -148,6 +148,20 @@ pub struct CriProcessConfig<'a> {
     /// default propagation, SELinux relabeling, recursive read-only,
     /// UID/GID mappings).
     pub mounts: &'a [oci_spec_types::runtime::Mount],
+    /// `ContainerConfig.linux.security_context.readonly_rootfs`
+    /// (0388) -- matching real cri-o's own `container.go`'s
+    /// `ReadOnly()`/`specgen.SetRootReadonly` exactly: `true` here
+    /// means the container's root filesystem must genuinely be
+    /// mounted read-only, not the always-writable default every other
+    /// container this project launches gets. Previously silently
+    /// ignored: `build_spec` used to force `readonly = false`
+    /// unconditionally, regardless of what the request actually
+    /// asked for -- a real, previously-undetected divergence from the
+    /// pod spec's own explicit intent (a common, often
+    /// policy-enforced request, e.g. Kubernetes's own Pod Security
+    /// Standards "Restricted" profile), the same shape of bug 0365
+    /// already fixed for `run_as_user`.
+    pub readonly_rootfs: bool,
 }
 
 /// Builds the container's own real OCI spec: the same
@@ -163,14 +177,17 @@ fn build_spec(
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
 
-    // Writable rootfs -- the same fix, same reasoning, as
+    // Writable rootfs by default -- the same fix, same reasoning, as
     // `synthesize_spec`/`enter_spec`'s own identical override
     // (`Spec::example()`'s conservative `readonly: true` is not what
-    // a real container engine wants by default).
+    // a real container engine wants by default) -- unless the request
+    // itself explicitly asked for a read-only one (0388, see
+    // `CriProcessConfig::readonly_rootfs`'s own doc comment), matching
+    // real cri-o's own `specgen.SetRootReadonly(ctr.ReadOnly(...))`.
     spec.root
         .as_mut()
         .expect("Spec::example always sets root")
-        .readonly = false;
+        .readonly = cri.readonly_rootfs;
 
     let image_entrypoint = image_config.entrypoint.clone().unwrap_or_default();
     let image_cmd = image_config.cmd.clone().unwrap_or_default();
@@ -425,6 +442,7 @@ mod tests {
             dns_searches: &[],
             dns_options: &[],
             mounts: &[],
+            readonly_rootfs: false,
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();
@@ -439,6 +457,39 @@ mod tests {
         assert_eq!(process.cwd, "/from-kube");
         assert!(!spec.root.unwrap().readonly);
         assert_eq!(spec.hostname.as_deref(), Some("test-pod-hostname"));
+    }
+
+    /// `security_context.readonly_rootfs` (0388): previously silently
+    /// ignored (`build_spec` used to force `readonly = false`
+    /// unconditionally, regardless of the request); now genuinely
+    /// honored, matching real cri-o's own `specgen.SetRootReadonly`.
+    /// The `false` case (the common, unconfigured default) is already
+    /// covered by every other test in this module asserting a
+    /// writable root; this one covers the previously-broken `true`
+    /// case.
+    #[test]
+    fn build_spec_honors_an_explicit_readonly_rootfs_request() {
+        let image_config = oci_spec_types::image::ContainerConfig {
+            cmd: Some(strings(&["sh"])),
+            ..Default::default()
+        };
+        let cri = CriProcessConfig {
+            command: &[],
+            args: &[],
+            envs: Vec::new(),
+            working_dir: "",
+            hostname: "readonly-rootfs-test",
+            dns_servers: &[],
+            dns_searches: &[],
+            dns_options: &[],
+            mounts: &[],
+            readonly_rootfs: true,
+        };
+        let spec = build_spec(&cri, &image_config).unwrap();
+        assert!(
+            spec.root.unwrap().readonly,
+            "an explicit readonly_rootfs: true request must produce a genuinely read-only root"
+        );
     }
 
     #[test]
@@ -457,6 +508,7 @@ mod tests {
             dns_searches: &[],
             dns_options: &[],
             mounts: &[],
+            readonly_rootfs: false,
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();

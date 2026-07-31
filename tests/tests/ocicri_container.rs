@@ -2450,6 +2450,87 @@ async fn create_container_run_as_user_and_group_zero_succeeds() {
     assert!(created.is_ok(), "{created:?}");
 }
 
+/// `security_context.readonly_rootfs` (`docs/design/0388`): a real,
+/// explicit `readonly_rootfs: true` request must set `root.readonly`
+/// in the real generated `config.json` -- previously silently ignored
+/// (`build_spec` used to force `readonly = false` unconditionally
+/// regardless of the request), the same shape of bug `0365` already
+/// fixed for `run_as_user`. Checked the same host-independent way
+/// `ociman_run.rs`'s own `run_read_only_sets_root_readonly_in_the_
+/// real_spec` checks its own identical `--read-only` flag (reading
+/// the actual spec back out), **not** by asserting a real in-container
+/// write attempt fails: that test's own doc comment already found,
+/// the hard way, that remounting `/` read-only can silently no-op
+/// under this project's own rootless "fake root in a userns" model on
+/// some hosts (`oci_runtime_core::launch`'s own `RemountReadonly`
+/// handler tolerates the exact same real `CAP_SYS_ADMIN`-in-the-
+/// owning-namespace limitation for `/sys`), so a real write-attempt
+/// assertion here would be exactly as host-dependent, not a stronger
+/// check.
+#[tokio::test]
+async fn create_container_readonly_rootfs_sets_root_readonly_in_the_real_spec() {
+    let Some((storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let mut readonly_config = container_config("readonly-rootfs-test", 0);
+    readonly_config.linux = Some(oci_cri_types::LinuxContainerConfig {
+        security_context: Some(oci_cri_types::LinuxContainerSecurityContext {
+            readonly_rootfs: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let readonly_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(readonly_config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+
+    let spec: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundle_dir(storage.path(), &readonly_id).join("config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        spec["root"]["readonly"],
+        serde_json::json!(true),
+        "expected readonly_rootfs: true to set root.readonly: {spec:?}"
+    );
+
+    // Contrast: an otherwise-identical container with no security
+    // context at all (the common, unconfigured default) keeps the
+    // existing writable-by-default behavior unchanged -- a real
+    // regression guard for the exact bug this closes (`build_spec`
+    // used to force `readonly = false` unconditionally).
+    let writable_config = container_config("writable-rootfs-test", 0);
+    let writable_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(writable_config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+    let writable_spec: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundle_dir(storage.path(), &writable_id).join("config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        writable_spec["root"]["readonly"],
+        serde_json::json!(true),
+        "the unconfigured default must stay writable: {writable_spec:?}"
+    );
+}
+
 /// A non-root `run_as_user`/`run_as_group`, `run_as_username` at all,
 /// and `run_as_group` given without `run_as_user`/`run_as_username`
 /// are each a real, clear error — see `validate_run_as_user`'s own

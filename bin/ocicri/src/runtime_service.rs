@@ -1388,6 +1388,15 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
                 .as_ref()
                 .and_then(|l| l.security_context.as_ref()),
         )?;
+        // `security_context.readonly_rootfs` (0388): read here,
+        // before `bundle::prepare` builds the spec, the same
+        // "resolve every CRI-level input up front" shape every other
+        // `CriProcessConfig` field already follows.
+        let readonly_rootfs = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref())
+            .is_some_and(|sc| sc.readonly_rootfs);
         // `ContainerConfig.mounts` (0304): validated and translated to
         // plain bind mounts *before* `bundle::prepare` ever extracts a
         // single layer -- a config-shaped client error here should
@@ -1411,6 +1420,7 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
                 dns_searches,
                 dns_options,
                 mounts: &mounts,
+                readonly_rootfs,
             },
         )
         .map_err(|e| match e {
