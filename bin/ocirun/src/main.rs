@@ -353,6 +353,21 @@ enum Command {
         /// real runc's own default at last.
         #[arg(long = "ignore-paused")]
         ignore_paused: bool,
+        /// Write the exec'd process's own real pid to this file —
+        /// matching real `runc exec --pid-file`/`crun exec --pid-file`
+        /// exactly (checked directly, `~/git/runc/exec.go`'s own
+        /// `createPidFile(r.pidFile, process)` call, `~/git/crun/src/
+        /// exec.c`'s own identical `pid_file` option): the real,
+        /// final pid of the exec'd process itself, *not* this
+        /// project's own outer relay-fork pid when a PID namespace is
+        /// joined (matching real runc's own `setnsProcess.execSetns`,
+        /// which reports its own *inner* forked child's pid for the
+        /// exact same reason — a `setns(2)` into a PID namespace never
+        /// moves the calling process into it, only a subsequent
+        /// forked child becomes a member, so only that child's pid is
+        /// ever meaningful from inside the joined namespace).
+        #[arg(long = "pid-file")]
+        pid_file: Option<PathBuf>,
         /// Command and arguments to run inside the container.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
@@ -705,6 +720,7 @@ fn main() -> std::process::ExitCode {
                 preserve_fds,
                 cap,
                 ignore_paused,
+                pid_file,
                 args,
             }) => cmd_exec(
                 &root,
@@ -717,6 +733,7 @@ fn main() -> std::process::ExitCode {
                 preserve_fds,
                 &cap,
                 ignore_paused,
+                pid_file.as_deref(),
             ),
             Some(Command::Features) => oci_cli_common::output::print_json(&features::features()),
             Some(Command::Ps {
@@ -1899,6 +1916,7 @@ fn cmd_exec(
     preserve_fds: u32,
     cap: &[String],
     ignore_paused: bool,
+    pid_file: Option<&Path>,
 ) -> anyhow::Result<()> {
     verify_preserve_fds(preserve_fds)?;
     let store = StateStore::open(root)
@@ -1999,7 +2017,14 @@ fn cmd_exec(
     // threads by this point, same as `run`'s/`create`'s own safety
     // note.
     #[allow(unsafe_code)]
-    let exit_code = unsafe { oci_runtime_core::exec::exec(pid, request) }.context("exec")?;
+    let exit_code = unsafe {
+        oci_runtime_core::exec::exec_reporting_pid(pid, request, |exec_pid| {
+            if let Some(path) = pid_file {
+                write_pid_file(path, exec_pid);
+            }
+        })
+    }
+    .context("exec")?;
 
     // The exec'd process's own exit code becomes ours, same convention
     // `run`/`create` already follow.

@@ -91,23 +91,35 @@ pub struct ExecRequest {
     pub close_stdin: bool,
 }
 
-/// Run `request.args` as a new process inside the already-running
-/// container whose init process is `pid`, joining `request.namespaces`
-/// and applying `request.user`/`capabilities`/`no_new_privileges`/
-/// `cwd`/`env`. Returns the same exit code the exec'd process would
-/// report to its own shell, one of `launch`'s own `*_EXIT_CODE`
-/// constants if `oci-tools` itself failed before it ever ran, or (if
-/// `request.timeout` was given and elapsed first) the same `128 +
-/// SIGKILL` code a shell reports for any other signal-killed process
-/// — see [`ExecRequest::timeout`]'s own doc comment.
+/// Like [`exec`], but calls `on_pid` with the exec'd process's own
+/// real, host-visible pid as soon as it's known — before blocking on
+/// its exit — matching [`crate::launch::run_reporting_pid`]'s own
+/// identical shape and reasoning exactly (used there for `ocirun run
+/// --pid-file`; this is its counterpart for `ocirun exec --pid-file`,
+/// 0387). `exec` itself is just this with a no-op callback, so
+/// ordinary callers pay only the cost of one extra pipe and a 4-byte
+/// read, not a behavioral difference.
+///
+/// The reported pid is always the **real, final** one a caller could
+/// actually signal/track — when `request.namespaces` includes a PID
+/// namespace (`needs_pid_relay` below), that's the *inner* relay
+/// fork's own pid, never the outer one `fork`/`wait` operate on here,
+/// exactly matching real runc's own checked-directly behavior
+/// (`~/git/runc/libcontainer/process_linux.go`'s `setnsProcess.
+/// execSetns`: the outer relay -- `PidFirstChild` there -- is reaped
+/// as a zombie and discarded; only the inner `Pid` is ever handed to
+/// `createPidFile`).
 ///
 /// # Safety
 ///
 /// Must be called from a single-threaded process — this forks (see
-/// [`crate::process::fork_and_wait`]'s safety note, which this
-/// inherits).
+/// [`crate::process::fork`]'s safety note, which this inherits).
 #[allow(unsafe_code)]
-pub unsafe fn exec(pid: i32, request: ExecRequest) -> io::Result<i32> {
+pub unsafe fn exec_reporting_pid(
+    pid: i32,
+    request: ExecRequest,
+    on_pid: impl FnOnce(i32),
+) -> io::Result<i32> {
     if request.args.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -140,6 +152,14 @@ pub unsafe fn exec(pid: i32, request: ExecRequest) -> io::Result<i32> {
     let needs_pid_relay =
         request.namespaces.contains(&NamespaceType::Pid) || request.timeout.is_some();
 
+    // Same real pid-reporting pipe `launch::create`'s own
+    // `pid_pipe_write`/`read_container_pid` pair already establishes:
+    // written by the forked child (see `ExecSetup::report_pid`), read
+    // back here in the original process, well before the final,
+    // separate blocking wait below.
+    let (read_fd, write_fd) =
+        rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(io::Error::from)?;
+
     let setup = ExecSetup {
         opened,
         needs_pid_relay,
@@ -152,12 +172,68 @@ pub unsafe fn exec(pid: i32, request: ExecRequest) -> io::Result<i32> {
         preserve_fds: request.preserve_fds,
         timeout: request.timeout,
         stdin_fd,
+        pid_pipe_write: write_fd,
     };
 
-    // SAFETY: forwarded from this function's own contract.
+    // SAFETY: forwarded from this function's own contract. Unlike
+    // `exec`'s own previous `fork_and_wait`-based implementation, this
+    // needs the direct child's own pid available (to wait on
+    // separately, after reading the real pid back over the pipe
+    // above) — the same reasoning `launch::create`'s own identical
+    // `process::fork` (not `fork_and_wait`) call already documents.
     #[allow(unsafe_code)]
-    let status = unsafe { process::fork_and_wait(move || setup.run()) }?;
+    let direct_child_pid = unsafe { process::fork(move || setup.run()) }?;
+
+    let exec_pid = read_exec_pid(read_fd)?;
+    on_pid(exec_pid);
+
+    let status = process::wait(direct_child_pid)?;
     Ok(process::exit_code_from_wait_status(status))
+}
+
+/// Run `request.args` as a new process inside the already-running
+/// container whose init process is `pid`, joining `request.namespaces`
+/// and applying `request.user`/`capabilities`/`no_new_privileges`/
+/// `cwd`/`env`. Returns the same exit code the exec'd process would
+/// report to its own shell, one of `launch`'s own `*_EXIT_CODE`
+/// constants if `oci-tools` itself failed before it ever ran, or (if
+/// `request.timeout` was given and elapsed first) the same `128 +
+/// SIGKILL` code a shell reports for any other signal-killed process
+/// — see [`ExecRequest::timeout`]'s own doc comment.
+///
+/// # Safety
+///
+/// Same contract as [`exec_reporting_pid`].
+#[allow(unsafe_code)]
+pub unsafe fn exec(pid: i32, request: ExecRequest) -> io::Result<i32> {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { exec_reporting_pid(pid, request, |_pid| {}) }
+}
+
+/// Block until the exec'd process (or its relay, if a pid namespace
+/// was joined) reports the real, final pid over the pipe
+/// [`exec_reporting_pid`] set up, or report why it never did (setup
+/// failed before reaching that point — the failure itself was already
+/// printed to stderr by the child) — the exact same real protocol
+/// `launch::read_container_pid` already establishes (4 raw,
+/// native-endian bytes; a premature `EOF` means the child died before
+/// ever writing one), kept as its own small copy here rather than a
+/// cross-module `pub` export, matching this module's own existing
+/// `fail`-not-shared precedent.
+fn read_exec_pid(read_fd: rustix::fd::OwnedFd) -> io::Result<i32> {
+    let mut buf = [0u8; 4];
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = rustix::io::read(&read_fd, &mut buf[filled..]).map_err(io::Error::from)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "exec'd process exited before reporting its pid (setup likely failed)",
+            ));
+        }
+        filled += n;
+    }
+    Ok(i32::from_ne_bytes(buf))
 }
 
 struct ExecSetup {
@@ -176,6 +252,12 @@ struct ExecSetup {
     /// in the original process before any fork — the same reasoning
     /// `launch::ChildSetup::stdin_fd` already established.
     stdin_fd: Option<std::fs::File>,
+    /// The write end of [`exec_reporting_pid`]'s own real pid-
+    /// reporting pipe — the same shape `launch::ChildSetup::
+    /// pid_pipe_write` already establishes, just unconditional here
+    /// (every `exec_reporting_pid` call wants the real pid back,
+    /// unlike `launch::run`, which never reports one at all).
+    pid_pipe_write: rustix::fd::OwnedFd,
 }
 
 impl ExecSetup {
@@ -202,21 +284,47 @@ impl ExecSetup {
             #[allow(unsafe_code)]
             let inner = unsafe { process::fork(|| self.exec_now()) };
             match inner {
-                Ok(child_pid) => match wait_with_deadline(child_pid, timeout) {
-                    Ok(status) => std::process::exit(process::exit_code_from_wait_status(status)),
-                    Err(e) => fail(
-                        SETUP_FAILURE_EXIT_CODE,
-                        &format!("waiting for exec'd process: {e}"),
-                    ),
-                },
+                Ok(child_pid) => {
+                    // Report the *real* exec'd pid (the inner relay
+                    // fork, not this outer relay process's own pid) --
+                    // see `exec_reporting_pid`'s own doc comment for
+                    // exactly why this must be the inner one, matching
+                    // real runc's own checked-directly behavior.
+                    self.report_pid(child_pid);
+                    match wait_with_deadline(child_pid, timeout) {
+                        Ok(status) => {
+                            std::process::exit(process::exit_code_from_wait_status(status))
+                        }
+                        Err(e) => fail(
+                            SETUP_FAILURE_EXIT_CODE,
+                            &format!("waiting for exec'd process: {e}"),
+                        ),
+                    }
+                }
                 Err(e) => fail(
                     SETUP_FAILURE_EXIT_CODE,
                     &format!("forking into the joined pid namespace: {e}"),
                 ),
             }
         } else {
+            // No relay fork at all: this same process is the one that
+            // (successfully) `exec`s, so its own pid is the real,
+            // final one to report -- the same "no PID namespace"
+            // branch `launch::ChildSetup::run` reports `own_pid` from.
+            // SAFETY: `getpid()` has no safety requirements.
+            let own_pid = rustix::process::getpid().as_raw_nonzero().get();
+            self.report_pid(own_pid);
             self.exec_now();
         }
+    }
+
+    /// Report `pid` (the exec'd process's own real, final pid) to
+    /// whoever is reading [`Self::pid_pipe_write`] — the same
+    /// "best-effort, nothing more useful to do on failure than let the
+    /// reader see `EOF`" convention `launch::ChildSetup::report_
+    /// container_pid` already establishes.
+    fn report_pid(&self, pid: i32) {
+        let _ = rustix::io::write(&self.pid_pipe_write, &pid.to_ne_bytes());
     }
 
     /// Apply identity, then `exec`. Never returns: a successful `exec`

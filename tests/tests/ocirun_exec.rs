@@ -849,3 +849,117 @@ fn exec_always_forwards_real_stdin_unconditionally() {
 
     ocirun(root_dir.path(), &["delete", "--force", "exec-stdin-test"]);
 }
+
+/// `ocirun exec --pid-file` (`docs/design/0387`), matching real `runc
+/// exec --pid-file`/`crun exec --pid-file` exactly (checked directly,
+/// `~/git/runc/utils_linux.go`'s own `createPidFile(r.pidFile,
+/// process)` call in its `runner.run`; `~/git/crun/src/exec.c`'s own
+/// identical `pid_file` option): the file must contain the real,
+/// host-visible pid of the exec'd process *itself* -- proven here not
+/// just by reading it back, but by sending it a real `SIGKILL`
+/// directly and observing the exec'd `ocirun exec` process's own exit
+/// code become the matching `128 + SIGKILL` code (`process::exit_
+/// code_from_wait_status`), which could only happen if the pid in the
+/// file really is the one this project's own relay is blocked waiting
+/// on. The default bundle already joins a PID namespace (see `exec_
+/// joins_the_running_containers_namespaces`'s own doc comment), so
+/// this single test already exercises the PID-namespace-relay branch
+/// (`ExecSetup::run`'s `needs_pid_relay` path, reporting the *inner*
+/// fork's own pid, never the outer relay's) -- the only branch that
+/// actually needs its own dedicated coverage, since the no-relay
+/// branch is just `rustix::process::getpid()` of the process about to
+/// `exec` itself, with nothing else in between that could plausibly
+/// report the wrong value.
+#[test]
+fn exec_pid_file_writes_the_real_pid_of_the_exec_process() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    let pid_file = bundle_dir.path().join("exec.pid");
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let create = ocirun_create(root_dir.path(), bundle_dir.path(), "exec-pid-file-test");
+    assert!(create.status.success(), "{create:?}");
+    let start = ocirun(root_dir.path(), &["start", "exec-pid-file-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-pid-file-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let exec = std::process::Command::new(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args(["exec", "--pid-file"])
+        .arg(&pid_file)
+        .args(["exec-pid-file-test", "/bin/sh", "-c", "sleep 30"])
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ocirun exec");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !pid_file.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(pid_file.exists(), "--pid-file was never written");
+
+    let file_content = std::fs::read_to_string(&pid_file).unwrap();
+    let exec_pid: i32 = file_content.trim().parse().unwrap_or_else(|e| {
+        panic!("--pid-file content {file_content:?} not a plain decimal pid: {e}")
+    });
+    assert_eq!(
+        file_content,
+        exec_pid.to_string(),
+        "--pid-file's own content should be exactly the bare decimal pid, no trailing newline, \
+         matching real runc's own createPidFile"
+    );
+
+    // Prove `exec_pid` is really the exec'd `sleep 30` process itself,
+    // not this project's own outer relay pid: killing it directly
+    // must make `ocirun exec`'s own wait immediately observe that
+    // exact signal death.
+    //
+    // SAFETY: `kill(2)` on a plain `i32` pid has no memory-safety
+    // requirements of its own.
+    #[allow(unsafe_code)]
+    let kill_result = unsafe { libc::kill(exec_pid, libc::SIGKILL) };
+    assert_eq!(
+        kill_result,
+        0,
+        "SIGKILL to the reported pid should succeed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let out = exec
+        .wait_with_output()
+        .expect("failed to wait for ocirun exec");
+    assert_eq!(
+        out.status.code(),
+        Some(128 + libc::SIGKILL),
+        "ocirun exec's own exit code should reflect the exec'd process's real SIGKILL death: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The container itself must be unaffected: still running after the
+    // exec'd process was killed directly.
+    assert_eq!(
+        oci_tools_tests::state_status(root_dir.path(), "exec-pid-file-test"),
+        "running"
+    );
+
+    ocirun(
+        root_dir.path(),
+        &["delete", "--force", "exec-pid-file-test"],
+    );
+}
