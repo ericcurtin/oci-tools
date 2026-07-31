@@ -26,6 +26,7 @@
 //! [`prepare_in`]'s own `write_etc_hosts`/`write_resolv_conf` call
 //! sites, and `runtime_service.rs`'s own `build_cri_bind_mounts`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -207,6 +208,27 @@ pub struct CriProcessConfig<'a> {
     /// same hardcoded default set, no matter what a pod's own
     /// `capabilities` actually requested.
     pub capabilities: Vec<String>,
+    /// `PodSandboxConfig.linux.sysctls` (0396) -- a real, sandbox-
+    /// (i.e. pod-)level CRI concept, not a container-level one at all
+    /// (checked directly: `LinuxContainerConfig` in the CRI proto has
+    /// no `sysctls` field of its own). Real cri-o applies these once,
+    /// to its own real infra ("pause") container's spec, since every
+    /// other container in the same pod shares that process's already-
+    /// configured namespaces and so inherits the same effective
+    /// values for free — this project has no infra process or shared
+    /// per-pod namespaces at all yet (`docs/design/0233`), so this
+    /// applies the identical sandbox-level setting independently to
+    /// *each* container's own generated spec instead, the same
+    /// "resolve a sandbox-level CRI concept per-container, since
+    /// there's no separate sandbox process to bind it to" precedent
+    /// hostname/`/etc/hosts`/`/etc/resolv.conf` already established
+    /// (`0292`, `0296`, `0297`). Real validation (whether the given
+    /// key is even namespaced, and whether this container's own
+    /// declared namespaces satisfy it) happens later, for free, via
+    /// the same shared `oci_runtime_core::sysctl::apply` every other
+    /// caller of `oci_runtime_core::launch` already goes through
+    /// (`0395`).
+    pub sysctl: BTreeMap<String, String>,
 }
 
 /// Builds the container's own real OCI spec: the same
@@ -317,6 +339,11 @@ fn build_spec(
     linux
         .readonly_paths
         .extend(cri.readonly_paths.iter().cloned());
+
+    // `PodSandboxConfig.linux.sysctls` (0396): see `CriProcessConfig::
+    // sysctl`'s own doc comment for exactly why this is resolved
+    // per-container rather than once for the whole sandbox.
+    linux.sysctl = cri.sysctl.clone();
 
     // `ContainerConfig.mounts` (0304), appended after the standard
     // proc/sys/dev/... set `Spec::example()` already provides --
@@ -517,6 +544,7 @@ mod tests {
             masked_paths: &[],
             readonly_paths: &[],
             capabilities: oci_spec_types::runtime::podman_default_capabilities(),
+            sysctl: BTreeMap::new(),
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();
@@ -562,6 +590,7 @@ mod tests {
             masked_paths: &[],
             readonly_paths: &[],
             capabilities: oci_spec_types::runtime::podman_default_capabilities(),
+            sysctl: BTreeMap::new(),
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         assert!(
@@ -609,6 +638,7 @@ mod tests {
             masked_paths: &[],
             readonly_paths: &[],
             capabilities: oci_spec_types::runtime::podman_default_capabilities(),
+            sysctl: BTreeMap::new(),
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let spec_resources = spec.linux.unwrap().resources.unwrap();
@@ -643,6 +673,7 @@ mod tests {
             masked_paths: &[],
             readonly_paths: &[],
             capabilities: oci_spec_types::runtime::podman_default_capabilities(),
+            sysctl: BTreeMap::new(),
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         assert!(spec.linux.unwrap().resources.is_none());
@@ -675,6 +706,7 @@ mod tests {
             masked_paths: &["/extra/masked".to_string()],
             readonly_paths: &["/extra/readonly".to_string()],
             capabilities: oci_spec_types::runtime::podman_default_capabilities(),
+            sysctl: BTreeMap::new(),
         };
         let default_spec = oci_spec_types::runtime::Spec::example();
         let default_linux = default_spec.linux.unwrap();
@@ -732,6 +764,7 @@ mod tests {
             masked_paths: &[],
             readonly_paths: &[],
             capabilities: oci_spec_types::runtime::podman_default_capabilities(),
+            sysctl: BTreeMap::new(),
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();
@@ -777,11 +810,48 @@ mod tests {
             masked_paths: &[],
             readonly_paths: &[],
             capabilities: requested.clone(),
+            sysctl: BTreeMap::new(),
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let capabilities = spec.process.unwrap().capabilities.unwrap();
         assert_eq!(capabilities.bounding, requested);
         assert_eq!(capabilities.effective, requested);
         assert_eq!(capabilities.permitted, requested);
+    }
+
+    /// `PodSandboxConfig.linux.sysctls` (0396): a real, sandbox-level
+    /// CRI concept, applied to this container's own generated spec
+    /// since this project has no real infra process/shared per-pod
+    /// namespaces of its own yet -- see `CriProcessConfig::sysctl`'s
+    /// own doc comment. Previously never wired in at all: `linux.
+    /// sysctl` stayed empty on every CRI container regardless of what
+    /// a pod's own `securityContext.sysctls` actually requested.
+    #[test]
+    fn build_spec_writes_the_sandboxs_own_sysctls_into_the_spec() {
+        let image_config = oci_spec_types::image::ContainerConfig {
+            cmd: Some(strings(&["sh"])),
+            ..Default::default()
+        };
+        let mut sysctl = BTreeMap::new();
+        sysctl.insert("kernel.shmmax".to_string(), "8000000".to_string());
+        let cri = CriProcessConfig {
+            command: &[],
+            args: &[],
+            envs: Vec::new(),
+            working_dir: "",
+            hostname: "sysctl-test",
+            dns_servers: &[],
+            dns_searches: &[],
+            dns_options: &[],
+            mounts: &[],
+            readonly_rootfs: false,
+            resources: None,
+            masked_paths: &[],
+            readonly_paths: &[],
+            capabilities: oci_spec_types::runtime::podman_default_capabilities(),
+            sysctl: sysctl.clone(),
+        };
+        let spec = build_spec(&cri, &image_config).unwrap();
+        assert_eq!(spec.linux.unwrap().sysctl, sysctl);
     }
 }

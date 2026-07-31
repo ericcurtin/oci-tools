@@ -501,6 +501,72 @@ async fn create_container_writes_a_real_resolv_conf_from_explicit_dns_config() {
     );
 }
 
+/// `PodSandboxConfig.linux.sysctls` (`docs/design/0396`): a real,
+/// sandbox-(pod-)level CRI concept, genuinely applied to a real
+/// started container's own kernel parameters — a real, previously-
+/// silent gap this closes: `linux.sysctl` stayed empty on every CRI
+/// container regardless of what a pod's own `securityContext.
+/// sysctls` actually requested. Uses a real `kernel.*` key that only
+/// needs an IPC namespace, always present for every container this
+/// project's own `ocicri` launches.
+#[tokio::test]
+async fn create_container_applies_the_sandboxs_own_sysctls_to_a_real_running_container() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, mut sandbox_config)) =
+        setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    sandbox_config.linux = Some(oci_cri_types::LinuxPodSandboxConfig {
+        sysctls: HashMap::from([("kernel.shmmax".to_string(), "8000000".to_string())]),
+        ..Default::default()
+    });
+
+    let mut config = container_config("sysctl-test", 0);
+    config.command = vec!["/bin/sleep".to_string(), "300".to_string()];
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+
+    let response = client
+        .exec_sync(oci_cri_types::ExecSyncRequest {
+            container_id: container_id.clone(),
+            cmd: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "cat /proc/sys/kernel/shmmax".to_string(),
+            ],
+            timeout: 0,
+        })
+        .await
+        .expect("ExecSync failed")
+        .into_inner();
+    assert_eq!(response.exit_code, 0, "{response:?}");
+    assert_eq!(String::from_utf8_lossy(&response.stdout).trim(), "8000000");
+
+    client
+        .stop_container(oci_cri_types::StopContainerRequest {
+            container_id,
+            timeout: 0,
+        })
+        .await
+        .unwrap();
+}
+
 /// With no `dns_config` at all (real kubelet's own common case for a
 /// pod with no special DNS policy, and `crictl`'s own bare default),
 /// the real host's own `/etc/resolv.conf` is copied verbatim into the

@@ -1489,6 +1489,20 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             requested_caps.map_or(&empty_strings, |c| &c.drop_capabilities),
         )
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        // `PodSandboxConfig.linux.sysctls` (0396) -- a real, sandbox-
+        // level CRI concept, not read from `config` (the per-
+        // container request) at all; see `CriProcessConfig::sysctl`'s
+        // own doc comment for exactly why this project applies it
+        // per-container instead of once for the whole sandbox. Real
+        // per-key validation (whether it's even namespaced, and
+        // whether this container's own declared namespaces satisfy
+        // it) happens later, for free, inside `oci_runtime_core::
+        // launch` itself (`0395`) -- nothing to check here at all.
+        let sysctl: std::collections::BTreeMap<String, String> = sandbox_config
+            .linux
+            .as_ref()
+            .map(|l| l.sysctls.clone().into_iter().collect())
+            .unwrap_or_default();
         // `ContainerConfig.mounts` (0304): validated and translated to
         // plain bind mounts *before* `bundle::prepare` ever extracts a
         // single layer -- a config-shaped client error here should
@@ -1517,6 +1531,7 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
                 masked_paths,
                 readonly_paths,
                 capabilities,
+                sysctl,
             },
         )
         .map_err(|e| match e {
