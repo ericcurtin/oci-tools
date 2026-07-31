@@ -236,6 +236,160 @@ pub const ALL_CAPABILITY_NAMES: &[&str] = &[
     "CAP_CHECKPOINT_RESTORE",
 ];
 
+/// The special `--cap-add`/`--cap-drop` (`ociman`) / `add_
+/// capabilities`/`drop_capabilities` (`ocicri`, `0392`) value meaning
+/// "every capability this build recognizes" — matching real `docker`/
+/// `podman`'s own `capabilities.All` (`"ALL"`, compared
+/// case-insensitively on the way in, like every other name here).
+pub const CAP_ALL: &str = "ALL";
+
+/// Normalize one capability name the same way real `docker`/`podman`
+/// do (checked directly against `~/git/container-libs/common/pkg/
+/// capabilities/capabilities.go`'s own `NormalizeCapabilities`):
+/// upper-cased, `CAP_` prefixed if not already, and validated against
+/// every capability name this build actually recognizes
+/// ([`ALL_CAPABILITY_NAMES`] — the same list [`capability_named`]
+/// accepts, so a name this normalizes successfully is guaranteed to
+/// also be one the runtime itself can actually apply). [`CAP_ALL`]/
+/// `"all"`/`"ALL"` is left as the literal `"ALL"` marker, un-prefixed
+/// and unvalidated against the name list — it's a merge-time
+/// instruction, not a real capability name.
+///
+/// Shared by `ociman run --cap-add`/`--cap-drop` and `ocicri
+/// CreateContainer`'s own `security_context.capabilities.add_
+/// capabilities`/`drop_capabilities` (`0392`) — moved here, out of
+/// `ociman`-private code, the moment a second, unrelated caller needed
+/// the identical primitive (the same "shared prerequisite" reasoning
+/// `oci_runtime_core::etc_hosts`/`resolv_conf` already established for
+/// their own second callers, `0296`/`0297`).
+pub fn normalize_capability(name: &str) -> io::Result<String> {
+    let upper = name.to_ascii_uppercase();
+    if upper == CAP_ALL {
+        return Ok(upper);
+    }
+    let prefixed = if upper.starts_with("CAP_") {
+        upper
+    } else {
+        format!("CAP_{upper}")
+    };
+    if !ALL_CAPABILITY_NAMES.contains(&prefixed.as_str()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown capability {name:?}"),
+        ));
+    }
+    Ok(prefixed)
+}
+
+/// [`normalize_capability`] applied to every name in `names`.
+pub fn normalize_capabilities(names: &[String]) -> io::Result<Vec<String>> {
+    names
+        .iter()
+        .map(|name| normalize_capability(name))
+        .collect()
+}
+
+/// Compute a container's own final capability set from `base` (the
+/// default set before any add/drop override) plus add/drop overrides
+/// — a direct, checked-against-the-real-source port of real `docker`/
+/// `podman`'s own `MergeCapabilities` (`~/git/container-libs/common/
+/// pkg/capabilities/capabilities.go`), not an independently invented
+/// algorithm:
+///
+/// * `drop=["ALL"]` (in any case) discards `base` entirely and keeps
+///   only whatever `add` separately grants — real `docker`/`podman`'s
+///   own documented behavior, not "drop everything and ignore `add`
+///   too".
+/// * `drop=["ALL"]` together with `add=["ALL"]` is a real, refused
+///   error (`"adding all capabilities and removing all capabilities
+///   not allowed"`), matching the real source exactly, not silently
+///   resolved either way.
+/// * `add=["ALL"]` (without `drop=["ALL"]`) replaces `base` with every
+///   capability this build recognizes ([`ALL_CAPABILITY_NAMES`]) —
+///   real `docker`/`podman` use the *calling process's own real
+///   bounding set* here instead, which has no equivalent meaning for a
+///   runtime-spec's own `bounding`/`effective`/`permitted` arrays (a
+///   declaration of what the *container* should have, independent of
+///   whatever privilege the invoking process itself happens to hold)
+///   — using the full recognized-name list is the more literal,
+///   correct reading of "grant every capability" for that context.
+///   `add=["ALL"]` combined with an individual `drop` (e.g. `drop =
+///   ["CHOWN"]`) still applies that drop on top of the full set —
+///   matching real cri-o's own identical, checked-directly
+///   `SpecSetupCapabilities` behavior for this exact combination
+///   (`~/git/cri-o/internal/factory/container/container.go`,
+///   `kubernetes/kubernetes#51980`).
+/// * The same capability appearing in both `add` and `drop` (after
+///   `all`-handling above) is a real, surfaced error, never silently
+///   resolved one way or the other.
+///
+/// Deliberately does *not* replicate real cri-o's own `toCAPPrefixed`
+/// quirk (`container.go`): a name already starting with a
+/// case-insensitive `cap_` prefix is returned *verbatim*, un-
+/// uppercased, there — so a request literally spelled `"cap_chown"`
+/// ends up as that exact lowercase string in cri-o's own generated
+/// spec, not the canonical `"CAP_CHOWN"` every real runtime's own
+/// capability-name matching actually expects. [`normalize_capability`]
+/// always uppercases first, so this can never happen here — the same
+/// "diverge from a real tool's own bug, keep the more correct
+/// behavior" precedent this project already established elsewhere
+/// (e.g. `0376`'s rootless hard-limit fix).
+pub fn merge_capabilities(
+    base: &[String],
+    adds: &[String],
+    drops: &[String],
+) -> io::Result<Vec<String>> {
+    if adds.is_empty() && drops.is_empty() {
+        return Ok(base.to_vec());
+    }
+    let adds = normalize_capabilities(adds)?;
+    let drops = normalize_capabilities(drops)?;
+
+    if drops.iter().any(|c| c == CAP_ALL) {
+        if adds.iter().any(|c| c == CAP_ALL) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "adding all capabilities and removing all capabilities not allowed",
+            ));
+        }
+        let mut result = adds;
+        result.sort();
+        result.dedup();
+        return Ok(result);
+    }
+
+    let (base, adds): (Vec<String>, Vec<String>) = if adds.iter().any(|c| c == CAP_ALL) {
+        (
+            ALL_CAPABILITY_NAMES.iter().map(|s| s.to_string()).collect(),
+            Vec::new(),
+        )
+    } else {
+        (base.to_vec(), adds)
+    };
+
+    for add in &adds {
+        if drops.contains(add) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("capability {add:?} cannot be dropped and added"),
+            ));
+        }
+    }
+
+    let mut result: Vec<String> = base
+        .into_iter()
+        .filter(|cap| !drops.contains(cap))
+        .collect();
+    for add in adds {
+        if !result.contains(&add) {
+            result.push(add);
+        }
+    }
+    result.sort();
+    result.dedup();
+    Ok(result)
+}
+
 const ALL_CAPABILITIES: &[CapabilitySet] = &[
     CapabilitySet::CHOWN,
     CapabilitySet::DAC_OVERRIDE,
@@ -372,5 +526,113 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("self")).unwrap();
         assert!(!setgroups_denied(dir.path()).unwrap());
+    }
+
+    fn strings(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn normalize_capability_adds_the_cap_prefix_and_upper_cases() {
+        assert_eq!(normalize_capability("chown").unwrap(), "CAP_CHOWN");
+        assert_eq!(normalize_capability("Chown").unwrap(), "CAP_CHOWN");
+        assert_eq!(normalize_capability("CAP_CHOWN").unwrap(), "CAP_CHOWN");
+        assert_eq!(normalize_capability("cap_chown").unwrap(), "CAP_CHOWN");
+    }
+
+    #[test]
+    fn normalize_capability_leaves_all_as_the_literal_marker() {
+        assert_eq!(normalize_capability("all").unwrap(), "ALL");
+        assert_eq!(normalize_capability("ALL").unwrap(), "ALL");
+        assert_eq!(normalize_capability("All").unwrap(), "ALL");
+    }
+
+    #[test]
+    fn normalize_capability_rejects_an_unknown_name() {
+        let err = normalize_capability("not_a_real_capability").unwrap_err();
+        assert!(err.to_string().contains("not_a_real_capability"), "{err}");
+    }
+
+    #[test]
+    fn merge_capabilities_is_the_base_untouched_when_nothing_is_given() {
+        let base = strings(&["CAP_CHOWN", "CAP_FOWNER"]);
+        assert_eq!(merge_capabilities(&base, &[], &[]).unwrap(), base);
+    }
+
+    #[test]
+    fn merge_capabilities_drops_a_base_capability() {
+        let base = strings(&["CAP_CHOWN", "CAP_FOWNER"]);
+        let result = merge_capabilities(&base, &[], &strings(&["chown"])).unwrap();
+        assert_eq!(result, strings(&["CAP_FOWNER"]));
+    }
+
+    #[test]
+    fn merge_capabilities_adds_a_capability_not_in_base() {
+        let base = strings(&["CAP_CHOWN"]);
+        let result = merge_capabilities(&base, &strings(&["net_admin"]), &[]).unwrap();
+        assert_eq!(result, strings(&["CAP_CHOWN", "CAP_NET_ADMIN"]));
+    }
+
+    #[test]
+    fn merge_capabilities_adding_a_capability_already_in_base_does_not_duplicate_it() {
+        let base = strings(&["CAP_CHOWN"]);
+        let result = merge_capabilities(&base, &strings(&["chown"]), &[]).unwrap();
+        assert_eq!(result, strings(&["CAP_CHOWN"]));
+    }
+
+    #[test]
+    fn merge_capabilities_rejects_the_same_capability_added_and_dropped() {
+        let base = strings(&["CAP_CHOWN"]);
+        let err = merge_capabilities(&base, &strings(&["net_admin"]), &strings(&["net_admin"]))
+            .unwrap_err();
+        assert!(err.to_string().contains("CAP_NET_ADMIN"), "{err}");
+    }
+
+    #[test]
+    fn merge_capabilities_drop_all_keeps_only_what_add_grants_ignoring_base() {
+        let base = strings(&["CAP_CHOWN", "CAP_FOWNER"]);
+        let result =
+            merge_capabilities(&base, &strings(&["net_admin"]), &strings(&["all"])).unwrap();
+        assert_eq!(result, strings(&["CAP_NET_ADMIN"]));
+    }
+
+    #[test]
+    fn merge_capabilities_add_all_replaces_base_with_every_recognized_capability() {
+        let base = strings(&["CAP_CHOWN"]);
+        let result = merge_capabilities(&base, &strings(&["all"]), &[]).unwrap();
+        let mut expected: Vec<String> =
+            ALL_CAPABILITY_NAMES.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn merge_capabilities_add_all_and_drop_all_together_is_a_real_error() {
+        let base = strings(&["CAP_CHOWN"]);
+        let err = merge_capabilities(&base, &strings(&["all"]), &strings(&["all"])).unwrap_err();
+        assert!(err.to_string().contains("not allowed"), "{err}");
+    }
+
+    #[test]
+    fn merge_capabilities_result_is_always_sorted_and_deduplicated() {
+        let base = strings(&["CAP_FOWNER", "CAP_CHOWN"]);
+        let result = merge_capabilities(&base, &strings(&["chown"]), &[]).unwrap();
+        assert_eq!(result, strings(&["CAP_CHOWN", "CAP_FOWNER"]));
+    }
+
+    /// `add=["ALL"]` combined with an individual `drop` applies that
+    /// drop on top of the full set, matching real cri-o's own
+    /// checked-directly behavior (`merge_capabilities`'s own doc
+    /// comment, `kubernetes/kubernetes#51980`) -- a case ociman's own
+    /// CLI has no way to trigger (`--cap-add=all --cap-drop=chown` is
+    /// perfectly expressible there too, so this isn't `ocicri`-only,
+    /// just previously untested).
+    #[test]
+    fn merge_capabilities_add_all_with_an_individual_drop_removes_just_that_one() {
+        let base = strings(&["CAP_CHOWN"]);
+        let result = merge_capabilities(&base, &strings(&["all"]), &strings(&["chown"])).unwrap();
+        assert!(!result.contains(&"CAP_CHOWN".to_string()));
+        assert!(result.contains(&"CAP_NET_ADMIN".to_string()));
+        assert_eq!(result.len(), ALL_CAPABILITY_NAMES.len() - 1);
     }
 }

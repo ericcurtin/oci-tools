@@ -1454,17 +1454,41 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         // empty (the common case, and the only reachable case for a
         // `privileged: true` request, already rejected earlier by
         // `validate_privileged`) when no security context was given.
-        let empty_paths: Vec<String> = Vec::new();
+        let empty_strings: Vec<String> = Vec::new();
         let masked_paths = config
             .linux
             .as_ref()
             .and_then(|l| l.security_context.as_ref())
-            .map_or(&empty_paths, |sc| &sc.masked_paths);
+            .map_or(&empty_strings, |sc| &sc.masked_paths);
         let readonly_paths = config
             .linux
             .as_ref()
             .and_then(|l| l.security_context.as_ref())
-            .map_or(&empty_paths, |sc| &sc.readonly_paths);
+            .map_or(&empty_strings, |sc| &sc.readonly_paths);
+        // `security_context.capabilities.add_capabilities`/
+        // `drop_capabilities` (0392): merged up front, before `bundle::
+        // prepare` ever extracts a layer, the same "config-shaped
+        // client error should never cost a real, wasted rootfs
+        // extraction" reasoning `build_cri_bind_mounts`'s own call site
+        // just below already established -- an unknown capability name
+        // or a contradictory add/drop request is a real client-input
+        // problem (`invalid_argument`), not the generic `internal`
+        // `PrepareError::Other` would otherwise map to. `privileged:
+        // true` never reaches here at all (already rejected earlier by
+        // `validate_privileged`), so the base set is always this
+        // project's own real `podman`-default set, matching `ociman
+        // run`'s own identical non-privileged branch.
+        let requested_caps = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref())
+            .and_then(|sc| sc.capabilities.as_ref());
+        let capabilities = oci_runtime_core::identity::merge_capabilities(
+            &oci_spec_types::runtime::podman_default_capabilities(),
+            requested_caps.map_or(&empty_strings, |c| &c.add_capabilities),
+            requested_caps.map_or(&empty_strings, |c| &c.drop_capabilities),
+        )
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
         // `ContainerConfig.mounts` (0304): validated and translated to
         // plain bind mounts *before* `bundle::prepare` ever extracts a
         // single layer -- a config-shaped client error here should
@@ -1492,6 +1516,7 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
                 resources,
                 masked_paths,
                 readonly_paths,
+                capabilities,
             },
         )
         .map_err(|e| match e {

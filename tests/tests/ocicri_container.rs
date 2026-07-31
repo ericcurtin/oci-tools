@@ -2697,6 +2697,147 @@ async fn create_container_masked_paths_genuinely_masks_a_real_file_inside_the_ru
         .unwrap();
 }
 
+/// `security_context.capabilities.add_capabilities`/`.drop_
+/// capabilities` (`docs/design/0392`): previously every CRI container
+/// got exactly the same hardcoded real `podman`-default 11-capability
+/// set, no matter what a pod's own `capabilities` actually requested.
+/// Verified end to end via a real `/proc/self/status` read inside a
+/// running container -- the same real bitmask-diffing technique
+/// `ocirun_exec.rs`'s own `exec_cap_adds_a_capability_on_top_of_the_
+/// containers_own_default_set` test already established, ported here
+/// for `ocicri`'s own real `podman`-default base (11 capabilities,
+/// not `ocirun`'s own smaller 3-capability `Spec::example()` default)
+/// -- computed programmatically (not hand-derived) from `oci_spec_
+/// types::runtime::podman_default_capabilities()`'s own documented bit
+/// positions to avoid a transcription error: `CAP_CHOWN`(0)|`CAP_DAC_
+/// OVERRIDE`(1)|`CAP_FOWNER`(3)|`CAP_FSETID`(4)|`CAP_KILL`(5)|`CAP_
+/// NET_BIND_SERVICE`(10)|`CAP_SETFCAP`(31)|`CAP_SETGID`(6)|`CAP_
+/// SETPCAP`(8)|`CAP_SETUID`(7)|`CAP_SYS_CHROOT`(18) = `0x800405fb`.
+#[tokio::test]
+async fn create_container_capabilities_add_and_drop_change_the_real_process_capability_sets() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let grep_caps = r#"grep -E "^(CapPrm|CapEff|CapBnd|CapAmb):" /proc/self/status"#;
+
+    async fn run_and_get_caps(
+        client: &mut RuntimeServiceClient<tonic::transport::Channel>,
+        sandbox_id: &str,
+        sandbox_config: &PodSandboxConfig,
+        name: &str,
+        security_context: Option<oci_cri_types::LinuxContainerSecurityContext>,
+        grep_caps: &str,
+    ) -> String {
+        let mut config = container_config(name, 0);
+        config.command = vec!["/bin/sleep".to_string(), "300".to_string()];
+        if let Some(security_context) = security_context {
+            config.linux = Some(oci_cri_types::LinuxContainerConfig {
+                security_context: Some(security_context),
+                ..Default::default()
+            });
+        }
+        let container_id = client
+            .create_container(CreateContainerRequest {
+                pod_sandbox_id: sandbox_id.to_string(),
+                config: Some(config),
+                sandbox_config: Some(sandbox_config.clone()),
+            })
+            .await
+            .expect("CreateContainer failed")
+            .into_inner()
+            .container_id;
+        client
+            .start_container(oci_cri_types::StartContainerRequest {
+                container_id: container_id.clone(),
+            })
+            .await
+            .unwrap();
+        wait_for_state(client, &container_id, ContainerState::ContainerRunning).await;
+        let response = client
+            .exec_sync(oci_cri_types::ExecSyncRequest {
+                container_id: container_id.clone(),
+                cmd: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    grep_caps.to_string(),
+                ],
+                timeout: 0,
+            })
+            .await
+            .expect("ExecSync failed")
+            .into_inner();
+        assert_eq!(response.exit_code, 0, "{response:?}");
+        client
+            .stop_container(oci_cri_types::StopContainerRequest {
+                container_id,
+                timeout: 0,
+            })
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&response.stdout).trim().to_string()
+    }
+
+    let default_caps = run_and_get_caps(
+        &mut client,
+        &sandbox_id,
+        &sandbox_config,
+        "caps-default",
+        None,
+        grep_caps,
+    )
+    .await;
+    assert_eq!(
+        default_caps,
+        "CapPrm:\t00000000800405fb\nCapEff:\t00000000800405fb\nCapBnd:\t00000000800405fb\nCapAmb:\t0000000000000000",
+        "the unconfigured default should be the real podman-default 11-capability set: {default_caps:?}"
+    );
+
+    let with_add = run_and_get_caps(
+        &mut client,
+        &sandbox_id,
+        &sandbox_config,
+        "caps-add",
+        Some(oci_cri_types::LinuxContainerSecurityContext {
+            capabilities: Some(oci_cri_types::Capability {
+                add_capabilities: vec!["NET_ADMIN".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        grep_caps,
+    )
+    .await;
+    assert_eq!(
+        with_add,
+        "CapPrm:\t00000000800415fb\nCapEff:\t00000000800415fb\nCapBnd:\t00000000800415fb\nCapAmb:\t0000000000000000",
+        "add_capabilities: [NET_ADMIN] should add exactly bit 12 on top of the default set: {with_add:?}"
+    );
+
+    let with_drop = run_and_get_caps(
+        &mut client,
+        &sandbox_id,
+        &sandbox_config,
+        "caps-drop",
+        Some(oci_cri_types::LinuxContainerSecurityContext {
+            capabilities: Some(oci_cri_types::Capability {
+                drop_capabilities: vec!["CHOWN".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        grep_caps,
+    )
+    .await;
+    assert_eq!(
+        with_drop,
+        "CapPrm:\t00000000800405fa\nCapEff:\t00000000800405fa\nCapBnd:\t00000000800405fa\nCapAmb:\t0000000000000000",
+        "drop_capabilities: [CHOWN] should clear exactly bit 0 from the default set: {with_drop:?}"
+    );
+}
+
 /// A non-root `run_as_user`/`run_as_group`, `run_as_username` at all,
 /// and `run_as_group` given without `run_as_user`/`run_as_username`
 /// are each a real, clear error — see `validate_run_as_user`'s own

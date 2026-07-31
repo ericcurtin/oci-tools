@@ -197,6 +197,16 @@ pub struct CriProcessConfig<'a> {
     /// declared intent for security-conscious workloads.
     pub masked_paths: &'a [String],
     pub readonly_paths: &'a [String],
+    /// `security_context.capabilities.add_capabilities`/`.drop_
+    /// capabilities` (0392), already merged onto this project's own
+    /// real `podman`-default set by the caller (`oci_runtime_core::
+    /// identity::merge_capabilities`, shared with `ociman run
+    /// --cap-add`/`--cap-drop`) -- a plain, final bounding/effective/
+    /// permitted list, no merge logic left to run here at all.
+    /// Previously never read: every CRI container got exactly the
+    /// same hardcoded default set, no matter what a pod's own
+    /// `capabilities` actually requested.
+    pub capabilities: Vec<String>,
 }
 
 /// Builds the container's own real OCI spec: the same
@@ -268,11 +278,14 @@ fn build_spec(
         "/".to_string()
     };
 
+    // `security_context.capabilities.add_capabilities`/`.drop_
+    // capabilities` (0392): already merged by the caller onto this
+    // project's own real `podman`-default set -- see `CriProcessConfig::
+    // capabilities`'s own doc comment.
     if let Some(capabilities) = process.capabilities.as_mut() {
-        let podman_caps = oci_spec_types::runtime::podman_default_capabilities();
-        capabilities.bounding = podman_caps.clone();
-        capabilities.effective = podman_caps.clone();
-        capabilities.permitted = podman_caps;
+        capabilities.bounding = cri.capabilities.clone();
+        capabilities.effective = cri.capabilities.clone();
+        capabilities.permitted = cri.capabilities.clone();
     }
 
     let linux = spec
@@ -503,6 +516,7 @@ mod tests {
             resources: None,
             masked_paths: &[],
             readonly_paths: &[],
+            capabilities: oci_spec_types::runtime::podman_default_capabilities(),
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();
@@ -547,6 +561,7 @@ mod tests {
             resources: None,
             masked_paths: &[],
             readonly_paths: &[],
+            capabilities: oci_spec_types::runtime::podman_default_capabilities(),
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         assert!(
@@ -593,6 +608,7 @@ mod tests {
             resources: Some(resources),
             masked_paths: &[],
             readonly_paths: &[],
+            capabilities: oci_spec_types::runtime::podman_default_capabilities(),
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let spec_resources = spec.linux.unwrap().resources.unwrap();
@@ -626,6 +642,7 @@ mod tests {
             resources: None,
             masked_paths: &[],
             readonly_paths: &[],
+            capabilities: oci_spec_types::runtime::podman_default_capabilities(),
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         assert!(spec.linux.unwrap().resources.is_none());
@@ -657,6 +674,7 @@ mod tests {
             resources: None,
             masked_paths: &["/extra/masked".to_string()],
             readonly_paths: &["/extra/readonly".to_string()],
+            capabilities: oci_spec_types::runtime::podman_default_capabilities(),
         };
         let default_spec = oci_spec_types::runtime::Spec::example();
         let default_linux = default_spec.linux.unwrap();
@@ -713,6 +731,7 @@ mod tests {
             resources: None,
             masked_paths: &[],
             readonly_paths: &[],
+            capabilities: oci_spec_types::runtime::podman_default_capabilities(),
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();
@@ -726,5 +745,43 @@ mod tests {
             "nothing declared anywhere falls back to the same real PATH ociman applies (0194)"
         );
         assert_eq!(spec.hostname.as_deref(), Some("fallback-hostname-test"));
+    }
+
+    /// `security_context.capabilities` (0392): the caller (`runtime_
+    /// service.rs`'s own `create_container`) already merges the
+    /// request onto this project's own real `podman`-default set via
+    /// the shared `oci_runtime_core::identity::merge_capabilities` --
+    /// `build_spec` itself just writes whatever final list it's given
+    /// straight onto `bounding`/`effective`/`permitted`, no merge
+    /// logic left to run here. Previously every CRI container got
+    /// exactly the same hardcoded default set unconditionally.
+    #[test]
+    fn build_spec_writes_the_given_capabilities_onto_all_three_sets() {
+        let image_config = oci_spec_types::image::ContainerConfig {
+            cmd: Some(strings(&["sh"])),
+            ..Default::default()
+        };
+        let requested = strings(&["CAP_CHOWN", "CAP_NET_ADMIN"]);
+        let cri = CriProcessConfig {
+            command: &[],
+            args: &[],
+            envs: Vec::new(),
+            working_dir: "",
+            hostname: "capabilities-test",
+            dns_servers: &[],
+            dns_searches: &[],
+            dns_options: &[],
+            mounts: &[],
+            readonly_rootfs: false,
+            resources: None,
+            masked_paths: &[],
+            readonly_paths: &[],
+            capabilities: requested.clone(),
+        };
+        let spec = build_spec(&cri, &image_config).unwrap();
+        let capabilities = spec.process.unwrap().capabilities.unwrap();
+        assert_eq!(capabilities.bounding, requested);
+        assert_eq!(capabilities.effective, requested);
+        assert_eq!(capabilities.permitted, requested);
     }
 }
