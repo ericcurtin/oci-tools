@@ -273,7 +273,21 @@ fn run(args: &[String]) -> anyhow::Result<()> {
             oci_runtime_core::launch::CgroupSetup::Systemd {
                 scope_name: format!("ocicri-{container_id}.scope"),
                 description: format!("ocicri container {container_id}"),
-                resources: None,
+                // `ContainerConfig.linux.resources` (0390), already
+                // written into the bundle's own `spec.linux.resources`
+                // at `CreateContainer` time (`bundle::build_spec`) --
+                // read back out here the exact same way `ociman run`/
+                // `create`'s own identical call site already does, so
+                // a container actually starts with the requested
+                // limits in effect rather than only ever picking them
+                // up via a later, separate `UpdateContainerResources`
+                // call.
+                resources: bundle
+                    .spec
+                    .linux
+                    .as_ref()
+                    .and_then(|l| l.resources.clone())
+                    .map(Box::new),
             },
             // No attach/interactive concept at this layer (real CRI
             // streaming attach is its own future RPC). Output goes to

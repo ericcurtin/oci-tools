@@ -162,6 +162,22 @@ pub struct CriProcessConfig<'a> {
     /// Standards "Restricted" profile), the same shape of bug 0365
     /// already fixed for `run_as_user`.
     pub readonly_rootfs: bool,
+    /// `ContainerConfig.linux.resources` (0390), already translated
+    /// via `linux_container_resources_to_oci` into the same
+    /// [`oci_spec_types::runtime::LinuxResources`] shape `ociman run`/
+    /// `create` already writes into a bundle's own `spec.linux.
+    /// resources`. `None` when the request declared no resources at
+    /// all (the proto's own optional `LinuxContainerResources`
+    /// message, distinct from an all-zero one — both mean "no
+    /// constraint" here). Previously never wired in at `CreateContainer`
+    /// time at all: a container ran completely unconstrained by any
+    /// CPU/memory limit until (if ever) a separate, later
+    /// `UpdateContainerResources` call happened to arrive — a real,
+    /// significant divergence from ordinary Kubernetes QoS/resource-
+    /// isolation expectations, since kubelet normally never issues
+    /// that RPC for a pod without in-place vertical scaling; resources
+    /// are expected to take effect at creation.
+    pub resources: Option<oci_spec_types::runtime::LinuxResources>,
 }
 
 /// Builds the container's own real OCI spec: the same
@@ -247,6 +263,18 @@ fn build_spec(
     linux.seccomp = Some(oci_runtime_core::seccomp::filter_to_supported_syscalls(
         &oci_runtime_core::seccomp::default_profile(),
     ));
+
+    // `ContainerConfig.linux.resources` (0390): written into the
+    // bundle spec at create time so it's actually in effect from the
+    // container's very first process, matching ordinary Kubernetes
+    // QoS expectations -- previously only ever reachable through a
+    // separate, later `UpdateContainerResources` call kubelet
+    // normally never makes for an unscaled pod, so a container ran
+    // completely unconstrained until then. The launcher (see
+    // `launcher.rs`) reads this same `spec.linux.resources` back out
+    // when actually starting the container, the identical plumbing
+    // `ociman run`/`create` already use.
+    linux.resources = cri.resources.clone();
 
     // `ContainerConfig.mounts` (0304), appended after the standard
     // proc/sys/dev/... set `Spec::example()` already provides --
@@ -443,6 +471,7 @@ mod tests {
             dns_options: &[],
             mounts: &[],
             readonly_rootfs: false,
+            resources: None,
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();
@@ -484,12 +513,85 @@ mod tests {
             dns_options: &[],
             mounts: &[],
             readonly_rootfs: true,
+            resources: None,
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         assert!(
             spec.root.unwrap().readonly,
             "an explicit readonly_rootfs: true request must produce a genuinely read-only root"
         );
+    }
+
+    /// `ContainerConfig.linux.resources` (0390): previously never
+    /// wired into the generated spec at all -- a container ran
+    /// completely unconstrained until (if ever) a later, separate
+    /// `UpdateContainerResources` call happened to arrive. Now written
+    /// straight into `spec.linux.resources`, the same field the
+    /// launcher (`launcher.rs`) reads back out when actually starting
+    /// the container.
+    #[test]
+    fn build_spec_writes_an_explicit_resources_request_into_the_spec() {
+        let image_config = oci_spec_types::image::ContainerConfig {
+            cmd: Some(strings(&["sh"])),
+            ..Default::default()
+        };
+        let resources = oci_spec_types::runtime::LinuxResources {
+            memory: Some(oci_spec_types::runtime::LinuxMemory {
+                limit: Some(128 * 1024 * 1024),
+                ..Default::default()
+            }),
+            cpu: Some(oci_spec_types::runtime::LinuxCpu {
+                shares: Some(512),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cri = CriProcessConfig {
+            command: &[],
+            args: &[],
+            envs: Vec::new(),
+            working_dir: "",
+            hostname: "resources-test",
+            dns_servers: &[],
+            dns_searches: &[],
+            dns_options: &[],
+            mounts: &[],
+            readonly_rootfs: false,
+            resources: Some(resources),
+        };
+        let spec = build_spec(&cri, &image_config).unwrap();
+        let spec_resources = spec.linux.unwrap().resources.unwrap();
+        assert_eq!(
+            spec_resources.memory.unwrap().limit,
+            Some(128 * 1024 * 1024)
+        );
+        assert_eq!(spec_resources.cpu.unwrap().shares, Some(512));
+    }
+
+    /// The common, unconfigured default (no `ContainerConfig.linux.
+    /// resources` at all) must leave `spec.linux.resources` absent, a
+    /// real regression guard for the exact bug this closes.
+    #[test]
+    fn build_spec_leaves_resources_absent_when_none_are_requested() {
+        let image_config = oci_spec_types::image::ContainerConfig {
+            cmd: Some(strings(&["sh"])),
+            ..Default::default()
+        };
+        let cri = CriProcessConfig {
+            command: &[],
+            args: &[],
+            envs: Vec::new(),
+            working_dir: "",
+            hostname: "no-resources-test",
+            dns_servers: &[],
+            dns_searches: &[],
+            dns_options: &[],
+            mounts: &[],
+            readonly_rootfs: false,
+            resources: None,
+        };
+        let spec = build_spec(&cri, &image_config).unwrap();
+        assert!(spec.linux.unwrap().resources.is_none());
     }
 
     #[test]
@@ -509,6 +611,7 @@ mod tests {
             dns_options: &[],
             mounts: &[],
             readonly_rootfs: false,
+            resources: None,
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();

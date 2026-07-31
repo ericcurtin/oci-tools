@@ -1438,6 +1438,17 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             .as_ref()
             .and_then(|l| l.security_context.as_ref())
             .is_some_and(|sc| sc.readonly_rootfs);
+        // `ContainerConfig.linux.resources` (0390): translated up
+        // front via the same `linux_container_resources_to_oci`
+        // `UpdateContainerResources` already uses, so a container
+        // actually starts with the requested limits in effect rather
+        // than only ever picking them up via a later, separate update
+        // call.
+        let resources = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.resources.as_ref())
+            .map(linux_container_resources_to_oci);
         // `ContainerConfig.mounts` (0304): validated and translated to
         // plain bind mounts *before* `bundle::prepare` ever extracts a
         // single layer -- a config-shaped client error here should
@@ -1462,6 +1473,7 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
                 dns_options,
                 mounts: &mounts,
                 readonly_rootfs,
+                resources,
             },
         )
         .map_err(|e| match e {

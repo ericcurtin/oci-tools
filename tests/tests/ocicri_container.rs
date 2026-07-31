@@ -1807,6 +1807,96 @@ async fn update_container_resources_changes_the_real_live_cgroup() {
         .unwrap();
 }
 
+/// `ContainerConfig.linux.resources` (`docs/design/0390`): a real,
+/// explicit resources request must already be in effect the moment a
+/// container starts, with no separate `UpdateContainerResources` call
+/// needed at all -- matching ordinary Kubernetes QoS/resource-
+/// isolation expectations (kubelet normally never issues that RPC for
+/// a pod without in-place vertical scaling). Previously never wired
+/// in at `CreateContainer` time: a container ran completely
+/// unconstrained until (if ever) a later, separate update call
+/// happened to arrive. Checked the same way `update_container_
+/// resources_changes_the_real_live_cgroup` checks its own identical
+/// fields: real `memory.max`/`cpu.max` cgroup files read back
+/// directly, not just the RPC's own content-free success response.
+#[tokio::test]
+async fn create_container_resources_take_effect_at_creation_without_a_later_update_call() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session (containers get no cgroup)");
+        return;
+    }
+
+    let mut config = container_config("create-with-resources", 0);
+    config.command = vec!["/bin/sleep".to_string(), "300".to_string()];
+    config.linux = Some(oci_cri_types::LinuxContainerConfig {
+        resources: Some(oci_cri_types::LinuxContainerResources {
+            memory_limit_in_bytes: 64 * 1024 * 1024,
+            cpu_quota: 50_000,
+            cpu_period: 100_000,
+            // Deliberately no `cpuset_cpus`/`cpuset_mems` -- the same
+            // "not always delegated into a real user systemd
+            // session's own cgroup subtree" reasoning `update_
+            // container_resources_changes_the_real_live_cgroup`'s own
+            // doc comment already establishes.
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+
+    // No `UpdateContainerResources` call anywhere in this test: the
+    // limits below must already reflect what `CreateContainer` itself
+    // requested.
+    let verbose = client
+        .container_status(ContainerStatusRequest {
+            container_id: container_id.clone(),
+            verbose: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let info = verbose.info.get("info").expect("verbose info under 'info'");
+    let parsed: serde_json::Value = serde_json::from_str(info).unwrap();
+    let pid = parsed["pid"].as_i64().expect("running container has a pid") as i32;
+    let cgroup_dir =
+        oci_runtime_core::cgroups::cgroup_dir_for_running_pid(Path::new("/sys/fs/cgroup"), pid)
+            .expect("resolving the real cgroup for a running container");
+
+    let memory_max = std::fs::read_to_string(cgroup_dir.join("memory.max")).unwrap();
+    assert_eq!(memory_max.trim(), (64 * 1024 * 1024).to_string());
+    let cpu_max = std::fs::read_to_string(cgroup_dir.join("cpu.max")).unwrap();
+    assert_eq!(cpu_max.trim(), "50000 100000");
+
+    client
+        .stop_container(oci_cri_types::StopContainerRequest {
+            container_id,
+            timeout: 0,
+        })
+        .await
+        .unwrap();
+}
+
 /// The CRI log path (`docs/design/0242`): a container created with
 /// kubelet's own `log_directory` + `log_path` convention streams its
 /// stdout/stderr into a real, CRI-format log file (`<RFC3339Nano>
