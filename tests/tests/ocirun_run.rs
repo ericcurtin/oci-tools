@@ -228,6 +228,44 @@ fn run_honors_an_explicit_umask_declared_in_the_bundle() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0077");
 }
 
+/// An explicit `process.oomScoreAdj` in the bundle's own `config.json`
+/// is genuinely applied via a real `/proc/self/oom_score_adj` write —
+/// matching real `runc`/`crun` exactly (neither has a CLI flag of its
+/// own for this either — it's a pure `config.json` field, set by
+/// whoever generates the bundle, e.g. `ociman run --oom-score-adj`).
+/// A real, positive (increasing) value: an unprivileged process may
+/// always raise its own `oom_score_adj` without `CAP_SYS_RESOURCE`.
+#[test]
+fn run_honors_an_explicit_oom_score_adj_declared_in_the_bundle() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(
+        dir.path(),
+        &busybox,
+        &[
+            "/bin/sh",
+            "-c",
+            "read x < /proc/self/oom_score_adj && echo $x",
+        ],
+    );
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["process"]["oomScoreAdj"] = serde_json::json!(500);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let out = ocirun_run(dir.path(), "oom-score-adj-explicit-test");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "500");
+}
+
 #[test]
 fn run_drops_capabilities_the_spec_does_not_grant() {
     let Some(busybox) = busybox_path() else {

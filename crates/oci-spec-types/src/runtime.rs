@@ -171,6 +171,18 @@ pub struct Process {
     /// Whether `PR_SET_NO_NEW_PRIVS` is set before `execve`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_new_privileges: bool,
+    /// A real, immediate `/proc/self/oom_score_adj` tuning for the
+    /// container's own init process — `None` (the common,
+    /// unconfigured default) leaves whatever value it inherited from
+    /// its own parent untouched, matching real crun's own identical
+    /// `oom_score_adj_present` guard (`oci_runtime_core::oom::apply`).
+    /// Real `crun`/`runc` both apply this only at container-creation
+    /// time, never for an `exec`'d process (checked directly, no
+    /// equivalent call from either project's own exec path) — this
+    /// project's own counterpart matches that scope exactly, wired
+    /// only into `oci_runtime_core::launch`, not `exec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_score_adj: Option<i32>,
 }
 
 /// The user (and supplementary groups) a container process runs as.
@@ -649,6 +661,7 @@ impl Spec {
                     soft: 1024,
                 }],
                 no_new_privileges: true,
+                oom_score_adj: None,
             }),
             root: Some(Root {
                 path: "rootfs".to_string(),

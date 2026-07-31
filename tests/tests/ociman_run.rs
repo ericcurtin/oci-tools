@@ -358,6 +358,50 @@ fn run_umask_flag_rejects_an_invalid_value() {
     assert!(stderr.contains("umask"), "{stderr}");
 }
 
+/// `--oom-score-adj` sets the container's own init process's real
+/// `/proc/self/oom_score_adj`, matching real `podman run
+/// --oom-score-adj` exactly — a real, previously-silent gap this
+/// closes: this flag, the underlying `process.oomScoreAdj` spec
+/// field, and the real `/proc/self/oom_score_adj` write itself never
+/// existed anywhere in this project before now. Uses a real, positive
+/// (increasing) value: an unprivileged process may always *raise* its
+/// own `oom_score_adj` without `CAP_SYS_RESOURCE` (only *lowering* it
+/// below its current value needs that capability, which this
+/// project's own default capability set doesn't grant), so this is
+/// the one value shape guaranteed to succeed regardless of the host's
+/// own starting value.
+#[test]
+fn run_oom_score_adj_flag_sets_a_real_value() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/oom-score-adj:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--oom-score-adj", "500"])
+        .args(["ociman-test/oom-score-adj:latest"])
+        .args(["/bin/cat", "/proc/self/oom_score_adj"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "500");
+}
+
 /// `--privileged` grants every capability this build recognizes
 /// (`CapEff` becomes all 41 recognized bits set, `0x1ffffffffff` --
 /// confirmed by hand against a real running container first, the same

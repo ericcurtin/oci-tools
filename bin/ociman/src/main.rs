@@ -553,6 +553,23 @@ struct RunArgs {
     /// `docker`/`podman`/`runc`/`crun` themselves always guarantee.
     #[arg(long)]
     umask: Option<String>,
+    /// Tune the container's own init process's real `/proc/self/
+    /// oom_score_adj`, matching real `podman run --oom-score-adj`
+    /// exactly (checked directly, `~/git/podman/cmd/podman/common/
+    /// create.go`'s own `oomScoreAdjFlagName`) — no client-side range
+    /// pre-validation, matching real `podman`/`crun` themselves
+    /// (neither validates the real kernel-enforced `-1000..=1000`
+    /// range before the write itself; an out-of-range value is a
+    /// real, surfaced `EINVAL` at container-start time, the exact same
+    /// "let the kernel's own rejection speak for itself" real crun's
+    /// own `libcrun_set_oom` already follows). Not given at all leaves
+    /// the container's own init process's inherited value untouched —
+    /// a real, previously-silent gap this closes: this flag, and the
+    /// underlying `process.oomScoreAdj` spec field, plus the real
+    /// `/proc/self/oom_score_adj` write itself, never existed anywhere
+    /// in this project at all before now.
+    #[arg(long = "oom-score-adj")]
+    oom_score_adj: Option<i32>,
     /// Grant the container every capability this build recognizes
     /// and disable seccomp confinement entirely, matching real
     /// `docker run --privileged`/`podman run --privileged`'s own
@@ -6964,6 +6981,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             shm_size_bytes,
             &tmpfs_mounts,
             umask,
+            args.oom_score_adj,
         )?;
         // Prepended, not appended: `spec.mounts`' own already-present
         // entries (`/proc`, `/dev`, ...) are all subdirectories of the
@@ -12100,6 +12118,7 @@ fn synthesize_spec(
     shm_size_bytes: Option<i64>,
     tmpfs_mounts: &[ParsedTmpfs],
     umask: Option<u32>,
+    oom_score_adj: Option<i32>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -12150,6 +12169,7 @@ fn synthesize_spec(
     process.user.uid = uid;
     process.user.gid = gid;
     process.user.umask = umask;
+    process.oom_score_adj = oom_score_adj;
     if !group_add.is_empty() {
         let mut gids = std::collections::BTreeSet::new();
         for group in group_add {

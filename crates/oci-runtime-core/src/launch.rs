@@ -831,6 +831,7 @@ fn build_child_setup(bundle: &Bundle, rootfs: &Path, id: &str) -> io::Result<Chi
         capabilities: process_spec.capabilities.clone(),
         no_new_privileges: process_spec.no_new_privileges,
         rlimits: process_spec.rlimits.clone(),
+        oom_score_adj: process_spec.oom_score_adj,
         seccomp: linux.and_then(|l| l.seccomp.clone()),
         exec_fifo: None,
         pid_pipe_write: None,
@@ -923,6 +924,10 @@ struct ChildSetup {
     capabilities: Option<LinuxCapabilities>,
     no_new_privileges: bool,
     rlimits: Vec<PosixRlimit>,
+    /// See [`crate::oom::apply`]'s own doc comment — only ever applied
+    /// here (container-creation time), never for an `exec`'d process,
+    /// matching real crun's own identical scope exactly.
+    oom_score_adj: Option<i32>,
     seccomp: Option<LinuxSeccomp>,
     /// Set by [`create`] (left `None` by [`run`], which `exec`s
     /// immediately with no synchronization needed): path to block on
@@ -1080,6 +1085,16 @@ impl ChildSetup {
         // becoming a fake-root-in-a-userns.
         if let Err(e) = rlimits::apply(&self.rlimits) {
             fail(SETUP_FAILURE_EXIT_CODE, &format!("setting rlimits: {e}"));
+        }
+        // Also a plain process attribute, same reasoning as rlimits
+        // just above — matching real crun's own `libcrun_set_oom` call
+        // sites, both also unconditionally early, well before any
+        // namespace/identity work.
+        if let Err(e) = crate::oom::apply(Path::new("/proc"), self.oom_score_adj) {
+            fail(
+                SETUP_FAILURE_EXIT_CODE,
+                &format!("setting oom_score_adj: {e}"),
+            );
         }
         // Also strictly before `unshare`: entering the target cgroup
         // *before* a `CLONE_NEWCGROUP` unshare is what makes that

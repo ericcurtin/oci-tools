@@ -85,6 +85,7 @@ pub mod keyring;
 pub mod launch;
 pub mod namespaces;
 pub mod nsenter;
+pub mod oom;
 pub mod overlay;
 pub mod process;
 pub mod resolv_conf;
