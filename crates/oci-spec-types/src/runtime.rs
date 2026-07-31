@@ -313,6 +313,22 @@ pub struct Linux {
     /// Paths remounted read-only inside the container.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub readonly_paths: Vec<String>,
+    /// Kernel parameters (`/proc/sys/...`) to set for the container,
+    /// keyed by their dotted `sysctl(8)`-style name (e.g. `"net.ipv4.
+    /// ip_forward"`), matching the real runtime-spec's own `Linux.
+    /// Sysctl map[string]string` field exactly
+    /// (`~/git/container-libs/vendor/github.com/opencontainers/
+    /// runtime-spec/specs-go/config.go`). Applied by
+    /// `oci_runtime_core::sysctl::apply`, which also validates each
+    /// key against the container's own actually-declared namespace
+    /// list first, matching real crun's own `validate_sysctl` exactly
+    /// — see that function's own doc comment for exactly which
+    /// prefixes are recognized and why a `net.*` key can never
+    /// succeed for any container this project itself ever launches
+    /// (rootless containers never have a real network namespace of
+    /// their own, `Spec::into_rootless`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sysctl: BTreeMap<String, String>,
 }
 
 /// One entry of [`Linux::namespaces`]: a namespace type, and (for
@@ -698,6 +714,7 @@ impl Spec {
                 seccomp: None,
                 masked_paths: default_masked_paths(),
                 readonly_paths: default_readonly_paths(),
+                sysctl: BTreeMap::new(),
             }),
             annotations: BTreeMap::new(),
         }

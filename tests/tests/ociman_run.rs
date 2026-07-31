@@ -402,6 +402,87 @@ fn run_oom_score_adj_flag_sets_a_real_value() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "500");
 }
 
+/// `--sysctl` sets a real, honored `/proc/sys/...` kernel parameter
+/// for the container, matching real `podman run --sysctl` exactly —
+/// a real, previously-silent gap this closes: `linux.sysctl` and this
+/// flag never existed anywhere in this project before now. Uses a
+/// real `kernel.*` key that only needs an IPC namespace (always
+/// present for every container this project's own `ociman run`
+/// launches), not a `net.*` one -- see the next test for exactly why
+/// that one can never succeed here.
+#[test]
+fn run_sysctl_flag_sets_a_real_kernel_parameter() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/sysctl:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--sysctl", "kernel.shmmax=8000000"])
+        .args(["ociman-test/sysctl:latest"])
+        .args(["/bin/cat", "/proc/sys/kernel/shmmax"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "8000000");
+}
+
+/// A real, checked-directly safety property: a `net.*` sysctl can
+/// never succeed for any container this project itself launches,
+/// since none of them ever have a real, private network namespace of
+/// their own (every one shares the host's real network namespace
+/// unconditionally, `Spec::into_rootless`) -- a clear, immediate
+/// error rather than silently modifying the *host's own* real
+/// networking configuration, matching real crun's own identical
+/// `validate_sysctl` protection exactly (`oci_runtime_core::sysctl`'s
+/// own doc comment explains why this matters specifically for this
+/// project's own architecture).
+#[test]
+fn run_sysctl_flag_rejects_a_net_key_since_there_is_no_real_network_namespace() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/sysctl-net:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--sysctl", "net.ipv4.ip_forward=1"])
+        .args(["ociman-test/sysctl-net:latest", "/bin/true"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        !out.status.success(),
+        "a net.* sysctl should never succeed: no container here has a real network namespace"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("network namespace"), "{stderr}");
+}
+
 /// `--privileged` grants every capability this build recognizes
 /// (`CapEff` becomes all 41 recognized bits set, `0x1ffffffffff` --
 /// confirmed by hand against a real running container first, the same

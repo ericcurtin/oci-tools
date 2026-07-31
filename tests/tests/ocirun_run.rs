@@ -266,6 +266,66 @@ fn run_honors_an_explicit_oom_score_adj_declared_in_the_bundle() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "500");
 }
 
+/// An explicit `linux.sysctl` in the bundle's own `config.json` is
+/// genuinely applied via a real `/proc/sys/...` write — matching real
+/// `runc`/`crun` exactly (neither has a CLI flag of its own for this
+/// either — it's a pure `config.json` field, set by whoever generates
+/// the bundle, e.g. `ociman run --sysctl`). Uses a real `kernel.*` key
+/// that only needs an IPC namespace, always present in the default
+/// bundle `write_bundle` produces.
+#[test]
+fn run_honors_an_explicit_sysctl_declared_in_the_bundle() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(
+        dir.path(),
+        &busybox,
+        &["/bin/sh", "-c", "cat /proc/sys/kernel/shmmax"],
+    );
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["linux"]["sysctl"] = serde_json::json!({"kernel.shmmax": "8000000"});
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let out = ocirun_run(dir.path(), "sysctl-explicit-test");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "8000000");
+}
+
+/// A `net.*` sysctl in the bundle's own `config.json` is a real,
+/// immediate error, never silently applied to the *host's own* real
+/// networking configuration -- `ocirun`'s own default bundle
+/// (`write_bundle`) never declares a network namespace at all.
+#[test]
+fn run_rejects_a_net_sysctl_declared_in_the_bundle() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(dir.path(), &busybox, &["/bin/true"]);
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["linux"]["sysctl"] = serde_json::json!({"net.ipv4.ip_forward": "1"});
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let out = ocirun_run(dir.path(), "sysctl-net-reject-test");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("network namespace"),
+        "{out:?}"
+    );
+}
+
 #[test]
 fn run_drops_capabilities_the_spec_does_not_grant() {
     let Some(busybox) = busybox_path() else {

@@ -832,6 +832,7 @@ fn build_child_setup(bundle: &Bundle, rootfs: &Path, id: &str) -> io::Result<Chi
         no_new_privileges: process_spec.no_new_privileges,
         rlimits: process_spec.rlimits.clone(),
         oom_score_adj: process_spec.oom_score_adj,
+        sysctl: linux.map(|l| l.sysctl.clone()).unwrap_or_default(),
         seccomp: linux.and_then(|l| l.seccomp.clone()),
         exec_fifo: None,
         pid_pipe_write: None,
@@ -928,6 +929,11 @@ struct ChildSetup {
     /// here (container-creation time), never for an `exec`'d process,
     /// matching real crun's own identical scope exactly.
     oom_score_adj: Option<i32>,
+    /// See [`crate::sysctl::apply`]'s own doc comment — only ever
+    /// applied here, never for an `exec`'d process, matching real
+    /// crun's own identical scope (checked directly, no equivalent
+    /// call anywhere in its own exec path either).
+    sysctl: BTreeMap<String, String>,
     seccomp: Option<LinuxSeccomp>,
     /// Set by [`create`] (left `None` by [`run`], which `exec`s
     /// immediately with no synchronization needed): path to block on
@@ -1268,6 +1274,15 @@ impl ChildSetup {
                 SETUP_FAILURE_EXIT_CODE,
                 &format!("joining a new session keyring: {e}"),
             );
+        }
+        // `linux.sysctl`, also strictly before rootfs/pivot_root
+        // (matching real crun's own identical placement,
+        // `container.c`'s own `HANDLER_CONFIGURE_BEFORE_MOUNTS` right
+        // after) — needs to run *after* `unshare` above (unlike
+        // `rlimits`/`oom_score_adj`), since `sysctl::validate` checks
+        // which namespaces are actually present in `self.flags`.
+        if let Err(e) = crate::sysctl::apply(Path::new("/proc"), self.flags, &self.sysctl) {
+            fail(SETUP_FAILURE_EXIT_CODE, &format!("setting sysctl: {e}"));
         }
         // Must happen *before* `pivot_root` below (part of the plan
         // loop) — see `exec_fifo`'s own doc comment on why an ordinary

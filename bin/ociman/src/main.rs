@@ -570,6 +570,23 @@ struct RunArgs {
     /// in this project at all before now.
     #[arg(long = "oom-score-adj")]
     oom_score_adj: Option<i32>,
+    /// Set a kernel parameter (`sysctl(8)`-style `KEY=VALUE`) for the
+    /// container, matching real `podman run --sysctl` exactly
+    /// (checked directly, `~/git/podman/cmd/podman/common/create.go`'s
+    /// own `sysctlFlagName`, a repeatable string slice). Only the
+    /// `KEY=VALUE` syntax is validated here; whether the given key is
+    /// actually one this project's own containers can ever honor is a
+    /// real, immediate error at container-start time instead (`oci_
+    /// runtime_core::sysctl::validate`, matching real crun's own
+    /// identical "validate against the container's own actually-
+    /// unshared namespaces" check) — every `net.*` key, in particular,
+    /// can never succeed for any container this project itself ever
+    /// launches (rootless containers never have a real, private
+    /// network namespace of their own). A real, previously-silent gap
+    /// this closes: `linux.sysctl` and this flag never existed
+    /// anywhere in this project at all before now.
+    #[arg(long = "sysctl", value_name = "KEY=VALUE")]
+    sysctl: Vec<String>,
     /// Grant the container every capability this build recognizes
     /// and disable seccomp confinement entirely, matching real
     /// `docker run --privileged`/`podman run --privileged`'s own
@@ -6693,6 +6710,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         &args.cap_drop,
     )?;
     let umask = args.umask.as_deref().map(parse_umask).transpose()?;
+    let sysctl = parse_sysctls(&args.sysctl)?;
     let (memory_limit_bytes, memory_swap_bytes) = parse_and_validate_memory_and_cpus(
         args.memory.as_deref(),
         args.memory_swap.as_deref(),
@@ -6982,6 +7000,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             &tmpfs_mounts,
             umask,
             args.oom_score_adj,
+            sysctl,
         )?;
         // Prepended, not appended: `spec.mounts`' own already-present
         // entries (`/proc`, `/dev`, ...) are all subdirectories of the
@@ -12119,6 +12138,7 @@ fn synthesize_spec(
     tmpfs_mounts: &[ParsedTmpfs],
     umask: Option<u32>,
     oom_score_adj: Option<i32>,
+    sysctl: std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -12284,6 +12304,7 @@ fn synthesize_spec(
         .linux
         .as_mut()
         .expect("Spec::example always sets linux");
+    linux.sysctl = sysctl;
 
     let resources = resources_from_cli(
         memory_limit_bytes,
@@ -12516,6 +12537,29 @@ fn parse_umask(s: &str) -> anyhow::Result<u32> {
         "invalid umask string {s:?}: must be 1 to 4 octal digits (e.g. \"0022\")"
     );
     Ok(u32::from_str_radix(s, 8).expect("validated as 1-4 octal digits above"))
+}
+
+/// Parse `--sysctl`'s own repeatable `KEY=VALUE` entries into a map —
+/// only the syntax is checked here (a real, immediate error on
+/// anything missing an `=`); whether a given key is one this
+/// project's own containers can ever actually honor is checked much
+/// later, at real container-start time, by `oci_runtime_core::
+/// sysctl::validate` (see `--sysctl`'s own doc comment for why that's
+/// the right place, matching real crun's own identical division of
+/// labor). A duplicate key (repeating the same `--sysctl` name twice)
+/// silently keeps the *last* one given, the same "later entries win"
+/// convention `--env`/`--label` already established elsewhere in this
+/// same command.
+fn parse_sysctls(entries: &[String]) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut map = std::collections::BTreeMap::new();
+    for entry in entries {
+        let (key, value) = entry.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("invalid --sysctl {entry:?}: must be in the form of KEY=VALUE")
+        })?;
+        anyhow::ensure!(!key.is_empty(), "invalid --sysctl {entry:?}: empty key");
+        map.insert(key.to_string(), value.to_string());
+    }
+    Ok(map)
 }
 
 /// Parse `--memory`/`--memory-swap` into raw byte counts and validate
@@ -13909,6 +13953,50 @@ mod tests {
     fn parse_umask_rejects_a_0o_prefixed_or_hex_looking_string() {
         assert!(parse_umask("0o22").is_err());
         assert!(parse_umask("0x22").is_err());
+    }
+
+    #[test]
+    fn parse_sysctls_parses_one_or_more_key_value_entries() {
+        let map = parse_sysctls(&[
+            "kernel.shmmax=1000000".to_string(),
+            "kernel.msgmax=100".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get("kernel.shmmax").map(String::as_str),
+            Some("1000000")
+        );
+        assert_eq!(map.get("kernel.msgmax").map(String::as_str), Some("100"));
+    }
+
+    #[test]
+    fn parse_sysctls_of_an_empty_slice_is_an_empty_map() {
+        assert!(parse_sysctls(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_sysctls_rejects_an_entry_with_no_equals_sign() {
+        let err = parse_sysctls(&["kernel.shmmax".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("kernel.shmmax"), "{err}");
+    }
+
+    #[test]
+    fn parse_sysctls_a_repeated_key_keeps_the_last_value() {
+        let map =
+            parse_sysctls(&["kernel.shmmax=1".to_string(), "kernel.shmmax=2".to_string()]).unwrap();
+        assert_eq!(map.get("kernel.shmmax").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn parse_sysctls_allows_a_value_containing_its_own_equals_sign() {
+        // `split_once` stops at the *first* `=`, so a value like
+        // `a=b` for key `foo` (`foo=a=b`) keeps the rest intact --
+        // matters for some real sysctl values (e.g. `net.ipv4.
+        // ip_local_port_range` is space-separated, not `=`-shaped, but
+        // this is still the correct general rule).
+        let map = parse_sysctls(&["foo=a=b".to_string()]).unwrap();
+        assert_eq!(map.get("foo").map(String::as_str), Some("a=b"));
     }
 
     fn strings(names: &[&str]) -> Vec<String> {

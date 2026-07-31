@@ -94,6 +94,7 @@ pub mod rootfs;
 pub mod seccomp;
 pub mod signal;
 pub mod state;
+pub mod sysctl;
 pub mod systemd_cgroup;
 pub mod validate;
 
