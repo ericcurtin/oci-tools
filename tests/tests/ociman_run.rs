@@ -246,6 +246,118 @@ fn run_rejects_the_same_capability_added_and_dropped() {
     );
 }
 
+/// The container's own real `umask(2)` defaults to `0022` when
+/// `--umask` isn't given at all — matching real `docker`/`podman`/
+/// `runc`/`crun` themselves (`oci_runtime_core::identity::apply`'s
+/// own fallback) — a real, previously-silent gap this closes: every
+/// container this project ever launched used to simply inherit
+/// whatever umask its own *launching* process happened to have,
+/// rather than this deterministic default. Verified end to end via a
+/// real busybox `umask` builtin call, not just checking the generated
+/// spec.
+#[test]
+fn run_without_umask_defaults_to_0022() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/umask-default:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "ociman-test/umask-default:latest"])
+        .args(["/bin/sh", "-c", "umask"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "0022",
+        "the container's own real umask must default to 0022 regardless of the host's own \
+         umask, matching real docker/podman/runc/crun"
+    );
+}
+
+/// `--umask` sets the container's own real `umask(2)` to exactly the
+/// given value, matching real `podman run --umask` exactly, verified
+/// end to end (not just the generated spec): a real busybox `umask`
+/// builtin call inside the running container reports it back.
+#[test]
+fn run_umask_flag_sets_a_real_custom_umask() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/umask-custom:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--umask", "0077"])
+        .args(["ociman-test/umask-custom:latest"])
+        .args(["/bin/sh", "-c", "umask"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0077");
+}
+
+/// An invalid `--umask` value (not 1-4 octal digits) is a real,
+/// immediate CLI error, matching real `podman run --umask`'s own
+/// checked `umaskRegex` -- the container never even starts.
+#[test]
+fn run_umask_flag_rejects_an_invalid_value() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/umask-invalid:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--rm", "--umask", "999"])
+        .args(["ociman-test/umask-invalid:latest", "/bin/true"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(!out.status.success(), "999 is not valid octal");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("umask"), "{stderr}");
+}
+
 /// `--privileged` grants every capability this build recognizes
 /// (`CapEff` becomes all 41 recognized bits set, `0x1ffffffffff` --
 /// confirmed by hand against a real running container first, the same

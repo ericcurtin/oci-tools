@@ -174,6 +174,60 @@ fn run_applies_the_default_capability_set_and_no_new_privileges() {
     );
 }
 
+/// A bundle whose `config.json` declares no `process.user.umask` at
+/// all gets the same real, deterministic `0022` default every real
+/// `runc`/`crun` themselves always fall back to
+/// (`oci_runtime_core::identity::apply`'s own fallback,
+/// `~/git/crun/src/libcrun/container.c:1447`) -- a real,
+/// previously-silent gap: this project's containers used to simply
+/// inherit whatever umask their own *launching* process happened to
+/// have, never calling `umask(2)` at all anywhere.
+#[test]
+fn run_defaults_to_umask_0022_when_the_bundle_declares_none() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(dir.path(), &busybox, &["/bin/sh", "-c", "umask"]);
+
+    let out = ocirun_run(dir.path(), "umask-default-test");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0022");
+}
+
+/// An explicit `process.user.umask` in the bundle's own `config.json`
+/// is genuinely applied, matching real `runc`/`crun` exactly (neither
+/// has a CLI flag of its own for this -- it's a pure `config.json`
+/// field, set by whoever generates the bundle, e.g. `ociman run
+/// --umask`).
+#[test]
+fn run_honors_an_explicit_umask_declared_in_the_bundle() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(dir.path(), &busybox, &["/bin/sh", "-c", "umask"]);
+    let config_path = dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["process"]["user"]["umask"] = serde_json::json!(0o77);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let out = ocirun_run(dir.path(), "umask-explicit-test");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0077");
+}
+
 #[test]
 fn run_drops_capabilities_the_spec_does_not_grant() {
     let Some(busybox) = busybox_path() else {

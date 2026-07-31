@@ -9,6 +9,11 @@
 //! effective, or a later step fails because an earlier one already
 //! dropped the privilege it needed.
 //!
+//! 0. `umask(2)` to `process.user.umask` if given, else the same real
+//!    `0o022` default crun itself always falls back to
+//!    (`~/git/crun/src/libcrun/container.c:1447`) — unprivileged, no
+//!    ordering dependency on anything below, but applied first anyway,
+//!    matching crun's own placement.
 //! 1. `setgroups(2)` for `process.user.additionalGids` — but *only* if
 //!    `/proc/self/setgroups` doesn't already say `deny` (the rootless ID
 //!    mapping dance in [`crate::namespaces::write_id_mappings`] writes
@@ -55,6 +60,17 @@ pub fn apply(
     capabilities: Option<&LinuxCapabilities>,
     no_new_privileges: bool,
 ) -> io::Result<()> {
+    // `umask(2)` — always called, matching real crun's own
+    // unconditional `def->process && def->process->user` branch (a
+    // container's own process/user is always present here): a caller
+    // that happened to have a stricter/looser umask than `0o022`
+    // before invoking this project's own binaries (a real, plausible
+    // operational scenario -- many hardened shells/systemd units set
+    // their own `umask`/`UMask=`) must not leak that into every
+    // container's own file-creation permissions, matching what real
+    // `runc`/`crun` themselves already guarantee unconditionally.
+    rustix::process::umask(rustix::fs::Mode::from_raw_mode(user.umask.unwrap_or(0o022)));
+
     apply_supplementary_groups(proc_root, &user.additional_gids)?;
 
     let empty = LinuxCapabilities::default();

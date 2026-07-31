@@ -537,6 +537,22 @@ struct RunArgs {
     /// surfaced error, not silently resolved one way or the other.
     #[arg(long = "cap-drop", value_delimiter = ',')]
     cap_drop: Vec<String>,
+    /// Set the container's own init process's real `umask(2)`, matching
+    /// real `podman run --umask` exactly (checked directly,
+    /// `~/git/podman/cmd/podman/common/create.go`'s own `umaskFlagName`):
+    /// 1-4 octal digits (`^[0-7]{1,4}$`, real podman's own checked
+    /// `umaskRegex`), e.g. `0022`/`022`/`77`. Not given at all leaves
+    /// the container's own real, deterministic `0o022` default in
+    /// place (`oci_runtime_core::identity::apply`'s own fallback,
+    /// matching real crun's identical `umask_present ? umask : 0022`)
+    /// — a real, previously-silent gap this closes: every container
+    /// this project ever launched used to simply inherit whatever
+    /// umask its own *launching* process happened to have (a real,
+    /// plausible divergence for a caller with e.g. a hardened
+    /// `umask 077` shell), rather than the deterministic value real
+    /// `docker`/`podman`/`runc`/`crun` themselves always guarantee.
+    #[arg(long)]
+    umask: Option<String>,
     /// Grant the container every capability this build recognizes
     /// and disable seccomp confinement entirely, matching real
     /// `docker run --privileged`/`podman run --privileged`'s own
@@ -6659,6 +6675,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         &args.cap_add,
         &args.cap_drop,
     )?;
+    let umask = args.umask.as_deref().map(parse_umask).transpose()?;
     let (memory_limit_bytes, memory_swap_bytes) = parse_and_validate_memory_and_cpus(
         args.memory.as_deref(),
         args.memory_swap.as_deref(),
@@ -6946,6 +6963,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             &rlimits,
             shm_size_bytes,
             &tmpfs_mounts,
+            umask,
         )?;
         // Prepended, not appended: `spec.mounts`' own already-present
         // entries (`/proc`, `/dev`, ...) are all subdirectories of the
@@ -12081,6 +12099,7 @@ fn synthesize_spec(
     rlimits: &[oci_spec_types::runtime::PosixRlimit],
     shm_size_bytes: Option<i64>,
     tmpfs_mounts: &[ParsedTmpfs],
+    umask: Option<u32>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -12130,6 +12149,7 @@ fn synthesize_spec(
     });
     process.user.uid = uid;
     process.user.gid = gid;
+    process.user.umask = umask;
     if !group_add.is_empty() {
         let mut gids = std::collections::BTreeSet::new();
         for group in group_add {
@@ -12460,6 +12480,22 @@ fn resolve_security_opts(
         }
     };
     Ok((seccomp, no_new_privileges))
+}
+
+/// Parse `--umask`'s own 1-4 octal-digit string into a raw `u32`,
+/// matching real `podman run --umask`'s own checked-directly
+/// validation exactly: `~/git/podman/libpod/options.go`'s own
+/// `umaskRegex = ^[0-7]{1,4}$` (no `0o`/`0x` prefix, no sign, 1 to 4
+/// digits, each `0`-`7`) — real podman itself parses the validated
+/// string with `strconv.ParseUint(umask, 8, 32)`
+/// (`container_internal_common.go:3196`), the same octal
+/// interpretation `u32::from_str_radix(s, 8)` gives here.
+fn parse_umask(s: &str) -> anyhow::Result<u32> {
+    anyhow::ensure!(
+        !s.is_empty() && s.len() <= 4 && s.bytes().all(|b| (b'0'..=b'7').contains(&b)),
+        "invalid umask string {s:?}: must be 1 to 4 octal digits (e.g. \"0022\")"
+    );
+    Ok(u32::from_str_radix(s, 8).expect("validated as 1-4 octal digits above"))
 }
 
 /// Parse `--memory`/`--memory-swap` into raw byte counts and validate
@@ -13820,6 +13856,39 @@ mod tests {
         .unwrap();
         assert!(seccomp.is_none());
         assert!(no_new_privileges);
+    }
+
+    #[test]
+    fn parse_umask_accepts_one_to_four_octal_digits() {
+        assert_eq!(parse_umask("0").unwrap(), 0);
+        assert_eq!(parse_umask("22").unwrap(), 0o22);
+        assert_eq!(parse_umask("022").unwrap(), 0o22);
+        assert_eq!(parse_umask("0022").unwrap(), 0o22);
+        assert_eq!(parse_umask("0077").unwrap(), 0o77);
+        assert_eq!(parse_umask("7777").unwrap(), 0o7777);
+    }
+
+    #[test]
+    fn parse_umask_rejects_a_non_octal_digit() {
+        let err = parse_umask("0089").unwrap_err();
+        assert!(err.to_string().contains("0089"), "{err}");
+    }
+
+    #[test]
+    fn parse_umask_rejects_more_than_four_digits() {
+        let err = parse_umask("00022").unwrap_err();
+        assert!(err.to_string().contains("00022"), "{err}");
+    }
+
+    #[test]
+    fn parse_umask_rejects_an_empty_string() {
+        assert!(parse_umask("").is_err());
+    }
+
+    #[test]
+    fn parse_umask_rejects_a_0o_prefixed_or_hex_looking_string() {
+        assert!(parse_umask("0o22").is_err());
+        assert!(parse_umask("0x22").is_err());
     }
 
     fn strings(names: &[&str]) -> Vec<String> {

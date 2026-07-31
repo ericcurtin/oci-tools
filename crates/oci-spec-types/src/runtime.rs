@@ -184,6 +184,22 @@ pub struct User {
     /// Supplementary group IDs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_gids: Vec<u32>,
+    /// The `umask(2)` value for the container's init process, e.g.
+    /// `0o022` — an optional field on the real runtime-spec
+    /// (`~/git/container-libs/vendor/github.com/opencontainers/
+    /// runtime-spec/specs-go/config.go`'s own `Process.User.Umask
+    /// *uint32`), `None` here meaning "not given at all", distinct
+    /// from a real, if degenerate, explicit `0`. `identity::apply`'s
+    /// own default (`0o022`) applies when this is `None`, matching
+    /// real crun's own identical `umask_present ? umask : 0022`
+    /// fallback (`~/git/crun/src/libcrun/container.c:1447`, `:3835`)
+    /// — checked directly against this project's own already-captured
+    /// real `podman run`/crun `config.json` fixture (`tests/fixtures/
+    /// podman-generated-config-with-seccomp.json`), which already has
+    /// a real `"umask": 18` (`0o22`) this field used to silently drop
+    /// on parse before now having anywhere to go.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub umask: Option<u32>,
 }
 
 /// Linux capability sets (see `capabilities(7)`); each is a list of
@@ -1085,6 +1101,14 @@ mod tests {
         // linux.seccomp shape).
         let raw = include_str!("../tests/fixtures/podman-generated-config-with-seccomp.json");
         let spec: Spec = serde_json::from_str(raw).expect("parses real podman generated config");
+        // `process.user.umask` (real, captured `18` = `0o22`) used to
+        // be silently dropped entirely (`User` had no such field at
+        // all) -- now genuinely round-trips.
+        assert_eq!(
+            spec.process.as_ref().unwrap().user.umask,
+            Some(0o22),
+            "the real, captured process.user.umask must round-trip, not be silently dropped"
+        );
         let seccomp = spec.linux.unwrap().seccomp.unwrap();
 
         assert_eq!(seccomp.default_action, "SCMP_ACT_ERRNO");
