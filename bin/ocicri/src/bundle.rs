@@ -178,6 +178,25 @@ pub struct CriProcessConfig<'a> {
     /// that RPC for a pod without in-place vertical scaling; resources
     /// are expected to take effect at creation.
     pub resources: Option<oci_spec_types::runtime::LinuxResources>,
+    /// `security_context.masked_paths`/`.readonly_paths` (0391) --
+    /// appended onto this project's own existing default masked/
+    /// readonly path lists (`Spec::example()`'s own `default_masked_
+    /// paths()`/`default_readonly_paths()`), never replacing them,
+    /// matching real cri-o's own checked-directly `specgen.
+    /// AddLinuxMaskedPaths`/`AddLinuxReadonlyPaths` (a plain, non-
+    /// deduplicating append, `~/git/moby/vendor/github.com/
+    /// opencontainers/runtime-tools/generate/generate.go`). Real
+    /// cri-o's own equivalent (`internal/factory/container/
+    /// container.go`'s own `SpecSetPrivileges`) only applies these for
+    /// a non-`privileged` container; this project has no equivalent
+    /// gate to apply here at all, since `privileged: true` is already
+    /// a hard, earlier `Status::unimplemented` (`0389`) well before
+    /// `build_spec` is ever reached. Previously never read at all: a
+    /// pod's own explicit extra masked/readonly paths were silently
+    /// dropped, an easy-to-miss but real divergence from a pod's
+    /// declared intent for security-conscious workloads.
+    pub masked_paths: &'a [String],
+    pub readonly_paths: &'a [String],
 }
 
 /// Builds the container's own real OCI spec: the same
@@ -275,6 +294,16 @@ fn build_spec(
     // when actually starting the container, the identical plumbing
     // `ociman run`/`create` already use.
     linux.resources = cri.resources.clone();
+
+    // `security_context.masked_paths`/`.readonly_paths` (0391):
+    // appended onto this project's own already-existing default lists
+    // `Spec::example()` seeded, matching real cri-o's own identical
+    // "append, never replace" `AddLinuxMaskedPaths`/
+    // `AddLinuxReadonlyPaths` behavior exactly.
+    linux.masked_paths.extend(cri.masked_paths.iter().cloned());
+    linux
+        .readonly_paths
+        .extend(cri.readonly_paths.iter().cloned());
 
     // `ContainerConfig.mounts` (0304), appended after the standard
     // proc/sys/dev/... set `Spec::example()` already provides --
@@ -472,6 +501,8 @@ mod tests {
             mounts: &[],
             readonly_rootfs: false,
             resources: None,
+            masked_paths: &[],
+            readonly_paths: &[],
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();
@@ -514,6 +545,8 @@ mod tests {
             mounts: &[],
             readonly_rootfs: true,
             resources: None,
+            masked_paths: &[],
+            readonly_paths: &[],
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         assert!(
@@ -558,6 +591,8 @@ mod tests {
             mounts: &[],
             readonly_rootfs: false,
             resources: Some(resources),
+            masked_paths: &[],
+            readonly_paths: &[],
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let spec_resources = spec.linux.unwrap().resources.unwrap();
@@ -589,9 +624,73 @@ mod tests {
             mounts: &[],
             readonly_rootfs: false,
             resources: None,
+            masked_paths: &[],
+            readonly_paths: &[],
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         assert!(spec.linux.unwrap().resources.is_none());
+    }
+
+    /// `security_context.masked_paths`/`.readonly_paths` (0391):
+    /// previously never read at all; now appended onto this project's
+    /// own existing default lists, never replacing them, matching
+    /// real cri-o's own identical `AddLinuxMaskedPaths`/
+    /// `AddLinuxReadonlyPaths` "plain, non-deduplicating append"
+    /// behavior.
+    #[test]
+    fn build_spec_appends_extra_masked_and_readonly_paths_onto_the_existing_defaults() {
+        let image_config = oci_spec_types::image::ContainerConfig {
+            cmd: Some(strings(&["sh"])),
+            ..Default::default()
+        };
+        let cri = CriProcessConfig {
+            command: &[],
+            args: &[],
+            envs: Vec::new(),
+            working_dir: "",
+            hostname: "masked-paths-test",
+            dns_servers: &[],
+            dns_searches: &[],
+            dns_options: &[],
+            mounts: &[],
+            readonly_rootfs: false,
+            resources: None,
+            masked_paths: &["/extra/masked".to_string()],
+            readonly_paths: &["/extra/readonly".to_string()],
+        };
+        let default_spec = oci_spec_types::runtime::Spec::example();
+        let default_linux = default_spec.linux.unwrap();
+        let default_masked_count = default_linux.masked_paths.len();
+        let default_readonly_count = default_linux.readonly_paths.len();
+        assert!(
+            default_masked_count > 0 && default_readonly_count > 0,
+            "this project's own base spec must already have a real default list to append onto"
+        );
+
+        let spec = build_spec(&cri, &image_config).unwrap();
+        let linux = spec.linux.unwrap();
+        assert_eq!(linux.masked_paths.len(), default_masked_count + 1);
+        assert!(linux.masked_paths.contains(&"/extra/masked".to_string()));
+        assert!(
+            default_linux
+                .masked_paths
+                .iter()
+                .all(|p| linux.masked_paths.contains(p)),
+            "the existing default masked paths must survive, not be replaced"
+        );
+        assert_eq!(linux.readonly_paths.len(), default_readonly_count + 1);
+        assert!(
+            linux
+                .readonly_paths
+                .contains(&"/extra/readonly".to_string())
+        );
+        assert!(
+            default_linux
+                .readonly_paths
+                .iter()
+                .all(|p| linux.readonly_paths.contains(p)),
+            "the existing default readonly paths must survive, not be replaced"
+        );
     }
 
     #[test]
@@ -612,6 +711,8 @@ mod tests {
             mounts: &[],
             readonly_rootfs: false,
             resources: None,
+            masked_paths: &[],
+            readonly_paths: &[],
         };
         let spec = build_spec(&cri, &image_config).unwrap();
         let process = spec.process.unwrap();

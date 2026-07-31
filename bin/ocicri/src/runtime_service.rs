@@ -1449,6 +1449,22 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             .as_ref()
             .and_then(|l| l.resources.as_ref())
             .map(linux_container_resources_to_oci);
+        // `security_context.masked_paths`/`.readonly_paths` (0391),
+        // resolved the same way `readonly_rootfs` just above is;
+        // empty (the common case, and the only reachable case for a
+        // `privileged: true` request, already rejected earlier by
+        // `validate_privileged`) when no security context was given.
+        let empty_paths: Vec<String> = Vec::new();
+        let masked_paths = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref())
+            .map_or(&empty_paths, |sc| &sc.masked_paths);
+        let readonly_paths = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref())
+            .map_or(&empty_paths, |sc| &sc.readonly_paths);
         // `ContainerConfig.mounts` (0304): validated and translated to
         // plain bind mounts *before* `bundle::prepare` ever extracts a
         // single layer -- a config-shaped client error here should
@@ -1474,6 +1490,8 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
                 mounts: &mounts,
                 readonly_rootfs,
                 resources,
+                masked_paths,
+                readonly_paths,
             },
         )
         .map_err(|e| match e {

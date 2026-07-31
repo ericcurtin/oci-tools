@@ -2621,6 +2621,82 @@ async fn create_container_readonly_rootfs_sets_root_readonly_in_the_real_spec() 
     );
 }
 
+/// `security_context.masked_paths` (`docs/design/0391`): a real,
+/// explicit extra masked path must genuinely be masked (bind-mounted
+/// over with `/dev/null`) inside a real started container -- proven
+/// end to end, unlike `readonly_rootfs`'s own spec-only check, since
+/// masking a real, already-existing file is a plain, fresh bind mount
+/// entirely within this project's own unprivileged user namespace's
+/// authority (no `CAP_SYS_ADMIN`-in-the-owning-namespace remount
+/// concern the read-only cases are subject to). `/etc/hosts` (0296)
+/// is a real file this project's own `CreateContainer` already writes
+/// into the extracted rootfs before the container ever starts, so
+/// it's masked by the time the container's own mount namespace is set
+/// up.
+#[tokio::test]
+async fn create_container_masked_paths_genuinely_masks_a_real_file_inside_the_running_container() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let mut config = container_config("masked-paths-test", 0);
+    config.command = vec!["/bin/sleep".to_string(), "300".to_string()];
+    config.linux = Some(oci_cri_types::LinuxContainerConfig {
+        security_context: Some(oci_cri_types::LinuxContainerSecurityContext {
+            masked_paths: vec!["/etc/hosts".to_string()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+
+    let response = client
+        .exec_sync(oci_cri_types::ExecSyncRequest {
+            container_id: container_id.clone(),
+            cmd: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "cat /etc/hosts | wc -c".to_string(),
+            ],
+            timeout: 0,
+        })
+        .await
+        .expect("ExecSync failed")
+        .into_inner();
+    assert_eq!(response.exit_code, 0, "{response:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&response.stdout).trim(),
+        "0",
+        "a masked /etc/hosts should read back as a real, empty /dev/null"
+    );
+
+    client
+        .stop_container(oci_cri_types::StopContainerRequest {
+            container_id,
+            timeout: 0,
+        })
+        .await
+        .unwrap();
+}
+
 /// A non-root `run_as_user`/`run_as_group`, `run_as_username` at all,
 /// and `run_as_group` given without `run_as_user`/`run_as_username`
 /// are each a real, clear error — see `validate_run_as_user`'s own
