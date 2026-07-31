@@ -34,13 +34,26 @@
 //! skip" reasoning this project's own `ocibox rm`/`ephemeral` already
 //! established for an identical reason).
 //!
-//! Real `cri-o`'s own `RemoveImage` additionally refuses to remove an
-//! image any container still references (`volumeInUse`) — not ported
-//! here: this project's own `ocicri` can't create any container via
-//! CRI at all yet (every `RuntimeService` pod-sandbox/container RPC is
-//! still a real, honest `Status::unimplemented`), so there is
-//! currently no possible "in use by a real CRI container" case to
-//! even check against.
+//! `RemoveImage` also now refuses to remove an image any real,
+//! persisted CRI container still references (real cri-o's own
+//! `volumeInUse`, `~/git/cri-o/server/image_remove.go`) — this was
+//! previously, incorrectly documented here as "not possible to check
+//! yet" (a stale claim: `RuntimeService`'s container RPCs have been
+//! real since 0236-0238, well before this doc comment was last
+//! touched). `ContainerRecord::image_ref` already stores the exact
+//! manifest digest a container was created from (0237), so the check
+//! is a direct string comparison, no re-resolution needed (unlike
+//! `ociman rmi`'s own equivalent check, whose container annotation
+//! only stores the raw image *name*). Matches real `container-libs/
+//! storage`'s own `DeleteImage` (`~/git/container-libs/storage/
+//! store.go`): *any* container state counts, not just running ones —
+//! a merely `Created` or already-`Exited` record still blocks removal,
+//! exactly like a real podman/cri-o install. Unlike `ociman rmi
+//! --force`'s own cascading remove-the-containers-too option, this is
+//! an unconditional refusal: the real proto's own `RemoveImageRequest`
+//! has no force-equivalent field at all (checked directly,
+//! `oci-cri-types/proto/api.proto`), so there is nothing to opt into
+//! here.
 //!
 //! `PullImage`'s own real, unconditional pull runs on a
 //! `tokio::task::spawn_blocking` thread, not directly in its own
@@ -55,6 +68,7 @@ use std::collections::BTreeSet;
 
 use tonic::{Request, Response, Status};
 
+use crate::container;
 use crate::cri;
 
 /// The real `ImageService` state — like [`crate::runtime_service::
@@ -73,6 +87,15 @@ fn open_store() -> Result<oci_store::Store, Status> {
 
 fn store_error(context: &str, e: oci_store::StoreError) -> Status {
     Status::internal(format!("{context}: {e}"))
+}
+
+/// The container record directory, same resolution rules as
+/// `runtime_service::container_store_root` (an independent, one-line
+/// duplicate rather than a cross-module reuse — the two modules
+/// already keep their own separate `open_store`-shaped helpers this
+/// same way).
+fn container_store_root() -> std::path::PathBuf {
+    container::container_root(&oci_cli_common::storage::default_root())
 }
 
 /// `(uid, username)` from an image's own declared `ContainerConfig`
@@ -456,6 +479,31 @@ impl cri::image_service_server::ImageService for ImageServiceImpl {
         // this matches (removing by any one tag/ID removes every tag,
         // a genuinely different rule than `ociman rmi`'s own).
         let digest = resolved.record().manifest_digest.to_string();
+
+        // Real cri-o's own `volumeInUse` check (see this module's own
+        // doc comment): any real, persisted container record still
+        // pointing at this digest -- in *any* state, not just running
+        // -- refuses the whole removal outright, matching real
+        // `container-libs/storage`'s own identical `DeleteImage` rule.
+        // `container::load_all` already tolerates a missing
+        // container-store directory itself (no container has ever
+        // been created at all), returning an empty list rather than
+        // an error -- the same convention `list_images` above already
+        // relies on for a missing images dir.
+        let dependents: Vec<String> = container::load_all(&container_store_root())
+            .map_err(|e| Status::internal(format!("listing containers: {e}")))?
+            .into_iter()
+            .filter(|record| record.image_ref == digest)
+            .map(|record| record.id)
+            .collect();
+        if !dependents.is_empty() {
+            return Err(Status::unknown(format!(
+                "image {digest} is in use by {} container(s) ({})",
+                dependents.len(),
+                dependents.join(", ")
+            )));
+        }
+
         for record in store
             .list_images()
             .map_err(|e| store_error("listing images", e))?

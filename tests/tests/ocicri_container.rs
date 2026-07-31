@@ -12,13 +12,14 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::time::Duration;
 
+use oci_cri_types::image_service_client::ImageServiceClient;
 use oci_cri_types::runtime_service_client::RuntimeServiceClient;
 use oci_cri_types::{
     ContainerConfig as CriContainerConfig, ContainerFilter, ContainerMetadata, ContainerState,
     ContainerStateValue, ContainerStatusRequest, CreateContainerRequest, DnsConfig, IdMapping,
     ImageSpec, ListContainersRequest, Mount, MountPropagation, PodSandboxConfig,
-    PodSandboxMetadata, RemoveContainerRequest, RemovePodSandboxRequest, RunPodSandboxRequest,
-    StopPodSandboxRequest,
+    PodSandboxMetadata, RemoveContainerRequest, RemoveImageRequest, RemovePodSandboxRequest,
+    RunPodSandboxRequest, StopPodSandboxRequest,
 };
 use oci_spec_types::image::ContainerConfig;
 use oci_store::Store;
@@ -74,6 +75,27 @@ async fn connect(
         .await
         .expect("failed to connect to ocicri's own real unix socket");
     RuntimeServiceClient::new(channel)
+}
+
+/// Same real Unix socket [`connect`] uses, a second, independent
+/// client stub for `ImageService` -- both services are served by the
+/// exact same `ocicri` process/listener, matching real cri-o's own
+/// single-socket, multi-service shape.
+async fn connect_image_service(
+    socket_path: std::path::PathBuf,
+) -> ImageServiceClient<tonic::transport::Channel> {
+    let channel = tonic::transport::Endpoint::try_from("http://[::]:50051")
+        .unwrap()
+        .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
+            let socket_path = socket_path.clone();
+            async move {
+                let stream = tokio::net::UnixStream::connect(socket_path).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        }))
+        .await
+        .expect("failed to connect to ocicri's own real unix socket");
+    ImageServiceClient::new(channel)
 }
 
 fn pod_config(name: &str, uid: &str) -> PodSandboxConfig {
@@ -2761,4 +2783,101 @@ async fn create_container_bind_mount_follows_a_symlinked_host_path() {
         String::from_utf8_lossy(&read_back.stdout),
         "the real symlink target content"
     );
+}
+
+/// `ImageService::RemoveImage` refuses to remove an image a real,
+/// persisted CRI container record still references -- matching real
+/// cri-o's own `volumeInUse` check (`~/git/cri-o/server/
+/// image_remove.go`) and real `container-libs/storage`'s own
+/// identical `DeleteImage` rule: any container state counts, not just
+/// running ones (this test uses a merely `Created`, never-started
+/// container, the narrowest possible case). Removing the container
+/// first, then the image, succeeds -- a regression guard against the
+/// new check being over-broad.
+#[tokio::test]
+async fn remove_image_refuses_while_a_container_still_references_it() {
+    let Some((_storage, socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id,
+            config: Some(container_config("image-in-use", 0)),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+
+    let socket_path = socket.path().join("ocicri.sock");
+    let mut images = connect_image_service(socket_path).await;
+
+    let refused = images
+        .remove_image(RemoveImageRequest {
+            image: Some(ImageSpec {
+                image: IMAGE.to_string(),
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect_err("RemoveImage must refuse while a container still references this image");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::Unknown,
+        "matching real cri-o's own bare, unwrapped Go error for this exact case: {refused:?}"
+    );
+    assert!(
+        refused.message().contains(&container_id),
+        "the error should name the real, dependent container id: {refused:?}"
+    );
+
+    // Still fully present afterward -- the refused removal must not
+    // have partially deleted anything.
+    let still_present = images
+        .image_status(oci_cri_types::ImageStatusRequest {
+            image: Some(ImageSpec {
+                image: IMAGE.to_string(),
+                ..Default::default()
+            }),
+            verbose: false,
+        })
+        .await
+        .expect("ImageStatus failed")
+        .into_inner();
+    assert!(still_present.image.is_some(), "{still_present:?}");
+
+    // Remove the container, then the same removal succeeds.
+    client
+        .remove_container(RemoveContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .expect("RemoveContainer failed");
+
+    images
+        .remove_image(RemoveImageRequest {
+            image: Some(ImageSpec {
+                image: IMAGE.to_string(),
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("RemoveImage should succeed once no container references the image anymore");
+
+    let gone = images
+        .image_status(oci_cri_types::ImageStatusRequest {
+            image: Some(ImageSpec {
+                image: IMAGE.to_string(),
+                ..Default::default()
+            }),
+            verbose: false,
+        })
+        .await
+        .expect("ImageStatus failed")
+        .into_inner();
+    assert!(gone.image.is_none(), "{gone:?}");
 }
