@@ -3068,6 +3068,64 @@ async fn create_container_rejects_privileged_clearly_but_allows_the_default() {
     assert!(allowed.is_ok(), "{allowed:?}");
 }
 
+/// `security_context.supplemental_groups` (`docs/design/0399`): a
+/// real, explicit non-zero entry must be a clear, honest
+/// `Status::unimplemented` naming the offending value -- previously
+/// silently ignored entirely (not read anywhere at all), so a pod's
+/// own explicit `securityContext.supplementalGroups: [1000]` request
+/// used to be dropped with no error telling it so, the same shape of
+/// bug `0365` already fixed for `run_as_user`/`run_as_group`. An
+/// empty list, or one containing only `0` (already this project's own
+/// existing default), must still succeed exactly like a request with
+/// no security context at all.
+#[tokio::test]
+async fn create_container_rejects_a_non_zero_supplemental_group_but_allows_the_default() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let mut rejected_config = container_config("supplemental-group-test", 0);
+    rejected_config.linux = Some(oci_cri_types::LinuxContainerConfig {
+        security_context: Some(oci_cri_types::LinuxContainerSecurityContext {
+            supplemental_groups: vec![1000],
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let rejected = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(rejected_config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .expect_err("a non-zero supplemental group should be rejected");
+    assert_eq!(rejected.code(), tonic::Code::Unimplemented);
+    assert!(
+        rejected.message().contains("supplemental_groups 1000"),
+        "{rejected:?}"
+    );
+
+    let mut allowed_config = container_config("supplemental-group-zero-test", 0);
+    allowed_config.linux = Some(oci_cri_types::LinuxContainerConfig {
+        security_context: Some(oci_cri_types::LinuxContainerSecurityContext {
+            supplemental_groups: vec![0],
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let allowed = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(allowed_config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await;
+    assert!(allowed.is_ok(), "{allowed:?}");
+}
+
 /// End-to-end proof the bind mount is genuinely live at runtime, not
 /// just declared in `config.json`: a real file written on the host
 /// side of the mount is readable from *inside* the running container

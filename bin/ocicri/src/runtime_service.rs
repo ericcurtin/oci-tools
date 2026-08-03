@@ -697,6 +697,52 @@ fn validate_privileged(
     Ok(())
 }
 
+/// `ContainerConfig.linux.security_context.supplemental_groups`
+/// (0399) -- flagged as a real, still-open gap in every one of this
+/// function's own siblings' doc comments since `0388` ("the same
+/// rootless-mapping rejection `run_as_group` already has"), closed
+/// here the same way: previously read *nowhere at all*, so a pod's
+/// own explicit `securityContext.supplementalGroups: [1000]` was
+/// silently dropped, and the container quietly ran with no
+/// supplemental groups whatsoever -- a real, previously-undetected
+/// divergence from the pod spec's own explicit intent, exactly the
+/// same shape `validate_run_as_user` (`0365`) already fixed for
+/// `run_as_user`/`run_as_group`.
+///
+/// Real cri-o's own `setupContainerUser` (checked directly,
+/// `~/git/cri-o/server/container_create.go`) calls
+/// `specgen.AddProcessAdditionalGid` for every value in
+/// `sc.GetSupplementalGroups()` unconditionally, with no rootless-
+/// mapping concern of its own (real cri-o only ever runs rootful).
+/// This project's own containers are rootless-only and only ever map
+/// container gid 0 to this process's own real egid (`into_rootless`),
+/// the identical constraint `run_as_group` already enforces -- so a
+/// non-zero supplemental group is just as unmappable here, and gets
+/// the identical clear, honest `Status::unimplemented` rather than a
+/// silent no-op. An empty list, or one containing only `0` (a real,
+/// legitimate, if unusual, explicit request), already matches this
+/// project's own existing default (no supplemental groups beyond the
+/// one implicit primary gid) and needs no new spec field at all --
+/// only this validation was ever missing.
+fn validate_supplemental_groups(
+    security_context: Option<&cri::LinuxContainerSecurityContext>,
+) -> Result<(), Status> {
+    let Some(sc) = security_context else {
+        return Ok(());
+    };
+    for gid in &sc.supplemental_groups {
+        if *gid != 0 {
+            return Err(Status::unimplemented(format!(
+                "supplemental_groups {gid} resolves to a non-root container gid, which this \
+                 rootless runtime cannot map yet (only container gid 0 is mapped, to this \
+                 process's own egid; a subordinate gid range via /etc/subgid would be needed \
+                 for anything else)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `ContainerConfig.mounts` (0304, closing part of `0237`'s own
 /// deferred "CRI mounts" gap) -- a real, deliberately narrow first
 /// slice: an ordinary bind mount (`container_path`/`host_path`/
@@ -1431,6 +1477,15 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         // `security_context.privileged` (0389) -- checked right next
         // to `validate_run_as_user`, for the exact same reason.
         validate_privileged(
+            config
+                .linux
+                .as_ref()
+                .and_then(|l| l.security_context.as_ref()),
+        )?;
+        // `security_context.supplemental_groups` (0399) -- checked
+        // right next to `validate_run_as_user`/`validate_privileged`,
+        // for the exact same reason.
+        validate_supplemental_groups(
             config
                 .linux
                 .as_ref()
@@ -2878,6 +2933,53 @@ mod tests {
                 .message()
                 .contains("privileged containers are not yet supported"),
             "{status:?}"
+        );
+    }
+
+    /// `validate_supplemental_groups` (0399): no security context at
+    /// all, an empty list, or a list containing only `0` (all
+    /// equally, already the real, existing default) must succeed; any
+    /// non-zero entry -- alone or mixed in with a zero -- must be a
+    /// clear, honest `Status::unimplemented` naming the offending
+    /// value, the same shape `validate_run_as_user`'s own
+    /// `run_as_group` check already established.
+    #[test]
+    fn validate_supplemental_groups_rejects_a_non_zero_entry_but_allows_everything_else() {
+        assert!(validate_supplemental_groups(None).is_ok());
+        assert!(
+            validate_supplemental_groups(Some(&cri::LinuxContainerSecurityContext {
+                supplemental_groups: vec![],
+                ..Default::default()
+            }))
+            .is_ok()
+        );
+        assert!(
+            validate_supplemental_groups(Some(&cri::LinuxContainerSecurityContext {
+                supplemental_groups: vec![0],
+                ..Default::default()
+            }))
+            .is_ok()
+        );
+        let status = validate_supplemental_groups(Some(&cri::LinuxContainerSecurityContext {
+            supplemental_groups: vec![1000],
+            ..Default::default()
+        }))
+        .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+        assert!(
+            status.message().contains("supplemental_groups 1000"),
+            "{status:?}"
+        );
+
+        let mixed = validate_supplemental_groups(Some(&cri::LinuxContainerSecurityContext {
+            supplemental_groups: vec![0, 1000],
+            ..Default::default()
+        }))
+        .unwrap_err();
+        assert_eq!(mixed.code(), tonic::Code::Unimplemented);
+        assert!(
+            mixed.message().contains("supplemental_groups 1000"),
+            "{mixed:?}"
         );
     }
 }
