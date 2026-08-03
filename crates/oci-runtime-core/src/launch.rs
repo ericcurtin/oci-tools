@@ -281,6 +281,7 @@ pub unsafe fn run_reporting_pid(
         CgroupSetup::Systemd { .. } => {
             child_setup.cgroup_dir = None;
             child_setup.cgroup_writes = Vec::new();
+            child_setup.cgroup_unified = BTreeMap::new();
             let (ready_read, ready_write) =
                 rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
                     .map_err(io::Error::from)?;
@@ -339,17 +340,41 @@ pub unsafe fn run_reporting_pid(
         resources,
     } = &cgroup_setup
     {
-        if let Err(e) = systemd_cgroup::create_scope(
+        match systemd_cgroup::create_scope(
             direct_child_pid as u32,
             scope_name,
             description,
             resources.as_deref(),
         ) {
-            tracing::warn!(
-                scope = %scope_name,
-                error = %e,
-                "systemd cgroup driver unavailable (tolerated, container has no cgroup)"
-            );
+            Ok(dir) => {
+                // `resources.unified` (0398): the real systemd D-Bus
+                // properties `create_scope` just set cover every
+                // *other* `LinuxResources` field already, but have no
+                // equivalent for an arbitrary raw cgroup v2 file --
+                // matching real crun's own identical behavior exactly
+                // (`~/git/crun/src/libcrun/cgroup.c`'s own
+                // `libcrun_update_cgroup_resources`: the cgroup-
+                // manager-specific step runs first, then the raw
+                // cgroupfs writes — including `unified` — always
+                // additionally happen too, unconditionally, regardless
+                // of which manager actually created the cgroup). The
+                // common case (no `unified` entries at all) does
+                // nothing extra here at all — no new failure mode for
+                // every caller not using this real, opt-in feature.
+                let unified = resources.as_deref().map(|r| &r.unified);
+                if let Some(unified) = unified
+                    && !unified.is_empty()
+                {
+                    cgroups::apply_unified(&dir, unified)?;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    scope = %scope_name,
+                    error = %e,
+                    "systemd cgroup driver unavailable (tolerated, container has no cgroup)"
+                );
+            }
         }
         if let Some(write_fd) = &cgroup_ready_write {
             // Best-effort: if this write somehow fails, the child's own
@@ -795,6 +820,10 @@ fn build_child_setup(bundle: &Bundle, rootfs: &Path, id: &str) -> io::Result<Chi
         .and_then(|l| l.resources.as_ref())
         .map(cgroups::plan_resources)
         .unwrap_or_default();
+    let cgroup_unified = linux
+        .and_then(|l| l.resources.as_ref())
+        .map(|r| r.unified.clone())
+        .unwrap_or_default();
 
     let plan = rootfs::plan_rootfs_setup(bundle, rootfs);
 
@@ -826,6 +855,7 @@ fn build_child_setup(bundle: &Bundle, rootfs: &Path, id: &str) -> io::Result<Chi
         gid_mappings,
         cgroup_dir,
         cgroup_writes,
+        cgroup_unified,
         plan,
         user: process_spec.user.clone(),
         capabilities: process_spec.capabilities.clone(),
@@ -920,6 +950,15 @@ struct ChildSetup {
     gid_mappings: Vec<LinuxIdMapping>,
     cgroup_dir: Option<PathBuf>,
     cgroup_writes: Vec<CgroupWrite>,
+    /// `resources.unified` (0398) — see [`cgroups::apply_unified`]'s
+    /// own doc comment. Zeroed out (like [`Self::cgroup_writes`]) for
+    /// the systemd cgroup driver, which instead applies this same
+    /// field from the *parent* process, right after the real systemd
+    /// scope is created (`run_reporting_pid`'s own call site) —
+    /// matching real crun's own identical "the cgroup-manager-specific
+    /// step runs first, then these same raw writes always additionally
+    /// happen too" behavior.
+    cgroup_unified: BTreeMap<String, String>,
     plan: Vec<RootfsAction>,
     user: User,
     capabilities: Option<LinuxCapabilities>,
@@ -1122,6 +1161,16 @@ impl ChildSetup {
                 fail(
                     SETUP_FAILURE_EXIT_CODE,
                     &format!("applying cgroup resources: {e}"),
+                );
+            }
+            // `resources.unified` (0398) -- strictly after the
+            // structured writes just above, matching real crun's own
+            // identical ordering/precedence exactly (see
+            // `cgroups::apply_unified`'s own doc comment).
+            if let Err(e) = cgroups::apply_unified(dir, &self.cgroup_unified) {
+                fail(
+                    SETUP_FAILURE_EXIT_CODE,
+                    &format!("applying unified cgroup resources: {e}"),
                 );
             }
             if let Err(e) = cgroups::enter(dir) {

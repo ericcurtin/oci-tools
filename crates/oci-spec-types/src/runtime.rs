@@ -392,9 +392,9 @@ pub struct LinuxIdMapping {
 ///
 /// **Scope shipped so far**: `devices` (the only field `ocirun spec`'s
 /// default output sets), `memory`, `cpu`, `pids`, `blockIO` (`weight`
-/// only, `0366`). Per-device block-IO weight/throttling, huge-page,
-/// network, and RDMA limits are not modeled yet — no oci-tools
-/// feature exercises them.
+/// only, `0366`), `unified` (`0398`). Per-device block-IO weight/
+/// throttling, huge-page, network, and RDMA limits are not modeled
+/// yet — no oci-tools feature exercises them.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LinuxResources {
     /// Device cgroup allow/deny rules, evaluated in order (a later rule
@@ -416,6 +416,20 @@ pub struct LinuxResources {
     /// `rename_all` rule.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "blockIO")]
     pub block_io: Option<LinuxBlockIo>,
+    /// Raw cgroup v2 interface files to write verbatim, keyed by their
+    /// plain filename (e.g. `"memory.max"`) — matching the real
+    /// runtime-spec's own `Unified map[string]string` field exactly
+    /// (`~/git/container-libs/vendor/github.com/opencontainers/
+    /// runtime-spec/specs-go/config.go`). Applied by `oci_runtime_
+    /// core::cgroups::apply_unified` with **higher precedence than
+    /// every other field in this struct** — a value here for a file
+    /// `memory`/`cpu`/`pids`/`block_io` above also happens to write
+    /// overrides it, matching real crun's own checked-directly
+    /// behavior exactly (`~/git/crun/src/libcrun/cgroup-resources.c`'s
+    /// own `write_unified_resources`, applied strictly last: "They
+    /// have higher precedence and override any previous setting").
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unified: BTreeMap<String, String>,
 }
 
 /// `blockIO` cgroup limits — see [`LinuxResources`]'s own doc comment
@@ -709,6 +723,7 @@ impl Spec {
                     cpu: None,
                     pids: None,
                     block_io: None,
+                    unified: BTreeMap::new(),
                 }),
                 cgroups_path: None,
                 seccomp: None,

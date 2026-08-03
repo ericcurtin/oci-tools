@@ -572,6 +572,13 @@ fn linux_container_resources_to_oci(
     oci_spec_types::runtime::LinuxResources {
         memory: Some(memory),
         cpu: Some(cpu),
+        // `LinuxContainerResources.unified` (0398) -- a real cgroup v2
+        // raw-file passthrough field the CRI proto itself already
+        // documents ("e.g. \"memory.max\": ...") -- applied with
+        // higher precedence than `memory`/`cpu` above by the shared
+        // `oci_runtime_core::cgroups::apply_unified`, matching real
+        // crun's own identical precedence.
+        unified: linux.unified.clone().into_iter().collect(),
         ..Default::default()
     }
 }
@@ -2032,6 +2039,15 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         let writes = oci_runtime_core::cgroups::plan_resources(&resources);
         oci_runtime_core::cgroups::apply(&cgroup_dir, &writes)
             .map_err(|e| Status::internal(format!("updating resources for container {id}: {e}")))?;
+        // `resources.unified` (0398), strictly after the structured
+        // writes just above -- see `oci_runtime_core::cgroups::
+        // apply_unified`'s own doc comment for exactly why (real
+        // crun's own identical precedence).
+        oci_runtime_core::cgroups::apply_unified(&cgroup_dir, &resources.unified).map_err(|e| {
+            Status::internal(format!(
+                "updating unified resources for container {id}: {e}"
+            ))
+        })?;
 
         Ok(Response::new(cri::UpdateContainerResourcesResponse {}))
     }

@@ -343,6 +343,40 @@ pub fn apply(cgroup_dir: &Path, writes: &[CgroupWrite]) -> io::Result<()> {
     Ok(())
 }
 
+/// Write `resources.unified`'s own raw cgroup v2 interface files
+/// verbatim into `cgroup_dir` — matching real crun's own
+/// `write_unified_resources` exactly (`~/git/crun/src/libcrun/
+/// cgroup-resources.c`), including its own real safety check: a key
+/// containing a `/` is rejected outright, a real, immediate error
+/// rather than silently escaping the intended cgroup directory
+/// (crun's own identical rejection: `"key `%s` must be a file name
+/// without any slash"`).
+///
+/// Called strictly *after* [`apply`] at every one of this crate's own
+/// call sites (`oci_runtime_core::launch`'s create-time application,
+/// and `ocirun update`/`ociman update`/`ocicri UpdateContainerResources`'s
+/// own live-update paths) — matching real crun's own identical
+/// ordering and its own documented reasoning: "They have higher
+/// precedence and override any previous setting," so a caller naming
+/// e.g. `"memory.max"` here genuinely overrides whatever `[plan_
+/// resources`]'s own structured `memory`/`cpu`/`pids`/`block_io`
+/// translation already wrote for that same real file.
+pub fn apply_unified(
+    cgroup_dir: &Path,
+    unified: &std::collections::BTreeMap<String, String>,
+) -> io::Result<()> {
+    for (key, value) in unified {
+        if key.contains('/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("key {key:?} must be a file name without any slash"),
+            ));
+        }
+        std::fs::write(cgroup_dir.join(key), value)?;
+    }
+    Ok(())
+}
+
 /// Converts a cgroup v1 `blkio.weight`-range value (documented
 /// 10-1000) linearly to cgroup v2's `io.weight` range (1-10000) —
 /// matches real runc's own `ConvertBlkIOToIOWeightValue`/crun's own
@@ -877,6 +911,70 @@ mod tests {
     #[test]
     fn empty_resources_plan_no_writes() {
         assert_eq!(plan_resources(&LinuxResources::default()), vec![]);
+    }
+
+    #[test]
+    fn apply_unified_writes_every_entry_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let unified = std::collections::BTreeMap::from([
+            ("memory.max".to_string(), "104857600".to_string()),
+            ("pids.max".to_string(), "50".to_string()),
+        ]);
+        apply_unified(dir.path(), &unified).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("memory.max")).unwrap(),
+            "104857600"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("pids.max")).unwrap(),
+            "50"
+        );
+    }
+
+    #[test]
+    fn apply_unified_of_an_empty_map_is_a_real_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(apply_unified(dir.path(), &std::collections::BTreeMap::new()).is_ok());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn apply_unified_rejects_a_key_containing_a_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let unified =
+            std::collections::BTreeMap::from([("../escape".to_string(), "x".to_string())]);
+        let err = apply_unified(dir.path(), &unified).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("slash"), "{err}");
+    }
+
+    /// A real, checked-directly precedence property: writing `memory.
+    /// max` via `unified` after the structured `memory` field's own
+    /// value must genuinely win, matching real crun's own documented
+    /// "higher precedence, overrides any previous setting" exactly.
+    #[test]
+    fn apply_unified_after_apply_overrides_the_structured_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = LinuxResources {
+            memory: Some(LinuxMemory {
+                limit: Some(104_857_600),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply(dir.path(), &plan_resources(&resources)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("memory.max")).unwrap(),
+            "104857600"
+        );
+        let unified =
+            std::collections::BTreeMap::from([("memory.max".to_string(), "max".to_string())]);
+        apply_unified(dir.path(), &unified).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("memory.max")).unwrap(),
+            "max",
+            "unified must override the structured field's own already-written value"
+        );
     }
 
     #[test]

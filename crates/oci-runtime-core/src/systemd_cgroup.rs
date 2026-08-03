@@ -78,6 +78,18 @@ const SYSTEMD_BUS_NAME: &str = "org.freedesktop.systemd1";
 const SYSTEMD_OBJECT_PATH: &str = "/org/freedesktop/systemd1";
 const SYSTEMD_MANAGER_INTERFACE: &str = "org.freedesktop.systemd1.Manager";
 
+/// Where the real cgroup v2 unified hierarchy is mounted — the same
+/// path `crate::launch`'s own `CGROUP_ROOT`/`crate::cgroups`' callers
+/// already hardcode throughout this crate (this project targets
+/// cgroup v2 exclusively; there is no other mount point to consider).
+/// [`create_scope`]'s own real filesystem path (used directly by
+/// [`crate::cgroups::apply_unified`], not just returned for display)
+/// is only genuinely correct once joined with this — `/proc/<pid>/
+/// cgroup`'s own `"0::"` line is relative to this mount, not an
+/// absolute filesystem path itself, even though it happens to start
+/// with a leading `/` that makes it *look* like one.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
 /// How long [`create_scope`] gives its own background thread (see its
 /// own doc comment for why it's a thread, not just a deadline check)
 /// to connect, create the transient unit, and see its start job
@@ -90,10 +102,11 @@ const JOB_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// `.scope`) with `pid` as its sole initial member, waiting for
 /// systemd to confirm the migration has actually completed (see this
 /// module's own doc comment for why that wait is required) before
-/// returning the real cgroup path `pid` ended up in (read back from
+/// returning the real, absolute filesystem cgroup directory `pid`
+/// ended up in — `[CGROUP_ROOT]` joined onto the path read back from
 /// `/proc/<pid>/cgroup`, rather than reconstructed from the scope name
 /// and an assumed slice convention, since the actual path can vary
-/// depending on the caller's own delegated hierarchy).
+/// depending on the caller's own delegated hierarchy.
 ///
 /// Connects to the calling user's own D-Bus **session** bus (matching
 /// `systemd --user`, the only mode this rootless-only project runs
@@ -244,8 +257,14 @@ fn create_scope_dbus_roundtrip(
 
     wait_for_job(&mut signals, &job_path, scope_name)?;
 
-    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-        .and_then(|contents| parse_own_cgroup_path(&contents))
+    let relative = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .and_then(|contents| parse_own_cgroup_path(&contents))?;
+    // `relative` is cgroupfs-root-relative (see `parse_own_cgroup_path`'s
+    // own doc comment/tests) -- joined with the real mount point here,
+    // once, so every caller of `create_scope` gets a real, directly
+    // usable filesystem path back rather than having to remember to
+    // join it themselves.
+    Ok(PathBuf::from(CGROUP_ROOT).join(relative.strip_prefix("/").unwrap_or(&relative)))
 }
 
 /// How long [`reset_failed_unit`] waits for the D-Bus round trip
@@ -515,7 +534,13 @@ fn wait_for_job(
 /// Extract the cgroup v2 path from a `/proc/<pid>/cgroup` file's
 /// contents (`0::<path>` on a unified-hierarchy-only system, which is
 /// this project's own documented, exclusive target — see the
-/// top-level README's filesystem-policy design pillar).
+/// top-level README's filesystem-policy design pillar). The returned
+/// path is relative to wherever cgroup v2 happens to be mounted (this
+/// kernel interface has no concept of a mount point at all) — despite
+/// starting with a leading `/` that makes it *look* like an absolute
+/// filesystem path, it is not one; [`create_scope_dbus_roundtrip`]'s
+/// own caller of this function joins it with the real mount point
+/// ([`CGROUP_ROOT`]) before returning.
 fn parse_own_cgroup_path(contents: &str) -> io::Result<PathBuf> {
     contents
         .lines()

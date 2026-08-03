@@ -587,6 +587,26 @@ struct RunArgs {
     /// anywhere in this project at all before now.
     #[arg(long = "sysctl", value_name = "KEY=VALUE")]
     sysctl: Vec<String>,
+    /// Set a raw cgroup v2 interface file for the container, matching
+    /// real `podman run --cgroup-conf` exactly (checked directly,
+    /// `~/git/podman/cmd/podman/common/create.go`'s own
+    /// `cgroupConfFlagName`, a repeatable `KEY=VALUE` string slice
+    /// feeding `ResourceLimits.Unified`). Applied with **higher
+    /// precedence than every other resource flag** (`--memory`/
+    /// `--cpus`/...) — a value here for a file one of those also
+    /// happens to write overrides it, matching real crun's own
+    /// checked-directly behavior exactly (`~/git/crun/src/libcrun/
+    /// cgroup-resources.c`'s own `write_unified_resources`, applied
+    /// strictly last: "They have higher precedence and override any
+    /// previous setting"). Only the `KEY=VALUE` syntax is validated
+    /// here (a key containing a `/` is a real, immediate error at
+    /// container-start time instead, matching real crun's own
+    /// identical safety check — `oci_runtime_core::cgroups::
+    /// apply_unified`). A real, previously-silent gap this closes:
+    /// `resources.unified` and this flag never existed anywhere in
+    /// this project at all before now.
+    #[arg(long = "cgroup-conf", value_name = "KEY=VALUE")]
+    cgroup_conf: Vec<String>,
     /// Grant the container every capability this build recognizes
     /// and disable seccomp confinement entirely, matching real
     /// `docker run --privileged`/`podman run --privileged`'s own
@@ -6711,6 +6731,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
     )?;
     let umask = args.umask.as_deref().map(parse_umask).transpose()?;
     let sysctl = parse_sysctls(&args.sysctl)?;
+    let cgroup_conf = parse_cgroup_confs(&args.cgroup_conf)?;
     let (memory_limit_bytes, memory_swap_bytes) = parse_and_validate_memory_and_cpus(
         args.memory.as_deref(),
         args.memory_swap.as_deref(),
@@ -7001,6 +7022,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             umask,
             args.oom_score_adj,
             sysctl,
+            cgroup_conf,
         )?;
         // Prepended, not appended: `spec.mounts`' own already-present
         // entries (`/proc`, `/dev`, ...) are all subdirectories of the
@@ -12139,6 +12161,7 @@ fn synthesize_spec(
     umask: Option<u32>,
     oom_score_adj: Option<i32>,
     sysctl: std::collections::BTreeMap<String, String>,
+    cgroup_conf: std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -12314,7 +12337,18 @@ fn synthesize_spec(
         cpuset_cpus,
         cpuset_mems,
     );
-    if let Some(resources) = resources {
+    // `--cgroup-conf` (0398): needs a real `Some(LinuxResources)` to
+    // live on even when no other resource flag was given at all (the
+    // common case for every other flag `resources_from_cli` already
+    // covers) — this is the one resource-shaped flag that isn't
+    // conditional on `resources_from_cli`'s own "did the caller ask
+    // for anything at all" check, since an empty `cgroup_conf` map
+    // (the overwhelmingly common case) is itself indistinguishable
+    // from "not given", so this never changes behavior for a caller
+    // not using this real, opt-in feature.
+    if resources.is_some() || !cgroup_conf.is_empty() {
+        let mut resources = resources.unwrap_or_default();
+        resources.unified = cgroup_conf;
         linux.resources = Some(resources);
     }
 
@@ -12551,12 +12585,37 @@ fn parse_umask(s: &str) -> anyhow::Result<u32> {
 /// convention `--env`/`--label` already established elsewhere in this
 /// same command.
 fn parse_sysctls(entries: &[String]) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    parse_key_value_entries(entries, "--sysctl")
+}
+
+/// Parse `--cgroup-conf`'s own repeatable `KEY=VALUE` entries into a
+/// map — the exact same syntax-only parsing `parse_sysctls` already
+/// does (only `KEY=VALUE` is checked here; whether the given key is
+/// safe to write at all — no `/` in it — is checked much later, at
+/// real container-start time, by `oci_runtime_core::cgroups::
+/// apply_unified`, see `--cgroup-conf`'s own doc comment).
+fn parse_cgroup_confs(
+    entries: &[String],
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    parse_key_value_entries(entries, "--cgroup-conf")
+}
+
+/// Shared `KEY=VALUE` parsing both `parse_sysctls`/`parse_cgroup_confs`
+/// use — `flag_name` only affects the error message, so a mistake in
+/// one doesn't get misattributed to the other. A duplicate key
+/// silently keeps the *last* one given, the same "later entries win"
+/// convention `--env`/`--label` already established elsewhere in this
+/// same command.
+fn parse_key_value_entries(
+    entries: &[String],
+    flag_name: &str,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
     let mut map = std::collections::BTreeMap::new();
     for entry in entries {
         let (key, value) = entry.split_once('=').ok_or_else(|| {
-            anyhow::anyhow!("invalid --sysctl {entry:?}: must be in the form of KEY=VALUE")
+            anyhow::anyhow!("invalid {flag_name} {entry:?}: must be in the form of KEY=VALUE")
         })?;
-        anyhow::ensure!(!key.is_empty(), "invalid --sysctl {entry:?}: empty key");
+        anyhow::ensure!(!key.is_empty(), "invalid {flag_name} {entry:?}: empty key");
         map.insert(key.to_string(), value.to_string());
     }
     Ok(map)
@@ -13997,6 +14056,37 @@ mod tests {
         // this is still the correct general rule).
         let map = parse_sysctls(&["foo=a=b".to_string()]).unwrap();
         assert_eq!(map.get("foo").map(String::as_str), Some("a=b"));
+    }
+
+    #[test]
+    fn parse_cgroup_confs_parses_one_or_more_key_value_entries() {
+        let map = parse_cgroup_confs(&[
+            "memory.max=104857600".to_string(),
+            "pids.max=50".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("memory.max").map(String::as_str), Some("104857600"));
+        assert_eq!(map.get("pids.max").map(String::as_str), Some("50"));
+    }
+
+    #[test]
+    fn parse_cgroup_confs_of_an_empty_slice_is_an_empty_map() {
+        assert!(parse_cgroup_confs(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_cgroup_confs_rejects_an_entry_with_no_equals_sign() {
+        let err = parse_cgroup_confs(&["memory.max".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("--cgroup-conf"), "{err}");
+        assert!(err.to_string().contains("memory.max"), "{err}");
+    }
+
+    #[test]
+    fn parse_cgroup_confs_a_repeated_key_keeps_the_last_value() {
+        let map =
+            parse_cgroup_confs(&["memory.max=1".to_string(), "memory.max=2".to_string()]).unwrap();
+        assert_eq!(map.get("memory.max").map(String::as_str), Some("2"));
     }
 
     fn strings(names: &[&str]) -> Vec<String> {

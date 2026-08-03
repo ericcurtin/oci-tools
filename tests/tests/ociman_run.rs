@@ -483,6 +483,137 @@ fn run_sysctl_flag_rejects_a_net_key_since_there_is_no_real_network_namespace() 
     assert!(stderr.contains("network namespace"), "{stderr}");
 }
 
+/// `--cgroup-conf` writes a real, raw cgroup v2 interface file for the
+/// container, matching real `podman run --cgroup-conf` exactly — a
+/// real, previously-silent gap this closes: `resources.unified` and
+/// this flag never existed anywhere in this project before now.
+/// Verified against the real, live cgroup, not just the generated
+/// spec.
+#[test]
+fn run_cgroup_conf_flag_writes_a_real_cgroup_v2_file() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session (containers get no cgroup)");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cgroup-conf:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/cgroup-conf:latest",
+        &[
+            "-d",
+            "--cgroup-conf",
+            "memory.max=16777216",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    let containers =
+        oci_runtime_core::StateStore::open(storage_dir.path().join("containers")).unwrap();
+    let state = containers.load(&id).unwrap();
+    let pid = state.pid.expect("running container must have a pid");
+    let cgroup_dir =
+        oci_runtime_core::cgroups::cgroup_dir_for_running_pid(Path::new("/sys/fs/cgroup"), pid)
+            .expect("resolving real cgroup for a running container");
+    let memory_max = std::fs::read_to_string(cgroup_dir.join("memory.max")).unwrap();
+    assert_eq!(memory_max.trim(), "16777216");
+
+    Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["rm", "-f", &id])
+        .output()
+        .unwrap();
+}
+
+/// A real, checked-directly precedence property: `--cgroup-conf`
+/// genuinely overrides an overlapping `--memory` value, matching real
+/// crun's own documented "higher precedence, overrides any previous
+/// setting" exactly (`~/git/crun/src/libcrun/cgroup-resources.c`'s own
+/// `write_unified_resources`, applied strictly last).
+#[test]
+fn run_cgroup_conf_overrides_an_overlapping_memory_flag() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session (containers get no cgroup)");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cgroup-conf-precedence:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman_run(
+        storage_dir.path(),
+        "ociman-test/cgroup-conf-precedence:latest",
+        &[
+            "-d",
+            "--memory",
+            "999m",
+            "--cgroup-conf",
+            "memory.max=16777216",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    let containers =
+        oci_runtime_core::StateStore::open(storage_dir.path().join("containers")).unwrap();
+    let state = containers.load(&id).unwrap();
+    let pid = state.pid.expect("running container must have a pid");
+    let cgroup_dir =
+        oci_runtime_core::cgroups::cgroup_dir_for_running_pid(Path::new("/sys/fs/cgroup"), pid)
+            .expect("resolving real cgroup for a running container");
+    let memory_max = std::fs::read_to_string(cgroup_dir.join("memory.max")).unwrap();
+    assert_eq!(
+        memory_max.trim(),
+        "16777216",
+        "--cgroup-conf must win over the overlapping --memory value"
+    );
+
+    Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["rm", "-f", &id])
+        .output()
+        .unwrap();
+}
+
 /// `--privileged` grants every capability this build recognizes
 /// (`CapEff` becomes all 41 recognized bits set, `0x1ffffffffff` --
 /// confirmed by hand against a real running container first, the same

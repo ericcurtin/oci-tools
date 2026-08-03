@@ -1725,6 +1725,18 @@ fn cmd_update(
     let writes = oci_runtime_core::cgroups::plan_resources(&resources);
     oci_runtime_core::cgroups::apply(&cgroup_dir, &writes)
         .with_context(|| format!("applying updated resources to {}", cgroup_dir.display()))?;
+    // `resources.unified` (0398), strictly after the structured writes
+    // just above -- see `oci_runtime_core::cgroups::apply_unified`'s
+    // own doc comment for exactly why (real crun's own identical
+    // precedence).
+    oci_runtime_core::cgroups::apply_unified(&cgroup_dir, &resources.unified).with_context(
+        || {
+            format!(
+                "applying updated unified resources to {}",
+                cgroup_dir.display()
+            )
+        },
+    )?;
     Ok(())
 }
 
