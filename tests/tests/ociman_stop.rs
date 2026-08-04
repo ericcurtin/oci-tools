@@ -1294,3 +1294,101 @@ fn stop_with_nothing_given_at_all_is_a_clear_error() {
     let out_ignore = ociman(storage_dir.path(), &["stop", "--ignore"]);
     assert!(!out_ignore.status.success());
 }
+
+/// `stop --filter label=` only stops a container also matching (OR'd
+/// across multiple values, the same `ociman container prune --filter
+/// label=`/`ociman prune --filter label=` convention `Command::
+/// Stop::filter`'s own doc comment establishes for this command too),
+/// leaving a non-matching one completely untouched, and prints one
+/// line per matched id -- matching this command's own `--all` loop's
+/// identical output shape.
+#[test]
+fn stop_filter_label_only_stops_a_matching_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stop-filter-label:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let create_match = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--label",
+            "env=prod",
+            "ociman-test/stop-filter-label:latest",
+            "true",
+        ],
+    );
+    assert!(create_match.status.success(), "{create_match:?}");
+    let match_id = String::from_utf8_lossy(&create_match.stdout)
+        .trim()
+        .to_string();
+
+    let create_other = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--label",
+            "env=staging",
+            "ociman-test/stop-filter-label:latest",
+            "true",
+        ],
+    );
+    assert!(create_other.status.success(), "{create_other:?}");
+    let other_id = String::from_utf8_lossy(&create_other.stdout)
+        .trim()
+        .to_string();
+
+    let stop = ociman(storage_dir.path(), &["stop", "--filter", "label=env=prod"]);
+    assert!(
+        stop.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&stop.stdout).trim(),
+        match_id,
+        "{stop:?}"
+    );
+
+    // Neither container ever had a live process (both `create`, never
+    // `run -d`) -- both remain `created` either way, matching
+    // `stop_container`'s own already-established "never-started is a
+    // tolerated no-op" behavior; what this test actually proves is
+    // that only the matching container's own id was ever *selected*
+    // and printed at all.
+    let inspect_other: serde_json::Value = serde_json::from_slice(
+        &ociman(storage_dir.path(), &["inspect", &other_id, "--json"]).stdout,
+    )
+    .unwrap();
+    assert_eq!(inspect_other["status"], "created");
+}
+
+/// `--filter` cannot be combined with an explicit id, `--cidfile`, or
+/// `--all` -- a real, deliberate scope narrowing versus real `podman
+/// stop --filter` (which can genuinely narrow an explicit-names list
+/// further), documented on `Command::Stop::filter` itself.
+#[test]
+fn stop_filter_combined_with_all_or_an_explicit_id_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let with_all = ociman(
+        storage_dir.path(),
+        &["stop", "--filter", "label=env=prod", "--all"],
+    );
+    assert!(!with_all.status.success());
+
+    let with_id = ociman(
+        storage_dir.path(),
+        &["stop", "--filter", "label=env=prod", "some-id"],
+    );
+    assert!(!with_id.status.success());
+}

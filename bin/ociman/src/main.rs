@@ -2497,6 +2497,22 @@ enum Command {
         /// `--all` (nothing to resolve there in the first place).
         #[arg(short, long)]
         ignore: bool,
+        /// Stop every container matching every given filter instead
+        /// of an explicit `ID`/`--name` — a real, deliberately
+        /// narrower grammar than real `podman stop --filter`'s own
+        /// (only `label=<key>[=<value>]`, `label!=<key>[=<value>]`,
+        /// or `until=<duration-or-timestamp>`; see
+        /// [`LabelUntilFilters`]'s own doc comment for exactly why
+        /// this project's own model can't reach real podman's much
+        /// wider `ps`-grammar-reusing one yet). Mutually exclusive
+        /// with an explicit `ID`/`--name`, `--cidfile`, and `--all` —
+        /// real `podman stop --filter` can (checked directly,
+        /// `~/git/podman/pkg/domain/infra/abi/containers.go`'s own
+        /// `getContainers`) also be combined with explicit names to
+        /// narrow the filtered set further, a real, deliberately
+        /// deferred refinement this first slice doesn't attempt.
+        #[arg(long = "filter")]
+        filter: Vec<String>,
     },
     /// Send a signal to a running container's own init process — one
     /// immediate send, no grace period, no escalation (unlike `stop`),
@@ -3447,7 +3463,7 @@ enum ContainerCommand {
         force: bool,
         /// Only remove a container also matching every given filter
         /// — `label=<key>[=<value>]`, `label!=<key>[=<value>]`, or
-        /// `until=<duration-or-timestamp>` (see [`ContainerPruneFilters`]'s
+        /// `until=<duration-or-timestamp>` (see [`LabelUntilFilters`]'s
         /// own doc comment for the exact semantics each uses).
         /// Real `podman container prune --filter` additionally
         /// accepts `annotation=`/`annotation!=`, a concept this
@@ -3723,7 +3739,16 @@ fn main() -> std::process::ExitCode {
                 all,
                 cidfile,
                 ignore,
-            }) => cmd_stop(&ids, time, signal.as_deref(), all, &cidfile, ignore),
+                filter,
+            }) => cmd_stop(
+                &ids,
+                time,
+                signal.as_deref(),
+                all,
+                &cidfile,
+                ignore,
+                &filter,
+            ),
             Some(Command::Kill {
                 ids,
                 signal,
@@ -5603,41 +5628,51 @@ fn try_parse_dangling_filter(command: &str, f: &str) -> Option<anyhow::Result<bo
     })
 }
 
-/// Every `--filter` value `ociman container prune` accepts — a real,
-/// deliberately narrower grammar than `ociman prune`'s own
-/// [`PruneFilters`] (no `dangling=`, a filter key real `podman
-/// container prune` itself doesn't accept either — see
-/// [`ContainerCommand::Prune::filter`]'s own doc comment for the
-/// exact real, checked-directly confirmation). `labels` are OR'd
-/// together, matching this project's own already-established `ociman
-/// prune --filter label=` convention (`PruneFilters::labels`'s own
-/// doc comment) rather than `ociman ps --filter label=`'s own
-/// AND'd/every-constraint-narrows-further convention — this command
-/// is a prune-family sibling, not a listing/visibility filter.
+/// Every `--filter` value `ociman container prune`/`ociman stop
+/// --filter` accept — a real, deliberately narrower grammar than
+/// `ociman prune`'s own [`PruneFilters`] (no `dangling=`, a filter
+/// key real `podman container prune`/`podman stop --filter`
+/// themselves don't accept either — see [`ContainerCommand::
+/// Prune::filter`]/[`Command::Stop::filter`]'s own doc comments for
+/// the exact real, checked-directly confirmation each one has).
+/// `labels` are OR'd together, matching this project's own already-
+/// established `ociman prune --filter label=` convention
+/// (`PruneFilters::labels`'s own doc comment) rather than `ociman ps
+/// --filter label=`'s own AND'd/every-constraint-narrows-further
+/// convention — both of this struct's own consumers select/act on a
+/// whole set of containers by criteria, not narrow an already-listed
+/// one further.
 #[derive(Default)]
-struct ContainerPruneFilters {
+struct LabelUntilFilters {
     labels: Vec<LabelFilter>,
     until: Option<std::time::SystemTime>,
 }
 
-/// Parse `ociman container prune`'s own `--filter` values into a
-/// [`ContainerPruneFilters`].
-fn parse_container_prune_filters(filters: &[String]) -> anyhow::Result<ContainerPruneFilters> {
-    let mut parsed = ContainerPruneFilters::default();
+/// Parse a `label=`/`label!=`/`until=`-only `--filter` grammar (see
+/// [`LabelUntilFilters`]'s own doc comment for exactly which real
+/// commands share this) into a [`LabelUntilFilters`]. `command` is
+/// only used for the error message, so a mistake in one caller is
+/// never misattributed to another (the same convention
+/// [`parse_until_filter_value`] already established).
+fn parse_label_until_filters(
+    command: &str,
+    filters: &[String],
+) -> anyhow::Result<LabelUntilFilters> {
+    let mut parsed = LabelUntilFilters::default();
     let mut until_values = 0usize;
     for f in filters {
-        if let Some(result) = try_parse_label_filter("ociman container prune", f) {
+        if let Some(result) = try_parse_label_filter(command, f) {
             parsed.labels.push(result?);
         } else if let Some(rest) = f.strip_prefix("until=") {
             until_values += 1;
             anyhow::ensure!(
                 until_values == 1,
-                "ociman container prune: more than one until filter specified"
+                "{command}: more than one until filter specified"
             );
-            parsed.until = Some(parse_until_filter_value("ociman container prune", f, rest)?);
+            parsed.until = Some(parse_until_filter_value(command, f, rest)?);
         } else {
             anyhow::bail!(
-                "ociman container prune: --filter {f:?} is not yet supported (only \
+                "{command}: --filter {f:?} is not yet supported (only \
                  label=<key>[=<value>], label!=<key>[=<value>], or until=<duration-or-timestamp> \
                  are)"
             );
@@ -6189,8 +6224,7 @@ fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
     // real, checked-directly ordering `~/git/podman/pkg/domain/infra/
     // abi/system.go`'s own `SystemPrune` uses (containers pruned
     // strictly before images).
-    let containers_removed =
-        prune_eligible_containers(&containers, &ContainerPruneFilters::default())?;
+    let containers_removed = prune_eligible_containers(&containers, &LabelUntilFilters::default())?;
 
     let ImagePruneOutcome {
         images_removed,
@@ -8260,7 +8294,7 @@ fn cmd_container_exists(name: &str) -> anyhow::Result<()> {
 /// anything real for, by actually signaling a live process).
 fn cmd_container_prune(json: bool, filter: &[String]) -> anyhow::Result<()> {
     let containers = open_container_store()?;
-    let filters = parse_container_prune_filters(filter)?;
+    let filters = parse_label_until_filters("ociman container prune", filter)?;
     let removed = prune_eligible_containers(&containers, &filters)?;
     if json {
         oci_cli_common::output::print_json(&removed)?;
@@ -8282,43 +8316,58 @@ fn cmd_container_prune(json: bool, filter: &[String]) -> anyhow::Result<()> {
 /// `Paused` ones are always left untouched. See
 /// [`ContainerCommand::Prune`]'s own doc comment for the exact real,
 /// checked-directly eligibility filter this ports. `filters` (see
-/// [`ContainerPruneFilters`]) additionally narrows the set — an
-/// empty [`ContainerPruneFilters::default`] (the only way
-/// [`cmd_prune`]'s own `ociman prune` calls this today) matches
-/// every eligible container, preserving its existing, unfiltered
-/// behavior exactly.
+/// [`LabelUntilFilters`]) additionally narrows the set — an empty
+/// [`LabelUntilFilters::default`] (the only way [`cmd_prune`]'s own
+/// `ociman prune` calls this today) matches every eligible container,
+/// preserving its existing, unfiltered behavior exactly.
 fn prune_eligible_containers(
     containers: &StateStore,
-    filters: &ContainerPruneFilters,
+    filters: &LabelUntilFilters,
 ) -> anyhow::Result<Vec<String>> {
     let mut removed = Vec::new();
     for state in containers.list().context("listing containers")? {
         if !matches!(state.effective_status(), Status::Created | Status::Stopped) {
             continue;
         }
-        if !filters.labels.is_empty() {
-            let labels: std::collections::BTreeMap<String, String> = state
-                .annotations
-                .get(ANNOTATION_LABELS)
-                .and_then(|raw| serde_json::from_str(raw).ok())
-                .unwrap_or_default();
-            if !filters.labels.iter().any(|f| f.matches(&labels)) {
-                continue;
-            }
-        }
-        if let Some(until) = filters.until {
-            let Some(created) = oci_spec_types::time::parse_rfc3339_utc(&state.created) else {
-                continue;
-            };
-            if created >= until {
-                continue;
-            }
+        if !matches_label_until_filters(&state, filters) {
+            continue;
         }
         remove_container(containers, &state.id, true, None, true)
             .with_context(|| format!("removing container {}", state.id))?;
         removed.push(state.id);
     }
     Ok(removed)
+}
+
+/// Whether `state` matches every constraint in `filters` — shared by
+/// [`prune_eligible_containers`] (`ociman container prune --filter`)
+/// and `ociman stop --filter`'s own selection loop, so the two
+/// commands' `label=`/`until=` semantics can never silently drift
+/// apart from each other. An empty [`LabelUntilFilters`] always
+/// matches (no constraint given at all).
+fn matches_label_until_filters(
+    state: &oci_runtime_core::PersistedState,
+    filters: &LabelUntilFilters,
+) -> bool {
+    if !filters.labels.is_empty() {
+        let labels: std::collections::BTreeMap<String, String> = state
+            .annotations
+            .get(ANNOTATION_LABELS)
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default();
+        if !filters.labels.iter().any(|f| f.matches(&labels)) {
+            return false;
+        }
+    }
+    if let Some(until) = filters.until {
+        let Some(created) = oci_spec_types::time::parse_rfc3339_utc(&state.created) else {
+            return false;
+        };
+        if created >= until {
+            return false;
+        }
+    }
+    true
 }
 
 /// `ociman image exists` — resolves the same way every other
@@ -10238,6 +10287,13 @@ fn reset_failed_systemd_scope(container_id: &str, state: &oci_runtime_core::Pers
 /// genuinely attempted regardless of an earlier one's own stop
 /// failure. Unlike `rm`, there is no `--force`-implies-`--ignore`
 /// convention here — real `stop` has no `--force` at all.
+///
+/// `--filter` (see [`Command::Stop::filter`]'s own doc comment) is
+/// its own, separate selection mode, mirroring the `--all` loop
+/// above exactly (an already-`Stopped` match silently tolerated,
+/// every other failure still surfaced while every other match is
+/// still attempted) but narrowed to only the containers
+/// [`matches_label_until_filters`] actually matches.
 fn cmd_stop(
     ids: &[String],
     time_secs: Option<u64>,
@@ -10245,6 +10301,7 @@ fn cmd_stop(
     all: bool,
     cidfiles: &[PathBuf],
     ignore: bool,
+    filter: &[String],
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         cidfiles.is_empty() || !all,
@@ -10254,6 +10311,16 @@ fn cmd_stop(
         ids.is_empty() || !all,
         "cannot give both a container ID/name and --all"
     );
+    // `--filter` is its own, separate selection mode here (see
+    // `Command::Stop::filter`'s own doc comment for the real,
+    // deliberate narrowing versus podman's own richer "further
+    // narrows whatever else was given" semantics) — mutually
+    // exclusive with every other selection mode, the simplest correct
+    // scope for a first slice.
+    anyhow::ensure!(
+        filter.is_empty() || (ids.is_empty() && cidfiles.is_empty() && !all),
+        "--filter cannot be combined with a container ID/name, --cidfile, or --all"
+    );
     // Matches real podman's own checked-directly CLI-level validation
     // exactly (`validate.CheckAllLatestAndIDFile`): "you must provide
     // at least one name or id" is judged by whether `--cidfile` was
@@ -10262,11 +10329,36 @@ fn cmd_stop(
     // specifically so a `--cidfile` that turns out unreadable-but-
     // `--ignore`d still counts as "something was given" even once the
     // merged list below ends up empty because of it.
-    let nothing_given = ids.is_empty() && cidfiles.is_empty() && !all;
+    let nothing_given = ids.is_empty() && cidfiles.is_empty() && !all && filter.is_empty();
     anyhow::ensure!(
         !nothing_given,
         "no container ID/name given (try `ociman stop <ID>` or `--all`)"
     );
+
+    if !filter.is_empty() {
+        let parsed = parse_label_until_filters("ociman stop", filter)?;
+        let containers = open_container_store()?;
+        let mut first_error = None;
+        for state in containers.list().context("listing containers")? {
+            if !matches_label_until_filters(&state, &parsed) {
+                continue;
+            }
+            if state.effective_status() == Status::Stopped {
+                continue;
+            }
+            match stop_container(&state.id, time_secs, signal, true) {
+                Ok(()) => println!("{}", state.id),
+                Err(e) => {
+                    eprintln!("error stopping {}: {e:#}", state.id);
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        return match first_error {
+            Some(e) => Err(e.context("stopping containers")),
+            None => Ok(()),
+        };
+    }
     // Real podman's own exact semantics (`~/git/podman/cmd/podman/
     // containers/stop.go`): the file's own first line only, merged
     // into the same target list an explicit `ID`/`--name` argument
