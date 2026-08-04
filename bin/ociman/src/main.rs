@@ -300,6 +300,35 @@ enum PsSortKey {
     Status,
 }
 
+/// `ociman inspect --type`'s own resource kind, matching real `podman
+/// inspect --type`/`-t` exactly for the two kinds this project
+/// actually has (checked directly, `~/git/podman/cmd/podman/common/
+/// inspect.go`'s own `AllType`/`ContainerType`/`ImageType` constants
+/// and `~/git/podman/cmd/podman/inspect/inspect.go`'s own `inspect`
+/// function: `--type container`/`--type image` each call straight
+/// into their own single resolver, *never* falling back to the
+/// other kind on a miss, unlike `All` — real podman's own further
+/// `pod`/`network`/`volume`/`artifact` kinds are deliberately not
+/// listed here, matching this project's own established "no generic
+/// `inspect` for a resource with its own dedicated subcommand"
+/// convention (`ociman volume inspect` already exists separately).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+enum InspectType {
+    /// Try a container first, falling back to an image if no such
+    /// container exists — this project's own pre-existing default
+    /// behavior, unchanged.
+    #[default]
+    All,
+    /// Only ever resolve a container — a reference that doesn't
+    /// resolve to one is a real, immediate error, even if it would
+    /// otherwise resolve to a real image.
+    Container,
+    /// Only ever resolve an image — a reference that doesn't resolve
+    /// to one is a real, immediate error, even if it would otherwise
+    /// resolve to a real container.
+    Image,
+}
+
 /// Shared by [`Command::Run`] and [`Command::Create`] (0157) -- every
 /// flag `run` itself understands beyond `--rm`/`--detach` (which only
 /// `run` has: `create` never launches at all, so "detach" is
@@ -1714,6 +1743,15 @@ enum Command {
         /// of this cost.
         #[arg(short, long)]
         size: bool,
+        /// Force resolution to exactly one resource kind instead of
+        /// this command's own default container-then-image fallback
+        /// — matching real `podman inspect --type`/`-t` exactly (see
+        /// [`InspectType`]'s own doc comment for the precise,
+        /// checked-directly semantics): `container`/`image` each
+        /// refuse outright rather than silently falling back to the
+        /// other kind on a miss.
+        #[arg(short = 't', long = "type", value_enum, default_value_t = InspectType::All)]
+        inspect_type: InspectType,
     },
     /// Pull (if not already present), extract, and run an image's
     /// container — rootless, foreground. Kept (listable via `ps`,
@@ -3460,7 +3498,14 @@ fn main() -> std::process::ExitCode {
                 reference,
                 format,
                 size,
-            }) => cmd_inspect(&reference, cli.global.json, format.as_deref(), size),
+                inspect_type,
+            }) => cmd_inspect(
+                &reference,
+                cli.global.json,
+                format.as_deref(),
+                size,
+                inspect_type,
+            ),
             Some(Command::Run {
                 args,
                 rm,
@@ -6563,17 +6608,33 @@ fn cmd_inspect(
     json: bool,
     format: Option<&str>,
     size: bool,
+    inspect_type: InspectType,
 ) -> anyhow::Result<()> {
-    if let Ok(containers) = open_container_store()
-        && let Ok(id) = resolve_container_id(&containers, reference_str)
-        && let Ok(state) = containers.load(&id)
-    {
-        let mut view = ContainerInspectView::from_state(&state);
-        if size {
-            let store = open_store()?;
-            view.size = Some(compute_container_size(&store, &state));
+    // `--type container`/`--type image` (0409) each resolve to
+    // exactly one kind, never falling back to the other on a miss --
+    // matching real podman's own checked-directly `inspect`
+    // function exactly (`~/git/podman/cmd/podman/inspect/inspect.go`:
+    // `case common.ContainerType`/`case common.ImageType` each call
+    // straight into their own single resolver). `InspectType::All`
+    // (the default) keeps this project's own pre-existing container-
+    // then-image fallback completely unchanged.
+    if inspect_type != InspectType::Image {
+        let container = (|| {
+            let containers = open_container_store().ok()?;
+            let id = resolve_container_id(&containers, reference_str).ok()?;
+            containers.load(&id).ok()
+        })();
+        if let Some(state) = container {
+            let mut view = ContainerInspectView::from_state(&state);
+            if size {
+                let store = open_store()?;
+                view.size = Some(compute_container_size(&store, &state));
+            }
+            return print_inspect_result(&view, json, format);
         }
-        return print_inspect_result(&view, json, format);
+        if inspect_type == InspectType::Container {
+            anyhow::bail!("{reference_str}: no such container");
+        }
     }
 
     // Matches real `podman inspect`'s own identical restriction

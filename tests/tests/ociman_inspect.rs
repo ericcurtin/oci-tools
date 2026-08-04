@@ -169,6 +169,112 @@ fn inspect_of_an_unknown_reference_is_a_clear_error() {
     assert!(!out.status.success());
 }
 
+/// `ociman inspect --type image` (0409), matching real `podman
+/// inspect --type image` exactly -- resolves *only* an image, never
+/// falling back to (or even considering) a container of the exact
+/// same name, unlike the default `--type all` behavior.
+#[test]
+fn inspect_type_image_never_resolves_a_container_of_the_same_name() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-type:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "inspect-type-shared-name",
+            "ociman-test/inspect-type:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    // The default (`--type all`) resolves the container first.
+    let default_inspect = ociman(storage_dir.path(), &["inspect", "inspect-type-shared-name"]);
+    assert!(default_inspect.status.success());
+    let default_view: serde_json::Value = serde_json::from_slice(&default_inspect.stdout).unwrap();
+    assert!(default_view.get("status").is_some(), "{default_view:?}");
+
+    // `--type image` on that exact same name must fail -- it's a
+    // real container name, never an image reference at all, and
+    // `--type image` never considers a container regardless.
+    let image_inspect = ociman(
+        storage_dir.path(),
+        &["inspect", "--type", "image", "inspect-type-shared-name"],
+    );
+    assert!(!image_inspect.status.success());
+    assert!(
+        String::from_utf8_lossy(&image_inspect.stderr).contains("no such image"),
+        "{image_inspect:?}"
+    );
+
+    // `--type image` on the real image reference still works.
+    let image_inspect_ok = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "--type",
+            "image",
+            "ociman-test/inspect-type:latest",
+        ],
+    );
+    assert!(
+        image_inspect_ok.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&image_inspect_ok.stderr)
+    );
+    let image_view: serde_json::Value = serde_json::from_slice(&image_inspect_ok.stdout).unwrap();
+    assert!(image_view.get("architecture").is_some(), "{image_view:?}");
+}
+
+/// `ociman inspect --type container` (0409), matching real `podman
+/// inspect --type container` exactly -- resolves *only* a container,
+/// never falling back to an image even when the given reference
+/// would otherwise resolve to a real one.
+#[test]
+fn inspect_type_container_never_resolves_an_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-type-container-only:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    // No container ever created -- only the image exists.
+    let container_inspect = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "--type",
+            "container",
+            "ociman-test/inspect-type-container-only:latest",
+        ],
+    );
+    assert!(!container_inspect.status.success());
+    assert!(
+        String::from_utf8_lossy(&container_inspect.stderr).contains("no such container"),
+        "{container_inspect:?}"
+    );
+}
+
 /// Real docker/podman rule, checked directly: `inspect` (and `rmi`)
 /// resolve by image ID too, not just a tag reference -- the exact
 /// short digest `ociman images`' own `DIGEST` column already prints.
