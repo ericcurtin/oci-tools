@@ -353,6 +353,20 @@ enum Command {
         /// real runc's own default at last.
         #[arg(long = "ignore-paused")]
         ignore_paused: bool,
+        /// Force the exec'd process's own `no_new_privileges` to
+        /// `true`, matching real `runc exec --no-new-privs`/`crun
+        /// exec --no-new-privs` exactly (checked directly,
+        /// `~/git/runc/exec.go`/`~/git/crun/src/exec.c`: both are
+        /// plain, bare boolean flags — given at all forces `true`,
+        /// there is no way to force `false` back through this same
+        /// flag, since neither real tool's own CLI framework
+        /// supports an explicit `--no-new-privs=false` form here).
+        /// Not given at all (the default) leaves the exec'd process
+        /// inheriting the container's own already-declared `process.
+        /// noNewPrivileges` unchanged, exactly as before this flag
+        /// existed.
+        #[arg(long = "no-new-privs")]
+        no_new_privs: bool,
         /// Write the exec'd process's own real pid to this file —
         /// matching real `runc exec --pid-file`/`crun exec --pid-file`
         /// exactly (checked directly, `~/git/runc/exec.go`'s own
@@ -733,6 +747,7 @@ fn main() -> std::process::ExitCode {
                 preserve_fds,
                 cap,
                 ignore_paused,
+                no_new_privs,
                 pid_file,
                 args,
             }) => cmd_exec(
@@ -746,6 +761,7 @@ fn main() -> std::process::ExitCode {
                 preserve_fds,
                 &cap,
                 ignore_paused,
+                no_new_privs,
                 pid_file.as_deref(),
             ),
             Some(Command::Features) => oci_cli_common::output::print_json(&features::features()),
@@ -1947,6 +1963,7 @@ fn cmd_exec(
     preserve_fds: u32,
     cap: &[String],
     ignore_paused: bool,
+    no_new_privs: bool,
     pid_file: Option<&Path>,
 ) -> anyhow::Result<()> {
     verify_preserve_fds(preserve_fds)?;
@@ -2023,7 +2040,12 @@ fn cmd_exec(
         namespaces,
         user: effective_user,
         capabilities: effective_capabilities,
-        no_new_privileges: process_spec.no_new_privileges,
+        // `--no-new-privs` (matching real `runc exec`/`crun exec
+        // --no-new-privs` exactly, checked directly): given at all
+        // forces `true`; not given leaves the exec'd process
+        // inheriting the container's own already-declared value
+        // unchanged, exactly as before this flag existed.
+        no_new_privileges: no_new_privs || process_spec.no_new_privileges,
         cwd: cwd
             .map(str::to_string)
             .unwrap_or_else(|| process_spec.cwd.clone()),

@@ -644,6 +644,78 @@ fn exec_cap_adds_a_capability_on_top_of_the_containers_own_default_set() {
     ocirun(root_dir.path(), &["delete", "--force", "exec-cap-test"]);
 }
 
+/// `ocirun exec --no-new-privs` (matching real `runc exec --no-new-
+/// privs`/`crun exec --no-new-privs` exactly, checked directly): a
+/// plain, bare boolean flag that forces the exec'd process's own
+/// `NoNewPrivs` to `1`, even when the container's own declared
+/// `process.noNewPrivileges` is `false` -- not given at all (the
+/// default) leaves it inheriting that same declared value unchanged.
+#[test]
+fn exec_no_new_privs_flag_forces_it_on_regardless_of_the_containers_own_declared_value() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+    let config_path = bundle_dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["process"]["noNewPrivileges"] = serde_json::json!(false);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let create = ocirun_create(root_dir.path(), bundle_dir.path(), "exec-no-new-privs-test");
+    assert!(create.status.success(), "{create:?}");
+    let start = ocirun(root_dir.path(), &["start", "exec-no-new-privs-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-no-new-privs-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let grep_nnp = r#"grep -E "^NoNewPrivs:" /proc/self/status"#;
+
+    let without_flag = ocirun(
+        root_dir.path(),
+        &["exec", "exec-no-new-privs-test", "/bin/sh", "-c", grep_nnp],
+    );
+    assert!(without_flag.status.success(), "{without_flag:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&without_flag.stdout).trim(),
+        "NoNewPrivs:\t0",
+        "no --no-new-privs given should inherit the container's own declared false value"
+    );
+
+    let with_flag = ocirun(
+        root_dir.path(),
+        &[
+            "exec",
+            "--no-new-privs",
+            "exec-no-new-privs-test",
+            "/bin/sh",
+            "-c",
+            grep_nnp,
+        ],
+    );
+    assert!(with_flag.status.success(), "{with_flag:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&with_flag.stdout).trim(),
+        "NoNewPrivs:\t1",
+        "--no-new-privs should force it on regardless of the container's own declared value"
+    );
+
+    ocirun(
+        root_dir.path(),
+        &["delete", "--force", "exec-no-new-privs-test"],
+    );
+}
+
 /// Same real, reachable-`systemd --user`-session probe
 /// `ocirun_lifecycle.rs`'s own pause/resume test uses (see its own
 /// doc comment for why a real cgroup -- required by `pause`, unlike
