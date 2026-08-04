@@ -630,6 +630,207 @@ fn pause_all_and_cidfile_together_is_a_clear_error() {
     assert!(!unpause.status.success());
 }
 
+/// `pause --filter label=`/`unpause --filter label=` only act on a
+/// container also matching (OR'd across multiple values, the same
+/// `ociman rm`/`stop`/`restart --filter label=` convention), leaving
+/// a non-matching one completely untouched.
+#[test]
+fn pause_and_unpause_filter_label_only_act_on_a_matching_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/pause-filter-label:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run_match = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--name",
+            "pause-filter-match",
+            "--label",
+            "env=prod",
+            "ociman-test/pause-filter-label:latest",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut run_other = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--name",
+            "pause-filter-other",
+            "--label",
+            "env=staging",
+            "ociman-test/pause-filter-label:latest",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-filter-match",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-filter-other",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let pause = ociman(storage_dir.path(), &["pause", "--filter", "label=env=prod"]);
+    assert!(
+        pause.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&pause.stderr)
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-filter-match",
+            "paused",
+            Duration::from_secs(5)
+        ),
+        "paused"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-filter-other",
+            "running",
+            Duration::from_millis(200)
+        ),
+        "running",
+        "the non-matching container must be left completely untouched"
+    );
+
+    let unpause = ociman(
+        storage_dir.path(),
+        &["unpause", "--filter", "label=env=prod"],
+    );
+    assert!(
+        unpause.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&unpause.stderr)
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-filter-match",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    ociman(storage_dir.path(), &["stop", "--time", "0", "-a"]);
+    run_match.wait().unwrap();
+    run_other.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// A real, deliberate divergence from `--all`'s own tolerant skip
+/// (see `Command::Pause::filter`'s own doc comment): a `--filter`
+/// match that isn't actually running is a real, reported error here
+/// too, exactly like an explicit multi-id call already is -- `--all`
+/// alone is what silently tolerates it, not `--filter`.
+#[test]
+fn pause_filter_on_a_non_running_match_is_a_real_error_unlike_all() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/pause-filter-error:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--label",
+            "env=prod",
+            "ociman-test/pause-filter-error:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let pause = ociman(storage_dir.path(), &["pause", "--filter", "label=env=prod"]);
+    assert!(
+        !pause.status.success(),
+        "a never-started container matched by --filter must be a real error, not a silent skip"
+    );
+}
+
+/// `--filter` cannot be combined with an explicit id, `--cidfile`, or
+/// `--all` -- the same deliberate scope narrowing `ociman rm`/`stop`/
+/// `restart --filter` already established.
+#[test]
+fn pause_and_unpause_filter_combined_with_all_or_an_explicit_id_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let pause_with_all = ociman(
+        storage_dir.path(),
+        &["pause", "--filter", "label=env=prod", "--all"],
+    );
+    assert!(!pause_with_all.status.success());
+    let pause_with_id = ociman(
+        storage_dir.path(),
+        &["pause", "--filter", "label=env=prod", "some-id"],
+    );
+    assert!(!pause_with_id.status.success());
+
+    let unpause_with_all = ociman(
+        storage_dir.path(),
+        &["unpause", "--filter", "label=env=prod", "--all"],
+    );
+    assert!(!unpause_with_all.status.success());
+    let unpause_with_id = ociman(
+        storage_dir.path(),
+        &["unpause", "--filter", "label=env=prod", "some-id"],
+    );
+    assert!(!unpause_with_id.status.success());
+}
+
 /// `--cidfile` (0320) matches real `podman pause --cidfile`/`podman
 /// unpause --cidfile` exactly: the file's own first line only,
 /// trailing content ignored, merged into the same target list an

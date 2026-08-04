@@ -2629,6 +2629,27 @@ enum Command {
         /// with `--all`.
         #[arg(long = "cidfile", value_name = "FILE")]
         cidfile: Vec<PathBuf>,
+        /// Pause every container matching every given filter instead
+        /// of an explicit `ID`/`--name` — the same real, deliberately
+        /// narrower `label=`/`label!=`/`until=` grammar `ociman rm`/
+        /// `stop`/`restart`/`container prune --filter` already
+        /// established (see [`LabelUntilFilters`]'s own doc comment).
+        /// Checked directly, `~/git/podman/cmd/podman/containers/
+        /// pause.go`'s own `--filter`. **A real, deliberate
+        /// divergence from this same family's own established
+        /// "shares `--all`'s own tolerant skip" shape**: real
+        /// podman's own `ContainerPause` only ever tolerates a
+        /// not-actually-running match when `options.All` is set
+        /// (`~/git/podman/pkg/domain/infra/abi/containers.go`,
+        /// checked directly — the exact same `err != nil &&
+        /// options.All && errors.Is(err, ErrCtrStateInvalid)` gate),
+        /// **not** merely because `--filter` was used instead of
+        /// explicit names — so a filter match that isn't currently
+        /// running is a real, reported error here too, exactly like
+        /// an explicit, multi-id call already is. Mutually exclusive
+        /// with an explicit `ID`/`--name`, `--cidfile`, and `--all`.
+        #[arg(long = "filter")]
+        filter: Vec<String>,
     },
     /// Unpause one or more containers previously frozen by `pause` —
     /// matching real `podman unpause` exactly, including its own real
@@ -2649,6 +2670,16 @@ enum Command {
         /// with `--all`.
         #[arg(long = "cidfile", value_name = "FILE")]
         cidfile: Vec<PathBuf>,
+        /// Unpause every container matching every given filter
+        /// instead of an explicit `ID`/`--name` — see
+        /// [`Command::Pause::filter`]'s own doc comment for the exact
+        /// same grammar and the same real, deliberate "does not share
+        /// `--all`'s own tolerant skip" divergence, confirmed
+        /// identically for `ContainerUnpause` (`~/git/podman/pkg/
+        /// domain/infra/abi/containers.go`). Mutually exclusive with
+        /// an explicit `ID`/`--name`, `--cidfile`, and `--all`.
+        #[arg(long = "filter")]
+        filter: Vec<String>,
     },
     /// Update a running container's real cgroup resource limits in
     /// place — matching real `podman update` for exactly the same
@@ -3791,8 +3822,18 @@ fn main() -> std::process::ExitCode {
                 all,
                 cidfile,
             }) => cmd_kill(&ids, &signal, all, &cidfile),
-            Some(Command::Pause { ids, all, cidfile }) => cmd_pause(&ids, all, &cidfile),
-            Some(Command::Unpause { ids, all, cidfile }) => cmd_unpause(&ids, all, &cidfile),
+            Some(Command::Pause {
+                ids,
+                all,
+                cidfile,
+                filter,
+            }) => cmd_pause(&ids, all, &cidfile, &filter),
+            Some(Command::Unpause {
+                ids,
+                all,
+                cidfile,
+                filter,
+            }) => cmd_unpause(&ids, all, &cidfile, &filter),
             Some(Command::Update {
                 id,
                 memory,
@@ -11662,15 +11703,25 @@ fn cmd_top(id: &str, ps_args: &[String]) -> anyhow::Result<()> {
 /// `ociman pause` — see [`Command::Pause`]'s own doc comment for the
 /// full `--all`/`--cidfile`/multi-target shape (0320). Delegates the
 /// actual per-container logic to [`pause_or_unpause_one`].
-fn cmd_pause(ids: &[String], all: bool, cidfiles: &[PathBuf]) -> anyhow::Result<()> {
-    cmd_pause_or_unpause(ids, all, cidfiles, true)
+fn cmd_pause(
+    ids: &[String],
+    all: bool,
+    cidfiles: &[PathBuf],
+    filter: &[String],
+) -> anyhow::Result<()> {
+    cmd_pause_or_unpause(ids, all, cidfiles, filter, true)
 }
 
 /// `ociman unpause` — see [`Command::Unpause`]'s own doc comment for
 /// the full `--all`/`--cidfile`/multi-target shape (0320). Delegates
 /// the actual per-container logic to [`pause_or_unpause_one`].
-fn cmd_unpause(ids: &[String], all: bool, cidfiles: &[PathBuf]) -> anyhow::Result<()> {
-    cmd_pause_or_unpause(ids, all, cidfiles, false)
+fn cmd_unpause(
+    ids: &[String],
+    all: bool,
+    cidfiles: &[PathBuf],
+    filter: &[String],
+) -> anyhow::Result<()> {
+    cmd_pause_or_unpause(ids, all, cidfiles, filter, false)
 }
 
 /// Shared `pause`/`unpause` implementation (0320): `freeze` selects
@@ -11687,11 +11738,19 @@ fn cmd_pause_or_unpause(
     ids: &[String],
     all: bool,
     cidfiles: &[PathBuf],
+    filter: &[String],
     freeze: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         cidfiles.is_empty() || !all,
         "--all and --cidfile cannot be used together"
+    );
+    // `--filter` is its own, separate selection mode -- see
+    // `Command::Pause::filter`'s own doc comment for the real,
+    // deliberate divergence from `--all`'s own tolerant-skip shape.
+    anyhow::ensure!(
+        filter.is_empty() || (ids.is_empty() && cidfiles.is_empty() && !all),
+        "--filter cannot be combined with a container ID/name, --cidfile, or --all"
     );
     // Real podman's own exact semantics (`~/git/podman/cmd/podman/
     // containers/pause.go`/`unpause.go`): the file's own first line
@@ -11712,6 +11771,38 @@ fn cmd_pause_or_unpause(
     );
 
     let verb = if freeze { "pausing" } else { "unpausing" };
+
+    if !filter.is_empty() {
+        let command = if freeze {
+            "ociman pause"
+        } else {
+            "ociman unpause"
+        };
+        let parsed = parse_label_until_filters(command, filter)?;
+        let containers = open_container_store()?;
+        // Deliberately **not** the same `--all`-only tolerant-skip
+        // loop below: real podman's own `ErrCtrStateInvalid`
+        // tolerance is gated on `options.All` specifically, not on
+        // `--filter` (checked directly, see `Command::Pause::
+        // filter`'s own doc comment) -- every filter match is
+        // genuinely attempted and every real failure genuinely
+        // reported, the same shape the explicit multi-id path below
+        // already has.
+        let mut first_error = None;
+        for state in containers.list().context("listing containers")? {
+            if !matches_label_until_filters(&state, &parsed) {
+                continue;
+            }
+            if let Err(e) = pause_or_unpause_one(&containers, &state.id, &state.id, freeze) {
+                eprintln!("error {verb} {}: {e:#}", state.id);
+                first_error.get_or_insert(e);
+            }
+        }
+        return match first_error {
+            Some(e) => Err(e.context(format!("{verb} containers"))),
+            None => Ok(()),
+        };
+    }
     let containers = open_container_store()?;
 
     if all {
