@@ -415,6 +415,63 @@ fn push_with_tls_verify_false_reaches_a_real_plain_http_registry() {
     );
 }
 
+/// `push --digestfile` (matching real `podman push --digestfile`
+/// exactly, checked directly against `~/git/podman/cmd/podman/
+/// images/push.go`): writes the pushed image's own manifest digest
+/// verbatim (no trailing newline) to the given file, exactly what
+/// stdout already prints on success.
+#[test]
+fn push_digestfile_writes_the_exact_digest_stdout_already_prints() {
+    let source_mock = start_mock_with_a_real_image();
+    let storage_dir = tempfile::tempdir().unwrap();
+    let pull = ociman(
+        storage_dir.path(),
+        &[
+            "pull",
+            "--tls-verify=false",
+            &format!("{}/testrepo:latest", source_mock.addr),
+        ],
+    );
+    assert!(pull.status.success());
+
+    let dest_mock = MockPushRegistry::start();
+    let tag = ociman(
+        storage_dir.path(),
+        &[
+            "tag",
+            &format!("{}/testrepo:latest", source_mock.addr),
+            &format!("{}/testrepo:latest", dest_mock.addr),
+        ],
+    );
+    assert!(tag.status.success());
+
+    let digestfile = storage_dir.path().join("digest.txt");
+    let push = ociman(
+        storage_dir.path(),
+        &[
+            "push",
+            "--tls-verify=false",
+            "--digestfile",
+            digestfile.to_str().unwrap(),
+            &format!("{}/testrepo:latest", dest_mock.addr),
+        ],
+    );
+    assert!(
+        push.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&push.stderr)
+    );
+
+    let stdout_digest = String::from_utf8_lossy(&push.stdout).trim().to_string();
+    assert!(stdout_digest.starts_with("sha256:"), "{stdout_digest:?}");
+    let file_contents = std::fs::read_to_string(&digestfile).unwrap();
+    assert_eq!(file_contents, stdout_digest);
+    assert!(
+        !file_contents.ends_with('\n'),
+        "real podman's own digestfile has no trailing newline: {file_contents:?}"
+    );
+}
+
 #[test]
 fn push_without_tls_verify_false_refuses_plain_http_by_default() {
     let source_mock = start_mock_with_a_real_image();

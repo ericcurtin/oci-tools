@@ -1092,6 +1092,21 @@ enum Command {
         /// exact same syntax/semantics.
         #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         tls_verify: bool,
+        /// Write the pushed image's own manifest digest
+        /// (`sha256:<hex>`, no trailing newline) to this file after a
+        /// successful push — matching real `podman push --digestfile`
+        /// exactly (checked directly, `~/git/podman/cmd/podman/
+        /// images/push.go`: `os.WriteFile(pushOptions.DigestFile,
+        /// []byte(report.ManifestDigest), 0o644)`, the same bare-
+        /// digest-no-newline shape `ociman build --iidfile`/`commit
+        /// --iidfile` already established for the identical reason).
+        /// Unlike `ocirun run --pid-file`'s own tolerated-failure
+        /// convention, a write failure here is a real, immediate
+        /// error — matching real podman's own identical, checked-
+        /// directly fatal behavior (`push.go`'s own `if err != nil {
+        /// return err }`, no logging-and-continuing fallback at all).
+        #[arg(long = "digestfile", value_name = "PATH")]
+        digestfile: Option<PathBuf>,
     },
     /// Search a registry — matching real `podman search`'s own
     /// `--list-tags` mode exactly (checked directly,
@@ -3700,7 +3715,13 @@ fn main() -> std::process::ExitCode {
             Some(Command::Push {
                 reference,
                 tls_verify,
-            }) => cmd_push(&reference, tls_verify, cli.global.json),
+                digestfile,
+            }) => cmd_push(
+                &reference,
+                tls_verify,
+                digestfile.as_deref(),
+                cli.global.json,
+            ),
             Some(Command::Search {
                 term,
                 list_tags,
@@ -4172,7 +4193,12 @@ struct PushResult {
     digest: String,
 }
 
-fn cmd_push(reference_str: &str, tls_verify: bool, json: bool) -> anyhow::Result<()> {
+fn cmd_push(
+    reference_str: &str,
+    tls_verify: bool,
+    digestfile: Option<&Path>,
+    json: bool,
+) -> anyhow::Result<()> {
     let store = open_store()?;
     let resolved = resolve_image_by_reference_or_id(&store, reference_str)?
         .ok_or_else(|| anyhow::anyhow!("{reference_str}: no such image in local storage"))?;
@@ -4201,6 +4227,16 @@ fn cmd_push(reference_str: &str, tls_verify: bool, json: bool) -> anyhow::Result
         .with_context(|| format!("pushing {reference}"));
     progress.finish_and_clear();
     result?;
+
+    // `--digestfile`: a real, immediate error on write failure,
+    // matching real podman's own identical fatal behavior exactly
+    // (see `Command::Push::digestfile`'s own doc comment for why
+    // this deliberately doesn't follow `ocirun run --pid-file`'s own
+    // different, tolerated-failure convention instead).
+    if let Some(path) = digestfile {
+        std::fs::write(path, record.manifest_digest.to_string())
+            .with_context(|| format!("writing --digestfile {}", path.display()))?;
+    }
 
     if json {
         oci_cli_common::output::print_json(&PushResult {
