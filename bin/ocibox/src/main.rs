@@ -153,6 +153,20 @@ enum Command {
             value_name = "HOST-DIR:CONTAINER-DIR[:ro]"
         )]
         volume: Vec<String>,
+        /// Pull/select a specific platform (`os/arch[/variant]`, e.g.
+        /// `linux/amd64`) for `--image` instead of the real host's
+        /// own default — matching real `distrobox create --platform`
+        /// exactly (checked directly,
+        /// `~/git/distrobox/internal/cli/create.go`'s own plain,
+        /// unvalidated-beyond-parsing `--platform` string flag).
+        /// Reuses the exact same shared `oci_spec_types::image::
+        /// parse_platform_spec` `ociman pull`/`run`/`create
+        /// --platform` (0307) and `ociman build --platform` already
+        /// use, moved out of `ociman`-private code (`docs/design/
+        /// 0403`) the moment this second, unrelated caller needed the
+        /// identical real parsing.
+        #[arg(long, value_name = "OS/ARCH[/VARIANT]")]
+        platform: Option<String>,
     },
     /// List real, created boxes — matching real `distrobox list`
     /// (alias `ls`), narrowed to what this project's own boxes
@@ -278,6 +292,13 @@ enum Command {
             value_name = "HOST-DIR:CONTAINER-DIR[:ro]"
         )]
         volume: Vec<String>,
+        /// Same as `ocibox create --platform` — matching `distrobox
+        /// ephemeral`'s own identical inherited flag (checked
+        /// directly: `~/git/distrobox/internal/cli/ephemeral.go`
+        /// copies every flag from its own `create` command,
+        /// `--platform` included).
+        #[arg(long, value_name = "OS/ARCH[/VARIANT]")]
+        platform: Option<String>,
         /// The command to run inside the box, and its own arguments —
         /// defaults to a shell (see `ocibox enter`'s own doc comment)
         /// if empty.
@@ -479,6 +500,7 @@ fn main() -> std::process::ExitCode {
                 hostname,
                 home,
                 volume,
+                platform,
             }) => cmd_create(
                 &image,
                 &name,
@@ -486,6 +508,7 @@ fn main() -> std::process::ExitCode {
                 hostname.as_deref(),
                 home.as_deref(),
                 &volume,
+                platform.as_deref(),
             ),
             Some(Command::List) => cmd_list(cli.global.json),
             Some(Command::Rm {
@@ -500,6 +523,7 @@ fn main() -> std::process::ExitCode {
                 hostname,
                 home,
                 volume,
+                platform,
                 command,
             }) => cmd_ephemeral(
                 &image,
@@ -507,6 +531,7 @@ fn main() -> std::process::ExitCode {
                 hostname.as_deref(),
                 home.as_deref(),
                 &volume,
+                platform.as_deref(),
                 &command,
             ),
             Some(Command::Export {
@@ -707,6 +732,7 @@ fn validate_hostname(hostname: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_create(
     image: &str,
     name: &str,
@@ -714,8 +740,9 @@ fn cmd_create(
     hostname: Option<&str>,
     home: Option<&Path>,
     volumes: &[String],
+    platform: Option<&str>,
 ) -> anyhow::Result<()> {
-    create_box(image, name, pull, hostname, home, volumes)?;
+    create_box(image, name, pull, hostname, home, volumes, platform)?;
     println!("{name}");
     Ok(())
 }
@@ -727,6 +754,7 @@ fn cmd_create(
 /// identical "no extra id line before dropping into the shell"
 /// output) can reuse every bit of real resolve/extract/persist logic
 /// without also inheriting `cmd_create`'s own final `println!`.
+#[allow(clippy::too_many_arguments)]
 fn create_box(
     image: &str,
     name: &str,
@@ -734,6 +762,7 @@ fn create_box(
     hostname: Option<&str>,
     home: Option<&Path>,
     volumes: &[String],
+    platform: Option<&str>,
 ) -> anyhow::Result<()> {
     validate_box_name(name)?;
     if let Some(hostname) = hostname {
@@ -743,6 +772,13 @@ fn create_box(
         .iter()
         .map(|v| parse_box_volume(v))
         .collect::<anyhow::Result<Vec<BoxVolume>>>()?;
+    // `--platform` (0403): falls back to the real host's own default,
+    // the same `Platform::host()` this project's own image resolution
+    // already used unconditionally before this flag existed.
+    let platform = platform
+        .map(|p| oci_spec_types::image::parse_platform_spec("ocibox create/ephemeral", p))
+        .transpose()?
+        .unwrap_or_else(oci_spec_types::image::Platform::host);
 
     let box_dir = boxes_root().join(name);
     anyhow::ensure!(
@@ -760,22 +796,11 @@ fn create_box(
     } else {
         oci_registry::PullPolicy::Missing
     };
-    let record = oci_registry::resolve_or_pull(
-        &store,
-        &reference,
-        pull_policy,
-        true,
-        &oci_spec_types::image::Platform::host(),
-        || {
-            oci_registry::pull_unconditionally(
-                &store,
-                &reference,
-                true,
-                &oci_spec_types::image::Platform::host(),
-            )
-        },
-    )
-    .with_context(|| format!("resolving {reference}"))?;
+    let record =
+        oci_registry::resolve_or_pull(&store, &reference, pull_policy, true, &platform, || {
+            oci_registry::pull_unconditionally(&store, &reference, true, &platform)
+        })
+        .with_context(|| format!("resolving {reference}"))?;
 
     let manifest = store
         .image_manifest(&record)
@@ -1289,16 +1314,18 @@ fn unique_random_box_name() -> anyhow::Result<String> {
 /// [`Command::Ephemeral`]'s own doc comment for the exact real
 /// `distrobox ephemeral` behavior this matches and why no new
 /// namespace/mount/launch code was needed to build it at all.
+#[allow(clippy::too_many_arguments)]
 fn cmd_ephemeral(
     image: &str,
     pull: bool,
     hostname: Option<&str>,
     home: Option<&Path>,
     volumes: &[String],
+    platform: Option<&str>,
     command: &[String],
 ) -> anyhow::Result<()> {
     let name = unique_random_box_name()?;
-    create_box(image, &name, pull, hostname, home, volumes)
+    create_box(image, &name, pull, hostname, home, volumes, platform)
         .with_context(|| format!("creating ephemeral box {name}"))?;
 
     let result = enter_and_get_exit_code(&name, command);

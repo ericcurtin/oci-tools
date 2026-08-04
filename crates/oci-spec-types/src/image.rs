@@ -135,6 +135,91 @@ impl Platform {
     }
 }
 
+/// Error returned by [`parse_platform_spec`].
+#[derive(Debug, thiserror::Error)]
+pub enum PlatformParseError {
+    /// The value was empty, or its `os` component (before the first
+    /// `/`) was empty.
+    #[error("{command}: invalid --platform value {value:?}")]
+    Empty {
+        /// Which flag/instruction was parsing this (for the error
+        /// message only).
+        command: String,
+        /// The full offending value.
+        value: String,
+    },
+    /// No `/`-separated architecture component at all.
+    #[error(
+        "{command}: --platform value {value:?} is missing an architecture (expected \
+         os/arch[/variant], e.g. linux/amd64)"
+    )]
+    MissingArchitecture {
+        /// Which flag/instruction was parsing this.
+        command: String,
+        /// The full offending value.
+        value: String,
+    },
+    /// More than three `/`-separated components.
+    #[error("{command}: invalid --platform value {value:?} (expected os/arch[/variant])")]
+    TooManyComponents {
+        /// Which flag/instruction was parsing this.
+        command: String,
+        /// The full offending value.
+        value: String,
+    },
+}
+
+/// Parse a `--platform`/`FROM --platform=` value (`os/arch[/variant]`,
+/// e.g. `linux/amd64`, `linux/arm64/v8`) into a real [`Platform`] —
+/// matching real BuildKit's own `platforms.Parse` accepted shape for
+/// the common, explicit `os/arch[/variant]` form (a bare `arch`, with
+/// no `os/` prefix, or the special `local`/`$BUILDPLATFORM`-style
+/// values real BuildKit also accepts, are deliberately not supported
+/// here — every real Containerfile/CLI invocation this project needs
+/// to handle in practice already spells out the full `linux/<arch>`
+/// form).
+///
+/// Originally `ociman`-private (shared by `ociman pull`/`run`/
+/// `create --platform`, `0307`, and `ociman build --platform`/
+/// `FROM --platform=`) — moved here (`docs/design/0403`) once
+/// `ocibox create`/`ephemeral --platform` needed the identical real
+/// parsing, the same "move a shared primitive out of one crate's own
+/// private code into a crate every real caller already depends on the
+/// moment a second, genuinely unrelated one needs it" move `glob`
+/// (`0295`)/`resolve_by_reference_or_id` (`oci_store`, 0122/0213)
+/// already went through. `command` names whichever flag/instruction is
+/// actually parsing, for an error message that points at the right one
+/// rather than a single hardcoded name.
+pub fn parse_platform_spec(command: &str, value: &str) -> Result<Platform, PlatformParseError> {
+    let mut parts = value.split('/');
+    let os = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| PlatformParseError::Empty {
+            command: command.to_string(),
+            value: value.to_string(),
+        })?;
+    let architecture = parts
+        .next()
+        .ok_or_else(|| PlatformParseError::MissingArchitecture {
+            command: command.to_string(),
+            value: value.to_string(),
+        })?;
+    let variant = parts.next().map(str::to_string);
+    if parts.next().is_some() {
+        return Err(PlatformParseError::TooManyComponents {
+            command: command.to_string(),
+            value: value.to_string(),
+        });
+    }
+    Ok(Platform {
+        os: os.to_string(),
+        architecture: architecture.to_string(),
+        variant,
+        os_version: None,
+    })
+}
+
 /// `GOARCH`-style name for the architecture we are running on.
 const fn host_arch() -> &'static str {
     if cfg!(target_arch = "x86_64") {
@@ -657,5 +742,63 @@ mod tests {
         assert_eq!(cfg.rootfs.kind, "layers");
         assert!(cfg.config.is_none());
         assert!(cfg.history.is_empty());
+    }
+
+    #[test]
+    fn parse_platform_spec_parses_os_arch_and_variant() {
+        let platform = parse_platform_spec("test", "linux/arm64/v8").unwrap();
+        assert_eq!(
+            platform,
+            Platform {
+                os: "linux".to_string(),
+                architecture: "arm64".to_string(),
+                variant: Some("v8".to_string()),
+                os_version: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_platform_spec_parses_os_and_arch_with_no_variant() {
+        let platform = parse_platform_spec("test", "linux/amd64").unwrap();
+        assert_eq!(
+            platform,
+            Platform {
+                os: "linux".to_string(),
+                architecture: "amd64".to_string(),
+                variant: None,
+                os_version: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_platform_spec_rejects_an_empty_os() {
+        let err = parse_platform_spec("test", "/amd64").unwrap_err();
+        assert!(matches!(err, PlatformParseError::Empty { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn parse_platform_spec_rejects_a_missing_architecture() {
+        let err = parse_platform_spec("test", "linux").unwrap_err();
+        assert!(
+            matches!(err, PlatformParseError::MissingArchitecture { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_platform_spec_rejects_too_many_components() {
+        let err = parse_platform_spec("test", "linux/arm64/v8/extra").unwrap_err();
+        assert!(
+            matches!(err, PlatformParseError::TooManyComponents { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_platform_spec_error_names_the_given_command() {
+        let err = parse_platform_spec("ocibox create/ephemeral", "linux").unwrap_err();
+        assert!(err.to_string().contains("ocibox create/ephemeral"), "{err}");
     }
 }

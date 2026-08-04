@@ -1186,43 +1186,16 @@ fn unused_build_arg_names<'a>(
     unused
 }
 
-/// Parse a `--platform`/`FROM --platform=` value (`os/arch[/variant]`,
-/// e.g. `linux/amd64`, `linux/arm64/v8`) into a real [`Platform`] —
-/// matching real BuildKit's own `platforms.Parse` accepted shape for
-/// the common, explicit `os/arch[/variant]` form (a bare `arch`, with
-/// no `os/` prefix, or the special `local`/`$BUILDPLATFORM`-style
-/// values real BuildKit also accepts, are deliberately not supported
-/// here — every real Containerfile this project needs to build in
-/// practice already spells out the full `linux/<arch>` form).
-///
-/// Shared by `ociman pull`/`run`/`create --platform` (0307) as well as
-/// `ociman build --platform`/`FROM --platform=` — `command` names
-/// whichever one is actually parsing, for an error message that
-/// points at the right flag rather than always saying "build" even
-/// when it wasn't.
+/// Parse a `--platform`/`FROM --platform=` value — a thin,
+/// `anyhow`-returning wrapper around the real, shared
+/// [`oci_spec_types::image::parse_platform_spec`] (moved there,
+/// `docs/design/0403`, once `ocibox create`/`ephemeral --platform`
+/// needed the identical real parsing this crate-private copy already
+/// did; this wrapper exists only so every one of this binary's own
+/// existing call sites — which all propagate errors via `?` into an
+/// `anyhow::Result` — needed no changes of their own at all).
 pub(crate) fn parse_platform_spec(command: &str, value: &str) -> anyhow::Result<Platform> {
-    let mut parts = value.split('/');
-    let os = parts
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{command}: invalid --platform value {value:?}"))?;
-    let architecture = parts.next().ok_or_else(|| {
-        anyhow::anyhow!(
-            "{command}: --platform value {value:?} is missing an architecture (expected \
-             os/arch[/variant], e.g. linux/amd64)"
-        )
-    })?;
-    let variant = parts.next().map(str::to_string);
-    anyhow::ensure!(
-        parts.next().is_none(),
-        "{command}: invalid --platform value {value:?} (expected os/arch[/variant])"
-    );
-    Ok(Platform {
-        os: os.to_string(),
-        architecture: architecture.to_string(),
-        variant,
-        os_version: None,
-    })
+    Ok(oci_spec_types::image::parse_platform_spec(command, value)?)
 }
 
 /// Parse `ociman build --build-arg`'s own raw `KEY=value`/bare `KEY`

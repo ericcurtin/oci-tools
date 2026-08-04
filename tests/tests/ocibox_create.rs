@@ -226,3 +226,94 @@ fn create_of_an_unresolvable_reference_leaves_no_box_directory_behind() {
         "a failed create should leave no box directory behind at all"
     );
 }
+
+/// `--platform` (0403): a real, valid value matching this test host's
+/// own actual platform still resolves and extracts a real rootfs
+/// exactly as before this flag existed -- confirming the CLI plumbing
+/// itself (not the underlying platform-selection logic, already
+/// proven end to end against a real multi-platform index by
+/// `ociman_platform.rs`'s own tests, reused here completely
+/// unchanged) is genuinely wired through to `create_box`.
+#[test]
+fn create_platform_flag_accepts_a_value_matching_the_host_and_succeeds() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/platform-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let host = oci_spec_types::image::Platform::host();
+    let platform_value = format!("{}/{}", host.os, host.architecture);
+
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/platform-base:latest",
+            "--name",
+            "platformbox",
+            "--platform",
+            &platform_value,
+        ],
+    );
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let rootfs = storage_dir
+        .path()
+        .join("boxes")
+        .join("platformbox")
+        .join("rootfs");
+    assert!(rootfs.join("bin").join("busybox").is_file());
+}
+
+/// A malformed `--platform` value is a real, immediate CLI error
+/// (surfaced through the shared `oci_spec_types::image::
+/// parse_platform_spec`, `docs/design/0403`), leaving no half-created
+/// box directory behind -- the same "a failed create leaves nothing
+/// behind" guarantee `create_of_an_unresolvable_reference_leaves_no_
+/// box_directory_behind` already proves for a failed pull.
+#[test]
+fn create_platform_flag_rejects_an_invalid_value() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/platform-invalid:latest",
+            "--name",
+            "badplatformbox",
+            "--platform",
+            "linux",
+        ],
+    );
+    assert!(!create.status.success());
+    assert!(
+        String::from_utf8_lossy(&create.stderr).contains("missing an architecture"),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert!(
+        !storage_dir
+            .path()
+            .join("boxes")
+            .join("badplatformbox")
+            .exists(),
+        "an invalid --platform value should leave no box directory behind at all"
+    );
+}
