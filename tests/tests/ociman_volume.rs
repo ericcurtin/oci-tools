@@ -244,6 +244,68 @@ fn volume_ls_filter_with_an_unrecognized_key_is_a_clear_error() {
     );
 }
 
+/// `volume ls --filter until=` (0411), matching real `podman volume
+/// ls --filter until=` exactly -- the identical strict `created <
+/// threshold` comparison `ociman ps`/`prune`/`images --filter until=`
+/// already share. `until=<duration>` matches volumes *older* than the
+/// given duration-ago threshold, the same real, easy-to-get-backwards
+/// semantic those notes already document -- a freshly created volume
+/// must not match a 24h-ago threshold, but does match a 1s-ago one
+/// once it's genuinely at least that old.
+#[test]
+fn volume_ls_filter_until_matches_volumes_created_strictly_before_the_threshold() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let create = ociman(storage_dir.path(), &["volume", "create", "until-vol"]);
+    assert!(create.status.success(), "{create:?}");
+
+    let list_fresh = ociman(
+        storage_dir.path(),
+        &["volume", "ls", "--filter", "until=24h", "-q"],
+    );
+    assert!(
+        list_fresh.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&list_fresh.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&list_fresh.stdout)
+            .trim()
+            .is_empty(),
+        "a freshly created volume must not match a 24h-ago threshold"
+    );
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    let list_old = ociman(
+        storage_dir.path(),
+        &["volume", "ls", "--filter", "until=1s", "-q"],
+    );
+    assert!(list_old.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&list_old.stdout).trim(),
+        "until-vol"
+    );
+}
+
+/// `volume ls --filter until=` given more than once is a clear error,
+/// matching real podman's own identical refusal -- the same rule
+/// `ociman ps`/`prune`/`images --filter until=` already established.
+#[test]
+fn volume_ls_filter_until_rejects_more_than_one_value() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &[
+            "volume", "ls", "--filter", "until=1h", "--filter", "until=2h",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("more than one until filter"),
+        "{out:?}"
+    );
+}
+
 /// `volume ls --format` (0335) renders one line per listed volume,
 /// reusing the exact same Go-template-*lite* engine `ociman
 /// inspect`/`ps`/`images --format` (`0332`-`0334`) already

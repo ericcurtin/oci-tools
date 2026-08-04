@@ -3176,8 +3176,17 @@ enum VolumeCommand {
         /// text this is behaviorally identical to a substring search,
         /// the same deliberate simplification `ociman ps --filter
         /// name=`/`command=` already established, avoiding a new
-        /// regex dependency this project has nowhere else). Multiple
-        /// values are OR'd together. May be given more than once.
+        /// regex dependency this project has nowhere else). Also
+        /// `until=<duration-or-timestamp>` (0411) — matches a volume
+        /// created strictly before the given duration-ago or absolute
+        /// RFC3339 timestamp, the exact same threshold computation
+        /// `ociman ps`/`prune`/`images --filter until=` already share
+        /// (`~/git/podman/pkg/domain/filters/volumes.go`'s own
+        /// `createUntilFilterVolumeFunction`, the identical shared
+        /// `filters.ComputeUntilTimestamp` primitive); at most one
+        /// value, matching real podman's own identical refusal of
+        /// more than one. Multiple `name=` values are OR'd together.
+        /// May be given more than once.
         #[arg(long = "filter")]
         filter: Vec<String>,
     },
@@ -11656,12 +11665,13 @@ fn cmd_volume_ls(
         !(quiet && format.is_some()),
         "quiet and format flags cannot be used together"
     );
-    // `--filter name=<substring>` (0410) -- every given value parsed
-    // up front, OR'd together, matching real `podman volume ls
-    // --filter name=`'s own combination rule (see `VolumeCommand::
-    // Ls::filter`'s own doc comment for the exact, checked-directly
-    // semantics).
+    // `--filter name=<substring>` (0410)/`until=<duration-or-
+    // timestamp>` (0411) -- every given value parsed up front, `name=`
+    // values OR'd together, matching real `podman volume ls --filter`'s
+    // own combination rules (see `VolumeCommand::Ls::filter`'s own doc
+    // comment for the exact, checked-directly semantics).
     let mut name_filters: Vec<String> = Vec::new();
+    let mut until_filter: Option<std::time::SystemTime> = None;
     for f in filter {
         if let Some(value) = f.strip_prefix("name=") {
             anyhow::ensure!(
@@ -11669,9 +11679,16 @@ fn cmd_volume_ls(
                 "ociman volume ls: --filter {f:?} is missing a value"
             );
             name_filters.push(value.to_string());
+        } else if let Some(rest) = f.strip_prefix("until=") {
+            anyhow::ensure!(
+                until_filter.is_none(),
+                "ociman volume ls: more than one until filter specified"
+            );
+            until_filter = Some(parse_until_filter_value("ociman volume ls", f, rest)?);
         } else {
             anyhow::bail!(
-                "ociman volume ls: --filter {f:?} is not yet supported (only name=<substring> is)"
+                "ociman volume ls: --filter {f:?} is not yet supported (only name=<substring> \
+                 or until=<duration-or-timestamp> are)"
             );
         }
     }
@@ -11679,6 +11696,19 @@ fn cmd_volume_ls(
     let mut records = store.list().context("listing volumes")?;
     if !name_filters.is_empty() {
         records.retain(|record| name_filters.iter().any(|want| record.name.contains(want)));
+    }
+    if let Some(threshold) = until_filter {
+        // Matches real podman's own `v.CreatedTime().Before(until)`
+        // exactly (`createUntilFilterVolumeFunction`) -- a volume
+        // whose own recorded `created_at` isn't a valid RFC3339
+        // timestamp at all is excluded rather than erroring the whole
+        // listing, matching this project's own established "absence
+        // over fabrication" convention (`ociman images --filter
+        // before=`/`since=`'s own identical treatment).
+        records.retain(|record| {
+            oci_spec_types::time::parse_rfc3339_utc(&record.created_at)
+                .is_some_and(|created| created < threshold)
+        });
     }
     if let Some(template) = format {
         for record in &records {
