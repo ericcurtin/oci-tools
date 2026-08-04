@@ -822,6 +822,19 @@ struct RunArgs {
     /// `labels` field.
     #[arg(long = "label", value_name = "KEY=VALUE")]
     label: Vec<String>,
+    /// Read additional `KEY=value`/bare-`KEY` label entries (one per
+    /// line, same shape `--label` itself accepts) from a file,
+    /// matching real `podman run --label-file` exactly (checked
+    /// directly, `~/git/podman/cmd/podman/common/create.go`'s own
+    /// `labelFileFlagName`). Repeatable; each file's own entries
+    /// override an earlier file's (or the image's own inherited
+    /// `Config.Labels`) for the same key, in the order given on the
+    /// command line — but always lose to `--label`, applied last,
+    /// regardless of where `--label`/`--label-file` each appear on
+    /// the command line, the exact same order-independent precedence
+    /// `-e`/`--env-file` already established for env vars.
+    #[arg(long = "label-file", value_name = "PATH")]
+    label_file: Vec<PathBuf>,
     /// Run as this user instead of the image's own declared `USER`,
     /// matching real `docker run -u`/`--user`/`podman run
     /// -u`/`--user` exactly: `<user|uid>[:<group|gid>]`, resolved
@@ -6830,6 +6843,17 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
     // never has to guess whether an absent annotation means "no
     // labels" or "never recorded at all".
     let mut labels = config.config.clone().unwrap_or_default().labels;
+    // `--label-file` (0402): each file's own entries fold in first, in
+    // the order given on the command line, before `--label` itself --
+    // which always wins for a shared key regardless of flag order,
+    // the same precedence `combined_env`'s own `--env-file`-then-
+    // `--env` construction just below already establishes for env
+    // vars.
+    for path in &args.label_file {
+        for (key, value) in build::parse_key_value_pairs(&build::read_label_file(path)?) {
+            labels.insert(key, value);
+        }
+    }
     for (key, value) in build::parse_key_value_pairs(&args.label) {
         labels.insert(key, value);
     }

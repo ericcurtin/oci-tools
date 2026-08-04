@@ -367,6 +367,130 @@ fn create_label_merges_with_and_overrides_the_image_own_inherited_labels() {
     );
 }
 
+/// `--label-file` (0402) reads `KEY=value`/bare-`KEY` entries from a
+/// real file, matching real `podman create --label-file` exactly —
+/// blank lines and `#`-comment lines (even with leading whitespace)
+/// are skipped, the same shape `--env-file` already established;
+/// merges with (never replaces) the image's own inherited labels the
+/// same way `--label` itself does.
+#[test]
+fn create_label_file_reads_entries_from_a_real_file_and_merges_with_the_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert("image.label".to_string(), "fromimage".to_string());
+    seed_image(
+        &store,
+        "ociman-test/label-file:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            labels,
+            ..Default::default()
+        },
+    );
+
+    let label_file_dir = tempfile::tempdir().unwrap();
+    let label_file_path = label_file_dir.path().join("labels.list");
+    std::fs::write(
+        &label_file_path,
+        "\n  # a comment, with leading whitespace\nfrom.file=yes\nbarekey\n",
+    )
+    .unwrap();
+
+    let create = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["create", "--name", "label-file-ctr", "--label-file"])
+        .arg(&label_file_path)
+        .args(["ociman-test/label-file:latest", "true"])
+        .output()
+        .expect("failed to spawn ociman create");
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let inspect = ociman(storage_dir.path(), &["inspect", "label-file-ctr"]);
+    assert!(inspect.status.success(), "{inspect:?}");
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(
+        view["labels"],
+        serde_json::json!({
+            "image.label": "fromimage",
+            "from.file": "yes",
+            "barekey": "",
+        }),
+        "{view:?}"
+    );
+}
+
+/// `--label` always wins over `--label-file` for a shared key,
+/// regardless of which one appears first on the command line —
+/// matching real `podman`'s own identical `--env`/`--env-file`
+/// precedence, the same fixed (not flag-order-dependent) rule this
+/// project's own `combined_env` construction already established.
+#[test]
+fn create_label_flag_always_wins_over_label_file_regardless_of_order() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/label-file-precedence:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let label_file_dir = tempfile::tempdir().unwrap();
+    let label_file_path = label_file_dir.path().join("labels.list");
+    std::fs::write(&label_file_path, "shared=from-file\n").unwrap();
+
+    // `--label` given *before* `--label-file` on the command line --
+    // still wins, since precedence is fixed, not flag-order-dependent.
+    let create = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "create",
+            "--name",
+            "label-file-precedence-ctr",
+            "--label",
+            "shared=from-flag",
+            "--label-file",
+        ])
+        .arg(&label_file_path)
+        .args(["ociman-test/label-file-precedence:latest", "true"])
+        .output()
+        .expect("failed to spawn ociman create");
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &["inspect", "label-file-precedence-ctr"],
+    );
+    assert!(inspect.status.success(), "{inspect:?}");
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(
+        view["labels"],
+        serde_json::json!({"shared": "from-flag"}),
+        "--label should always win over --label-file, even given first on the command line"
+    );
+}
+
 /// `inspect --format` (0332) renders a single scalar field with no
 /// surrounding JSON quoting -- matching real `podman inspect --format
 /// '{{.Field}}'`'s own default scalar-rendering exactly, just against

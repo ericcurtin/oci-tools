@@ -3285,6 +3285,21 @@ pub(crate) fn read_env_file(path: &Path) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
+/// Read one `--label-file`'s own lines into the same `KEY=value`/
+/// bare-`KEY` shape [`parse_key_value_pairs`] already understands —
+/// matching real `podman run --label-file` exactly (checked directly,
+/// `~/git/podman/cmd/podman/common/create.go`'s own
+/// `labelFileFlagName`): real podman itself shares one real parsing
+/// function, `parseEnvOrLabelFile` (`cmd/podman/parse/net.go`),
+/// between its own `--env-file` and `--label-file` — the identical
+/// file format [`read_env_file`] already implements, so this is a
+/// thin, distinctly-named wrapper around it rather than a second copy
+/// of the same trim/skip logic, matching real podman's own "one
+/// format, two callers" shape exactly.
+pub(crate) fn read_label_file(path: &Path) -> anyhow::Result<Vec<String>> {
+    read_env_file(path)
+}
+
 pub(crate) fn format_pairs(pairs: &[(String, String)]) -> String {
     pairs
         .iter()
@@ -3493,6 +3508,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist.list");
         assert!(read_env_file(&path).is_err());
+    }
+
+    /// `read_label_file` (0402) is a thin wrapper around
+    /// `read_env_file` -- the same real, shared file format real
+    /// podman itself uses for both `--env-file`/`--label-file`
+    /// (`parseEnvOrLabelFile`), proven here with the identical
+    /// blank/comment-skipping fixture `read_env_file`'s own test just
+    /// above uses, read back through the label-specific name instead.
+    #[test]
+    fn read_label_file_skips_blank_and_comment_lines_even_with_leading_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("labels.list");
+        std::fs::write(
+            &path,
+            "\n  \n# a comment\n  # an indented comment\nfoo=bar\nBARE_KEY\n",
+        )
+        .unwrap();
+        let entries = read_label_file(&path).unwrap();
+        assert_eq!(entries, vec!["foo=bar".to_string(), "BARE_KEY".to_string()]);
+    }
+
+    #[test]
+    fn read_label_file_missing_path_is_a_real_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.list");
+        assert!(read_label_file(&path).is_err());
     }
 
     #[test]
