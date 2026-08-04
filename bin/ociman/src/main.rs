@@ -1143,8 +1143,15 @@ enum Command {
     /// `registry` was never logged in to in the first place.
     Logout {
         /// The registry host to log out of, exactly as given to
-        /// `ociman login`.
-        registry: String,
+        /// `ociman login`. Mutually exclusive with `--all`.
+        registry: Option<String>,
+        /// Remove every registry's own stored credentials instead of
+        /// just one (matches real `podman logout --all` exactly,
+        /// `~/git/podman/vendor/go.podman.io/common/pkg/auth/
+        /// auth.go`'s own `opts.All` branch). Takes no `registry`
+        /// argument.
+        #[arg(long)]
+        all: bool,
     },
     /// Build an image from a Dockerfile/Containerfile. See the
     /// `build` module's own doc comment for exactly what's supported
@@ -3471,7 +3478,9 @@ fn main() -> std::process::ExitCode {
                 username,
                 password,
             }) => cmd_login(&registry, &username, &password, cli.global.json),
-            Some(Command::Logout { registry }) => cmd_logout(&registry, cli.global.json),
+            Some(Command::Logout { registry, all }) => {
+                cmd_logout(registry.as_deref(), all, cli.global.json)
+            }
             Some(Command::Build {
                 context,
                 file,
@@ -4288,11 +4297,36 @@ fn cmd_login(registry: &str, username: &str, password: &str, json: bool) -> anyh
 /// `ociman logout`'s own `--json` output.
 #[derive(Debug, Serialize)]
 struct LogoutResult {
-    registry: String,
+    /// `None` when `--all` was given (matches real podman's own
+    /// "all registries" wording having no single registry to name).
+    registry: Option<String>,
     removed: bool,
 }
 
-fn cmd_logout(registry: &str, json: bool) -> anyhow::Result<()> {
+fn cmd_logout(registry: Option<&str>, all: bool, json: bool) -> anyhow::Result<()> {
+    // Exact real error messages/conditions, `~/git/podman/vendor/
+    // go.podman.io/common/pkg/auth/auth.go`'s own `Logout`.
+    if all && registry.is_some() {
+        anyhow::bail!("--all takes no arguments");
+    }
+    let Some(registry) = registry else {
+        if !all {
+            anyhow::bail!("please provide a registry to log out from");
+        }
+        let path = default_auth_file_write_path();
+        let removed = oci_registry::credentials::unset_all(&path)
+            .with_context(|| format!("removing credentials from {}", path.display()))?;
+        if json {
+            oci_cli_common::output::print_json(&LogoutResult {
+                registry: None,
+                removed,
+            })?;
+        } else {
+            println!("Removed login credentials for all registries");
+        }
+        return Ok(());
+    };
+
     let path = default_auth_file_write_path();
     let removed = oci_registry::credentials::unset(&path, registry).with_context(|| {
         format!(
@@ -4303,7 +4337,7 @@ fn cmd_logout(registry: &str, json: bool) -> anyhow::Result<()> {
 
     if json {
         oci_cli_common::output::print_json(&LogoutResult {
-            registry: registry.to_string(),
+            registry: Some(registry.to_string()),
             removed,
         })?;
     } else if removed {

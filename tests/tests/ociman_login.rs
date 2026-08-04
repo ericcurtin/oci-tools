@@ -148,3 +148,63 @@ fn logout_of_a_registry_never_logged_into_is_a_real_no_op_not_an_error() {
     let view: serde_json::Value = serde_json::from_slice(&logout.stdout).unwrap();
     assert_eq!(view["removed"], false);
 }
+
+#[test]
+fn logout_all_removes_every_registry_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("auth.json");
+    assert!(
+        ociman(&auth_file, &["login", "quay.io", "-u", "a", "-p", "b"])
+            .status
+            .success()
+    );
+    assert!(
+        ociman(&auth_file, &["login", "ghcr.io", "-u", "c", "-p", "d"])
+            .status
+            .success()
+    );
+
+    let logout = ociman(&auth_file, &["logout", "--all"]);
+    assert!(
+        logout.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&logout.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&logout.stdout).trim(),
+        "Removed login credentials for all registries"
+    );
+
+    let root: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&auth_file).unwrap()).unwrap();
+    assert_eq!(root["auths"], serde_json::json!({}));
+}
+
+#[test]
+fn logout_all_together_with_a_registry_is_a_real_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("auth.json");
+
+    let logout = ociman(&auth_file, &["logout", "--all", "quay.io"]);
+    assert!(!logout.status.success());
+    assert!(
+        String::from_utf8_lossy(&logout.stderr).contains("--all takes no arguments"),
+        "stderr: {}",
+        String::from_utf8_lossy(&logout.stderr)
+    );
+}
+
+#[test]
+fn logout_with_neither_a_registry_nor_all_is_a_real_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("auth.json");
+
+    let logout = ociman(&auth_file, &["logout"]);
+    assert!(!logout.status.success());
+    assert!(
+        String::from_utf8_lossy(&logout.stderr)
+            .contains("please provide a registry to log out from"),
+        "stderr: {}",
+        String::from_utf8_lossy(&logout.stderr)
+    );
+}

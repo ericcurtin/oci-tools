@@ -153,6 +153,36 @@ pub fn unset(path: &Path, registry_host: &str) -> io::Result<bool> {
     Ok(removed)
 }
 
+/// Remove *every* entry from the auth file at `path` (`ociman logout
+/// --all`'s own backing) — unlike [`unset`], this always writes back
+/// (even when there was nothing to clear) *unless* `path` doesn't
+/// exist at all yet, matching [`unset`]'s own tolerance for that case.
+/// Preserves every other, unrelated top-level field (e.g.
+/// `credsStore`) exactly like [`set`]/[`unset`] both already do —
+/// only `auths` itself is ever touched. Returns whether there was
+/// actually at least one entry to remove (matches real podman's own
+/// `RemoveAllAuthentication`, `~/git/podman/vendor/go.podman.io/
+/// common/pkg/auth/auth.go`, which the exact same way just clears the
+/// whole `auths` map and always reports success either way — the
+/// return value here is purely a nicety for `--json` output, not
+/// something real podman itself surfaces).
+pub fn unset_all(path: &Path) -> io::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut root = read_or_default(path)?;
+    let auths = root
+        .get_mut("auths")
+        .and_then(|v| v.as_object_mut())
+        .expect("read_or_default always ensures a real, present `auths` object");
+    let had_any = !auths.is_empty();
+    if had_any {
+        auths.clear();
+        write_atomic(path, &root)?;
+    }
+    Ok(had_any)
+}
+
 /// Read `path` as a generic JSON value, defaulting to a fresh
 /// `{"auths": {}}` object if it doesn't exist yet — always guarantees
 /// a real, present, object-typed `auths` field on return (creating one
@@ -404,6 +434,54 @@ mod tests {
         let path = dir.path().join("does-not-exist.json");
         let removed = unset(&path, "quay.io").unwrap();
         assert!(!removed);
+        assert!(!path.exists(), "must not create the file just to log out");
+    }
+
+    #[test]
+    fn unset_all_clears_every_entry_but_preserves_other_top_level_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        set(&path, "quay.io", "user", "pass").unwrap();
+        set(&path, "ghcr.io", "user", "pass").unwrap();
+        {
+            let mut root: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            root["credsStore"] = serde_json::json!("desktop");
+            write_atomic(&path, &root).unwrap();
+        }
+
+        let had_any = unset_all(&path).unwrap();
+        assert!(had_any);
+
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(root["auths"], serde_json::json!({}));
+        assert_eq!(root["credsStore"], "desktop");
+    }
+
+    #[test]
+    fn unset_all_of_an_already_empty_auth_file_is_a_real_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"auths": {}}"#).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let had_any = unset_all(&path).unwrap();
+        assert!(!had_any);
+
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            before, after,
+            "must not rewrite the file when there was nothing to clear"
+        );
+    }
+
+    #[test]
+    fn unset_all_of_a_missing_file_is_a_real_no_op_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        let had_any = unset_all(&path).unwrap();
+        assert!(!had_any);
         assert!(!path.exists(), "must not create the file just to log out");
     }
 
