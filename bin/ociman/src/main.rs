@@ -1820,7 +1820,15 @@ enum Command {
         /// text is behaviorally identical to a substring search; an
         /// actual regex pattern with metacharacters is a deliberate,
         /// honest simplification not yet supported here, avoiding a
-        /// new dependency this project has nowhere else). Multiple
+        /// new dependency this project has nowhere else), or
+        /// `command=<substring>` (matching real `podman ps --filter
+        /// command=`'s own checked-directly behavior: a real regex
+        /// match against just the container's own *first* command
+        /// element — the executable itself, never its arguments —
+        /// simplified here to the same substring match `name=` above
+        /// already establishes, applied to the equivalent first
+        /// element of this project's own stored, space-joined command
+        /// string). Multiple
         /// values for the *same* key are OR'd together; different
         /// keys are ANDed (both checked directly against a real
         /// installed `podman ps`). Giving `status=` at all overrides
@@ -8295,6 +8303,16 @@ struct PsFilters {
     id: Vec<String>,
     /// `name=<substring>`, OR'd together.
     name: Vec<String>,
+    /// `command=<substring>`, OR'd together -- see `Command::Ps`'s
+    /// own doc comment for exactly which real, checked-directly
+    /// behavior this matches (real podman's own `command=` matches
+    /// only the container's own first command element -- the
+    /// executable itself, not its arguments -- via a real regex; this
+    /// project's own simplified equivalent extracts that same first
+    /// element from its own stored, space-joined command string and
+    /// substring-matches it, the same "avoid a new regex dependency"
+    /// simplification `name=` already established).
+    command: Vec<String>,
     /// `label=`/`label!=`, ANDed together -- a real, deliberate
     /// *difference* from `ociman prune --filter label=`'s own OR
     /// semantics (`0192`), matching real podman's own genuinely
@@ -8355,6 +8373,12 @@ fn parse_ps_filters(filters: &[String]) -> anyhow::Result<PsFilters> {
                 "ociman ps: --filter {f:?} is missing a value"
             );
             parsed.name.push(value.to_string());
+        } else if let Some(value) = f.strip_prefix("command=") {
+            anyhow::ensure!(
+                !value.is_empty(),
+                "ociman ps: --filter {f:?} is missing a value"
+            );
+            parsed.command.push(value.to_string());
         } else if let Some(result) = try_parse_label_filter("ociman ps", f) {
             parsed.labels.push(result?);
         } else if let Some(value) = f.strip_prefix("before=") {
@@ -8400,7 +8424,8 @@ fn parse_ps_filters(filters: &[String]) -> anyhow::Result<PsFilters> {
         } else {
             anyhow::bail!(
                 "ociman ps: --filter {f:?} is not yet supported (only status=<creating|created|\
-                 running|stopped|paused>, id=<prefix>, name=<substring>, label=<key>[=<value>]/\
+                 running|stopped|paused>, id=<prefix>, name=<substring>, \
+                 command=<substring>, label=<key>[=<value>]/\
                  label!=<key>[=<value>], before=<container>, since=<container>, \
                  ancestor=<image>, exited=<code>, or until=<duration-or-timestamp> are)"
             );
@@ -8553,6 +8578,27 @@ fn cmd_ps(
                     .map(String::as_str)
                     .unwrap_or("");
                 if !filters.name.iter().any(|want| name.contains(want.as_str())) {
+                    return false;
+                }
+            }
+            // `command=` is an ordinary additional constraint too,
+            // same visibility-rule treatment as `id=`/`name=` above --
+            // matched against just the first element of the stored,
+            // space-joined command (the executable itself), the same
+            // real `Command()[0]`-only scope real podman's own
+            // `command=` filter uses (see `PsFilters::command`'s own
+            // doc comment).
+            if !filters.command.is_empty() {
+                let executable = s
+                    .annotations
+                    .get(ANNOTATION_COMMAND)
+                    .and_then(|full| full.split_whitespace().next())
+                    .unwrap_or("");
+                if !filters
+                    .command
+                    .iter()
+                    .any(|want| executable.contains(want.as_str()))
+                {
                     return false;
                 }
             }

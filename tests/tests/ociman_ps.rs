@@ -946,6 +946,97 @@ fn ps_filter_name_matches_a_substring_and_still_respects_default_visibility() {
     assert!(String::from_utf8_lossy(&no_all.stdout).trim().is_empty());
 }
 
+/// `ociman ps --filter command=<substring>` (0404), matching real
+/// `podman ps --filter command=`'s own checked-directly behavior: a
+/// match against just the container's own *first* command element
+/// (the executable itself), never its arguments -- proven here by two
+/// containers with genuinely different executables, one of which also
+/// has an argument (`sleep`) that must *not* itself match, confirming
+/// this isn't a naive whole-command-line substring search.
+#[test]
+fn ps_filter_command_matches_only_the_first_command_element() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-filter-command:latest",
+        &busybox,
+        &["sh", "true", "sleep"],
+        ContainerConfig::default(),
+    );
+    let true_ctr = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "command-filter-true",
+            "ociman-test/ps-filter-command:latest",
+            "true",
+        ],
+    );
+    assert!(true_ctr.status.success(), "{true_ctr:?}");
+    let sh_ctr = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "command-filter-sh",
+            "ociman-test/ps-filter-command:latest",
+            "/bin/sh",
+            "-c",
+            "sleep 300",
+        ],
+    );
+    assert!(sh_ctr.status.success(), "{sh_ctr:?}");
+
+    // Matches the executable of exactly one of the two containers.
+    let matched_true = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "command=true", "-q"],
+    );
+    assert!(matched_true.status.success(), "{matched_true:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&matched_true.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "{matched_true:?}"
+    );
+    let matched_sh = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "command=sh", "-q"],
+    );
+    assert!(matched_sh.status.success(), "{matched_sh:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&matched_sh.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "{matched_sh:?}"
+    );
+
+    // `sleep` is an *argument* of the second container, never its own
+    // first command element -- a real match here would prove this is
+    // wrongly matching the whole command line rather than just the
+    // executable, the same real distinction real podman's own
+    // `Command()[0]`-only filter makes.
+    let no_match = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", "command=sleep", "-q"],
+    );
+    assert!(no_match.status.success(), "{no_match:?}");
+    assert!(
+        String::from_utf8_lossy(&no_match.stdout).trim().is_empty(),
+        "{no_match:?}"
+    );
+}
+
 /// `ociman ps --filter id=<prefix>` (0273), matching real `podman ps
 /// --filter id=`'s own checked-directly prefix-match semantics for a
 /// plain hex value.
