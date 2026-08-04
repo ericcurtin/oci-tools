@@ -629,6 +629,98 @@ fn volume_inspect_of_an_unknown_volume_is_a_clear_error() {
     );
 }
 
+/// `volume inspect --format`/`-f` (matching real `podman volume
+/// inspect --format` exactly, checked directly against `~/git/
+/// podman/cmd/podman/volumes/inspect.go`) renders the requested
+/// fields via the same Go-template-*lite* engine `volume ls
+/// --format`/`inspect`/`ps`/`images --format` already share.
+#[test]
+fn volume_inspect_format_renders_the_requested_fields() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    ociman(storage_dir.path(), &["volume", "create", "fmt-inspect-vol"]);
+
+    let format = ociman(
+        storage_dir.path(),
+        &[
+            "volume",
+            "inspect",
+            "fmt-inspect-vol",
+            "--format",
+            "{{.name}}={{.driver}}",
+        ],
+    );
+    assert!(
+        format.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&format.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&format.stdout).trim(),
+        "fmt-inspect-vol=local"
+    );
+
+    // The short flag `-f` behaves identically to `--format`.
+    let short = ociman(
+        storage_dir.path(),
+        &[
+            "volume",
+            "inspect",
+            "fmt-inspect-vol",
+            "-f",
+            "{{.name}}={{.driver}}",
+        ],
+    );
+    assert_eq!(short.stdout, format.stdout);
+}
+
+/// `--format`, when given, takes priority over `--json`/the default
+/// pretty JSON, and an unresolvable field path is a real, immediate
+/// error -- the same precedence and error behavior `volume ls`/
+/// `inspect`/`ps`/`images --format` already established.
+#[test]
+fn volume_inspect_format_takes_priority_over_json_and_errors_on_an_unknown_field() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    ociman(
+        storage_dir.path(),
+        &["volume", "create", "fmt-inspect-priority"],
+    );
+
+    let format = ociman(
+        storage_dir.path(),
+        &[
+            "volume",
+            "inspect",
+            "fmt-inspect-priority",
+            "--json",
+            "--format",
+            "{{.name}}",
+        ],
+    );
+    assert!(format.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&format.stdout).trim(),
+        "fmt-inspect-priority",
+        "the format template's own bare name, not --json's own object, should have won"
+    );
+
+    let bad = ociman(
+        storage_dir.path(),
+        &[
+            "volume",
+            "inspect",
+            "fmt-inspect-priority",
+            "--format",
+            "{{.nosuchfield}}",
+        ],
+    );
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("no field"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
 #[test]
 fn volume_rm_of_an_unknown_volume_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();

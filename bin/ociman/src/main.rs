@@ -3359,6 +3359,21 @@ enum VolumeCommand {
     Inspect {
         /// The volume's own name.
         name: String,
+        /// Render the result via a Go-template-*lite* string instead
+        /// of pretty JSON — matching real `podman volume inspect
+        /// --format`/`-f` exactly (checked directly, `~/git/podman/
+        /// cmd/podman/volumes/inspect.go`: `podman volume inspect
+        /// --format "{{.Driver}} {{.Scope}}" myvol`). Same engine/
+        /// scope `ociman inspect`/`ps`/`images`/`volume ls --format`
+        /// already share (`0332`-`0335`): `{{.field}}` placeholders
+        /// only, this project's own JSON field names (`{{.name}}`,
+        /// `{{.driver}}`, `{{.mountpoint}}`, `{{.created_at}}`), not
+        /// real podman's own Go-struct casing. Takes priority over
+        /// `--json` when given — reuses [`print_inspect_result`]
+        /// verbatim, the exact same shared helper `ociman inspect`'s
+        /// own container/image branches already call.
+        #[arg(long = "format", short = 'f', value_name = "TEMPLATE")]
+        format: Option<String>,
     },
     /// Remove a named volume — matching real `docker volume rm`/
     /// `podman volume rm`. Refuses a volume any container (running or
@@ -3867,7 +3882,9 @@ fn main() -> std::process::ExitCode {
                     quiet,
                     filter,
                 } => cmd_volume_ls(cli.global.json, format.as_deref(), quiet, &filter),
-                VolumeCommand::Inspect { name } => cmd_volume_inspect(&name, cli.global.json),
+                VolumeCommand::Inspect { name, format } => {
+                    cmd_volume_inspect(&name, cli.global.json, format.as_deref())
+                }
                 VolumeCommand::Rm { name, force } => cmd_volume_rm(&name, force),
                 VolumeCommand::Rename { name, new_name } => cmd_volume_rename(&name, &new_name),
                 VolumeCommand::Prune => cmd_volume_prune(cli.global.json),
@@ -12398,19 +12415,14 @@ fn cmd_volume_ls(
     Ok(())
 }
 
-fn cmd_volume_inspect(name: &str, json: bool) -> anyhow::Result<()> {
+fn cmd_volume_inspect(name: &str, json: bool, format: Option<&str>) -> anyhow::Result<()> {
     let store = open_volume_store()?;
     let record = store
         .get(name)
         .with_context(|| format!("looking up volume {name:?}"))?
         .ok_or_else(|| anyhow::anyhow!("no volume with name {name:?} found"))?;
     let view = VolumeView::from_record(&store, &record);
-    if json {
-        oci_cli_common::output::print_json(&view)?;
-    } else {
-        println!("{}", serde_json::to_string_pretty(&view)?);
-    }
-    Ok(())
+    print_inspect_result(&view, json, format)
 }
 
 /// Every container (running or stopped) whose own bundle actually
