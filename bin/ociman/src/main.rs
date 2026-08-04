@@ -1013,6 +1013,22 @@ struct RunArgs {
     /// run --pull` with no value), not a silent `always`.
     #[arg(long, value_enum, default_value_t = PullPolicy::Missing)]
     pull: PullPolicy,
+    /// Suppress the pull-progress spinner, if `image` actually needs
+    /// pulling at all — matching real `podman run --quiet`/`podman
+    /// create --quiet` exactly (checked directly, both live against a
+    /// real installed `podman 4.9.3` and against source, `~/git/
+    /// podman/cmd/podman/containers/create.go`'s own `cliVals.Quiet`):
+    /// confirmed live, a bare `podman create --quiet` against a
+    /// not-yet-present image prints only the resulting container id
+    /// on success, none of the usual "Trying to pull ...`"/"Copying
+    /// blob ..."/"Writing manifest ..." lines a non-quiet pull always
+    /// shows — the exact same progress-writer gate `ociman pull
+    /// --quiet` (0428) already established, reused here for its
+    /// second real call site. Has no effect at all when `image` is
+    /// already present locally (there is no pull to silence), and
+    /// never affects the container's own later output either way.
+    #[arg(short, long)]
+    quiet: bool,
     /// Pull this platform's manifest instead of the host's own when
     /// `image` needs pulling — see `Command::Pull`'s own identical
     /// flag for the exact same syntax/semantics (a pure image-
@@ -7737,8 +7753,14 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         None => {
             let reference = Reference::parse(&args.image)
                 .with_context(|| format!("parsing image reference {:?}", args.image))?;
-            let record =
-                resolve_or_pull(&store, &reference, args.tls_verify, args.pull, &platform)?;
+            let record = resolve_or_pull(
+                &store,
+                &reference,
+                args.tls_verify,
+                args.pull,
+                &platform,
+                args.quiet,
+            )?;
             (record, reference.to_string())
         }
     };
@@ -13631,6 +13653,7 @@ fn resolve_or_pull(
     tls_verify: bool,
     pull_policy: PullPolicy,
     platform: &Platform,
+    quiet: bool,
 ) -> anyhow::Result<ImageRecord> {
     oci_registry::resolve_or_pull(
         store,
@@ -13638,13 +13661,13 @@ fn resolve_or_pull(
         pull_policy.into(),
         tls_verify,
         platform,
-        // `false`: this implicit-pull path (`ociman run --pull`/
-        // `create`/`build`'s own `FROM`/`COPY --from=`) has no
-        // `--quiet` concept of its own -- always shows the spinner,
-        // exactly as before `ociman pull --quiet` (0428) existed.
-        // Scoped deliberately, not an oversight: only `ociman pull`
-        // itself gets to silence it.
-        || pull_unconditionally(store, reference, tls_verify, platform, false),
+        // `quiet`: `ociman run --quiet`/`create --quiet` (0439) thread
+        // their own flag all the way through to here; `build.rs`'s own
+        // `FROM`/`COPY --from=` call sites always pass `false` --
+        // `ociman build -q`'s own, separately-scoped quiet convention
+        // (0196) never touched this spinner in the first place, and
+        // still doesn't.
+        || pull_unconditionally(store, reference, tls_verify, platform, quiet),
     )
     .map_err(|e| match e {
         oci_registry::PullError::NotFoundLocally { reference } => {

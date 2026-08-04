@@ -416,6 +416,10 @@ pub fn cmd_build(
                     tls_verify,
                     pull_policy,
                     &Platform::host(),
+                    // `ociman build -q`'s own quiet convention (0196)
+                    // never touched this spinner -- see
+                    // `crate::resolve_or_pull`'s own doc comment.
+                    false,
                 )?;
                 let base_manifest = store
                     .image_manifest(&base_record)
@@ -2537,6 +2541,9 @@ fn external_image_source_root(
         tls_verify,
         pull_policy,
         &Platform::host(),
+        // See the other `crate::resolve_or_pull` call site in this
+        // file, just above.
+        false,
     )?;
     let manifest = store
         .image_manifest(&record)
