@@ -3445,6 +3445,24 @@ enum ContainerCommand {
         /// doc comment above).
         #[arg(short, long)]
         force: bool,
+        /// Only remove a container also matching every given filter
+        /// — `label=<key>[=<value>]`, `label!=<key>[=<value>]`, or
+        /// `until=<duration-or-timestamp>` (see [`ContainerPruneFilters`]'s
+        /// own doc comment for the exact semantics each uses).
+        /// Real `podman container prune --filter` additionally
+        /// accepts `annotation=`/`annotation!=`, a concept this
+        /// project has no separate equivalent of at all (every label
+        /// this project stores already lives in one place, unlike
+        /// real podman's own separate OCI-spec-annotations-vs-
+        /// config-labels distinction) — checked directly,
+        /// `~/git/podman/pkg/domain/filters/containers.go`'s own
+        /// `GeneratePruneContainerFilterFuncs`, which also confirms
+        /// real `podman container prune` has **no** `dangling=` key
+        /// at all (that's an image-only concept), matching this
+        /// command's own narrower grammar exactly rather than
+        /// `ociman prune`'s own wider one.
+        #[arg(long = "filter")]
+        filter: Vec<String>,
     },
 }
 
@@ -3761,7 +3779,9 @@ fn main() -> std::process::ExitCode {
             },
             Some(Command::Container { command }) => match command {
                 ContainerCommand::Exists { name, external: _ } => cmd_container_exists(&name),
-                ContainerCommand::Prune { force: _ } => cmd_container_prune(cli.global.json),
+                ContainerCommand::Prune { force: _, filter } => {
+                    cmd_container_prune(cli.global.json, &filter)
+                }
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),
@@ -5583,6 +5603,49 @@ fn try_parse_dangling_filter(command: &str, f: &str) -> Option<anyhow::Result<bo
     })
 }
 
+/// Every `--filter` value `ociman container prune` accepts — a real,
+/// deliberately narrower grammar than `ociman prune`'s own
+/// [`PruneFilters`] (no `dangling=`, a filter key real `podman
+/// container prune` itself doesn't accept either — see
+/// [`ContainerCommand::Prune::filter`]'s own doc comment for the
+/// exact real, checked-directly confirmation). `labels` are OR'd
+/// together, matching this project's own already-established `ociman
+/// prune --filter label=` convention (`PruneFilters::labels`'s own
+/// doc comment) rather than `ociman ps --filter label=`'s own
+/// AND'd/every-constraint-narrows-further convention — this command
+/// is a prune-family sibling, not a listing/visibility filter.
+#[derive(Default)]
+struct ContainerPruneFilters {
+    labels: Vec<LabelFilter>,
+    until: Option<std::time::SystemTime>,
+}
+
+/// Parse `ociman container prune`'s own `--filter` values into a
+/// [`ContainerPruneFilters`].
+fn parse_container_prune_filters(filters: &[String]) -> anyhow::Result<ContainerPruneFilters> {
+    let mut parsed = ContainerPruneFilters::default();
+    let mut until_values = 0usize;
+    for f in filters {
+        if let Some(result) = try_parse_label_filter("ociman container prune", f) {
+            parsed.labels.push(result?);
+        } else if let Some(rest) = f.strip_prefix("until=") {
+            until_values += 1;
+            anyhow::ensure!(
+                until_values == 1,
+                "ociman container prune: more than one until filter specified"
+            );
+            parsed.until = Some(parse_until_filter_value("ociman container prune", f, rest)?);
+        } else {
+            anyhow::bail!(
+                "ociman container prune: --filter {f:?} is not yet supported (only \
+                 label=<key>[=<value>], label!=<key>[=<value>], or until=<duration-or-timestamp> \
+                 are)"
+            );
+        }
+    }
+    Ok(parsed)
+}
+
 /// Parse `ociman prune`'s own `--filter` values into a [`PruneFilters`].
 fn parse_prune_filters(filters: &[String]) -> anyhow::Result<PruneFilters> {
     let mut parsed = PruneFilters::default();
@@ -6126,7 +6189,8 @@ fn cmd_prune(json: bool, all: bool, filter: &[String]) -> anyhow::Result<()> {
     // real, checked-directly ordering `~/git/podman/pkg/domain/infra/
     // abi/system.go`'s own `SystemPrune` uses (containers pruned
     // strictly before images).
-    let containers_removed = prune_eligible_containers(&containers)?;
+    let containers_removed =
+        prune_eligible_containers(&containers, &ContainerPruneFilters::default())?;
 
     let ImagePruneOutcome {
         images_removed,
@@ -8194,9 +8258,10 @@ fn cmd_container_exists(name: &str) -> anyhow::Result<()> {
 /// perfectly safe here since eligibility above already excludes
 /// `Running`/`Paused` (the only statuses `force` genuinely changes
 /// anything real for, by actually signaling a live process).
-fn cmd_container_prune(json: bool) -> anyhow::Result<()> {
+fn cmd_container_prune(json: bool, filter: &[String]) -> anyhow::Result<()> {
     let containers = open_container_store()?;
-    let removed = prune_eligible_containers(&containers)?;
+    let filters = parse_container_prune_filters(filter)?;
+    let removed = prune_eligible_containers(&containers, &filters)?;
     if json {
         oci_cli_common::output::print_json(&removed)?;
     } else {
@@ -8216,15 +8281,42 @@ fn cmd_container_prune(json: bool) -> anyhow::Result<()> {
 /// scope): every `Created`/`Stopped` container is removed, `Running`/
 /// `Paused` ones are always left untouched. See
 /// [`ContainerCommand::Prune`]'s own doc comment for the exact real,
-/// checked-directly eligibility filter this ports.
-fn prune_eligible_containers(containers: &StateStore) -> anyhow::Result<Vec<String>> {
+/// checked-directly eligibility filter this ports. `filters` (see
+/// [`ContainerPruneFilters`]) additionally narrows the set — an
+/// empty [`ContainerPruneFilters::default`] (the only way
+/// [`cmd_prune`]'s own `ociman prune` calls this today) matches
+/// every eligible container, preserving its existing, unfiltered
+/// behavior exactly.
+fn prune_eligible_containers(
+    containers: &StateStore,
+    filters: &ContainerPruneFilters,
+) -> anyhow::Result<Vec<String>> {
     let mut removed = Vec::new();
     for state in containers.list().context("listing containers")? {
-        if matches!(state.effective_status(), Status::Created | Status::Stopped) {
-            remove_container(containers, &state.id, true, None, true)
-                .with_context(|| format!("removing container {}", state.id))?;
-            removed.push(state.id);
+        if !matches!(state.effective_status(), Status::Created | Status::Stopped) {
+            continue;
         }
+        if !filters.labels.is_empty() {
+            let labels: std::collections::BTreeMap<String, String> = state
+                .annotations
+                .get(ANNOTATION_LABELS)
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default();
+            if !filters.labels.iter().any(|f| f.matches(&labels)) {
+                continue;
+            }
+        }
+        if let Some(until) = filters.until {
+            let Some(created) = oci_spec_types::time::parse_rfc3339_utc(&state.created) else {
+                continue;
+            };
+            if created >= until {
+                continue;
+            }
+        }
+        remove_container(containers, &state.id, true, None, true)
+            .with_context(|| format!("removing container {}", state.id))?;
+        removed.push(state.id);
     }
     Ok(removed)
 }

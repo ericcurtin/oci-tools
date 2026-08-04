@@ -222,6 +222,144 @@ fn container_prune_force_is_accepted_and_behaves_identically() {
     assert!(all_ids(storage_dir.path()).is_empty());
 }
 
+/// `container prune --filter label=` only removes a `Created`/
+/// `Stopped` container that also matches (OR'd across multiple
+/// values, matching `ociman prune --filter label=`'s own established
+/// convention, not `ociman ps --filter label=`'s AND'd one — see
+/// `ContainerPruneFilters`'s own doc comment in `bin/ociman/src/
+/// main.rs`), leaving a non-matching one completely untouched.
+#[test]
+fn container_prune_filter_label_only_removes_a_matching_stopped_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-prune-filter-label:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let create_match = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--label",
+            "env=prod",
+            "ociman-test/container-prune-filter-label:latest",
+            "true",
+        ],
+    );
+    assert!(create_match.status.success(), "{create_match:?}");
+    let match_id = String::from_utf8_lossy(&create_match.stdout)
+        .trim()
+        .to_string();
+
+    let create_other = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--label",
+            "env=staging",
+            "ociman-test/container-prune-filter-label:latest",
+            "true",
+        ],
+    );
+    assert!(create_other.status.success(), "{create_other:?}");
+    let other_id = String::from_utf8_lossy(&create_other.stdout)
+        .trim()
+        .to_string();
+
+    let prune = ociman(
+        storage_dir.path(),
+        &["container", "prune", "--filter", "label=env=prod"],
+    );
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&prune.stdout).trim(),
+        match_id,
+        "{prune:?}"
+    );
+
+    let remaining = all_ids(storage_dir.path());
+    assert_eq!(remaining, vec![other_id]);
+}
+
+/// `container prune --filter until=` only removes a container older
+/// than the given threshold, keeping a freshly created one, matching
+/// `ociman prune --filter until=`'s/`ociman images --filter until=`'s
+/// own already-established `until=` semantics exactly.
+#[test]
+fn container_prune_filter_until_keeps_a_freshly_created_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-prune-filter-until:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "ociman-test/container-prune-filter-until:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+    // A threshold in the past: this freshly created container is
+    // *not* older than it, so it must survive.
+    let prune_past = ociman(
+        storage_dir.path(),
+        &["container", "prune", "--filter", "until=1h"],
+    );
+    assert!(prune_past.status.success(), "{prune_past:?}");
+    assert!(
+        String::from_utf8_lossy(&prune_past.stdout)
+            .trim()
+            .is_empty()
+    );
+    assert_eq!(all_ids(storage_dir.path()), vec![id.clone()]);
+
+    // Once the container genuinely *is* older than the given
+    // duration, it's removed -- the same `sleep` then `until=1s`
+    // technique `ociman_prune.rs`'s own `prune_filter_until_removes_
+    // an_image_older_than_the_threshold` already established.
+    std::thread::sleep(Duration::from_secs(2));
+    let prune_old = ociman(
+        storage_dir.path(),
+        &["container", "prune", "--filter", "until=1s"],
+    );
+    assert!(
+        prune_old.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune_old.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&prune_old.stdout).trim(),
+        id,
+        "{prune_old:?}"
+    );
+    assert!(all_ids(storage_dir.path()).is_empty());
+}
+
 /// `container prune --json` emits the same removed-id list as a plain
 /// JSON array, matching `volume prune --json`'s own already-
 /// established shape.
