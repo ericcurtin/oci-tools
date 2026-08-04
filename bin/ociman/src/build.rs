@@ -231,6 +231,8 @@ pub fn cmd_build(
     unsetlabel: &[String],
     ulimit: &[String],
     shm_size: Option<&str>,
+    memory: Option<&str>,
+    memory_swap: Option<&str>,
     quiet: bool,
     json: bool,
     timestamp: Option<i64>,
@@ -286,6 +288,28 @@ pub fn cmd_build(
     // applied to every `RUN` step's own `/dev/shm` mount (see `run_
     // step_spec`'s own call site via `StageContext::shm_size_bytes`).
     let shm_size_bytes = shm_size.map(crate::parse_memory_limit).transpose()?;
+
+    // `--memory`/`--memory-swap` — same reuse-the-existing-primitive
+    // shape as `--ulimit`/`--shm-size` above: `ociman run`/`create`'s
+    // own `parse_and_validate_memory_and_cpus` (validation included:
+    // `--memory-swap` requires `--memory`, and must be at least as
+    // large) and `resources_from_cli` (spec construction), reused
+    // verbatim rather than a second implementation of either. No
+    // `--memory-reservation`/`--cpus` counterpart yet for `build`
+    // (out of scope for this increment) -- passed as `None` here,
+    // same as `resources_from_cli`'s own already-established "not
+    // every caller needs every field" shape.
+    let (build_memory_limit_bytes, build_memory_swap_bytes, _) =
+        crate::parse_and_validate_memory_and_cpus(memory, memory_swap, None, None)?;
+    let resources = crate::resources_from_cli(
+        build_memory_limit_bytes,
+        build_memory_swap_bytes,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
 
     let instructions = oci_dockerfile::parse(&text).map_err(|e| anyhow::anyhow!(e))?;
     let (meta_args, stages) =
@@ -494,6 +518,7 @@ pub fn cmd_build(
             forced_mtime: timestamp,
             rlimits: &rlimits,
             shm_size_bytes,
+            resources: &resources,
         };
         let force_rootfs = copy_from_targets.contains(&stage_index);
         // `--squash`/`--squash-all` only ever apply to the target
@@ -823,6 +848,20 @@ struct StageContext<'a> {
     /// function): build-wide, no per-stage/per-instruction override,
     /// the same shape `rlimits` already established.
     shm_size_bytes: Option<i64>,
+    /// `--memory`/`--memory-swap`'s own already-validated
+    /// `LinuxResources`, if either was given — carried here for the
+    /// same reason `rlimits`/`shm_size_bytes` are: every `RUN` step
+    /// already threading `stage_ctx` through can reach it without yet
+    /// another parameter of its own. Applied to every `RUN` step in
+    /// every stage alike, matching real `podman build --memory`/
+    /// `--memory-swap` exactly (checked directly, `~/git/podman/
+    /// vendor/go.podman.io/buildah/run_linux.go`'s own `commonOpts.
+    /// Memory`/`commonOpts.MemorySwap` handling, called from the same
+    /// shared per-`RUN`-invocation setup function `rlimits`/`shm_
+    /// size_bytes` already found calling `addRlimits`/
+    /// `setupSpecialMountSpecChanges`): build-wide, no per-stage/
+    /// per-instruction override.
+    resources: &'a Option<oci_spec_types::runtime::LinuxResources>,
 }
 
 impl StageContext<'_> {
@@ -1462,6 +1501,7 @@ fn apply_instruction(
                 stage_ctx.forced_mtime,
                 stage_ctx.rlimits,
                 stage_ctx.shm_size_bytes,
+                stage_ctx.resources,
             )?;
         }
         Instruction::Copy {
@@ -1699,6 +1739,7 @@ fn run_instruction(
     forced_mtime: Option<i64>,
     rlimits: &[oci_spec_types::runtime::PosixRlimit],
     shm_size_bytes: Option<i64>,
+    resources: &Option<oci_spec_types::runtime::LinuxResources>,
 ) -> anyhow::Result<()> {
     let args = args_for_run(shell_or_exec, current_shell);
     let command_text = args.join(" ");
@@ -1746,6 +1787,7 @@ fn run_instruction(
         &arg_overlay,
         rlimits,
         shm_size_bytes,
+        resources,
     )
     .with_context(|| format!("preparing RUN {command_text}"))?;
     let bundle_dir = rootfs
@@ -1762,6 +1804,32 @@ fn run_instruction(
 
     let before = oci_layer::Snapshot::capture(rootfs)
         .with_context(|| format!("capturing rootfs state before RUN {command_text}"))?;
+
+    // `--memory`/`--memory-swap` (0455) need a *real* cgroup to
+    // actually enforce anything at all -- `CgroupSetup::FromSpec`
+    // (what plain `oci_runtime_core::launch::run` always uses, and
+    // what every earlier `RUN` step here used exclusively before this
+    // increment) only ever writes real limit files when `bundle.spec.
+    // linux.cgroupsPath` is set, which `run_step_spec` never does (a
+    // `RUN` step has never needed a cgroup at all before now — see
+    // `docs/design/0033`/`0034`'s own already-established "`ocirun`
+    // itself always uses `FromSpec`; `ociman run`/`create` use a
+    // transient systemd scope instead" split). So this `RUN` step
+    // gets the exact same treatment `ociman run`/`create` already do
+    // (see `cmd_run`'s own identical `cgroup_setup` construction) —
+    // but *only* when `resources` is actually `Some(...)` at all
+    // (i.e. `--memory`/`--memory-swap` was actually given): the
+    // overwhelmingly common no-flag case keeps the original, lighter
+    // `FromSpec`/no-real-cgroup path completely unchanged, so this
+    // never costs anything for a build that doesn't use either flag.
+    let cgroup_setup = match resources {
+        Some(resources) => oci_runtime_core::launch::CgroupSetup::Systemd {
+            scope_name: format!("ociman-build-{}.scope", crate::short_id()),
+            description: "oci-tools build RUN step".to_string(),
+            resources: Some(Box::new(resources.clone())),
+        },
+        None => oci_runtime_core::launch::CgroupSetup::FromSpec,
+    };
 
     // SAFETY: `ociman build`'s own process has not spawned any
     // additional threads by this point -- argument parsing, pulling,
@@ -1788,16 +1856,22 @@ fn run_instruction(
         // -- `ociman build`'s own `RUN` steps have no equivalent flags
         // (real `docker build`/`podman build` don't either); every
         // `RUN` step gets a fresh session keyring, matching real
-        // `runc`/`crun`'s own default.
-        oci_runtime_core::launch::run(
+        // `runc`/`crun`'s own default. `log_path: None`/`on_pid: |_| {}`
+        // -- a `RUN` step has no live-pid observer or persisted log
+        // file of its own, matching plain `run`'s own identical
+        // no-op values for both.
+        oci_runtime_core::launch::run_reporting_pid(
             "ociman-build",
             &bundle,
             &validated_rootfs,
+            None,
+            cgroup_setup,
             true,
             quiet,
             0,
             false,
             false,
+            |_pid| {},
         )
     }
     .with_context(|| format!("running RUN {command_text}"))?;
@@ -1896,6 +1970,7 @@ fn run_step_spec(
     arg_overlay: &[(String, String)],
     rlimits: &[oci_spec_types::runtime::PosixRlimit],
     shm_size_bytes: Option<i64>,
+    resources: &Option<oci_spec_types::runtime::LinuxResources>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -1993,6 +2068,13 @@ fn run_step_spec(
     linux.seccomp = Some(oci_runtime_core::seccomp::filter_to_supported_syscalls(
         &oci_runtime_core::seccomp::default_profile(),
     ));
+    // `--memory`/`--memory-swap` (matching real `podman build
+    // --memory`/`--memory-swap` exactly, see `StageContext::
+    // resources`'s own doc comment) — the exact same
+    // `linux.resources` field `ociman run/create --memory`/
+    // `--memory-swap` (`synthesize_spec`) already sets, reused
+    // verbatim here for a `RUN` step's own process instead.
+    linux.resources = resources.clone();
 
     Ok(spec)
 }

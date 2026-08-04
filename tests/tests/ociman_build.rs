@@ -8681,3 +8681,76 @@ fn build_without_shm_size_lets_a_run_step_write_well_past_one_megabyte_into_dev_
         String::from_utf8_lossy(&build.stderr)
     );
 }
+
+/// `ociman build --memory` (matching real `podman build --memory`/`-m`
+/// exactly) applies a real, kernel-enforced `RLIMIT`-adjacent cgroup
+/// memory cap to every `RUN` step -- the same real "gets killed by
+/// the kernel's own cgroup v2 OOM killer" verification `ociman run
+/// --memory`'s own test (`run_memory_limit_actually_gets_enforced_by_
+/// the_kernels_own_oom_killer`) already established, ported here for
+/// `RUN` steps instead.
+#[test]
+fn build_memory_limit_actually_gets_enforced_by_the_kernels_own_oom_killer() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-memory-base:latest",
+        &busybox,
+        &["sh", "yes", "head"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-memory-base:latest\n\
+         RUN x=$(yes | head -c 300000000); echo ${#x}\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--memory",
+            "16m",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-memory-result:latest",
+        ],
+    );
+    assert!(
+        !build.status.success(),
+        "a RUN step under a real 16 MiB --memory limit allocating ~300 MB must be killed by the \
+         kernel's own cgroup v2 OOM killer, failing the build: {build:?}"
+    );
+}
+
+/// `--memory-swap` requires `--memory` to also be given, matching real
+/// `ociman run/create --memory-swap`'s own identical validation
+/// (reused verbatim via `parse_and_validate_memory_and_cpus`).
+#[test]
+fn build_memory_swap_without_memory_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(context_dir.path(), "FROM scratch\n");
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--memory-swap",
+            "32m",
+            context_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(!build.status.success());
+    assert!(
+        String::from_utf8_lossy(&build.stderr).contains("--memory-swap requires --memory"),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}

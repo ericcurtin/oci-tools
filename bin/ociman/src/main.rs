@@ -1590,6 +1590,30 @@ enum Command {
         /// established.
         #[arg(long = "shm-size", allow_hyphen_values = true)]
         shm_size: Option<String>,
+        /// Maximum memory every `RUN` step's own cgroup may use, same
+        /// real `go-units.RAMInBytes` grammar as `ociman run/create
+        /// --memory` (reusing [`parse_and_validate_memory_and_cpus`]/
+        /// [`resources_from_cli`] verbatim) — matching real `podman
+        /// build --memory`/`-m` exactly (checked directly, `~/git/
+        /// podman/vendor/go.podman.io/buildah/pkg/cli/common.go`):
+        /// applies to every `RUN` step in every stage alike, no
+        /// per-stage/per-instruction override of any kind — matching
+        /// real podman's own identical single, build-wide value, the
+        /// same shape `--ulimit`/`--shm-size` already established. No
+        /// `--memory-reservation`/`--cpus`/`--cpuset-cpus`/
+        /// `--cpuset-mems` counterpart yet for `build` (out of scope
+        /// for this increment).
+        #[arg(short = 'm', long = "memory")]
+        memory: Option<String>,
+        /// Total memory **+ swap** every `RUN` step's own cgroup may
+        /// use (same units as `--memory`), matching real `podman
+        /// build --memory-swap` exactly: a combined cap, not a
+        /// swap-only one. `-1` means unlimited swap. Requires
+        /// `--memory` to also be given, same validation `ociman run/
+        /// create --memory-swap` already established (reused
+        /// verbatim via [`parse_and_validate_memory_and_cpus`]).
+        #[arg(long = "memory-swap", allow_hyphen_values = true)]
+        memory_swap: Option<String>,
         /// Refrain from announcing build progress — matching real
         /// `docker build -q`/`podman build --quiet` exactly (checked
         /// directly against a real installed `podman build -q`, three
@@ -4384,6 +4408,8 @@ fn main() -> std::process::ExitCode {
                 unsetlabel,
                 ulimit,
                 shm_size,
+                memory,
+                memory_swap,
                 quiet,
                 timestamp,
             }) => build::cmd_build(
@@ -4411,6 +4437,8 @@ fn main() -> std::process::ExitCode {
                 &unsetlabel,
                 &ulimit,
                 shm_size.as_deref(),
+                memory.as_deref(),
+                memory_swap.as_deref(),
                 quiet,
                 cli.global.json,
                 timestamp,
