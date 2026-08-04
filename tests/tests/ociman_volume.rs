@@ -317,6 +317,86 @@ fn volume_ls_filter_name_matches_a_substring() {
     assert!(String::from_utf8_lossy(&no_match.stdout).trim().is_empty());
 }
 
+/// `volume ls --filter label=`/`label!=` (0425) -- **ANDed together**,
+/// a real, deliberate difference from `images`/`prune --filter
+/// label=`'s own OR semantics, matching real `podman volume ls
+/// --filter label=`'s own checked-directly `MatchLabelFilters`
+/// exactly (see `VolumeCommand::Ls::filter`'s own doc comment in
+/// `bin/ociman/src/main.rs`).
+#[test]
+fn volume_ls_filter_label_multiple_values_are_anded_together() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    ociman(
+        storage_dir.path(),
+        &[
+            "volume",
+            "create",
+            "--label",
+            "env=prod",
+            "--label",
+            "team=infra",
+            "label-vol1",
+        ],
+    );
+    ociman(
+        storage_dir.path(),
+        &["volume", "create", "--label", "env=staging", "label-vol2"],
+    );
+
+    // Single value: only the matching volume.
+    let single = ociman(
+        storage_dir.path(),
+        &["volume", "ls", "--filter", "label=env=prod", "-q"],
+    );
+    assert!(single.status.success());
+    assert_eq!(String::from_utf8_lossy(&single.stdout).trim(), "label-vol1");
+
+    // Two values under the same key, both required (ANDed): only the
+    // volume matching *both* survives.
+    let both = ociman(
+        storage_dir.path(),
+        &[
+            "volume",
+            "ls",
+            "--filter",
+            "label=env=prod",
+            "--filter",
+            "label=team=infra",
+            "-q",
+        ],
+    );
+    assert!(both.status.success());
+    assert_eq!(String::from_utf8_lossy(&both.stdout).trim(), "label-vol1");
+
+    // Requiring a label neither volume actually has (via AND with a
+    // real one) matches nothing.
+    let none = ociman(
+        storage_dir.path(),
+        &[
+            "volume",
+            "ls",
+            "--filter",
+            "label=env=prod",
+            "--filter",
+            "label=team=nosuch",
+            "-q",
+        ],
+    );
+    assert!(none.status.success());
+    assert!(String::from_utf8_lossy(&none.stdout).trim().is_empty());
+
+    // `label!=` excludes a matching volume.
+    let negated = ociman(
+        storage_dir.path(),
+        &["volume", "ls", "--filter", "label!=env=prod", "-q"],
+    );
+    assert!(negated.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&negated.stdout).trim(),
+        "label-vol2"
+    );
+}
+
 /// An unrecognized `--filter` key is a clear error, matching this
 /// project's own established convention for every other `--filter`
 /// consumer (`ociman ps`/`images`/`prune`).

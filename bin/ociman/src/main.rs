@@ -3362,7 +3362,21 @@ enum VolumeCommand {
         /// exactly the kind of confusing input this project's own
         /// established "conflicting values is a clear error" rule
         /// already exists to catch for this same key everywhere
-        /// else). Multiple `name=` values are OR'd together. May be
+        /// else). Multiple `name=` values are OR'd together. Also
+        /// `label=<key>[=<value>]`/`label!=<key>[=<value>]` (0425,
+        /// needing `ociman volume create --label`'s own new schema,
+        /// `0424`, to have anything real to match against at all) —
+        /// **ANDed together**, a real, deliberate *difference* from
+        /// `ociman images`/`prune --filter label=`'s own OR semantics:
+        /// checked directly, `~/git/podman/pkg/domain/infra/abi/
+        /// volumes.go`'s own `VolumeList` groups every `label=` value
+        /// under the one shared key into a single `GenerateVolume
+        /// Filters("label", allValues, ...)` call, itself
+        /// `filters.MatchLabelFilters` — the exact same all-values-
+        /// must-match function real podman's own *container* label
+        /// filtering also uses (matching `ociman ps --filter label=`'s
+        /// own already-established ANDed convention, not `images`'
+        /// own separately-compiled-and-OR'd-per-value one). May be
         /// given more than once.
         #[arg(long = "filter")]
         filter: Vec<String>,
@@ -12316,6 +12330,7 @@ fn cmd_volume_ls(
     let mut until_filter: Option<std::time::SystemTime> = None;
     let mut after_references: Vec<String> = Vec::new();
     let mut dangling_filter: Option<bool> = None;
+    let mut label_filters: Vec<LabelFilter> = Vec::new();
     for f in filter {
         if let Some(value) = f.strip_prefix("name=") {
             anyhow::ensure!(
@@ -12323,6 +12338,8 @@ fn cmd_volume_ls(
                 "ociman volume ls: --filter {f:?} is missing a value"
             );
             name_filters.push(value.to_string());
+        } else if let Some(result) = try_parse_label_filter("ociman volume ls", f) {
+            label_filters.push(result?);
         } else if let Some(rest) = f.strip_prefix("until=") {
             anyhow::ensure!(
                 until_filter.is_none(),
@@ -12348,8 +12365,8 @@ fn cmd_volume_ls(
         } else {
             anyhow::bail!(
                 "ociman volume ls: --filter {f:?} is not yet supported (only name=<substring>, \
-                 until=<duration-or-timestamp>, after=<volume>/since=<volume>, or \
-                 dangling=true|false are)"
+                 label=<key>[=<value>], label!=<key>[=<value>], until=<duration-or-timestamp>, \
+                 after=<volume>/since=<volume>, or dangling=true|false are)"
             );
         }
     }
@@ -12360,6 +12377,13 @@ fn cmd_volume_ls(
     let mut records = store.list().context("listing volumes")?;
     if !name_filters.is_empty() {
         records.retain(|record| name_filters.iter().any(|want| record.name.contains(want)));
+    }
+    if !label_filters.is_empty() {
+        // ANDed together -- see `VolumeCommand::Ls::filter`'s own doc
+        // comment for the real, checked-directly confirmation this
+        // differs from `images`/`prune --filter label=`'s own OR
+        // semantics.
+        records.retain(|record| label_filters.iter().all(|f| f.matches(&record.labels)));
     }
     if let Some(threshold) = until_filter {
         // Matches real podman's own `v.CreatedTime().Before(until)`
