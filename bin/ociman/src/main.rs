@@ -2770,14 +2770,17 @@ enum Command {
     },
     /// `podman container`'s own subcommand family — see
     /// [`ContainerCommand`] for exactly which of its real subcommands
-    /// this covers. Unlike every other container verb (`ps`/`rm`/
-    /// `inspect`/...), which this project only ever exposes as a flat
-    /// top-level command, `exists` genuinely has **no** flat top-level
-    /// alias in real docker/podman either (checked directly: neither
-    /// tool documents a bare `podman exists`) — this family exists
-    /// purely to host that one real, checked-directly-necessary
-    /// subcommand, not to duplicate every flat verb under a second,
-    /// redundant namespace.
+    /// this covers. `exists`/`prune` genuinely have **no** flat
+    /// top-level alias in real docker/podman either (checked
+    /// directly: neither tool documents a bare `podman exists`) —
+    /// this family originally existed purely to host those two real,
+    /// checked-directly-necessary subcommands; `list`/`ls` (0431) is
+    /// a real, genuine *alias* for the already-existing flat
+    /// [`Command::Ps`] instead — hosted here too since real `podman
+    /// container list`/`ls` themselves live under this exact same
+    /// real subcommand family (the identical reasoning
+    /// [`Command::Image`]'s own doc comment already gives for
+    /// `image list`/`ls`, 0430).
     Container {
         #[command(subcommand)]
         command: ContainerCommand,
@@ -3608,6 +3611,48 @@ enum ContainerCommand {
         #[arg(long)]
         external: bool,
     },
+    /// `podman container list`'s own real alias for top-level `podman
+    /// ps` — checked directly, `~/git/podman/cmd/podman/containers/
+    /// list.go`: `listCmd` (`Aliases: []string{"ls"}`, `Parent:
+    /// containerCmd`, `RunE: ps`) shares the exact same function and
+    /// flag set (`listFlagSet`, defined once in `ps.go` and reused by
+    /// both) as top-level `podman ps`, not a separately-maintained
+    /// implementation. Matched here identically: dispatches straight
+    /// into the same [`cmd_ps`] `ociman ps` itself already calls,
+    /// with the identical field set — see [`Command::Ps`]'s own doc
+    /// comment for every flag's exact semantics, not repeated here
+    /// (the same "thin alias, one-liner doc comments" convention
+    /// `ImageCommand::List`, 0430, already established).
+    #[command(alias = "ls")]
+    List {
+        /// Same as [`Command::Ps::all`].
+        #[arg(short, long)]
+        all: bool,
+        /// Same as [`Command::Ps::quiet`].
+        #[arg(short, long)]
+        quiet: bool,
+        /// Same as [`Command::Ps::filter`].
+        #[arg(short, long = "filter")]
+        filter: Vec<String>,
+        /// Same as [`Command::Ps::last`].
+        #[arg(short = 'n', long = "last", default_value_t = -1, allow_hyphen_values = true)]
+        last: i64,
+        /// Same as [`Command::Ps::no_trunc`].
+        #[arg(long = "no-trunc")]
+        no_trunc: bool,
+        /// Same as [`Command::Ps::noheading`].
+        #[arg(long)]
+        noheading: bool,
+        /// Same as [`Command::Ps::format`].
+        #[arg(long = "format", value_name = "TEMPLATE")]
+        format: Option<String>,
+        /// Same as [`Command::Ps::size`].
+        #[arg(short = 's', long)]
+        size: bool,
+        /// Same as [`Command::Ps::sort`].
+        #[arg(long, value_enum)]
+        sort: Option<PsSortKey>,
+    },
     /// Remove every real, non-running container (`Created` or
     /// `Stopped`, this project's own vocabulary — never `Running`/
     /// `Paused`, and never `Creating`, matching real `podman
@@ -4024,6 +4069,28 @@ fn main() -> std::process::ExitCode {
             },
             Some(Command::Container { command }) => match command {
                 ContainerCommand::Exists { name, external: _ } => cmd_container_exists(&name),
+                ContainerCommand::List {
+                    all,
+                    quiet,
+                    filter,
+                    last,
+                    no_trunc,
+                    noheading,
+                    format,
+                    size,
+                    sort,
+                } => cmd_ps(
+                    all,
+                    quiet,
+                    cli.global.json,
+                    &filter,
+                    last,
+                    no_trunc,
+                    noheading,
+                    format.as_deref(),
+                    size,
+                    sort,
+                ),
                 ContainerCommand::Prune { force: _, filter } => {
                     cmd_container_prune(cli.global.json, &filter)
                 }

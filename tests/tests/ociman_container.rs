@@ -1,6 +1,7 @@
 //! `ociman container` subcommand family integration tests
-//! (`docs/design/0357`): currently just `exists` (see
-//! `ociman_exists.rs`) and `prune`.
+//! (`docs/design/0357`): `exists` (see `ociman_exists.rs`), `prune`,
+//! and `list`/`ls` (`docs/design/0431`, a real, genuine alias for
+//! `ociman ps` itself).
 //!
 //! `ociman container prune` removes every real, non-running container
 //! (this project's own `Created`/`Stopped`, never `Running`/`Paused`,
@@ -76,6 +77,60 @@ fn all_ids(storage_root: &Path) -> Vec<String> {
 /// and prints one line per removed id (no heading), matching real
 /// `podman container prune`'s own `PrintContainerPruneResults
 /// (responses, false)` exactly.
+/// `ociman container list`/`ociman container ls` (0431) are real
+/// aliases for `ociman ps` itself, matching real `podman container
+/// list`/`ls`'s own checked-directly identical `RunE`/flag set as
+/// top-level `podman ps` exactly (`~/git/podman/cmd/podman/
+/// containers/list.go`) -- byte-identical output for the same
+/// fixture state, not merely "close" or "similar".
+#[test]
+fn container_list_and_ls_are_byte_identical_aliases_for_ps() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-list-alias:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/container-list-alias:latest", "true"],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let ps = ociman(storage_dir.path(), &["ps", "-a"]);
+    assert!(ps.status.success());
+
+    let list = ociman(storage_dir.path(), &["container", "list", "-a"]);
+    assert!(
+        list.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert_eq!(list.stdout, ps.stdout);
+
+    let ls = ociman(storage_dir.path(), &["container", "ls", "-a"]);
+    assert!(
+        ls.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ls.stderr)
+    );
+    assert_eq!(ls.stdout, ps.stdout);
+
+    // The identical flag set works through the alias too, not just
+    // the bare default table.
+    let list_quiet = ociman(storage_dir.path(), &["container", "list", "-a", "-q"]);
+    let ps_quiet = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert!(list_quiet.status.success());
+    assert_eq!(list_quiet.stdout, ps_quiet.stdout);
+}
+
 #[test]
 fn container_prune_removes_created_and_stopped_but_not_running() {
     let Some(busybox) = busybox_path() else {
