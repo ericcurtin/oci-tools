@@ -255,6 +255,212 @@ fn healthcheck_run_actually_execs_the_test_and_reports_the_real_result() {
     child.wait().ok();
 }
 
+/// `ociman run --health-cmd` (0440) completely replaces the resolved
+/// image's own declared `HEALTHCHECK` -- the image here declares one
+/// that checks for `/image-healthy`, but `--health-cmd` at `run` time
+/// declares a genuinely different one checking for `/cli-healthy`
+/// instead; `ociman healthcheck run` must exec the *CLI* one, not the
+/// image's own, matching real podman's own checked-directly
+/// `MakeHealthCheckFromCli`/`applyHealthCheckOverrides` precedence
+/// exactly (see `Command::Run::health_cmd`'s own doc comment).
+#[test]
+fn run_health_cmd_overrides_the_images_own_declared_healthcheck() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/healthcheck-cli-override:latest",
+        &busybox,
+        &["sh", "test", "touch", "sleep"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 30".to_string(),
+            ]),
+            healthcheck: Some(HealthcheckConfig {
+                test: vec![
+                    "CMD".to_string(),
+                    "test".to_string(),
+                    "-f".to_string(),
+                    "/image-healthy".to_string(),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    let mut child = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/healthcheck-cli-override:latest",
+        &[
+            "-d",
+            "--health-cmd",
+            "test -f /cli-healthy",
+            "--health-interval",
+            "5s",
+            "--health-retries",
+            "2",
+            "--health-timeout",
+            "10s",
+            "--health-start-period",
+            "1s",
+        ],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20));
+
+    // Creating just the *image's* own expected file must still report
+    // `unhealthy` -- proving the image's own healthcheck is genuinely
+    // not the one being run at all, not merely also satisfied.
+    ociman(
+        storage_dir.path(),
+        &["exec", &id, "touch", "/image-healthy"],
+    );
+    let still_unhealthy = ociman(storage_dir.path(), &["healthcheck", "run", &id]);
+    assert!(!still_unhealthy.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&still_unhealthy.stdout).trim(),
+        "unhealthy"
+    );
+
+    // Creating the *CLI-declared* file instead reports `healthy`.
+    ociman(storage_dir.path(), &["exec", &id, "touch", "/cli-healthy"]);
+    let healthy = ociman(storage_dir.path(), &["healthcheck", "run", &id]);
+    assert!(
+        healthy.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&healthy.stderr)
+    );
+
+    ociman(storage_dir.path(), &["kill", &id]);
+    child.wait().ok();
+}
+
+/// `ociman run --no-healthcheck` (0440) disables even an image's own
+/// declared `HEALTHCHECK` entirely, matching real `podman run
+/// --no-healthcheck` exactly.
+#[test]
+fn run_no_healthcheck_disables_even_an_image_declared_one() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/healthcheck-no-healthcheck:latest",
+        &busybox,
+        &["sh", "test", "sleep"],
+        healthcheck_test_file_exists(),
+    );
+
+    let mut child = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/healthcheck-no-healthcheck:latest",
+        &["-d", "--no-healthcheck", "sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20));
+
+    let out = ociman(storage_dir.path(), &["healthcheck", "run", &id]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no healthcheck defined"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    ociman(storage_dir.path(), &["kill", &id]);
+    child.wait().ok();
+}
+
+/// `--health-cmd`/`--no-healthcheck` together is a real, immediate
+/// error, matching real podman's own exact wording -- checked
+/// directly, `~/git/podman/pkg/specgenutil/specgen.go`.
+#[test]
+fn run_health_cmd_and_no_healthcheck_together_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/healthcheck-conflict:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--health-cmd",
+            "true",
+            "--no-healthcheck",
+            "ociman-test/healthcheck-conflict:latest",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("cannot specify both --no-healthcheck and --health-cmd"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A bare `--health-cmd none` disables the healthcheck too, the same
+/// as `--no-healthcheck` -- matching real podman's own identical
+/// `MakeHealthCheckFromCli` special case exactly.
+#[test]
+fn run_health_cmd_none_disables_the_healthcheck_too() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/healthcheck-cmd-none:latest",
+        &busybox,
+        &["sh", "sleep"],
+        healthcheck_test_file_exists(),
+    );
+
+    let mut child = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/healthcheck-cmd-none:latest",
+        &["-d", "--health-cmd", "none", "sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20));
+
+    let out = ociman(storage_dir.path(), &["healthcheck", "run", &id]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no healthcheck defined"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    ociman(storage_dir.path(), &["kill", &id]);
+    child.wait().ok();
+}
+
 /// `HealthcheckConfig.timeout` (0308, closing `0172`'s own honestly-
 /// flagged gap): a genuinely hung test is killed once the configured
 /// timeout elapses and reported `unhealthy`, rather than blocking

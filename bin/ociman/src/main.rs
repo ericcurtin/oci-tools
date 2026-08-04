@@ -29,8 +29,9 @@ use oci_runtime_core::StateStore;
 use oci_runtime_core::state::Status;
 use oci_spec_types::Reference;
 use oci_spec_types::image::{
-    ContainerConfig, Descriptor, HistoryEntry, ImageConfig, ImageManifest, MEDIA_TYPE_IMAGE_CONFIG,
-    MEDIA_TYPE_IMAGE_LAYER_GZIP, MEDIA_TYPE_IMAGE_MANIFEST, Platform, RootFs,
+    ContainerConfig, Descriptor, HealthcheckConfig, HistoryEntry, ImageConfig, ImageManifest,
+    MEDIA_TYPE_IMAGE_CONFIG, MEDIA_TYPE_IMAGE_LAYER_GZIP, MEDIA_TYPE_IMAGE_MANIFEST, Platform,
+    RootFs,
 };
 use oci_spec_types::time::format_rfc3339_utc;
 use oci_store::{
@@ -102,6 +103,24 @@ const ANNOTATION_STOP_SIGNAL: &str = "io.oci-tools.stop-signal";
 /// around). See [`resolve_stop_timeout`]'s own doc comment for the
 /// exact, full precedence order.
 const ANNOTATION_STOP_TIMEOUT: &str = "io.oci-tools.stop-timeout";
+/// A `run`/`create --health-cmd`/`--no-healthcheck` override, a
+/// single JSON-encoded [`HealthcheckConfig`] — the same "one
+/// annotation, not one per field" convention [`ANNOTATION_LABELS`]'s
+/// own doc comment already establishes and for the identical reason.
+/// Present only when the container was actually given `--health-cmd`
+/// or `--no-healthcheck` at all (see [`Command::Run::health_cmd`]'s
+/// own doc comment for the exact real precedence this matches):
+/// completely *replaces* the resolved image's own declared
+/// `HEALTHCHECK` rather than merging with it, matching real podman's
+/// own checked-directly behavior exactly (`~/git/podman/pkg/specgen/
+/// generate/container.go`'s own `applyHealthCheckOverrides`, which is
+/// never even called at all once `s.HealthConfig` is already
+/// non-`nil` with a non-empty `Test`). Absent entirely (not merely
+/// present-but-empty) whenever neither flag was given — [`cmd_
+/// healthcheck_run`] falls back to the image's own declared
+/// `HEALTHCHECK` in exactly that case, unchanged from before this
+/// existed.
+const ANNOTATION_HEALTHCHECK: &str = "io.oci-tools.healthcheck";
 /// Present (value always `"true"`) whenever a container's own most
 /// recent launch was given `--rm` — the persisted record `cmd_start`
 /// (0154) needs to correctly auto-remove a container that was
@@ -862,6 +881,75 @@ struct RunArgs {
     /// doc comment for the exact, full precedence order.
     #[arg(long = "stop-timeout", value_name = "SECONDS")]
     stop_timeout: Option<u64>,
+    /// Override the resolved image's own declared `HEALTHCHECK`
+    /// entirely — matching real `docker run --health-cmd`/`podman run
+    /// --health-cmd` exactly (checked directly, `~/git/podman/pkg/
+    /// specgenutil/specgen.go`'s own `MakeHealthCheckFromCli`, called
+    /// only when this flag is actually given — see [`parse_health_
+    /// cmd_test`]'s own doc comment for the exact real command-string
+    /// grammar this accepts, including a bare `none` disabling any
+    /// healthcheck exactly like [`Self::no_healthcheck`] does).
+    /// **A real, checked-directly, easy-to-miss consequence of this
+    /// being the one and only trigger**: `--health-interval`/
+    /// `--health-retries`/`--health-timeout`/`--health-start-period`
+    /// (the four flags right below) have **no effect on this
+    /// container at all** unless this flag is *also* given — real
+    /// podman's own `ToSpecGen` genuinely never even reads any of
+    /// those four otherwise, confirmed directly from source rather
+    /// than assumed; there is no separate, standalone way to override
+    /// just the interval of an *inherited* image healthcheck at
+    /// `run`/`create` time in real podman either (only a later
+    /// `podman update`/`ociman update` — itself still not implemented
+    /// for this either — or a full `--health-cmd` re-declaration).
+    /// Mutually exclusive with `--no-healthcheck` (a real, immediate
+    /// error otherwise, matching real podman's own exact wording).
+    /// Persisted as [`ANNOTATION_HEALTHCHECK`]; read by [`cmd_
+    /// healthcheck_run`] in preference to the image's own declared
+    /// one. Real podman's own further `--health-on-failure`/`--health-
+    /// log-destination`/`--health-max-log-count`/`--health-max-log-
+    /// size` and the entire separate `--health-startup-*` family are
+    /// deliberately not implemented here — this project's own
+    /// `HealthcheckConfig` has no on-failure-action/log-file/startup-
+    /// variant concept at all yet (see its own doc comment: "Executing
+    /// a healthcheck periodically is out of scope for this project so
+    /// far").
+    #[arg(long = "health-cmd", value_name = "COMMAND")]
+    health_cmd: Option<String>,
+    /// See [`Self::health_cmd`]'s own doc comment for the exact real
+    /// condition under which this has any effect at all. `"disable"`
+    /// (matching real podman's own identical special-cased spelling)
+    /// stores a real `0`, meaning "no automatic timer" — irrelevant to
+    /// this project's own `ociman healthcheck run`, which always runs
+    /// exactly one check on demand regardless, but stored faithfully
+    /// regardless of whether anything ever reads it that way yet.
+    #[arg(long = "health-interval", default_value = "30s")]
+    health_interval: String,
+    /// See [`Self::health_cmd`]'s own doc comment for the exact real
+    /// condition under which this has any effect at all. Must be at
+    /// least `1`, matching real podman's own identical validation.
+    #[arg(long = "health-retries", default_value_t = 3)]
+    health_retries: u32,
+    /// See [`Self::health_cmd`]'s own doc comment for the exact real
+    /// condition under which this has any effect at all. Must parse
+    /// to at least one second, matching real podman's own identical
+    /// validation.
+    #[arg(long = "health-timeout", default_value = "30s")]
+    health_timeout: String,
+    /// See [`Self::health_cmd`]'s own doc comment for the exact real
+    /// condition under which this has any effect at all.
+    #[arg(long = "health-start-period", default_value = "0s")]
+    health_start_period: String,
+    /// Disable any healthcheck entirely — the resolved image's own
+    /// declared `HEALTHCHECK`, if any, is completely ignored — matching
+    /// real `docker run --no-healthcheck`/`podman run --no-healthcheck`
+    /// exactly (checked directly, `~/git/podman/pkg/specgenutil/
+    /// specgen.go`): equivalent to a real `HEALTHCHECK NONE`
+    /// Containerfile instruction, but decided at `run`/`create` time
+    /// instead. Mutually exclusive with `--health-cmd` (a real,
+    /// immediate error otherwise, matching real podman's own exact
+    /// wording). Persisted as [`ANNOTATION_HEALTHCHECK`].
+    #[arg(long = "no-healthcheck")]
+    no_healthcheck: bool,
     /// Set a label on the container: `KEY=value`, or bare `KEY` for an
     /// empty value (repeatable) — matching real `docker run --label`/
     /// `podman run --label` exactly. Merges with (rather than
@@ -7621,6 +7709,31 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         oci_runtime_core::signal::parse(stop_signal)
             .map_err(|e| anyhow::anyhow!("invalid --stop-signal {stop_signal:?}: {e}"))?;
     }
+    // `--health-cmd`/`--no-healthcheck` -- see `Command::Run::
+    // health_cmd`'s own doc comment for the exact real precedence.
+    // Matches real podman's own exact wording, checked directly
+    // (`~/git/podman/pkg/specgenutil/specgen.go`).
+    anyhow::ensure!(
+        args.health_cmd.is_none() || !args.no_healthcheck,
+        "cannot specify both --no-healthcheck and --health-cmd"
+    );
+    let healthcheck_override: Option<HealthcheckConfig> = if let Some(health_cmd) = &args.health_cmd
+    {
+        Some(make_healthcheck_from_cli(
+            health_cmd,
+            &args.health_interval,
+            args.health_retries,
+            &args.health_timeout,
+            &args.health_start_period,
+        )?)
+    } else if args.no_healthcheck {
+        Some(HealthcheckConfig {
+            test: vec!["NONE".to_string()],
+            ..Default::default()
+        })
+    } else {
+        None
+    };
     let rlimits = args
         .ulimit
         .iter()
@@ -7853,6 +7966,12 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         annotations.insert(
             ANNOTATION_STOP_TIMEOUT.to_string(),
             stop_timeout.to_string(),
+        );
+    }
+    if let Some(healthcheck) = &healthcheck_override {
+        annotations.insert(
+            ANNOTATION_HEALTHCHECK.to_string(),
+            serde_json::to_string(healthcheck).expect("HealthcheckConfig serializes"),
         );
     }
     let (container_id, mut state) = create_container_record(&containers, &annotations)?;
@@ -12538,6 +12657,124 @@ fn healthcheck_exec_args(test: &[String]) -> Option<Vec<String>> {
     }
 }
 
+/// Parse `ociman run`/`create --health-cmd`'s own raw string into the
+/// same `Test`-field shape (`["NONE"]`/`["CMD", ...]`/`["CMD-SHELL",
+/// "<command>"]`) [`healthcheck_exec_args`] already consumes --
+/// matching real podman's own checked-directly `MakeHealthCheckFromCli`
+/// exactly (`~/git/podman/pkg/specgenutil/specgen.go`): a JSON array
+/// is tried first (e.g. `["curl", "-f", "url"]`); if that fails to
+/// parse, the whole string is instead split on its first space purely
+/// to sniff a leading `CMD`/`CMD-SHELL`/`NONE` keyword. Then:
+/// * `NONE` (case-insensitive; any trailing array elements/text are
+///   discarded, even from a JSON array like `["NONE", "ignored"]`)
+///   always collapses to plain `["NONE"]`.
+/// * A leading `CMD` keyword re-splits the *whole* string on
+///   whitespace when it wasn't already a JSON array (`CMD curl -f
+///   url` -> `["CMD", "curl", "-f", "url"]`), or is kept as-is when it
+///   already was one.
+/// * A leading `CMD-SHELL` keyword is left completely untouched
+///   either way (already exactly two elements from the initial
+///   split).
+/// * Anything else — a bare string with no recognized keyword, or a
+///   single-element JSON array (`["curl"]`) — becomes `["CMD-SHELL",
+///   <command>]` (shell form): the *unwrapped* single element for a
+///   one-element JSON array, or the original string verbatim
+///   otherwise (byte-for-byte identical to Go's own `strings.
+///   Join(cmdArr, " ")` reassembly of an at-most-two-way, single-
+///   space `SplitN`, checked directly). A JSON array of two or more
+///   elements whose own first element isn't already a recognized
+///   keyword instead gets a bare `CMD` prepended (exec form,
+///   `["curl", "-f", "url"]` -> `["CMD", "curl", "-f", "url"]`).
+///
+/// A JSON array that parses but is empty (`--health-cmd '[]'`) is a
+/// real, immediate error, matching real podman's own exact wording.
+fn parse_health_cmd_test(input: &str) -> anyhow::Result<Vec<String>> {
+    let (mut cmd_arr, is_arr): (Vec<String>, bool) =
+        match serde_json::from_str::<Vec<String>>(input) {
+            Ok(arr) => (arr, true),
+            Err(_) => (input.splitn(2, ' ').map(str::to_string).collect(), false),
+        };
+    anyhow::ensure!(
+        !cmd_arr.is_empty(),
+        "must define a healthcheck command for all healthchecks"
+    );
+    let first_upper = cmd_arr[0].to_ascii_uppercase();
+    if first_upper == "CMD" || first_upper == "NONE" {
+        if !is_arr {
+            cmd_arr = input.split_whitespace().map(str::to_string).collect();
+        }
+    } else if first_upper != "CMD-SHELL" {
+        if is_arr && cmd_arr.len() > 1 {
+            cmd_arr.insert(0, "CMD".to_string());
+        } else {
+            // Only reachable here either with `!is_arr` (the concat
+            // below is always exactly `input` -- see this function's
+            // own doc comment) or with a single-element JSON array
+            // (the concat is that one, unwrapped element).
+            let concat = if is_arr {
+                cmd_arr[0].clone()
+            } else {
+                input.to_string()
+            };
+            cmd_arr = vec!["CMD-SHELL".to_string(), concat];
+        }
+    }
+    if cmd_arr[0].eq_ignore_ascii_case("NONE") {
+        cmd_arr = vec!["NONE".to_string()];
+    }
+    Ok(cmd_arr)
+}
+
+/// Build a full [`HealthcheckConfig`] purely from `ociman run`/
+/// `create`'s own `--health-cmd`/`--health-interval`/`--health-
+/// retries`/`--health-timeout`/`--health-start-period` flags --
+/// matching real podman's own checked-directly `MakeHealthCheckFromCli`
+/// exactly (`~/git/podman/pkg/specgenutil/specgen.go`), including its
+/// own real validation rules (`retries` must be at least 1, `timeout`
+/// at least one second, `start_period` non-negative) and its own
+/// `interval == "disable"` special case (maps to a real `0`, meaning
+/// "no automatic timer" -- irrelevant to this project's own `ociman
+/// healthcheck run`, which only ever runs one check on demand, but
+/// stored faithfully regardless). Real podman only ever calls this
+/// (or an equivalent) when `--health-cmd` is actually given -- see
+/// [`Command::Run`]'s own `health_interval`/`health_retries`/
+/// `health_timeout`/`health_start_period` doc comments for the exact
+/// same, checked-directly, easy-to-miss real consequence: none of
+/// those four flags have *any* effect at all without it.
+fn make_healthcheck_from_cli(
+    health_cmd: &str,
+    interval: &str,
+    retries: u32,
+    timeout: &str,
+    start_period: &str,
+) -> anyhow::Result<HealthcheckConfig> {
+    let test = parse_health_cmd_test(health_cmd)?;
+    let interval = if interval == "disable" {
+        "0s"
+    } else {
+        interval
+    };
+    let interval_duration = parse_simple_duration(interval)
+        .ok_or_else(|| anyhow::anyhow!("invalid --health-interval {interval:?}"))?;
+    anyhow::ensure!(retries >= 1, "--health-retries must be greater than 0");
+    let timeout_duration = parse_simple_duration(timeout)
+        .ok_or_else(|| anyhow::anyhow!("invalid --health-timeout {timeout:?}"))?;
+    anyhow::ensure!(
+        timeout_duration >= std::time::Duration::from_secs(1),
+        "--health-timeout must be at least 1 second"
+    );
+    let start_period_duration = parse_simple_duration(start_period)
+        .ok_or_else(|| anyhow::anyhow!("invalid --health-start-period {start_period:?}"))?;
+    Ok(HealthcheckConfig {
+        test,
+        interval: interval_duration.as_nanos() as i64,
+        timeout: timeout_duration.as_nanos() as i64,
+        start_period: start_period_duration.as_nanos() as i64,
+        start_interval: 0,
+        retries: i64::from(retries),
+    })
+}
+
 /// Run a container's own image-declared `HEALTHCHECK` test once,
 /// right now — matching real `podman healthcheck run`'s own core
 /// effect: resolves the container's own base image (via its already-
@@ -12577,27 +12814,47 @@ fn cmd_healthcheck_run(id: &str, ignore_result: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let store = open_store()?;
-    let base_reference = state
+    // A `run`/`create --health-cmd`/`--no-healthcheck` override
+    // (`0440`) completely replaces the resolved image's own declared
+    // `HEALTHCHECK` -- checked first, and, when present, entirely
+    // skipping the base-image lookup below (this container's own
+    // healthcheck is then fully self-contained, matching real
+    // podman's own already-fully-resolved-at-create-time persisted
+    // `HealthConfig` -- see `ANNOTATION_HEALTHCHECK`'s own doc
+    // comment for the exact precedence this matches).
+    let container_override: Option<HealthcheckConfig> = state
         .annotations
-        .get(ANNOTATION_IMAGE)
-        .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded base image reference"))?;
-    let base_record = store
-        .resolve_image(base_reference)
-        .context("resolving container's own image reference")?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{base_reference}: container {id:?}'s own base image is no longer in local storage"
-            )
+        .get(ANNOTATION_HEALTHCHECK)
+        .map(|json| serde_json::from_str(json))
+        .transpose()
+        .with_context(|| {
+            format!("parsing container {id:?}'s own persisted --health-cmd/--no-healthcheck")
         })?;
-    let image_config = store
-        .image_config(&base_record)
-        .with_context(|| format!("reading config for {base_reference}"))?;
-    let healthcheck = image_config
-        .config
+    let healthcheck = match &container_override {
+        Some(hc) => Some(hc.clone()),
+        None => {
+            let store = open_store()?;
+            let base_reference = state.annotations.get(ANNOTATION_IMAGE).ok_or_else(|| {
+                anyhow::anyhow!("container {id:?} has no recorded base image reference")
+            })?;
+            let base_record = store
+                .resolve_image(base_reference)
+                .context("resolving container's own image reference")?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{base_reference}: container {id:?}'s own base image is no longer in \
+                         local storage"
+                    )
+                })?;
+            let image_config = store
+                .image_config(&base_record)
+                .with_context(|| format!("reading config for {base_reference}"))?;
+            image_config.config.and_then(|c| c.healthcheck)
+        }
+    };
+    let test_args = healthcheck
         .as_ref()
-        .and_then(|c| c.healthcheck.as_ref());
-    let test_args = healthcheck.and_then(|hc| healthcheck_exec_args(&hc.test));
+        .and_then(|hc| healthcheck_exec_args(&hc.test));
     let Some(test_args) = test_args else {
         anyhow::bail!("container {id:?} has no healthcheck defined");
     };
@@ -15302,6 +15559,115 @@ mod tests {
     #[test]
     fn healthcheck_exec_args_cmd_shell_form_with_no_command_string_is_none() {
         assert_eq!(healthcheck_exec_args(&strings(&["CMD-SHELL"])), None);
+    }
+
+    #[test]
+    fn parse_health_cmd_test_bare_string_becomes_cmd_shell_verbatim() {
+        assert_eq!(
+            parse_health_cmd_test("curl -f http://localhost/").unwrap(),
+            strings(&["CMD-SHELL", "curl -f http://localhost/"])
+        );
+    }
+
+    #[test]
+    fn parse_health_cmd_test_single_word_becomes_cmd_shell() {
+        assert_eq!(
+            parse_health_cmd_test("true").unwrap(),
+            strings(&["CMD-SHELL", "true"])
+        );
+    }
+
+    #[test]
+    fn parse_health_cmd_test_none_case_insensitive_discards_trailing_text() {
+        assert_eq!(parse_health_cmd_test("none").unwrap(), strings(&["NONE"]));
+        assert_eq!(
+            parse_health_cmd_test("None extra ignored words").unwrap(),
+            strings(&["NONE"])
+        );
+    }
+
+    #[test]
+    fn parse_health_cmd_test_leading_cmd_keyword_resplits_on_whitespace() {
+        assert_eq!(
+            parse_health_cmd_test("CMD curl -f http://localhost/").unwrap(),
+            strings(&["CMD", "curl", "-f", "http://localhost/"])
+        );
+    }
+
+    #[test]
+    fn parse_health_cmd_test_leading_cmd_shell_keyword_is_untouched() {
+        assert_eq!(
+            parse_health_cmd_test("CMD-SHELL curl -f http://localhost/").unwrap(),
+            strings(&["CMD-SHELL", "curl -f http://localhost/"])
+        );
+    }
+
+    #[test]
+    fn parse_health_cmd_test_json_array_of_multiple_elements_gets_cmd_prepended() {
+        assert_eq!(
+            parse_health_cmd_test(r#"["curl", "-f", "http://localhost/"]"#).unwrap(),
+            strings(&["CMD", "curl", "-f", "http://localhost/"])
+        );
+    }
+
+    #[test]
+    fn parse_health_cmd_test_json_array_already_starting_with_cmd_is_unchanged() {
+        assert_eq!(
+            parse_health_cmd_test(r#"["CMD", "curl", "-f", "http://localhost/"]"#).unwrap(),
+            strings(&["CMD", "curl", "-f", "http://localhost/"])
+        );
+    }
+
+    #[test]
+    fn parse_health_cmd_test_single_element_json_array_becomes_cmd_shell_unwrapped() {
+        assert_eq!(
+            parse_health_cmd_test(r#"["curl"]"#).unwrap(),
+            strings(&["CMD-SHELL", "curl"])
+        );
+    }
+
+    #[test]
+    fn parse_health_cmd_test_json_array_none_collapses_discarding_extra_elements() {
+        assert_eq!(
+            parse_health_cmd_test(r#"["none", "ignored"]"#).unwrap(),
+            strings(&["NONE"])
+        );
+    }
+
+    #[test]
+    fn parse_health_cmd_test_empty_json_array_is_a_clear_error() {
+        assert!(parse_health_cmd_test("[]").is_err());
+    }
+
+    #[test]
+    fn make_healthcheck_from_cli_builds_every_field_from_the_given_flags() {
+        let hc =
+            make_healthcheck_from_cli("curl -f http://localhost/", "5s", 2, "3s", "10s").unwrap();
+        assert_eq!(
+            hc.test,
+            strings(&["CMD-SHELL", "curl -f http://localhost/"])
+        );
+        assert_eq!(hc.interval, 5_000_000_000);
+        assert_eq!(hc.retries, 2);
+        assert_eq!(hc.timeout, 3_000_000_000);
+        assert_eq!(hc.start_period, 10_000_000_000);
+        assert_eq!(hc.start_interval, 0);
+    }
+
+    #[test]
+    fn make_healthcheck_from_cli_interval_disable_stores_zero() {
+        let hc = make_healthcheck_from_cli("true", "disable", 3, "30s", "0s").unwrap();
+        assert_eq!(hc.interval, 0);
+    }
+
+    #[test]
+    fn make_healthcheck_from_cli_rejects_zero_retries() {
+        assert!(make_healthcheck_from_cli("true", "30s", 0, "30s", "0s").is_err());
+    }
+
+    #[test]
+    fn make_healthcheck_from_cli_rejects_a_sub_second_timeout() {
+        assert!(make_healthcheck_from_cli("true", "30s", 3, "0.5s", "0s").is_err());
     }
 
     #[test]
