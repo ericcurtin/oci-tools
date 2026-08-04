@@ -2950,6 +2950,33 @@ enum Command {
         /// containers/run.go`, reused verbatim for `exec` there too).
         #[arg(long = "preserve-fds", default_value_t = 0)]
         preserve_fds: u32,
+        /// Give the exec'd process the container's own full,
+        /// unrestricted bounding capability set instead of whichever
+        /// (possibly narrower) one the container's init process
+        /// itself started with — matching real `podman exec
+        /// --privileged` exactly (checked directly,
+        /// `~/git/podman/libpod/oci_conmon_exec_linux.go`'s own
+        /// `setProcessCapabilitiesExec`: `if options.Privileged {
+        /// pspec.Capabilities.Bounding = allCaps }`, the real, full
+        /// host bounding set, not merely `run --privileged`'s own
+        /// already-elevated *container-creation-time* set — the two
+        /// happen to coincide for a container that was itself
+        /// already `run --privileged`, but this flag's own real
+        /// effect is independent of that: it always grants the full
+        /// set regardless of what the container itself has). When
+        /// exec'ing as `uid=0` (root, the default absent `--user`),
+        /// `Effective`/`Permitted` are elevated to match; real
+        /// podman's own inheritable set is always unconditionally
+        /// cleared either way (`pspec.Capabilities.Inheritable =
+        /// []`), matched here too regardless of this flag. Real
+        /// podman's own further, narrower elevation for exec'ing as
+        /// exactly the container's own configured non-root user is
+        /// deliberately not implemented here — a real, honest
+        /// narrower-first-slice scope, the same established
+        /// precedent every other "first slice" design note in this
+        /// project already sets.
+        #[arg(long)]
+        privileged: bool,
         /// Command and arguments to run inside the container.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
@@ -3969,6 +3996,7 @@ fn main() -> std::process::ExitCode {
                 env_file,
                 interactive,
                 preserve_fds,
+                privileged,
                 args,
             }) => {
                 // Same flatten-then-single-`apply_env_overrides`-call
@@ -3989,6 +4017,7 @@ fn main() -> std::process::ExitCode {
                     &combined_env,
                     preserve_fds,
                     interactive,
+                    privileged,
                     &args,
                 )
             }
@@ -14317,6 +14346,7 @@ fn short_id() -> String {
     digest.hex()[..12].to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_exec(
     id: &str,
     user: Option<&str>,
@@ -14324,6 +14354,7 @@ fn cmd_exec(
     extra_env: &[String],
     preserve_fds: u32,
     interactive: bool,
+    privileged: bool,
     args: &[String],
 ) -> anyhow::Result<()> {
     verify_preserve_fds(preserve_fds)?;
@@ -14397,10 +14428,16 @@ fn cmd_exec(
     let mut effective_env = process_spec.env.clone();
     build::apply_env_overrides(&mut effective_env, extra_env);
 
+    let capabilities = resolve_exec_capabilities(
+        process_spec.capabilities.as_ref(),
+        privileged,
+        effective_user.uid,
+    );
+
     let request = oci_runtime_core::exec::ExecRequest {
         namespaces,
         user: effective_user,
-        capabilities: process_spec.capabilities.clone(),
+        capabilities,
         no_new_privileges: process_spec.no_new_privileges,
         cwd: cwd
             .map(str::to_string)
@@ -14439,6 +14476,51 @@ fn cmd_exec(
     // The exec'd process's own exit code becomes ours, same convention
     // `run` already follows.
     std::process::exit(exit_code);
+}
+
+/// `ociman exec --privileged`'s own capability computation — a
+/// direct, checked-against port of real podman's own
+/// `setProcessCapabilitiesExec` (`~/git/podman/libpod/oci_conmon_
+/// exec_linux.go`), minus its further, narrower elevation for
+/// exec'ing as exactly the container's own configured non-root user
+/// (see `Command::Exec::privileged`'s own doc comment for exactly
+/// why that one case is deliberately deferred). `base` is the
+/// container's own already-running init process's own capability
+/// set (`process_spec.capabilities`, `None` for a bundle with no
+/// capabilities section at all, treated the same as every-set-empty).
+fn resolve_exec_capabilities(
+    base: Option<&oci_spec_types::runtime::LinuxCapabilities>,
+    privileged: bool,
+    exec_uid: u32,
+) -> Option<oci_spec_types::runtime::LinuxCapabilities> {
+    let empty = oci_spec_types::runtime::LinuxCapabilities::default();
+    let base = base.unwrap_or(&empty);
+    let bounding = if privileged {
+        oci_runtime_core::identity::ALL_CAPABILITY_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        base.bounding.clone()
+    };
+    let (effective, permitted) = if exec_uid == 0 {
+        (bounding.clone(), bounding.clone())
+    } else {
+        (base.effective.clone(), base.permitted.clone())
+    };
+    Some(oci_spec_types::runtime::LinuxCapabilities {
+        bounding,
+        effective,
+        // Real podman's own unconditional clear, regardless of
+        // `--privileged`/exec uid (`pspec.Capabilities.Inheritable =
+        // []string{}`) -- inheritable capabilities only ever matter
+        // for a `uid != 0` exec using file capabilities, a real,
+        // separate mechanism this project has no equivalent of at
+        // all yet.
+        inheritable: Vec::new(),
+        permitted,
+        ambient: base.ambient.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -15405,5 +15487,97 @@ mod tests {
     fn tail_lines_on_empty_input_is_empty_regardless_of_n() {
         assert_eq!(tail_lines(b"", 5), b"");
         assert_eq!(tail_lines(b"", 0), b"");
+    }
+
+    fn caps(
+        bounding: &[&str],
+        effective: &[&str],
+        permitted: &[&str],
+    ) -> oci_spec_types::runtime::LinuxCapabilities {
+        oci_spec_types::runtime::LinuxCapabilities {
+            bounding: bounding.iter().map(|s| s.to_string()).collect(),
+            effective: effective.iter().map(|s| s.to_string()).collect(),
+            inheritable: vec!["CAP_STALE".to_string()],
+            permitted: permitted.iter().map(|s| s.to_string()).collect(),
+            ambient: vec!["CAP_AMBIENT_UNCHANGED".to_string()],
+        }
+    }
+
+    #[test]
+    fn resolve_exec_capabilities_without_privileged_keeps_the_containers_own_bounding_set() {
+        let base = caps(&["CAP_CHOWN"], &["CAP_CHOWN"], &["CAP_CHOWN"]);
+        let result = resolve_exec_capabilities(Some(&base), false, 0).unwrap();
+        assert_eq!(result.bounding, vec!["CAP_CHOWN".to_string()]);
+    }
+
+    #[test]
+    fn resolve_exec_capabilities_with_privileged_grants_the_full_bounding_set() {
+        let base = caps(&["CAP_CHOWN"], &["CAP_CHOWN"], &["CAP_CHOWN"]);
+        let result = resolve_exec_capabilities(Some(&base), true, 0).unwrap();
+        let expected: Vec<String> = oci_runtime_core::identity::ALL_CAPABILITY_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(result.bounding, expected);
+        assert!(
+            result.bounding.len() > 1,
+            "the full set is more than one capability"
+        );
+    }
+
+    #[test]
+    fn resolve_exec_capabilities_root_exec_elevates_effective_and_permitted_to_bounding() {
+        let base = caps(&["CAP_CHOWN"], &[], &[]);
+        let result = resolve_exec_capabilities(Some(&base), false, 0).unwrap();
+        assert_eq!(result.effective, result.bounding);
+        assert_eq!(result.permitted, result.bounding);
+    }
+
+    #[test]
+    fn resolve_exec_capabilities_non_root_exec_leaves_effective_and_permitted_untouched() {
+        let base = caps(
+            &["CAP_CHOWN", "CAP_SYS_ADMIN"],
+            &["CAP_CHOWN"],
+            &["CAP_CHOWN"],
+        );
+        let result = resolve_exec_capabilities(Some(&base), true, 1000).unwrap();
+        // Bounding is still elevated by --privileged regardless of
+        // uid, but effective/permitted are only ever elevated for a
+        // real root (uid 0) exec -- matching real podman's own
+        // checked-directly `execUser.Uid == 0` gate exactly.
+        assert_ne!(result.bounding, vec!["CAP_CHOWN".to_string()]);
+        assert_eq!(result.effective, vec!["CAP_CHOWN".to_string()]);
+        assert_eq!(result.permitted, vec!["CAP_CHOWN".to_string()]);
+    }
+
+    #[test]
+    fn resolve_exec_capabilities_always_clears_inheritable_regardless_of_privileged() {
+        let base = caps(&["CAP_CHOWN"], &[], &[]);
+        assert!(
+            resolve_exec_capabilities(Some(&base), false, 0)
+                .unwrap()
+                .inheritable
+                .is_empty()
+        );
+        assert!(
+            resolve_exec_capabilities(Some(&base), true, 0)
+                .unwrap()
+                .inheritable
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resolve_exec_capabilities_never_touches_ambient() {
+        let base = caps(&["CAP_CHOWN"], &[], &[]);
+        let result = resolve_exec_capabilities(Some(&base), true, 0).unwrap();
+        assert_eq!(result.ambient, vec!["CAP_AMBIENT_UNCHANGED".to_string()]);
+    }
+
+    #[test]
+    fn resolve_exec_capabilities_of_a_bundle_with_no_capabilities_section_treats_it_as_empty() {
+        let result = resolve_exec_capabilities(None, false, 0).unwrap();
+        assert!(result.bounding.is_empty());
+        assert!(result.effective.is_empty());
     }
 }

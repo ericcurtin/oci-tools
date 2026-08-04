@@ -533,6 +533,95 @@ fn exec_user_flag_resolves_a_named_user_via_the_containers_own_etc_passwd() {
     ociman(storage_dir.path(), &["rm", "--force", &id]);
 }
 
+/// `ociman exec --privileged` (matching real `podman exec
+/// --privileged` exactly, checked directly against `~/git/podman/
+/// libpod/oci_conmon_exec_linux.go`'s own `setProcessCapabilitiesExec`):
+/// the exec'd process's own real `CapBnd` (its bounding capability
+/// set, read straight back from `/proc/self/status` inside the
+/// container, the kernel's own ground truth) genuinely grows to the
+/// full set when given, strictly larger than the container's own
+/// default (podman's own 11-capability default, `ContainerConfig::
+/// default()`'s own implicit choice) without it.
+#[test]
+fn exec_privileged_genuinely_grants_the_full_bounding_capability_set() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/exec-privileged:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/exec-privileged:latest",
+        &["/bin/sh", "-c", "sleep 5"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    fn cap_bnd(status_output: &[u8]) -> u64 {
+        let text = String::from_utf8_lossy(status_output);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("CapBnd:"))
+            .unwrap_or_else(|| panic!("no CapBnd line in: {text:?}"));
+        let hex = line.split_whitespace().nth(1).unwrap();
+        u64::from_str_radix(hex, 16).unwrap()
+    }
+
+    let unprivileged = ociman(
+        storage_dir.path(),
+        &["exec", &id, "/bin/sh", "-c", "cat /proc/self/status"],
+    );
+    assert!(
+        unprivileged.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&unprivileged.stderr)
+    );
+    let unprivileged_bnd = cap_bnd(&unprivileged.stdout);
+
+    let privileged = ociman(
+        storage_dir.path(),
+        &[
+            "exec",
+            "--privileged",
+            &id,
+            "/bin/sh",
+            "-c",
+            "cat /proc/self/status",
+        ],
+    );
+    assert!(
+        privileged.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&privileged.stderr)
+    );
+    let privileged_bnd = cap_bnd(&privileged.stdout);
+
+    assert!(
+        privileged_bnd > unprivileged_bnd,
+        "privileged CapBnd ({privileged_bnd:#x}) should be strictly larger than the \
+         container's own default ({unprivileged_bnd:#x})"
+    );
+    // Every bit the container's own default already had must still be
+    // present too -- `--privileged` only ever adds, never removes.
+    assert_eq!(privileged_bnd & unprivileged_bnd, unprivileged_bnd);
+
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "--force", &id]);
+}
+
 /// `ociman exec --preserve-fds` (0351), matching real `podman exec
 /// --preserve-fds` exactly (checked directly against a real installed
 /// `podman exec --help`) -- correcting this project's own earlier,
