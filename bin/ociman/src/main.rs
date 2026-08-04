@@ -2588,6 +2588,19 @@ enum Command {
         /// deferred refinement this first slice doesn't attempt.
         #[arg(long = "filter")]
         filter: Vec<String>,
+        /// Act on the single, real most-recently-*created* container
+        /// instead of an explicit `ID`/`--name` — matching real
+        /// `podman stop --latest`/`-l` exactly (see [`Command::Rm::
+        /// latest`]'s own doc comment for the exact, checked-directly
+        /// `GetLatestContainer` semantics this shares verbatim,
+        /// `~/git/podman/cmd/podman/containers/stop.go`'s own
+        /// identical `validate.AddLatestFlag`). Mutually exclusive
+        /// with an explicit `ID`/`--name`, `--cidfile`, `--all`, and
+        /// `--filter` — the same real, checked-directly restriction
+        /// real podman's own `validate.CheckAllLatestAndIDFile`
+        /// already enforces.
+        #[arg(short = 'l', long)]
+        latest: bool,
     },
     /// Send a signal to a running container's own init process — one
     /// immediate send, no grace period, no escalation (unlike `stop`),
@@ -4035,6 +4048,7 @@ fn main() -> std::process::ExitCode {
                 cidfile,
                 ignore,
                 filter,
+                latest,
             }) => cmd_stop(
                 &ids,
                 time,
@@ -4043,6 +4057,7 @@ fn main() -> std::process::ExitCode {
                 &cidfile,
                 ignore,
                 &filter,
+                latest,
             ),
             Some(Command::Kill {
                 ids,
@@ -10731,6 +10746,13 @@ fn reset_failed_systemd_scope(container_id: &str, state: &oci_runtime_core::Pers
 /// every other failure still surfaced while every other match is
 /// still attempted) but narrowed to only the containers
 /// [`matches_label_until_filters`] actually matches.
+///
+/// `--latest`/`-l` (see [`Command::Stop::latest`]'s own doc comment)
+/// resolves to [`resolve_latest_container`]'s own single id, merged
+/// into the same target list an explicit `ID` already builds (the
+/// same convention `--cidfile`'s own merge already establishes) — no
+/// separate selection logic of its own at all.
+#[allow(clippy::too_many_arguments)]
 fn cmd_stop(
     ids: &[String],
     time_secs: Option<u64>,
@@ -10739,6 +10761,7 @@ fn cmd_stop(
     cidfiles: &[PathBuf],
     ignore: bool,
     filter: &[String],
+    latest: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         cidfiles.is_empty() || !all,
@@ -10758,6 +10781,13 @@ fn cmd_stop(
         filter.is_empty() || (ids.is_empty() && cidfiles.is_empty() && !all),
         "--filter cannot be combined with a container ID/name, --cidfile, or --all"
     );
+    // `--latest`/`-l` -- matching real podman's own checked-directly
+    // `validate.CheckAllLatestAndIDFile` restriction exactly (see
+    // `Command::Stop::latest`'s own doc comment).
+    anyhow::ensure!(
+        !latest || (ids.is_empty() && cidfiles.is_empty() && !all && filter.is_empty()),
+        "--latest cannot be combined with a container ID/name, --cidfile, --all, or --filter"
+    );
     // Matches real podman's own checked-directly CLI-level validation
     // exactly (`validate.CheckAllLatestAndIDFile`): "you must provide
     // at least one name or id" is judged by whether `--cidfile` was
@@ -10766,7 +10796,8 @@ fn cmd_stop(
     // specifically so a `--cidfile` that turns out unreadable-but-
     // `--ignore`d still counts as "something was given" even once the
     // merged list below ends up empty because of it.
-    let nothing_given = ids.is_empty() && cidfiles.is_empty() && !all && filter.is_empty();
+    let nothing_given =
+        ids.is_empty() && cidfiles.is_empty() && !all && filter.is_empty() && !latest;
     anyhow::ensure!(
         !nothing_given,
         "no container ID/name given (try `ociman stop <ID>` or `--all`)"
@@ -10812,6 +10843,10 @@ fn cmd_stop(
                 return Err(e).with_context(|| format!("reading --cidfile {}", path.display()));
             }
         }
+    }
+    if latest {
+        let containers = open_container_store()?;
+        ids.push(resolve_latest_container(&containers)?);
     }
 
     if all {
