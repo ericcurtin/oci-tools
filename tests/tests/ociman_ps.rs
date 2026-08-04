@@ -530,6 +530,103 @@ fn rm_all_and_an_explicit_id_together_is_a_clear_error() {
     );
 }
 
+/// `rm --filter label=` (the same real, deliberately narrower
+/// `label=`/`until=` grammar `ociman stop --filter`/`ociman container
+/// prune --filter` already established) only removes a container
+/// also matching (OR'd across multiple values), leaving a
+/// non-matching one completely untouched.
+#[test]
+fn rm_filter_label_only_removes_a_matching_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rm-filter-label:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    // A real, already-exited (`Stopped`) container, not a bare
+    // never-started `create` -- `rm` without `--force` refuses a
+    // non-`Stopped` container (the same real gate `rm --all` without
+    // `--force` already has, see `rm_all_without_force_skips_a_non_
+    // stopped_container_...` above), so this filter test needs a
+    // genuinely stopped one to actually exercise the removal path.
+    let run_match = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--label",
+            "env=prod",
+            "ociman-test/rm-filter-label:latest",
+            "true",
+        ],
+    );
+    assert!(run_match.status.success(), "{run_match:?}");
+    let match_id = ociman(storage_dir.path(), &["ps", "-a", "-q"])
+        .stdout
+        .to_owned();
+    let match_id = String::from_utf8_lossy(&match_id).trim().to_string();
+
+    let run_other = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--label",
+            "env=staging",
+            "ociman-test/rm-filter-label:latest",
+            "true",
+        ],
+    );
+    assert!(run_other.status.success(), "{run_other:?}");
+    let ps_ids = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    let other_id = String::from_utf8_lossy(&ps_ids.stdout)
+        .lines()
+        .map(str::to_string)
+        .find(|id| id != &match_id)
+        .expect("a second container (the one just run) should now exist");
+
+    let rm = ociman(storage_dir.path(), &["rm", "--filter", "label=env=prod"]);
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rm.stdout).trim(),
+        match_id,
+        "{rm:?}"
+    );
+
+    let ps_after = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert_eq!(String::from_utf8_lossy(&ps_after.stdout).trim(), other_id);
+}
+
+/// `--filter` cannot be combined with an explicit id, `--cidfile`, or
+/// `--all` -- the same deliberate scope narrowing `ociman stop
+/// --filter` already established, documented on `Command::Rm::filter`
+/// itself.
+#[test]
+fn rm_filter_combined_with_all_or_an_explicit_id_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let with_all = ociman(
+        storage_dir.path(),
+        &["rm", "--filter", "label=env=prod", "--all"],
+    );
+    assert!(!with_all.status.success());
+
+    let with_id = ociman(
+        storage_dir.path(),
+        &["rm", "--filter", "label=env=prod", "some-id"],
+    );
+    assert!(!with_id.status.success());
+}
+
 /// `rm --all` without `--force` still refuses a non-stopped container
 /// (real `podman rm --all` alone, without `--force`, leaves a running
 /// container untouched too) — but every *other* container is still

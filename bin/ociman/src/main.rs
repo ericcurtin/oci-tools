@@ -2239,6 +2239,25 @@ enum Command {
         /// only ever reached when this flag is actually given.
         #[arg(short = 't', long = "time")]
         time: Option<u64>,
+        /// Remove every container matching every given filter
+        /// instead of an explicit `ID`/`--name` — the same real,
+        /// deliberately narrower `label=<key>[=<value>]`/
+        /// `label!=<key>[=<value>]`/`until=<duration-or-timestamp>`
+        /// grammar `ociman stop --filter`/`ociman container prune
+        /// --filter` already established (see [`LabelUntilFilters`]'s
+        /// own doc comment for exactly why this project's own model
+        /// can't reach real podman's much wider `ps`-grammar-reusing
+        /// one yet — checked directly, `~/git/podman/cmd/podman/
+        /// containers/rm.go`'s own `--filter`, wired through the
+        /// identical `getContainers` real `podman stop --filter`
+        /// already goes through). Mutually exclusive with an
+        /// explicit `ID`/`--name`, `--cidfile`, and `--all` — the same
+        /// deliberate narrowing `ociman stop --filter`'s own doc
+        /// comment already explains (real podman can combine
+        /// `--filter` with explicit names to narrow further; this
+        /// first slice doesn't attempt that).
+        #[arg(long = "filter")]
+        filter: Vec<String>,
     },
     /// Copy files/directories between the local filesystem and a
     /// container (running or stopped), or between two containers —
@@ -3702,7 +3721,8 @@ fn main() -> std::process::ExitCode {
                 cidfile,
                 ignore,
                 time,
-            }) => cmd_rm(&ids, force, all, &cidfile, ignore, time),
+                filter,
+            }) => cmd_rm(&ids, force, all, &cidfile, ignore, time, &filter),
             Some(Command::Cp {
                 src,
                 dest,
@@ -9295,6 +9315,12 @@ fn format_container_size(size: &ContainerSizeView) -> String {
 /// difference from `--all`'s own "keep going past a per-container
 /// failure" policy, which still applies once a name/ID has actually
 /// resolved to something real).
+///
+/// `--filter` (see [`Command::Rm::filter`]'s own doc comment) is its
+/// own, separate selection mode, mirroring the `--all` loop's own
+/// "attempt every match, report the first real failure at the end"
+/// shape exactly but narrowed to only the containers
+/// [`matches_label_until_filters`] actually matches.
 fn cmd_rm(
     ids: &[String],
     force: bool,
@@ -9302,6 +9328,7 @@ fn cmd_rm(
     cidfiles: &[PathBuf],
     ignore: bool,
     time_secs: Option<u64>,
+    filter: &[String],
 ) -> anyhow::Result<()> {
     // Matches real `podman rm`'s own identical, checked-directly
     // restriction exactly (`~/git/podman/cmd/podman/containers/
@@ -9315,10 +9342,39 @@ fn cmd_rm(
         cidfiles.is_empty() || !all,
         "--all and --cidfile cannot be used together"
     );
+    // `--filter` is its own, separate selection mode -- see
+    // `Command::Rm::filter`'s own doc comment for the real,
+    // deliberate narrowing versus real podman's own richer "further
+    // narrows whatever else was given" semantics.
+    anyhow::ensure!(
+        filter.is_empty() || (ids.is_empty() && cidfiles.is_empty() && !all),
+        "--filter cannot be combined with a container ID/name, --cidfile, or --all"
+    );
     // Matches real `podman rm --force`'s own checked-directly
     // behavior exactly: forcing implies ignoring too, the same
     // convention `ociman rmi --force` already established.
     let ignore = ignore || force;
+
+    if !filter.is_empty() {
+        let parsed = parse_label_until_filters("ociman rm", filter)?;
+        let containers = open_container_store()?;
+        let mut first_error = None;
+        for state in containers.list().context("listing containers")? {
+            if !matches_label_until_filters(&state, &parsed) {
+                continue;
+            }
+            if let Err(e) = remove_container(&containers, &state.id, force, time_secs, true) {
+                eprintln!("error removing {}: {e:#}", state.id);
+                first_error.get_or_insert(e);
+                continue;
+            }
+            println!("{}", state.id);
+        }
+        return match first_error {
+            Some(e) => Err(e.context("removing containers")),
+            None => Ok(()),
+        };
+    }
     // Whether *anything* was given at all, captured before the merge
     // below -- matching real podman's own checked-directly CLI-level
     // validation exactly (`validate.CheckAllLatestAndIDFile`): "you
