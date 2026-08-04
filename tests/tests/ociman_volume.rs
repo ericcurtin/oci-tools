@@ -78,7 +78,7 @@ fn wait_for_container_status(
 }
 
 #[test]
-fn volume_create_prints_the_given_name_and_is_idempotent() {
+fn volume_create_prints_the_given_name() {
     let storage_dir = tempfile::tempdir().unwrap();
     let create = ociman(storage_dir.path(), &["volume", "create", "myvol"]);
     assert!(
@@ -87,11 +87,49 @@ fn volume_create_prints_the_given_name_and_is_idempotent() {
         String::from_utf8_lossy(&create.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&create.stdout).trim(), "myvol");
+}
 
-    // A second create of the same name is a real, idempotent success,
-    // not an error -- matching real `podman volume create` exactly.
+/// `ociman volume create` of an already-existing name, without
+/// `--ignore`, is a real, immediate error (0406) -- matching real
+/// `podman volume create`'s own checked-directly stricter default
+/// (verified live against an installed `podman 4.9.3`: `Error: volume
+/// with name X already exists`, exit 125), a genuine correction of
+/// this project's own earlier, disproven "checked directly" claim
+/// that a second create was always a silent, idempotent success (that
+/// claim actually matches real *docker*'s own different behavior, not
+/// podman's -- see `docs/design/0406`).
+#[test]
+fn volume_create_of_an_existing_name_without_ignore_is_a_real_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let create = ociman(storage_dir.path(), &["volume", "create", "myvol"]);
+    assert!(create.status.success(), "{create:?}");
+
     let create_again = ociman(storage_dir.path(), &["volume", "create", "myvol"]);
-    assert!(create_again.status.success());
+    assert!(!create_again.status.success());
+    assert!(
+        String::from_utf8_lossy(&create_again.stderr).contains("already exists"),
+        "{create_again:?}"
+    );
+}
+
+/// `ociman volume create --ignore` restores the old, opt-in-now
+/// idempotent behavior -- matching real `podman volume create
+/// --ignore` exactly.
+#[test]
+fn volume_create_ignore_flag_makes_an_existing_name_idempotent() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let create = ociman(storage_dir.path(), &["volume", "create", "myvol"]);
+    assert!(create.status.success(), "{create:?}");
+
+    let create_again = ociman(
+        storage_dir.path(),
+        &["volume", "create", "--ignore", "myvol"],
+    );
+    assert!(
+        create_again.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create_again.stderr)
+    );
     assert_eq!(
         String::from_utf8_lossy(&create_again.stdout).trim(),
         "myvol"

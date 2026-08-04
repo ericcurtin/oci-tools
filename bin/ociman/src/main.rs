@@ -3068,16 +3068,35 @@ enum SystemCommand {
 #[derive(Debug, clap::Subcommand)]
 enum VolumeCommand {
     /// Create a new named volume — matching real `docker volume
-    /// create`/`podman volume create` exactly, including creating an
-    /// already-existing volume of the same name being a real,
-    /// idempotent success (not an error) and a bare invocation with no
-    /// name at all generating a random one.
+    /// create`/`podman volume create` exactly for the common case,
+    /// with a bare invocation and no name at all generating a random
+    /// one. Creating an already-existing volume of the same name is a
+    /// real, checked-directly *genuine divergence* between the two
+    /// real tools this project reconciles the same way every other
+    /// `--ignore`-shaped command here already does: real `docker
+    /// volume create` on an existing name is always a silent,
+    /// idempotent success (no `--ignore`-equivalent concept exists at
+    /// all), but real `podman volume create` on an existing name is a
+    /// real, immediate error (`"volume with name X already exists"`,
+    /// verified directly against a live installed `podman 4.9.3`, not
+    /// merely assumed from a stale, disproven earlier claim) *unless*
+    /// `--ignore` is also given — matching that stricter, more
+    /// specific podman behavior by default, the same "podman is the
+    /// primary reference when the two real tools genuinely disagree"
+    /// choice this project already makes throughout (every other
+    /// `--ignore` flag here exists for exactly this reason).
     Create {
         /// The volume's own name — random (this project's own usual
         /// short hex id) if omitted, matching real `docker volume
         /// create`/`podman volume create` with no `NAME` argument
         /// exactly.
         name: Option<String>,
+        /// Don't error if a volume of this name already exists —
+        /// matching real `podman volume create --ignore` exactly (see
+        /// this command's own doc comment for exactly why this
+        /// exists at all).
+        #[arg(long)]
+        ignore: bool,
     },
     /// List every real, currently-existing volume — matching real
     /// `docker volume ls`/`podman volume ls`.
@@ -3555,8 +3574,8 @@ fn main() -> std::process::ExitCode {
                 }
             },
             Some(Command::Volume { command }) => match command {
-                VolumeCommand::Create { name } => {
-                    cmd_volume_create(name.as_deref(), cli.global.json)
+                VolumeCommand::Create { name, ignore } => {
+                    cmd_volume_create(name.as_deref(), ignore, cli.global.json)
                 }
                 VolumeCommand::Ls { format, quiet } => {
                     cmd_volume_ls(cli.global.json, format.as_deref(), quiet)
@@ -11463,7 +11482,7 @@ impl VolumeView {
     }
 }
 
-fn cmd_volume_create(name: Option<&str>, json: bool) -> anyhow::Result<()> {
+fn cmd_volume_create(name: Option<&str>, ignore: bool, json: bool) -> anyhow::Result<()> {
     let name = match name {
         Some(name) => {
             anyhow::ensure!(
@@ -11476,6 +11495,20 @@ fn cmd_volume_create(name: Option<&str>, json: bool) -> anyhow::Result<()> {
         None => short_id(),
     };
     let store = open_volume_store()?;
+    // Matching real `podman volume create`'s own stricter default
+    // (checked directly against a live installed `podman 4.9.3`, not
+    // assumed): an already-existing name is a real, immediate error
+    // unless `--ignore` was given -- see `Command::Volume`'s own
+    // `Create` doc comment for exactly why this differs from real
+    // `docker volume create`'s own always-idempotent behavior, and
+    // why `VolumeStore::get_or_create` itself (the shared primitive
+    // `--volume name:/path`'s own auto-create-on-first-reference path
+    // also calls) deliberately keeps its own unconditional idempotent
+    // behavior rather than gaining this same check.
+    anyhow::ensure!(
+        ignore || !store.exists(&name),
+        "volume with name {name:?} already exists"
+    );
     let record = store
         .get_or_create(&name)
         .with_context(|| format!("creating volume {name:?}"))?;

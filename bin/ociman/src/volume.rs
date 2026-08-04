@@ -94,16 +94,22 @@ impl VolumeStore {
         }
     }
 
-    /// Create `name` if it doesn't already exist — idempotent,
-    /// matching real `podman volume create`'s own identical "already
-    /// exists -> just return the existing one" behavior (checked
-    /// directly: a second real `podman volume create` of the same
-    /// name succeeds, printing the same name back, rather than
-    /// erroring "already exists" the way `ociman run --name` on an
-    /// already-used container name does). Also what `--volume
+    /// Create `name` if it doesn't already exist — always
+    /// idempotent, deliberately with no `--ignore`-style gate of its
+    /// own at this layer. This is the shared primitive `--volume
     /// name:/path` itself calls on first use, matching real `docker
     /// run -v name:/path`/`podman run -v name:/path`'s own identical
-    /// "auto-create on first reference" convention.
+    /// "auto-create on first reference, silently, every time"
+    /// convention — genuinely different from `ociman volume create`'s
+    /// own top-level command, which now enforces real podman's own
+    /// stricter "already exists is a real error unless `--ignore`"
+    /// rule itself (`0406`) one layer up, in `cmd_volume_create`, on
+    /// top of this same, still-unconditionally-idempotent function —
+    /// an earlier version of this doc comment claimed `ociman volume
+    /// create` itself was unconditionally idempotent too, "checked
+    /// directly" against real podman; re-verified directly against a
+    /// live installed `podman 4.9.3` while scoping `0406` and found
+    /// to be simply wrong, corrected there instead of repeated here.
     pub(crate) fn get_or_create(&self, name: &str) -> io::Result<VolumeRecord> {
         if let Some(existing) = self.get(name)? {
             return Ok(existing);
