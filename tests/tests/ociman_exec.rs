@@ -51,6 +51,28 @@ fn ociman_run_detached(
         .expect("failed to spawn ociman run")
 }
 
+/// Same as [`ociman_run_detached`], but with `--name` given *before*
+/// the image -- `RunArgs::args`'s own `trailing_var_arg = true`
+/// captures everything positional after the image into the
+/// container's own command, so `--name` must come first.
+fn ociman_run_detached_named(
+    storage_root: &Path,
+    name: &str,
+    image: &str,
+    container_args: &[&str],
+) -> std::process::Child {
+    Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_root)
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--name", name, image])
+        .args(container_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run")
+}
+
 /// Find the (only) container's id via `ps -a -q`, polling briefly
 /// since it may not have been persisted yet the instant `run` was
 /// spawned. A generous timeout: `ociman run` now attempts a real
@@ -88,6 +110,36 @@ fn wait_for_container_status(
             && let Some(entry) = views
                 .as_array()
                 .and_then(|a| a.iter().find(|e| e["id"] == id))
+        {
+            let status = entry["status"].as_str().unwrap_or_default().to_string();
+            if status == want || Instant::now() >= deadline {
+                return status;
+            }
+        } else if Instant::now() >= deadline {
+            return String::new();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Same as [`wait_for_container_status`], but matched by `--name`
+/// instead of id -- needed for `--latest`/leading-slash tests, which
+/// exist to prove the *name-given* target is the one actually acted
+/// on, distinct from this file's own existing id-based tests.
+fn wait_for_container_status_by_name(
+    storage_root: &Path,
+    name: &str,
+    want: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = ociman(storage_root, &["ps", "-a", "--json"]);
+        if out.status.success()
+            && let Ok(views) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            && let Some(entry) = views
+                .as_array()
+                .and_then(|a| a.iter().find(|e| e["name"] == name))
         {
             let status = entry["status"].as_str().unwrap_or_default().to_string();
             if status == want || Instant::now() >= deadline {
@@ -911,4 +963,270 @@ fn exec_interactive_forwards_real_stdin() {
 
     run.wait().unwrap();
     ociman(storage_dir.path(), &["rm", "--force", &id]);
+}
+
+/// `ociman exec --latest`/`-l` (matching real `podman exec --latest`
+/// exactly) execs into the single, real most-recently-*created*
+/// container instead of naming one explicitly.
+#[test]
+fn exec_latest_execs_into_the_most_recently_created_running_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/exec-latest:latest",
+        &busybox,
+        &["sh", "test", "touch"],
+        ContainerConfig::default(),
+    );
+
+    let mut older = ociman_run_detached_named(
+        storage_dir.path(),
+        "exec-latest-older",
+        "ociman-test/exec-latest:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "exec-latest-older",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    // A real, distinguishable creation-time gap.
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Only the *newer* container's own command ever creates this
+    // marker file -- proving `--latest` genuinely targeted it, not
+    // merely that some exec succeeded against something.
+    let mut newer = ociman_run_detached_named(
+        storage_dir.path(),
+        "exec-latest-newer",
+        "ociman-test/exec-latest:latest",
+        &["/bin/sh", "-c", "touch /newer-marker && sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "exec-latest-newer",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    // A real, if tiny, race between the container's own status
+    // flipping to "running" and its own `touch /newer-marker` shell
+    // command actually finishing -- retried briefly rather than a
+    // single fixed sleep, matching this project's own established
+    // poll-with-timeout convention.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let exec = loop {
+        let attempt = ociman(
+            storage_dir.path(),
+            &["exec", "--latest", "test", "-f", "/newer-marker"],
+        );
+        if attempt.status.success() || Instant::now() >= deadline {
+            break attempt;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        exec.status.success(),
+        "--latest must have targeted the newer container: stderr: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+
+    ociman(storage_dir.path(), &["kill", "-a"]);
+    older.wait().ok();
+    newer.wait().ok();
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// `ociman exec --cidfile` (matching real `podman exec --cidfile`
+/// exactly, genuinely present in real podman's own source despite not
+/// appearing in an older installed `podman 4.9.3 --help`'s own
+/// output) reads the container ID from the file's own first line.
+#[test]
+fn exec_cidfile_reads_the_container_id_from_a_file() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/exec-cidfile:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/exec-cidfile:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let cidfile = storage_dir.path().join("cid");
+    std::fs::write(&cidfile, format!("{id}\ntrailing garbage ignored")).unwrap();
+
+    let exec = ociman(
+        storage_dir.path(),
+        &["exec", "--cidfile", cidfile.to_str().unwrap(), "true"],
+    );
+    assert!(
+        exec.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+
+    ociman(storage_dir.path(), &["kill", &id]);
+    run.wait().ok();
+}
+
+/// `--latest` and `--cidfile` together is a real, immediate error,
+/// matching real podman's own exact wording.
+#[test]
+fn exec_latest_and_cidfile_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let cidfile = storage_dir.path().join("cid");
+    std::fs::write(&cidfile, "whatever").unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &[
+            "exec",
+            "--latest",
+            "--cidfile",
+            cidfile.to_str().unwrap(),
+            "true",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("--latest and --cidfile can not be used together"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// No container reference and no `--latest`/`--cidfile` at all is a
+/// real, immediate error, matching real podman's own exact wording
+/// (confirmed live against an installed `podman 4.9.3`).
+#[test]
+fn exec_with_nothing_at_all_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["exec"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(
+            "exec requires the name or ID of a container or the --latest or --cidfile flag"
+        ),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `--latest` with no command at all is a real, immediate error,
+/// matching real podman's own exact wording (confirmed live against
+/// an installed `podman 4.9.3`: `must provide a non-empty command to
+/// start an exec session: invalid argument`).
+#[test]
+fn exec_latest_with_no_command_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/exec-latest-no-cmd:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/exec-latest-no-cmd:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20));
+
+    let out = ociman(storage_dir.path(), &["exec", "--latest"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("must provide a non-empty command to start an exec session"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    ociman(storage_dir.path(), &["kill", &id]);
+    run.wait().ok();
+}
+
+/// A leading `/` on the container reference is stripped, matching
+/// real podman's own identical docker-compatibility quirk
+/// (`strings.TrimPrefix(args[0], "/")`).
+#[test]
+fn exec_strips_a_leading_slash_from_the_container_reference() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/exec-leading-slash:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let mut run = ociman_run_detached_named(
+        storage_dir.path(),
+        "exec-leading-slash-ctr",
+        "ociman-test/exec-leading-slash:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "exec-leading-slash-ctr",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let exec = ociman(
+        storage_dir.path(),
+        &["exec", "/exec-leading-slash-ctr", "true"],
+    );
+    assert!(
+        exec.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+
+    ociman(storage_dir.path(), &["kill", "exec-leading-slash-ctr"]);
+    run.wait().ok();
 }

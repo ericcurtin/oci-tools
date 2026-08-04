@@ -3187,8 +3187,48 @@ enum Command {
     /// Run an additional process inside an already-running container,
     /// joining its existing namespaces.
     Exec {
-        /// The container's ID or `--name`.
-        id: String,
+        /// The container's ID or `--name`, followed by the command
+        /// and arguments to run inside it — combined into one
+        /// positional list rather than a separate `ID` field, since
+        /// which element is actually the container reference depends
+        /// on whether `--latest`/`--cidfile` was given at all —
+        /// exactly matching real podman's own checked-directly manual
+        /// disambiguation (`~/git/podman/cmd/podman/containers/
+        /// exec.go`'s own `determineTargetCtrAndCmd`): with neither
+        /// given, the first element is the container reference (a
+        /// leading `/` stripped, matching real podman's own identical
+        /// docker-compatibility quirk — a container is sometimes
+        /// referred to with one, the same convention `docker inspect`/
+        /// `docker exec` themselves tolerate) and every remaining
+        /// element is the command; with either, every element here is
+        /// the command instead, the container coming from that flag
+        /// alone. Giving neither this nor `--latest`/`--cidfile`, or
+        /// giving one of those but no command at all, is a real,
+        /// immediate error matching real podman's own exact wording
+        /// (confirmed live against an installed `podman 4.9.3`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        positional: Vec<String>,
+        /// Exec into the single, real most-recently-*created*
+        /// container instead of naming one explicitly — matching real
+        /// `podman exec --latest`/`-l` exactly (see [`Command::Rm::
+        /// latest`]'s own doc comment for the exact, checked-directly
+        /// `GetLatestContainer` semantics this shares verbatim).
+        /// Mutually exclusive with `--cidfile` and with giving an
+        /// explicit container reference as this command's own first
+        /// positional element.
+        #[arg(short = 'l', long)]
+        latest: bool,
+        /// Read the container ID from `FILE`'s own first line instead
+        /// of naming one explicitly — matching real `podman exec
+        /// --cidfile` exactly (checked directly, `~/git/podman/cmd/
+        /// podman/containers/exec.go`; genuinely present in that
+        /// source tree despite not appearing in an older installed
+        /// `podman 4.9.3 --help`'s own output — a newer real flag,
+        /// not a stale citation). Mutually exclusive with `--latest`
+        /// and with giving an explicit container reference as this
+        /// command's own first positional element.
+        #[arg(long = "cidfile", value_name = "FILE")]
+        cidfile: Option<PathBuf>,
         /// Username or UID, and optionally groupname or GID
         /// (`<user>[:<group>]`), resolved against the container's own
         /// `/etc/passwd`/`/etc/group` — matching real `podman exec
@@ -3291,9 +3331,6 @@ enum Command {
         /// project already sets.
         #[arg(long)]
         privileged: bool,
-        /// Command and arguments to run inside the container.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        args: Vec<String>,
     },
     /// Print a container's captured stdout/stderr (combined, not kept
     /// separate — see `docs/design/0025`).
@@ -4459,7 +4496,9 @@ fn main() -> std::process::ExitCode {
             Some(Command::Rename { id, name }) => cmd_rename(&id, &name),
             Some(Command::Top { id, ps_args }) => cmd_top(&id, &ps_args),
             Some(Command::Exec {
-                id,
+                positional,
+                latest,
+                cidfile,
                 user,
                 workdir,
                 env,
@@ -4467,8 +4506,45 @@ fn main() -> std::process::ExitCode {
                 interactive,
                 preserve_fds,
                 privileged,
-                args,
             }) => {
+                // Manual disambiguation, matching real podman's own
+                // checked-directly `determineTargetCtrAndCmd` exactly
+                // — see `Command::Exec::positional`'s own doc comment
+                // for exactly why this can't be plain, structured
+                // clap positional binding.
+                anyhow::ensure!(
+                    !(latest && cidfile.is_some()),
+                    "--latest and --cidfile can not be used together"
+                );
+                let (id, args) = if latest || cidfile.is_some() {
+                    let id = if latest {
+                        let containers = open_container_store()?;
+                        resolve_latest_container(&containers)?
+                    } else {
+                        let path = cidfile.as_deref().expect("cidfile is Some in this branch");
+                        let content = std::fs::read_to_string(path)
+                            .with_context(|| format!("reading --cidfile {}", path.display()))?;
+                        content.split('\n').next().unwrap_or("").to_string()
+                    };
+                    (id, positional)
+                } else {
+                    let mut iter = positional.into_iter();
+                    let first = iter.next().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "exec requires the name or ID of a container or the --latest or \
+                             --cidfile flag"
+                        )
+                    })?;
+                    // Matches real podman's own identical docker-
+                    // compatibility quirk (`strings.TrimPrefix(args[0],
+                    // "/")`) -- see this field's own doc comment.
+                    let id = first.strip_prefix('/').unwrap_or(&first).to_string();
+                    (id, iter.collect::<Vec<String>>())
+                };
+                anyhow::ensure!(
+                    !args.is_empty(),
+                    "must provide a non-empty command to start an exec session: invalid argument"
+                );
                 // Same flatten-then-single-`apply_env_overrides`-call
                 // approach `run`/`create` use, and for the identical
                 // reason: `--env-file` folds in first (in the order
