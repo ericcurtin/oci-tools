@@ -252,6 +252,8 @@ pub fn cmd_build(
     shm_size: Option<&str>,
     memory: Option<&str>,
     memory_swap: Option<&str>,
+    cpuset_cpus: Option<&str>,
+    cpuset_mems: Option<&str>,
     http_proxy: bool,
     quiet: bool,
     json: bool,
@@ -309,16 +311,24 @@ pub fn cmd_build(
     // step_spec`'s own call site via `StageContext::shm_size_bytes`).
     let shm_size_bytes = shm_size.map(crate::parse_memory_limit).transpose()?;
 
-    // `--memory`/`--memory-swap` — same reuse-the-existing-primitive
-    // shape as `--ulimit`/`--shm-size` above: `ociman run`/`create`'s
-    // own `parse_and_validate_memory_and_cpus` (validation included:
-    // `--memory-swap` requires `--memory`, and must be at least as
-    // large) and `resources_from_cli` (spec construction), reused
-    // verbatim rather than a second implementation of either. No
-    // `--memory-reservation`/`--cpus` counterpart yet for `build`
-    // (out of scope for this increment) -- passed as `None` here,
-    // same as `resources_from_cli`'s own already-established "not
-    // every caller needs every field" shape.
+    // `--memory`/`--memory-swap`/`--cpuset-cpus`/`--cpuset-mems` —
+    // same reuse-the-existing-primitive shape as `--ulimit`/
+    // `--shm-size` above: `ociman run`/`create`'s own `parse_and_
+    // validate_memory_and_cpus` (validation included: `--memory-swap`
+    // requires `--memory`, and must be at least as large) and
+    // `resources_from_cli` (spec construction), reused verbatim
+    // rather than a second implementation of either. No
+    // `--memory-reservation`/`--cpus` counterpart at all for `build`
+    // (real `podman build` has neither -- both are `run`/`create`/
+    // `update`-only convenience flags, checked directly, see `0456`'s
+    // own doc comment) -- passed as `None` here, same as `resources_
+    // from_cli`'s own already-established "not every caller needs
+    // every field" shape. `--cpuset-cpus`/`--cpuset-mems` need no
+    // parsing/validation of their own at all (same as `ociman run/
+    // create`'s own identical flags): passed straight through as
+    // plain strings, the kernel/`oci_runtime_core::systemd_cgroup`'s
+    // own translation layer rejects a malformed value, never this
+    // CLI layer.
     let (build_memory_limit_bytes, build_memory_swap_bytes, _) =
         crate::parse_and_validate_memory_and_cpus(memory, memory_swap, None, None)?;
     let resources = crate::resources_from_cli(
@@ -327,8 +337,8 @@ pub fn cmd_build(
         None,
         None,
         None,
-        None,
-        None,
+        cpuset_cpus,
+        cpuset_mems,
     );
 
     let instructions = oci_dockerfile::parse(&text).map_err(|e| anyhow::anyhow!(e))?;

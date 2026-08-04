@@ -8,6 +8,7 @@
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use oci_spec_types::image::ContainerConfig;
 use oci_store::Store;
@@ -6527,7 +6528,7 @@ fn build_squash_disables_the_build_cache() {
         .unwrap()
         .to_string();
 
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::thread::sleep(Duration::from_millis(20));
     let second = ociman(
         storage_dir.path(),
         &[
@@ -7861,11 +7862,9 @@ fn build_updates_created_to_match_the_last_history_entry_after_a_run_step() {
         .expect("a RUN step should give the built image a real created timestamp");
     let parsed = oci_spec_types::time::parse_rfc3339_utc(created)
         .expect("created should be a valid RFC3339 timestamp");
-    let elapsed = parsed
-        .duration_since(before)
-        .unwrap_or(std::time::Duration::ZERO);
+    let elapsed = parsed.duration_since(before).unwrap_or(Duration::ZERO);
     assert!(
-        elapsed < std::time::Duration::from_secs(30),
+        elapsed < Duration::from_secs(30),
         "created ({created}) should be roughly \"now\" (the real build time), not the base \
          image's own (which this project's own `seed_image` always leaves as `None`)"
     );
@@ -8417,11 +8416,9 @@ fn build_without_timestamp_uses_the_real_current_time() {
     let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
     let created = view["created"].as_str().unwrap();
     let parsed = oci_spec_types::time::parse_rfc3339_utc(created).unwrap();
-    let elapsed = parsed
-        .duration_since(before)
-        .unwrap_or(std::time::Duration::ZERO);
+    let elapsed = parsed.duration_since(before).unwrap_or(Duration::ZERO);
     assert!(
-        elapsed < std::time::Duration::from_secs(30),
+        elapsed < Duration::from_secs(30),
         "created ({created}) should be roughly \"now\", not some leftover forced value"
     );
 }
@@ -8490,7 +8487,7 @@ fn build_timestamp_makes_two_differently_timed_builds_produce_the_same_digest() 
     };
 
     let first_digest = build_once("ociman-test/timestamp-repro-1:latest");
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    std::thread::sleep(Duration::from_secs(2));
     let second_digest = build_once("ociman-test/timestamp-repro-2:latest");
 
     assert_eq!(
@@ -8951,4 +8948,146 @@ fn build_explicit_env_overrides_the_hosts_own_http_proxy_value() {
         String::from_utf8_lossy(&run.stdout),
         "http://explicit.example.test:9999\n"
     );
+}
+
+/// Same probe `ociman_run.rs`'s own identically-named helper uses: a
+/// real, self-cleaning D-Bus round trip rather than just checking a
+/// socket path exists.
+fn systemd_user_session_available() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-system-running"])
+        .output()
+        .is_ok_and(|out| !out.stdout.is_empty())
+}
+
+/// Poll `systemctl --user list-units` for the one `ociman-build-*
+/// .scope` unit a live `RUN` step's own transient scope creates —
+/// unlike `ociman run`/`create`'s own persisted container state (see
+/// `ociman_run.rs`'s own `real_scope_name`, which reads a container
+/// id-keyed `state.json`), a `RUN` step's own scope name is derived
+/// from a fresh, unpredictable `short_id()` nonce with no persisted
+/// record anywhere this test could look up directly — so this lists
+/// real, currently-active units matching this crate's own fixed
+/// `ociman-build-` prefix instead (see `run_instruction`'s own
+/// `cgroup_setup` construction), safe to rely on since no other
+/// command in this project ever creates a scope under that prefix.
+fn wait_for_build_scope(timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = Command::new("systemctl")
+            .args([
+                "--user",
+                "list-units",
+                "--all",
+                "--no-legend",
+                "--plain",
+                "ociman-build-*.scope",
+            ])
+            .output()
+            .expect("failed to run systemctl --user list-units");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Some(line) = stdout.lines().next()
+            && let Some(unit) = line.split_whitespace().next()
+        {
+            return unit.to_string();
+        }
+        if Instant::now() >= deadline {
+            panic!("no ociman-build-*.scope ever appeared within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `ociman build --cpuset-cpus`/`--cpuset-mems` (matching real
+/// `podman build --cpuset-cpus`/`--cpuset-mems` exactly) set the real
+/// transient systemd scope's own `AllowedCPUs`/`AllowedMemoryNodes`
+/// properties for every `RUN` step -- the same real, live-property
+/// verification `ociman run --cpuset-cpus`/`--cpuset-mems`'s own test
+/// (`run_cpuset_flags_set_the_real_systemd_scopes_own_allowed_cpus_
+/// property`) already established, ported here for `RUN` steps
+/// instead (discovering the scope name by pattern rather than via
+/// persisted container state -- see `wait_for_build_scope`'s own doc
+/// comment for why).
+#[test]
+fn build_cpuset_flags_set_the_real_systemd_scopes_own_allowed_cpus_property() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-cpuset-base:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-cpuset-base:latest\n\
+         RUN sleep 5\n",
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "build",
+            "--cpuset-cpus",
+            "0-1",
+            "--cpuset-mems",
+            "0",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-cpuset-result:latest",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman build");
+
+    let scope_name = wait_for_build_scope(Duration::from_secs(10));
+
+    let show_cpus = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            &scope_name,
+            "-p",
+            "AllowedCPUs",
+            "--value",
+        ])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let allowed_cpus = String::from_utf8_lossy(&show_cpus.stdout)
+        .trim()
+        .to_string();
+    let show_mems = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            &scope_name,
+            "-p",
+            "AllowedMemoryNodes",
+            "--value",
+        ])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let allowed_mems = String::from_utf8_lossy(&show_mems.stdout)
+        .trim()
+        .to_string();
+
+    let status = child.wait().expect("failed to wait on ociman build");
+
+    assert_eq!(allowed_cpus, "0-1");
+    assert_eq!(allowed_mems, "0");
+    assert!(status.success(), "ociman build itself should still succeed");
 }

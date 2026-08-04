@@ -1605,9 +1605,9 @@ enum Command {
         /// go.podman.io/buildah/pkg/cli/common.go`'s own
         /// `CommonBuildOptions` — both are `run`/`create`/`update`-only
         /// convenience flags with no `build` equivalent); its own
-        /// `--cpu-period`/`--cpu-quota`/`--cpu-shares`/`--cpuset-cpus`/
-        /// `--cpuset-mems` remain a real, deliberately out-of-scope gap
-        /// here for now, a natural follow-up to this same increment.
+        /// `--cpu-period`/`--cpu-quota`/`--cpu-shares` remain a real,
+        /// deliberately out-of-scope gap here for now (`--cpuset-cpus`/
+        /// `--cpuset-mems` are implemented just below).
         #[arg(short = 'm', long = "memory")]
         memory: Option<String>,
         /// Total memory **+ swap** every `RUN` step's own cgroup may
@@ -1641,6 +1641,27 @@ enum Command {
             action = clap::ArgAction::Set
         )]
         http_proxy: bool,
+        /// Which CPUs every `RUN` step's own cgroup may run on
+        /// (`cpuset.cpus`-style range list, e.g. `0-2` or `0,2`),
+        /// matching real `podman build --cpuset-cpus` exactly
+        /// (checked directly, `~/git/podman/vendor/go.podman.io/
+        /// buildah/pkg/cli/common.go`): reuses `ociman run/create
+        /// --cpuset-cpus`'s own identical "no syntax validation here,
+        /// straight through to `resources_from_cli`" shape verbatim —
+        /// see that flag's own doc comment for the same known
+        /// rootless-cgroup-delegation caveat (`docs/design/0056`).
+        /// Applies to every `RUN` step in every stage alike, no
+        /// per-stage/per-instruction override, the same shape
+        /// `--ulimit`/`--shm-size`/`--memory` already established.
+        #[arg(long = "cpuset-cpus")]
+        cpuset_cpus: Option<String>,
+        /// Which NUMA memory nodes every `RUN` step's own cgroup may
+        /// use (`cpuset.mems`-style range list), matching real
+        /// `podman build --cpuset-mems` exactly. Same "no syntax
+        /// validation, straight through", and the same rootless
+        /// delegation caveat, as `--cpuset-cpus` just above.
+        #[arg(long = "cpuset-mems")]
+        cpuset_mems: Option<String>,
         /// Refrain from announcing build progress — matching real
         /// `docker build -q`/`podman build --quiet` exactly (checked
         /// directly against a real installed `podman build -q`, three
@@ -4437,6 +4458,8 @@ fn main() -> std::process::ExitCode {
                 shm_size,
                 memory,
                 memory_swap,
+                cpuset_cpus,
+                cpuset_mems,
                 http_proxy,
                 quiet,
                 timestamp,
@@ -4467,6 +4490,8 @@ fn main() -> std::process::ExitCode {
                 shm_size.as_deref(),
                 memory.as_deref(),
                 memory_swap.as_deref(),
+                cpuset_cpus.as_deref(),
+                cpuset_mems.as_deref(),
                 http_proxy,
                 quiet,
                 cli.global.json,
