@@ -2138,6 +2138,21 @@ enum Command {
         /// that real, checked-directly absence exactly (0316).
         #[arg(long = "cidfile", value_name = "FILE")]
         cidfile: Vec<PathBuf>,
+        /// Restart every container matching every given filter
+        /// instead of an explicit `ID`/`--name` — the same real,
+        /// deliberately narrower `label=`/`label!=`/`until=` grammar
+        /// `ociman rm --filter`/`ociman stop --filter`/`ociman
+        /// container prune --filter` already established (see
+        /// [`LabelUntilFilters`]'s own doc comment). Checked
+        /// directly, `~/git/podman/cmd/podman/containers/
+        /// restart.go`'s own `--filter`, wired through the identical
+        /// `getContainers` real `podman stop --filter` already goes
+        /// through. Mutually exclusive with an explicit `ID`/
+        /// `--name`, `--cidfile`, and `--all` — the same deliberate
+        /// narrowing `ociman stop --filter`'s own doc comment already
+        /// explains.
+        #[arg(long = "filter")]
+        filter: Vec<String>,
     },
     /// Remove one or more stopped containers' storage — matching real
     /// `podman rm <ID> [ID...]` exactly. Refuses a still-running one
@@ -3713,7 +3728,8 @@ fn main() -> std::process::ExitCode {
                 time,
                 all,
                 cidfile,
-            }) => cmd_restart(&ids, time, all, &cidfile),
+                filter,
+            }) => cmd_restart(&ids, time, all, &cidfile, &filter),
             Some(Command::Rm {
                 ids,
                 force,
@@ -11101,16 +11117,44 @@ fn attach_and_wait_for_exit(containers: &StateStore, resolved: &str) -> anyhow::
 /// "defer the background thread until no more forking can possibly
 /// happen in this process" reasoning, just widened from "the rest of
 /// this one call" to "the rest of this whole `--all` sweep".
+///
+/// `--filter` (see [`Command::Restart::filter`]'s own doc comment) is
+/// its own, separate selection mode: the matched ids are collected
+/// and handed to [`restart_many`] exactly the same way `--all`'s own
+/// full container list already is, so it shares that same deferred-
+/// scope-reset handling automatically, with no filter-specific
+/// change to that logic needed at all.
 fn cmd_restart(
     ids: &[String],
     time_secs: Option<u64>,
     all: bool,
     cidfiles: &[PathBuf],
+    filter: &[String],
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         cidfiles.is_empty() || !all,
         "--all and --cidfile cannot be used together"
     );
+    // `--filter` is its own, separate selection mode -- see
+    // `Command::Restart::filter`'s own doc comment for the real,
+    // deliberate narrowing versus real podman's own richer "further
+    // narrows whatever else was given" semantics.
+    anyhow::ensure!(
+        filter.is_empty() || (ids.is_empty() && cidfiles.is_empty() && !all),
+        "--filter cannot be combined with a container ID/name, --cidfile, or --all"
+    );
+    if !filter.is_empty() {
+        let parsed = parse_label_until_filters("ociman restart", filter)?;
+        let containers = open_container_store()?;
+        let targets: Vec<String> = containers
+            .list()
+            .context("listing containers")?
+            .into_iter()
+            .filter(|s| matches_label_until_filters(s, &parsed))
+            .map(|s| s.id)
+            .collect();
+        return restart_many(&targets, time_secs);
+    }
     // Real podman's own exact semantics (`~/git/podman/cmd/podman/
     // containers/restart.go`): the file's own first line only, merged
     // into the same target list an explicit `ID`/`--name` argument

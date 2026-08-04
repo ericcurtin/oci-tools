@@ -933,6 +933,108 @@ fn restart_all_with_an_explicit_id_is_a_clear_error() {
     assert!(!out.status.success());
 }
 
+/// `restart --filter label=` (the same real, deliberately narrower
+/// `label=`/`until=` grammar `ociman rm --filter`/`ociman stop
+/// --filter`/`ociman container prune --filter` already established)
+/// only restarts a container also matching, leaving a non-matching
+/// one completely untouched -- a never-started, matching one is
+/// started for the first time (its own `true` command runs and
+/// exits), exactly like `restart --all`'s own identical treatment of
+/// a never-started container.
+#[test]
+fn restart_filter_label_only_restarts_a_matching_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/restart-filter-label:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let create_match = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--label",
+            "env=prod",
+            "--name",
+            "restart-filter-match",
+            "ociman-test/restart-filter-label:latest",
+            "true",
+        ],
+    );
+    assert!(create_match.status.success(), "{create_match:?}");
+
+    let create_other = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--label",
+            "env=staging",
+            "--name",
+            "restart-filter-other",
+            "ociman-test/restart-filter-label:latest",
+            "true",
+        ],
+    );
+    assert!(create_other.status.success(), "{create_other:?}");
+
+    let restart = ociman(
+        storage_dir.path(),
+        &["restart", "--filter", "label=env=prod"],
+    );
+    assert!(
+        restart.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+
+    // The matching, never-started container was started for the first
+    // time (its own `true` command ran and exited).
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            "restart-filter-match",
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped",
+        "the matching container should have been started for the first time"
+    );
+    // The non-matching container is completely untouched, still
+    // `created`.
+    assert_eq!(
+        inspect_json(storage_dir.path(), "restart-filter-other")["status"],
+        "created"
+    );
+}
+
+/// `--filter` cannot be combined with an explicit id, `--cidfile`, or
+/// `--all` -- the same deliberate scope narrowing `ociman stop
+/// --filter`/`ociman rm --filter` already established, documented on
+/// `Command::Restart::filter` itself.
+#[test]
+fn restart_filter_combined_with_all_or_an_explicit_id_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let with_all = ociman(
+        storage_dir.path(),
+        &["restart", "--filter", "label=env=prod", "--all"],
+    );
+    assert!(!with_all.status.success());
+
+    let with_id = ociman(
+        storage_dir.path(),
+        &["restart", "--filter", "label=env=prod", "some-id"],
+    );
+    assert!(!with_id.status.success());
+}
+
 /// A genuinely paused container in the mix is now genuinely restarted
 /// by `--all` too (0324, closing the most-repeated "still ahead" item
 /// across six consecutive design notes) -- `cmd_restart` shares
