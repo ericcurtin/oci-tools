@@ -169,6 +169,81 @@ fn volume_ls_reports_no_volumes_when_empty_and_lists_real_ones_once_created() {
     assert!(stdout.contains("vol-b"), "{stdout}");
 }
 
+/// `volume ls --filter name=<substring>` (0410), matching real
+/// `podman volume ls --filter name=` exactly -- a real substring
+/// match against the volume's own name (the same "avoid a new regex
+/// dependency" simplification `ociman ps --filter name=`/`command=`
+/// already established); multiple values are OR'd together.
+#[test]
+fn volume_ls_filter_name_matches_a_substring() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    ociman(storage_dir.path(), &["volume", "create", "filter-alpha"]);
+    ociman(storage_dir.path(), &["volume", "create", "filter-beta"]);
+    ociman(storage_dir.path(), &["volume", "create", "unrelated"]);
+
+    let filtered = ociman(
+        storage_dir.path(),
+        &["volume", "ls", "--filter", "name=filter-", "-q"],
+    );
+    assert!(
+        filtered.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+    let filtered_stdout = String::from_utf8_lossy(&filtered.stdout).into_owned();
+    let mut names: Vec<&str> = filtered_stdout.trim().lines().collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["filter-alpha", "filter-beta"], "{names:?}");
+
+    // Multiple `name=` values are OR'd together.
+    let multi = ociman(
+        storage_dir.path(),
+        &[
+            "volume",
+            "ls",
+            "--filter",
+            "name=alpha",
+            "--filter",
+            "name=unrelated",
+            "-q",
+        ],
+    );
+    assert!(multi.status.success());
+    let multi_stdout = String::from_utf8_lossy(&multi.stdout).into_owned();
+    let mut multi_names: Vec<&str> = multi_stdout.trim().lines().collect();
+    multi_names.sort_unstable();
+    assert_eq!(
+        multi_names,
+        vec!["filter-alpha", "unrelated"],
+        "{multi_names:?}"
+    );
+
+    // A non-matching substring finds nothing.
+    let no_match = ociman(
+        storage_dir.path(),
+        &["volume", "ls", "--filter", "name=zzz", "-q"],
+    );
+    assert!(no_match.status.success());
+    assert!(String::from_utf8_lossy(&no_match.stdout).trim().is_empty());
+}
+
+/// An unrecognized `--filter` key is a clear error, matching this
+/// project's own established convention for every other `--filter`
+/// consumer (`ociman ps`/`images`/`prune`).
+#[test]
+fn volume_ls_filter_with_an_unrecognized_key_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &["volume", "ls", "--filter", "bogus=value"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not yet supported"),
+        "{out:?}"
+    );
+}
+
 /// `volume ls --format` (0335) renders one line per listed volume,
 /// reusing the exact same Go-template-*lite* engine `ociman
 /// inspect`/`ps`/`images --format` (`0332`-`0334`) already

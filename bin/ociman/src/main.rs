@@ -3168,6 +3168,18 @@ enum VolumeCommand {
         /// "quiet and format flags cannot be used together").
         #[arg(short, long)]
         quiet: bool,
+        /// Filter the listed volumes: `name=<substring>` — matching
+        /// real `podman volume ls --filter name=`'s own checked-
+        /// directly behavior (`~/git/podman/pkg/domain/filters/
+        /// volumes.go`'s own `case "name":`, a real regex match
+        /// against the volume's own name — for ordinary, non-regex
+        /// text this is behaviorally identical to a substring search,
+        /// the same deliberate simplification `ociman ps --filter
+        /// name=`/`command=` already established, avoiding a new
+        /// regex dependency this project has nowhere else). Multiple
+        /// values are OR'd together. May be given more than once.
+        #[arg(long = "filter")]
+        filter: Vec<String>,
     },
     /// Print low-level JSON for a named volume — matching real
     /// `docker volume inspect`/`podman volume inspect`'s own general
@@ -3629,9 +3641,11 @@ fn main() -> std::process::ExitCode {
                 VolumeCommand::Create { name, ignore } => {
                     cmd_volume_create(name.as_deref(), ignore, cli.global.json)
                 }
-                VolumeCommand::Ls { format, quiet } => {
-                    cmd_volume_ls(cli.global.json, format.as_deref(), quiet)
-                }
+                VolumeCommand::Ls {
+                    format,
+                    quiet,
+                    filter,
+                } => cmd_volume_ls(cli.global.json, format.as_deref(), quiet, &filter),
                 VolumeCommand::Inspect { name } => cmd_volume_inspect(&name, cli.global.json),
                 VolumeCommand::Rm { name, force } => cmd_volume_rm(&name, force),
                 VolumeCommand::Rename { name, new_name } => cmd_volume_rename(&name, &new_name),
@@ -11629,7 +11643,12 @@ fn cmd_volume_create(name: Option<&str>, ignore: bool, json: bool) -> anyhow::Re
     Ok(())
 }
 
-fn cmd_volume_ls(json: bool, format: Option<&str>, quiet: bool) -> anyhow::Result<()> {
+fn cmd_volume_ls(
+    json: bool,
+    format: Option<&str>,
+    quiet: bool,
+    filter: &[String],
+) -> anyhow::Result<()> {
     // Matches real `podman volume ls`'s own identical restriction
     // exactly (`~/git/podman/cmd/podman/volumes/list.go`'s own
     // checked-directly error text).
@@ -11637,8 +11656,30 @@ fn cmd_volume_ls(json: bool, format: Option<&str>, quiet: bool) -> anyhow::Resul
         !(quiet && format.is_some()),
         "quiet and format flags cannot be used together"
     );
+    // `--filter name=<substring>` (0410) -- every given value parsed
+    // up front, OR'd together, matching real `podman volume ls
+    // --filter name=`'s own combination rule (see `VolumeCommand::
+    // Ls::filter`'s own doc comment for the exact, checked-directly
+    // semantics).
+    let mut name_filters: Vec<String> = Vec::new();
+    for f in filter {
+        if let Some(value) = f.strip_prefix("name=") {
+            anyhow::ensure!(
+                !value.is_empty(),
+                "ociman volume ls: --filter {f:?} is missing a value"
+            );
+            name_filters.push(value.to_string());
+        } else {
+            anyhow::bail!(
+                "ociman volume ls: --filter {f:?} is not yet supported (only name=<substring> is)"
+            );
+        }
+    }
     let store = open_volume_store()?;
-    let records = store.list().context("listing volumes")?;
+    let mut records = store.list().context("listing volumes")?;
+    if !name_filters.is_empty() {
+        records.retain(|record| name_filters.iter().any(|want| record.name.contains(want)));
+    }
     if let Some(template) = format {
         for record in &records {
             let view = VolumeView::from_record(&store, record);
