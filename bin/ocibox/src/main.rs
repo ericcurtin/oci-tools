@@ -186,6 +186,26 @@ enum Command {
     /// project has no interactive confirmation prompt to skip in the
     /// first place (the same "nothing to skip" reasoning `create
     /// --pull`'s own doc comment already gives for `--yes`).
+    ///
+    /// `--rm-home` is accepted too (0405), for the identical real
+    /// reason `--force` already is, but checked directly against
+    /// real distrobox's own actual implementation first rather than
+    /// assumed from its help text alone: `~/git/distrobox/pkg/
+    /// commands/rm.go`'s own `removeContainer` only *ever* removes a
+    /// box's own custom home when `--rm-home` was given **and**
+    /// `noTTY` (real distrobox's own `-y`/`--yes`) is `false` **and**
+    /// the box's own home differs from the real user's own real
+    /// `$HOME` — even then, only after a real interactive
+    /// confirmation prompt this project has no equivalent of at all
+    /// (defaulting to "no" if never answered). Since this project's
+    /// own `ocibox` has no interactive terminal session concept
+    /// whatsoever (every invocation is the real, checked-directly
+    /// equivalent of real distrobox's own always-`--yes` case), real
+    /// distrobox's own `--rm-home` *never* actually removes anything
+    /// either, under the one real mode this project can ever run in
+    /// — so a genuinely faithful port is this exact same real no-op,
+    /// not the unconditional removal a surface reading of its own
+    /// help text alone would suggest.
     Rm {
         /// The box name(s) to remove, exactly as given to `ocibox
         /// create --name` — ignored entirely if `--all` is also given
@@ -204,6 +224,12 @@ enum Command {
         /// comment).
         #[arg(long, short = 'f')]
         force: bool,
+        /// Accepted for real CLI compatibility with `distrobox rm
+        /// --rm-home`; has no effect, matching real distrobox's own
+        /// actual behavior under the one real mode this project can
+        /// ever run in (see this command's own doc comment).
+        #[arg(long = "rm-home")]
+        rm_home: bool,
         /// Remove every existing box, matching real `distrobox rm
         /// --all` exactly, including its own real "takes priority over
         /// any names also given, rather than erroring" behavior (see
@@ -514,6 +540,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Rm {
                 names,
                 force: _,
+                rm_home: _,
                 all,
             }) => cmd_rm(&names, all),
             Some(Command::Enter { name, command }) => cmd_enter(&name, &command),

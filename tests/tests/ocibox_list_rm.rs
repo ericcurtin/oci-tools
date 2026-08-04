@@ -180,6 +180,72 @@ fn rm_removes_a_real_box_entirely() {
     assert_eq!(String::from_utf8_lossy(&list.stdout).trim(), "no boxes");
 }
 
+/// `rm --rm-home` (0405): a real, checked-directly no-op -- real
+/// distrobox's own `--rm-home` only ever removes a box's own custom
+/// home when driven by a real interactive terminal session (which
+/// `ocibox` has no equivalent of at all), so the one real mode this
+/// project can ever run in never removes it either, matching real
+/// distrobox's own actual behavior under that same mode exactly (see
+/// `Command::Rm`'s own doc comment for the full, checked-directly
+/// reasoning). Proven here against a real custom `--home` directory
+/// that survives `rm --rm-home` completely untouched, even though the
+/// box's own storage directory itself is still genuinely removed.
+#[test]
+fn rm_rm_home_flag_is_a_real_no_op_and_never_removes_the_custom_home() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/rm-home-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let custom_home = tempfile::tempdir().unwrap();
+    std::fs::write(custom_home.path().join("canary.txt"), b"still here").unwrap();
+
+    let mut create = Command::new(bin_path("ocibox"));
+    create
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "create",
+            "--image",
+            "ocibox-test/rm-home-base:latest",
+            "--name",
+            "rmhomebox",
+            "--home",
+        ])
+        .arg(custom_home.path());
+    let create = create.output().expect("failed to spawn ocibox create");
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let box_dir = storage_dir.path().join("boxes").join("rmhomebox");
+    assert!(box_dir.is_dir());
+
+    let rm = ocibox(storage_dir.path(), &["rm", "rmhomebox", "--rm-home"]);
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert!(
+        !box_dir.exists(),
+        "the box's own storage directory is still genuinely removed"
+    );
+    assert!(
+        custom_home.path().join("canary.txt").exists(),
+        "the real, custom --home directory must survive --rm-home completely untouched"
+    );
+}
+
 /// `rm` of a name that simply doesn't resolve to any real box is a
 /// warning, not a hard error (0321 — a real correction: previously
 /// this hard-errored, before checking real `distrobox`'s own actual
