@@ -118,6 +118,96 @@ fn history_lists_real_layers_and_metadata_entries_newest_first() {
     assert!(lines[2].contains("RUN /bin/sh -c echo hello"), "{stdout:?}");
 }
 
+/// `history --no-trunc` (matching real `podman history --no-trunc`
+/// exactly) shows the plain table's own `CREATED BY` column in full
+/// instead of the default 60-character-plus-`...` truncation; has no
+/// effect on `--format`/`--json`, which already show the full string
+/// either way.
+#[test]
+fn history_no_trunc_shows_the_full_command_only_in_the_plain_table() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/history-no-trunc-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let long_command = "echo this-is-a-genuinely-long-shell-command-well-past-sixty-characters-total > /marker.txt";
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        &format!("FROM ociman-test/history-no-trunc-base:latest\nRUN {long_command}\n"),
+    );
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/history-no-trunc-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let full_created_by = format!("RUN /bin/sh -c {long_command}");
+    assert!(
+        full_created_by.chars().count() > 60,
+        "fixture must actually exceed the 60-char truncation threshold"
+    );
+
+    // Without --no-trunc: truncated to "..." in the plain table.
+    let truncated = ociman(
+        storage_dir.path(),
+        &["history", "ociman-test/history-no-trunc-result:latest"],
+    );
+    assert!(truncated.status.success());
+    let truncated_stdout = String::from_utf8_lossy(&truncated.stdout).into_owned();
+    assert!(truncated_stdout.contains("..."), "{truncated_stdout:?}");
+    assert!(
+        !truncated_stdout.contains(&full_created_by),
+        "{truncated_stdout:?}"
+    );
+
+    // With --no-trunc: the full command appears verbatim, no "...".
+    let full = ociman(
+        storage_dir.path(),
+        &[
+            "history",
+            "ociman-test/history-no-trunc-result:latest",
+            "--no-trunc",
+        ],
+    );
+    assert!(full.status.success());
+    let full_stdout = String::from_utf8_lossy(&full.stdout).into_owned();
+    assert!(full_stdout.contains(&full_created_by), "{full_stdout:?}");
+    assert!(!full_stdout.contains("..."), "{full_stdout:?}");
+
+    // --json already shows the full string either way, matching real
+    // podman: --no-trunc only affects the plain table.
+    let json = ociman(
+        storage_dir.path(),
+        &[
+            "history",
+            "ociman-test/history-no-trunc-result:latest",
+            "--json",
+        ],
+    );
+    assert!(json.status.success());
+    let views: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(views[0]["created_by"], full_created_by);
+}
+
 #[test]
 fn history_of_an_unknown_reference_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();

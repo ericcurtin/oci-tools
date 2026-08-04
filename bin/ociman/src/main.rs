@@ -1634,6 +1634,17 @@ enum Command {
         /// immediate error.
         #[arg(long = "format", value_name = "TEMPLATE")]
         format: Option<String>,
+        /// Show each layer's own full, untruncated `CREATED BY`
+        /// instead of the default 60-character-plus-`...`
+        /// truncation the plain table always applies otherwise —
+        /// matching real `podman history --no-trunc` exactly
+        /// (checked directly, `~/git/podman/cmd/podman/images/
+        /// history.go`'s own `historyReporter.CreatedBy()`). Has no
+        /// effect on `--format`/`--json`, which already print the
+        /// full string either way — matching real podman exactly.
+        /// Same pattern as `ociman ps --no-trunc`.
+        #[arg(long = "no-trunc")]
+        no_trunc: bool,
     },
     /// Reclaim disk space no longer needed: every `Created`/`Stopped`
     /// container (unconditionally, regardless of `--all` — see
@@ -3569,9 +3580,11 @@ fn main() -> std::process::ExitCode {
             }) => cmd_rmi(&references, force, all, ignore, cli.global.json),
             Some(Command::Tag { source, target }) => cmd_tag(&source, &target, cli.global.json),
             Some(Command::Untag { image, references }) => cmd_untag(&image, &references),
-            Some(Command::History { reference, format }) => {
-                cmd_history(&reference, cli.global.json, format.as_deref())
-            }
+            Some(Command::History {
+                reference,
+                format,
+                no_trunc,
+            }) => cmd_history(&reference, cli.global.json, format.as_deref(), no_trunc),
             Some(Command::Prune { all, filter }) => cmd_prune(cli.global.json, all, &filter),
             Some(Command::System { command }) => match command {
                 SystemCommand::Df { verbose } => cmd_system_df(cli.global.json, verbose),
@@ -5226,7 +5239,12 @@ fn history_layer_sizes(history: &[HistoryEntry], layers: &[Descriptor]) -> Vec<u
         .collect()
 }
 
-fn cmd_history(reference_str: &str, json: bool, format: Option<&str>) -> anyhow::Result<()> {
+fn cmd_history(
+    reference_str: &str,
+    json: bool,
+    format: Option<&str>,
+    no_trunc: bool,
+) -> anyhow::Result<()> {
     let reference = Reference::parse(reference_str)
         .with_context(|| format!("parsing image reference {reference_str:?}"))?;
     let store = open_store()?;
@@ -5284,12 +5302,14 @@ fn cmd_history(reference_str: &str, json: bool, format: Option<&str>) -> anyhow:
         // shell commands are the common case) -- char-based, not
         // byte-based, so this never panics on a multi-byte UTF-8
         // boundary the way a naive byte-slice truncation could.
-        let created_by: String = if view.created_by.chars().count() > 60 {
+        // `--no-trunc` (matching real `podman history --no-trunc`
+        // exactly) skips this entirely.
+        let created_by: String = if no_trunc || view.created_by.chars().count() <= 60 {
+            view.created_by.clone()
+        } else {
             let mut truncated: String = view.created_by.chars().take(57).collect();
             truncated.push_str("...");
             truncated
-        } else {
-            view.created_by.clone()
         };
         println!("{:<24} {:<60} {:>12}", view.created, created_by, view.size);
     }
