@@ -1135,8 +1135,24 @@ enum Command {
         registry: String,
         #[arg(short, long)]
         username: String,
+        /// Mutually exclusive with `--password-stdin`.
         #[arg(short, long)]
-        password: String,
+        password: Option<String>,
+        /// Read the password from stdin instead of `--password`
+        /// (matches real `podman login --password-stdin` exactly,
+        /// including its own real "concatenate every line with no
+        /// separator at all" quirk -- `~/git/podman/vendor/
+        /// go.podman.io/common/pkg/auth/auth.go`'s own
+        /// `opts.StdinPassword` branch, checked directly). Real
+        /// podman also requires `--username` to already be given
+        /// whenever this is set, but `username` is already
+        /// unconditionally mandatory in this command's own arg
+        /// struct, so that check can never trigger here -- a real,
+        /// deliberate divergence (this project simply has no
+        /// "username-less" login shape for it to matter for), not an
+        /// oversight.
+        #[arg(long = "password-stdin")]
+        password_stdin: bool,
     },
     /// Remove a registry's own stored credentials, matching real
     /// `docker logout`/`podman logout`. A no-op (not an error) if
@@ -3477,7 +3493,14 @@ fn main() -> std::process::ExitCode {
                 registry,
                 username,
                 password,
-            }) => cmd_login(&registry, &username, &password, cli.global.json),
+                password_stdin,
+            }) => cmd_login(
+                &registry,
+                &username,
+                password.as_deref(),
+                password_stdin,
+                cli.global.json,
+            ),
             Some(Command::Logout { registry, all }) => {
                 cmd_logout(registry.as_deref(), all, cli.global.json)
             }
@@ -4278,9 +4301,42 @@ struct LoginResult {
     auth_file: String,
 }
 
-fn cmd_login(registry: &str, username: &str, password: &str, json: bool) -> anyhow::Result<()> {
+fn cmd_login(
+    registry: &str,
+    username: &str,
+    password: Option<&str>,
+    password_stdin: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    // Exact real error message/condition, `~/git/podman/vendor/
+    // go.podman.io/common/pkg/auth/auth.go`'s own `opts.StdinPassword`
+    // branch: `--password-stdin` and `--password` are mutually
+    // exclusive (the "must provide --username" branch never triggers
+    // here -- see `Command::Login`'s own doc comment for why).
+    if password_stdin && password.is_some() {
+        anyhow::bail!("can't specify both --password-stdin and --password");
+    }
+    let password = if password_stdin {
+        // Real podman's own quirk, checked directly: every stdin line
+        // is concatenated with *no* separator at all (`scanner.Text()`
+        // strips each line's own trailing newline, and nothing is
+        // re-inserted between them) -- reproduced verbatim, not a
+        // guess.
+        use std::io::BufRead as _;
+        let stdin = std::io::stdin();
+        let mut joined = String::new();
+        for line in stdin.lock().lines() {
+            joined.push_str(&line.context("reading password from stdin")?);
+        }
+        joined
+    } else {
+        password
+            .context("either --password or --password-stdin is required")?
+            .to_string()
+    };
+
     let path = default_auth_file_write_path();
-    oci_registry::credentials::set(&path, registry, username, password)
+    oci_registry::credentials::set(&path, registry, username, &password)
         .with_context(|| format!("writing credentials for {registry} to {}", path.display()))?;
 
     if json {

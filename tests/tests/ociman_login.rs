@@ -20,6 +20,23 @@ fn ociman(auth_file: &Path, args: &[&str]) -> std::process::Output {
         .expect("failed to spawn ociman")
 }
 
+/// Like [`ociman`], but pipes `stdin_bytes` to the child's stdin
+/// instead of leaving it closed -- for exercising `--password-stdin`.
+fn ociman_with_stdin(auth_file: &Path, args: &[&str], stdin_bytes: &[u8]) -> std::process::Output {
+    use std::io::Write as _;
+    let mut child = Command::new(bin_path("ociman"))
+        .env("REGISTRY_AUTH_FILE", auth_file)
+        .env_remove("OCI_TOOLS_LOG")
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman");
+    child.stdin.take().unwrap().write_all(stdin_bytes).unwrap();
+    child.wait_with_output().unwrap()
+}
+
 #[test]
 fn login_writes_real_credentials_ociman_pull_could_actually_use() {
     let dir = tempfile::tempdir().unwrap();
@@ -206,5 +223,105 @@ fn logout_with_neither_a_registry_nor_all_is_a_real_error() {
             .contains("please provide a registry to log out from"),
         "stderr: {}",
         String::from_utf8_lossy(&logout.stderr)
+    );
+}
+
+#[test]
+fn login_password_stdin_writes_the_same_credentials_as_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("auth.json");
+
+    let login = ociman_with_stdin(
+        &auth_file,
+        &[
+            "login",
+            "quay.io",
+            "--username",
+            "myuser",
+            "--password-stdin",
+        ],
+        b"mypass\n",
+    );
+    assert!(
+        login.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&login.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&login.stdout).trim(),
+        "Login Succeeded!"
+    );
+
+    let root: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&auth_file).unwrap()).unwrap();
+    // Same `base64("myuser:mypass")` fixture the plain `--password`
+    // test already uses -- proves the stdin path produces exactly
+    // the same credentials.
+    assert_eq!(root["auths"]["quay.io"]["auth"], "bXl1c2VyOm15cGFzcw==");
+}
+
+#[test]
+fn login_password_stdin_concatenates_multiple_lines_with_no_separator() {
+    // Real podman's own checked-directly quirk: `bufio.Scanner` strips
+    // each line's own trailing newline and nothing is re-inserted --
+    // multiple stdin lines become one, run-together password.
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("auth.json");
+
+    let login = ociman_with_stdin(
+        &auth_file,
+        &["login", "quay.io", "--username", "user", "--password-stdin"],
+        b"pass\nword\n",
+    );
+    assert!(login.status.success());
+
+    let root: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&auth_file).unwrap()).unwrap();
+    // `base64("user:password")`, checked directly -- proves the two
+    // stdin lines "pass" and "word" really were joined with no
+    // separator into "password", not e.g. "pass\nword" or "pass
+    // word".
+    assert_eq!(root["auths"]["quay.io"]["auth"], "dXNlcjpwYXNzd29yZA==");
+}
+
+#[test]
+fn login_rejects_both_password_and_password_stdin_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("auth.json");
+
+    let login = ociman_with_stdin(
+        &auth_file,
+        &[
+            "login",
+            "quay.io",
+            "--username",
+            "user",
+            "--password",
+            "pass",
+            "--password-stdin",
+        ],
+        b"other\n",
+    );
+    assert!(!login.status.success());
+    assert!(
+        String::from_utf8_lossy(&login.stderr)
+            .contains("can't specify both --password-stdin and --password"),
+        "stderr: {}",
+        String::from_utf8_lossy(&login.stderr)
+    );
+}
+
+#[test]
+fn login_with_neither_password_nor_password_stdin_is_a_real_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("auth.json");
+
+    let login = ociman(&auth_file, &["login", "quay.io", "--username", "user"]);
+    assert!(!login.status.success());
+    assert!(
+        String::from_utf8_lossy(&login.stderr)
+            .contains("either --password or --password-stdin is required"),
+        "stderr: {}",
+        String::from_utf8_lossy(&login.stderr)
     );
 }
