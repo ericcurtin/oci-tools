@@ -273,6 +273,57 @@ fn save_with_no_output_flag_writes_the_archive_straight_to_stdout_and_nothing_el
 }
 
 #[test]
+fn save_quiet_still_writes_a_correct_archive() {
+    // The progress spinner only ever draws to stderr, and is already
+    // automatically hidden whenever stderr isn't a real terminal
+    // (true of this whole automated suite) -- so `--quiet` has no
+    // separately observable stdout/stderr difference to assert on
+    // here (same established limitation every other spinner-backed
+    // command in this project already has, see `oci_cli_common::
+    // progress`'s own module doc comment). What *is* real and
+    // checkable: the flag is accepted and the archive it produces is
+    // still byte-for-byte correct.
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/save-quiet:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let record = store
+        .resolve_image("docker.io/ociman-test/save-quiet:latest")
+        .unwrap()
+        .unwrap();
+
+    let output_path = storage_dir.path().join("out.tar");
+    let save = ociman(
+        storage_dir.path(),
+        &[
+            "save",
+            "--quiet",
+            "--format",
+            "oci-archive",
+            "-o",
+            output_path.to_str().unwrap(),
+            "ociman-test/save-quiet:latest",
+        ],
+    );
+    assert!(
+        save.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&save.stderr)
+    );
+    let entries = read_tar_entries(&std::fs::read(&output_path).unwrap());
+    assert!(entries.contains_key(&format!("blobs/sha256/{}", record.manifest_digest.hex())));
+}
+
+#[test]
 fn save_resolves_by_a_short_image_id_the_same_way_push_does() {
     let Some(busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");

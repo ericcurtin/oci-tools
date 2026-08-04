@@ -157,6 +157,64 @@ fn save_then_load_round_trips_through_the_real_cli_into_a_usable_image() {
 }
 
 #[test]
+fn load_quiet_still_loads_correctly() {
+    // Same real limitation `save_quiet_still_writes_a_correct_archive`
+    // in `ociman_save.rs` already documents: the spinner only ever
+    // draws to stderr and is already automatically hidden whenever
+    // stderr isn't a real terminal, so there's no separately
+    // observable output difference to assert on here -- what *is*
+    // real and checkable is that the flag is accepted and the image
+    // it loads is still correct.
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_store = Store::open(source_dir.path()).unwrap();
+    seed_image(
+        &source_store,
+        "ociman-test/load-quiet:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let source_record = source_store
+        .resolve_image("docker.io/ociman-test/load-quiet:latest")
+        .unwrap()
+        .unwrap();
+
+    let archive_path = source_dir.path().join("out.tar");
+    let save = ociman(
+        source_dir.path(),
+        &[
+            "save",
+            "-o",
+            archive_path.to_str().unwrap(),
+            "ociman-test/load-quiet:latest",
+        ],
+    );
+    assert!(save.status.success());
+
+    let dest_dir = tempfile::tempdir().unwrap();
+    let load = ociman(
+        dest_dir.path(),
+        &["load", "--quiet", "-i", archive_path.to_str().unwrap()],
+    );
+    assert!(
+        load.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&load.stderr)
+    );
+
+    let dest_store = Store::open(dest_dir.path()).unwrap();
+    let dest_record = dest_store
+        .resolve_image("docker.io/ociman-test/load-quiet:latest")
+        .unwrap()
+        .unwrap();
+    assert_eq!(dest_record.manifest_digest, source_record.manifest_digest);
+}
+
+#[test]
 fn load_with_json_prints_the_reference_and_digest() {
     let Some(busybox) = busybox_path() else {
         eprintln!("skipping: busybox not found on $PATH");

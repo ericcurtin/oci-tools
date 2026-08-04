@@ -2933,6 +2933,17 @@ enum Command {
         /// reason that default had been kept different).
         #[arg(long, value_enum, default_value_t = SaveFormat::DockerArchive)]
         format: SaveFormat,
+        /// Suppress the progress spinner — matching real `podman
+        /// save --quiet`/`docker save --quiet` exactly (checked
+        /// directly, `~/git/podman/pkg/domain/infra/abi/images.go`'s
+        /// own `SaveImage`: `if !options.Quiet { saveOptions.Writer
+        /// = os.Stderr }`, gating the entire progress writer, not
+        /// just its style). Only ever visibly different on a real
+        /// terminal — the spinner is already automatically hidden
+        /// whenever stderr isn't one, same as every other spinner in
+        /// this project.
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Load an image from a real archive file previously written by
     /// `ociman save`/`podman save`/`docker save` — matching real
@@ -2954,6 +2965,12 @@ enum Command {
         /// out.tar`).
         #[arg(short, long, value_name = "PATH")]
         input: Option<PathBuf>,
+        /// Suppress the progress spinner — matching real `podman
+        /// load --quiet`/`docker load --quiet` exactly. See
+        /// `Command::Save`'s own identical flag for the exact same
+        /// real semantics/confirmation.
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Create a new, single-layer image straight from a plain tar
     /// (e.g. one `ociman export`, `tar cf`, or real `docker export`
@@ -3810,8 +3827,17 @@ fn main() -> std::process::ExitCode {
                 reference,
                 output,
                 format,
-            }) => cmd_save(&reference, output.as_deref(), format, cli.global.json),
-            Some(Command::Load { input }) => cmd_load(input.as_deref(), cli.global.json),
+                quiet,
+            }) => cmd_save(
+                &reference,
+                output.as_deref(),
+                format,
+                quiet,
+                cli.global.json,
+            ),
+            Some(Command::Load { input, quiet }) => {
+                cmd_load(input.as_deref(), quiet, cli.global.json)
+            }
             Some(Command::Import {
                 path,
                 reference,
@@ -4011,6 +4037,7 @@ fn cmd_save(
     reference_str: &str,
     output: Option<&Path>,
     format: SaveFormat,
+    quiet: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let store = open_store()?;
@@ -4020,7 +4047,8 @@ fn cmd_save(
 
     use std::io::Write as _;
 
-    let progress = oci_cli_common::progress::spinner(format!("saving {reference_str}"));
+    let progress =
+        oci_cli_common::progress::spinner_unless_quiet(quiet, format!("saving {reference_str}"));
     let result = match output {
         Some(path) => (|| -> anyhow::Result<()> {
             let file = std::fs::File::create(path)
@@ -4073,10 +4101,11 @@ struct LoadResult {
     digest: String,
 }
 
-fn cmd_load(input: Option<&Path>, json: bool) -> anyhow::Result<()> {
+fn cmd_load(input: Option<&Path>, quiet: bool, json: bool) -> anyhow::Result<()> {
     let store = open_store()?;
 
-    let progress = oci_cli_common::progress::spinner("loading image".to_string());
+    let progress =
+        oci_cli_common::progress::spinner_unless_quiet(quiet, "loading image".to_string());
     let result = match input {
         Some(path) => (|| -> anyhow::Result<archive::LoadedImage> {
             let file =
