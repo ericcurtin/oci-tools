@@ -207,6 +207,58 @@ fn update_ad_hoc_memory_and_pids_limit_flags_write_the_real_cgroup() {
     cleanup(root_dir.path(), "adhoc-memory-pids-test", &cgroup_dir);
 }
 
+/// `--memory-reservation` (0401) -- a real, previously-missing flag,
+/// matching real `runc update --memory-reservation`/`crun update
+/// --memory-reservation` exactly: writes the real cgroup v2
+/// `memory.low` file, given here alongside `--memory` (a hard limit)
+/// to prove both land independently in the same update.
+#[test]
+fn update_ad_hoc_memory_reservation_flag_writes_the_real_cgroup() {
+    let Some((bundle_dir, root_dir, cgroup_dir)) =
+        create_and_start_with_real_cgroup("adhoc-memory-reservation-test")
+    else {
+        return;
+    };
+    let _ = &bundle_dir;
+
+    let update = ocirun(
+        root_dir.path(),
+        &[
+            "update",
+            "adhoc-memory-reservation-test",
+            "--memory",
+            "100m",
+            "--memory-reservation",
+            "64m",
+        ],
+    );
+    assert!(
+        update.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("memory.max"))
+            .unwrap()
+            .trim(),
+        "104857600"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("memory.low"))
+            .unwrap()
+            .trim(),
+        "67108864",
+        "--memory-reservation 64m must parse as 64 * 1024 * 1024 bytes and land in memory.low"
+    );
+
+    cleanup(
+        root_dir.path(),
+        "adhoc-memory-reservation-test",
+        &cgroup_dir,
+    );
+}
+
 /// `ocirun update`'s own ad-hoc CPU-bandwidth flags (0356) --
 /// `--cpu-share`/`--cpu-period`/`--cpu-quota`/`--cpu-burst`, matching
 /// real `runc update`/`crun update`'s own identical flags exactly --

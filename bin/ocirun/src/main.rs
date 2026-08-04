@@ -468,6 +468,19 @@ enum Command {
         /// established).
         #[arg(long = "memory-swap", allow_hyphen_values = true)]
         memory_swap: Option<String>,
+        /// A soft memory limit (same units as `--memory`), matching
+        /// real `runc update --memory-reservation`/`crun update
+        /// --memory-reservation` exactly (checked directly,
+        /// `~/git/runc/update.go`'s own `MemoryReservation`,
+        /// `~/git/crun/src/update.c`'s own `"memory-reservation"`
+        /// entry) -- writes straight to the real cgroup v2
+        /// `memory.low` file via the exact same already-existing
+        /// `oci_spec_types::runtime::LinuxMemory.reservation`/
+        /// `oci_runtime_core::cgroups` plumbing `ociman run/create/
+        /// update --memory-reservation` uses, no relationship with
+        /// `--memory` required either way (unlike `--memory-swap`).
+        #[arg(long = "memory-reservation")]
+        memory_reservation: Option<String>,
         /// Maximum number of processes/threads, matching real `runc
         /// update --pids-limit`/`crun update --pids-limit` exactly --
         /// passed straight through to `pids.max` with no clamping or
@@ -746,6 +759,7 @@ fn main() -> std::process::ExitCode {
                 resources,
                 memory,
                 memory_swap,
+                memory_reservation,
                 pids_limit,
                 cpuset_cpus,
                 cpuset_mems,
@@ -764,6 +778,7 @@ fn main() -> std::process::ExitCode {
                 &UpdateFlags {
                     memory: memory.as_deref(),
                     memory_swap: memory_swap.as_deref(),
+                    memory_reservation: memory_reservation.as_deref(),
                     pids_limit,
                     cpuset_cpus: cpuset_cpus.as_deref(),
                     cpuset_mems: cpuset_mems.as_deref(),
@@ -1629,6 +1644,7 @@ fn parse_memory_swap_limit(value: &str) -> anyhow::Result<i64> {
 struct UpdateFlags<'a> {
     memory: Option<&'a str>,
     memory_swap: Option<&'a str>,
+    memory_reservation: Option<&'a str>,
     pids_limit: Option<i64>,
     cpuset_cpus: Option<&'a str>,
     cpuset_mems: Option<&'a str>,
@@ -1655,13 +1671,16 @@ fn resources_from_flags(
     flags: &UpdateFlags<'_>,
 ) -> anyhow::Result<oci_spec_types::runtime::LinuxResources> {
     let mut resources = oci_spec_types::runtime::LinuxResources::default();
-    if flags.memory.is_some() || flags.memory_swap.is_some() {
+    if flags.memory.is_some() || flags.memory_swap.is_some() || flags.memory_reservation.is_some() {
         let mut mem = oci_spec_types::runtime::LinuxMemory::default();
         if let Some(memory) = flags.memory {
             mem.limit = Some(parse_memory_limit(memory)?);
         }
         if let Some(memory_swap) = flags.memory_swap {
             mem.swap = Some(parse_memory_swap_limit(memory_swap)?);
+        }
+        if let Some(memory_reservation) = flags.memory_reservation {
+            mem.reservation = Some(parse_memory_limit(memory_reservation)?);
         }
         resources.memory = Some(mem);
     }
@@ -2104,6 +2123,34 @@ mod tests {
         let mem = resources.memory.unwrap();
         assert_eq!(mem.limit, Some(100 * 1024 * 1024));
         assert_eq!(mem.swap, Some(200 * 1024 * 1024));
+    }
+
+    /// `--memory-reservation` (0401): built alongside `--memory`/
+    /// `--memory-swap` in the same `LinuxMemory`, and also on its own
+    /// with neither of the other two given at all -- a bare soft
+    /// reservation needs no hard limit to be meaningful.
+    #[test]
+    fn resources_from_flags_builds_memory_reservation_alone_and_combined() {
+        let resources = resources_from_flags(&UpdateFlags {
+            memory_reservation: Some("64m"),
+            ..Default::default()
+        })
+        .unwrap();
+        let mem = resources.memory.unwrap();
+        assert_eq!(mem.limit, None);
+        assert_eq!(mem.reservation, Some(64 * 1024 * 1024));
+
+        let resources = resources_from_flags(&UpdateFlags {
+            memory: Some("100m"),
+            memory_swap: Some("200m"),
+            memory_reservation: Some("64m"),
+            ..Default::default()
+        })
+        .unwrap();
+        let mem = resources.memory.unwrap();
+        assert_eq!(mem.limit, Some(100 * 1024 * 1024));
+        assert_eq!(mem.swap, Some(200 * 1024 * 1024));
+        assert_eq!(mem.reservation, Some(64 * 1024 * 1024));
     }
 
     #[test]

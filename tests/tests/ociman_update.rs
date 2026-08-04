@@ -224,6 +224,8 @@ fn update_changes_the_real_live_cgroup_limits_of_a_running_container() {
             "update",
             "--memory",
             "64m",
+            "--memory-reservation",
+            "32m",
             "--cpus",
             "0.5",
             "--pids-limit",
@@ -241,6 +243,17 @@ fn update_changes_the_real_live_cgroup_limits_of_a_running_container() {
     let cgroup_dir = real_cgroup_dir_for(storage_dir.path(), &id);
     let memory_max = std::fs::read_to_string(cgroup_dir.join("memory.max")).unwrap();
     assert_eq!(memory_max.trim(), (64 * 1024 * 1024).to_string());
+
+    // `--memory-reservation` (0401): a real, previously-missing flag,
+    // written to the same real cgroup v2 `memory.low` file `ociman
+    // run --memory-reservation`'s own end-to-end test proves via the
+    // systemd scope's own `MemoryLow` property -- here checked
+    // directly against the raw cgroupfs file instead, since `ociman
+    // update` writes it that way regardless of which driver created
+    // the cgroup in the first place (systemd's own `Delegate=true`
+    // leaves the real cgroupfs directly writable).
+    let memory_low = std::fs::read_to_string(cgroup_dir.join("memory.low")).unwrap();
+    assert_eq!(memory_low.trim(), (32 * 1024 * 1024).to_string());
 
     let cpu_max = std::fs::read_to_string(cgroup_dir.join("cpu.max")).unwrap();
     // 0.5 CPUs -> a 50_000us quota over the fixed 100_000us period,

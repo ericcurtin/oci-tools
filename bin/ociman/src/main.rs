@@ -377,6 +377,24 @@ struct RunArgs {
     /// doc comment for why this matters.
     #[arg(long = "memory-swap", allow_hyphen_values = true)]
     memory_swap: Option<String>,
+    /// A soft memory limit (same units as `--memory`), matching real
+    /// `docker run --memory-reservation`/`podman run
+    /// --memory-reservation` exactly: unlike `--memory`'s own hard
+    /// cap (which the kernel's cgroup v2 OOM killer enforces by
+    /// killing the process outright), this is a soft target the
+    /// kernel only reclaims back down to under real memory pressure
+    /// -- writes straight to the real cgroup v2 `memory.low` file
+    /// (`oci_spec_types::runtime::LinuxMemory.reservation`, already
+    /// fully wired into both cgroup drivers this project supports:
+    /// `oci_runtime_core::cgroups`' own raw-cgroupfs writer and
+    /// `systemd_cgroup`'s own `MemoryLow` D-Bus property, neither of
+    /// which had a CLI flag reaching them before now). Real
+    /// `docker`/`podman` apply zero validation of their own beyond
+    /// parsing (confirmed directly, `~/git/podman/cmd/podman/common/
+    /// create.go`'s own `memoryReservationFlagName`) -- no required
+    /// relationship with `--memory` either way, unlike `--memory-swap`.
+    #[arg(long = "memory-reservation")]
+    memory_reservation: Option<String>,
     /// Size of `/dev/shm`, matching real `docker run --shm-size`/
     /// `podman run --shm-size` exactly: a byte count, or one
     /// suffixed with `b`/`k`/`m`/`g`/`t` (same binary-unit grammar as
@@ -2485,10 +2503,10 @@ enum Command {
     /// Update a running container's real cgroup resource limits in
     /// place — matching real `podman update` for exactly the same
     /// subset of resource flags `ociman run` itself already supports
-    /// (`--memory`/`--memory-swap`/`--cpus`/`--pids-limit`/
-    /// `--cpuset-cpus`/`--cpuset-mems`; real `podman update`'s own
-    /// larger flag set — `--cpu-shares`/`--cpu-period`/`--cpu-quota`/
-    /// `--cpu-rt-period`/`--cpu-rt-runtime`/`--memory-reservation`/
+    /// (`--memory`/`--memory-swap`/`--memory-reservation`/`--cpus`/
+    /// `--pids-limit`/`--cpuset-cpus`/`--cpuset-mems`; real `podman
+    /// update`'s own larger flag set — `--cpu-shares`/`--cpu-period`/
+    /// `--cpu-quota`/`--cpu-rt-period`/`--cpu-rt-runtime`/
     /// `--memory-swappiness`/`--blkio-weight*`/`--device-*-bps`/
     /// `--device-*-iops` — is out of scope for the same reason `run`
     /// itself doesn't support them either). Requires the container to
@@ -2509,6 +2527,9 @@ enum Command {
         /// See `Command::Run`'s own identical flag.
         #[arg(long = "memory-swap", allow_hyphen_values = true)]
         memory_swap: Option<String>,
+        /// See `Command::Run`'s own identical flag.
+        #[arg(long = "memory-reservation")]
+        memory_reservation: Option<String>,
         /// See `Command::Run`'s own identical flag.
         #[arg(long)]
         cpus: Option<f64>,
@@ -3492,6 +3513,7 @@ fn main() -> std::process::ExitCode {
                 id,
                 memory,
                 memory_swap,
+                memory_reservation,
                 cpus,
                 pids_limit,
                 cpuset_cpus,
@@ -3500,6 +3522,7 @@ fn main() -> std::process::ExitCode {
                 &id,
                 memory.as_deref(),
                 memory_swap.as_deref(),
+                memory_reservation.as_deref(),
                 cpus,
                 pids_limit,
                 cpuset_cpus.as_deref(),
@@ -6732,11 +6755,13 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
     let umask = args.umask.as_deref().map(parse_umask).transpose()?;
     let sysctl = parse_sysctls(&args.sysctl)?;
     let cgroup_conf = parse_cgroup_confs(&args.cgroup_conf)?;
-    let (memory_limit_bytes, memory_swap_bytes) = parse_and_validate_memory_and_cpus(
-        args.memory.as_deref(),
-        args.memory_swap.as_deref(),
-        args.cpus,
-    )?;
+    let (memory_limit_bytes, memory_swap_bytes, memory_reservation_bytes) =
+        parse_and_validate_memory_and_cpus(
+            args.memory.as_deref(),
+            args.memory_swap.as_deref(),
+            args.memory_reservation.as_deref(),
+            args.cpus,
+        )?;
     // `parse_memory_limit` verbatim, no dedicated wrapper -- same
     // real, identical `go-units.RAMInBytes` grammar backs both real
     // `--memory` and `--shm-size` (see `--shm-size`'s own doc comment
@@ -6998,6 +7023,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             &user_resolve_root,
             memory_limit_bytes,
             memory_swap_bytes,
+            memory_reservation_bytes,
             args.cpus,
             args.pids_limit,
             args.cpuset_cpus.as_deref(),
@@ -11149,20 +11175,23 @@ fn pause_or_unpause_one(
 /// update` itself already uses — a real, direct-library-call reuse
 /// (never exec'ing `ocirun`), matching this project's own "share as
 /// much Rust code as possible" pillar.
+#[allow(clippy::too_many_arguments)]
 fn cmd_update(
     id: &str,
     memory: Option<&str>,
     memory_swap: Option<&str>,
+    memory_reservation: Option<&str>,
     cpus: Option<f64>,
     pids_limit: Option<i64>,
     cpuset_cpus: Option<&str>,
     cpuset_mems: Option<&str>,
 ) -> anyhow::Result<()> {
-    let (memory_limit_bytes, memory_swap_bytes) =
-        parse_and_validate_memory_and_cpus(memory, memory_swap, cpus)?;
+    let (memory_limit_bytes, memory_swap_bytes, memory_reservation_bytes) =
+        parse_and_validate_memory_and_cpus(memory, memory_swap, memory_reservation, cpus)?;
     let resources = resources_from_cli(
         memory_limit_bytes,
         memory_swap_bytes,
+        memory_reservation_bytes,
         cpus,
         pids_limit,
         cpuset_cpus,
@@ -11170,8 +11199,8 @@ fn cmd_update(
     )
     .ok_or_else(|| {
         anyhow::anyhow!(
-            "no resource flags given -- at least one of --memory/--memory-swap/--cpus/\
-             --pids-limit/--cpuset-cpus/--cpuset-mems is required"
+            "no resource flags given -- at least one of --memory/--memory-swap/\
+             --memory-reservation/--cpus/--pids-limit/--cpuset-cpus/--cpuset-mems is required"
         )
     })?;
 
@@ -12137,6 +12166,7 @@ fn synthesize_spec(
     rootfs: &Path,
     memory_limit_bytes: Option<i64>,
     memory_swap_bytes: Option<i64>,
+    memory_reservation_bytes: Option<i64>,
     cpus: Option<f64>,
     pids_limit: Option<i64>,
     cpuset_cpus: Option<&str>,
@@ -12332,6 +12362,7 @@ fn synthesize_spec(
     let resources = resources_from_cli(
         memory_limit_bytes,
         memory_swap_bytes,
+        memory_reservation_bytes,
         cpus,
         pids_limit,
         cpuset_cpus,
@@ -12621,24 +12652,39 @@ fn parse_key_value_entries(
     Ok(map)
 }
 
-/// Parse `--memory`/`--memory-swap` into raw byte counts and validate
-/// them together with `--cpus`, the same "does this even make sense"
-/// checks (memory-swap needs memory; memory-swap must be at least
-/// memory; cpus must be positive/finite) `ociman run`'s own
-/// `prepare_container` already needed — shared with `ociman update`
-/// (0171) so there is exactly one implementation of this validation,
-/// not two silently drifting copies of the same three `ensure!`s.
-/// `--pids-limit`/`--cpuset-cpus`/`--cpuset-mems` need no equivalent
-/// validation here (`resources_from_cli`'s own doc comment covers
-/// them: no syntax validation at all, matching real `docker`/`podman`
-/// themselves).
+/// Parse `--memory`/`--memory-swap`/`--memory-reservation` into raw
+/// byte counts and validate them together with `--cpus`, the same
+/// "does this even make sense" checks (memory-swap needs memory;
+/// memory-swap must be at least memory; cpus must be positive/finite)
+/// `ociman run`'s own `prepare_container` already needed — shared
+/// with `ociman update` (0171) so there is exactly one implementation
+/// of this validation, not two silently drifting copies of the same
+/// `ensure!`s. `--memory-reservation` gets no relationship check with
+/// `--memory` at all (unlike `--memory-swap`), matching real
+/// `docker`/`podman`'s own identical zero-validation-beyond-parsing
+/// behavior (checked directly, `~/git/podman/cmd/podman/common/
+/// create.go`'s own `memoryReservationFlagName`) — a reservation
+/// higher than the hard limit is accepted exactly as given, since the
+/// kernel's own cgroup v2 `memory.low` semantics don't require one
+/// relative to `memory.max` either. `--pids-limit`/`--cpuset-cpus`/
+/// `--cpuset-mems` need no equivalent validation here
+/// (`resources_from_cli`'s own doc comment covers them: no syntax
+/// validation at all, matching real `docker`/`podman` themselves).
 fn parse_and_validate_memory_and_cpus(
     memory: Option<&str>,
     memory_swap: Option<&str>,
+    memory_reservation: Option<&str>,
     cpus: Option<f64>,
-) -> anyhow::Result<(Option<i64>, Option<i64>)> {
+) -> anyhow::Result<(Option<i64>, Option<i64>, Option<i64>)> {
     let memory_limit_bytes = memory.map(parse_memory_limit).transpose()?;
     let memory_swap_bytes = memory_swap.map(parse_memory_swap_limit).transpose()?;
+    // `parse_memory_limit` verbatim, no dedicated wrapper -- the same
+    // real, identical `go-units.RAMInBytes` grammar backs
+    // `--memory`/`--memory-reservation`/`--shm-size` alike (checked
+    // directly), and `--memory-swap`/`--shm-size` already established
+    // the precedent of reusing it directly rather than introducing a
+    // same-shaped wrapper purely to rename its own error-message text.
+    let memory_reservation_bytes = memory_reservation.map(parse_memory_limit).transpose()?;
     anyhow::ensure!(
         memory_swap_bytes.is_none() || memory_limit_bytes.is_some(),
         "--memory-swap requires --memory to also be set (there is nothing to convert a \
@@ -12654,23 +12700,29 @@ fn parse_and_validate_memory_and_cpus(
         cpus.is_none_or(|c| c > 0.0 && c.is_finite()),
         "--cpus must be a positive, finite number"
     );
-    Ok((memory_limit_bytes, memory_swap_bytes))
+    Ok((
+        memory_limit_bytes,
+        memory_swap_bytes,
+        memory_reservation_bytes,
+    ))
 }
 
 /// Build a `LinuxResources` from `ociman run`'s own `--memory`/
-/// `--memory-swap`/`--cpus`/`--pids-limit`/`--cpuset-cpus`/
-/// `--cpuset-mems` flags, `None` if none of the six were given at all
-/// (leaving `spec.linux.resources` untouched, exactly as before any of
-/// these flags existed).
+/// `--memory-swap`/`--memory-reservation`/`--cpus`/`--pids-limit`/
+/// `--cpuset-cpus`/`--cpuset-mems` flags, `None` if none of the seven
+/// were given at all (leaving `spec.linux.resources` untouched,
+/// exactly as before any of these flags existed).
 fn resources_from_cli(
     memory_limit_bytes: Option<i64>,
     memory_swap_bytes: Option<i64>,
+    memory_reservation_bytes: Option<i64>,
     cpus: Option<f64>,
     pids_limit: Option<i64>,
     cpuset_cpus: Option<&str>,
     cpuset_mems: Option<&str>,
 ) -> Option<oci_spec_types::runtime::LinuxResources> {
     if memory_limit_bytes.is_none()
+        && memory_reservation_bytes.is_none()
         && cpus.is_none()
         && pids_limit.is_none()
         && cpuset_cpus.is_none()
@@ -12678,23 +12730,38 @@ fn resources_from_cli(
     {
         return None;
     }
-    let memory = memory_limit_bytes.map(|limit| oci_spec_types::runtime::LinuxMemory {
-        limit: Some(limit),
-        // An explicit `--memory-swap` value is used as-is (including
-        // `-1` for unlimited); when it's not given, default the same
-        // way real `docker run --memory` does when `--memory-swap` is
-        // left unset too: a *combined* memory+swap cap of twice the
-        // memory limit (i.e. up to one additional memory limit's
-        // worth of real swap) — checked directly against
-        // `~/git/moby/daemon/daemon_unix.go`'s
-        // `adaptContainerSettings`'s own `MemorySwap == 0` gate.
-        // Without this, the container's own cgroup would have *no*
-        // swap limit at all, letting it page out to swap indefinitely
-        // instead of ever actually hitting the OOM killer — silently
-        // defeating the entire point of `--memory`.
-        swap: memory_swap_bytes.or_else(|| limit.checked_mul(2)),
-        ..Default::default()
-    });
+    // Built whenever *either* `--memory` or `--memory-reservation` is
+    // given, not just the former — a caller who only wants a soft
+    // reservation with no hard cap at all still needs a real
+    // `LinuxMemory` to carry it into the spec, the same "built from
+    // any one of several related flags" shape `LinuxCpu` just below
+    // already establishes for `--cpus`/`--cpuset-cpus`/`--cpuset-mems`.
+    let memory = if memory_limit_bytes.is_some() || memory_reservation_bytes.is_some() {
+        Some(oci_spec_types::runtime::LinuxMemory {
+            limit: memory_limit_bytes,
+            // An explicit `--memory-swap` value is used as-is
+            // (including `-1` for unlimited); when it's not given,
+            // default the same way real `docker run --memory` does
+            // when `--memory-swap` is left unset too: a *combined*
+            // memory+swap cap of twice the memory limit (i.e. up to
+            // one additional memory limit's worth of real swap) —
+            // checked directly against `~/git/moby/daemon/
+            // daemon_unix.go`'s `adaptContainerSettings`'s own
+            // `MemorySwap == 0` gate. Without this, the container's
+            // own cgroup would have *no* swap limit at all, letting
+            // it page out to swap indefinitely instead of ever
+            // actually hitting the OOM killer — silently defeating
+            // the entire point of `--memory`. Only computed when
+            // `--memory` itself was given (a bare `--memory-reservation`
+            // with no hard limit has nothing to double).
+            swap: memory_swap_bytes
+                .or_else(|| memory_limit_bytes.and_then(|limit| limit.checked_mul(2))),
+            reservation: memory_reservation_bytes,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
     // `--cpus 1.5` -> a quota of 150_000 microseconds over a fixed
     // 100_000-microsecond (100ms) period, the same fixed period and
     // conversion real `moby`'s own `NanoCPUs`-handling code uses
@@ -13629,49 +13696,69 @@ mod tests {
     #[test]
     fn parse_and_validate_memory_and_cpus_is_none_none_when_nothing_was_given() {
         assert_eq!(
-            parse_and_validate_memory_and_cpus(None, None, None).unwrap(),
-            (None, None)
+            parse_and_validate_memory_and_cpus(None, None, None, None).unwrap(),
+            (None, None, None)
         );
     }
 
     #[test]
     fn parse_and_validate_memory_and_cpus_parses_and_combines_memory_and_swap() {
         assert_eq!(
-            parse_and_validate_memory_and_cpus(Some("128m"), Some("256m"), None).unwrap(),
-            (Some(128 * 1024 * 1024), Some(256 * 1024 * 1024))
+            parse_and_validate_memory_and_cpus(Some("128m"), Some("256m"), None, None).unwrap(),
+            (Some(128 * 1024 * 1024), Some(256 * 1024 * 1024), None)
         );
     }
 
     #[test]
     fn parse_and_validate_memory_and_cpus_rejects_memory_swap_without_memory() {
-        assert!(parse_and_validate_memory_and_cpus(None, Some("256m"), None).is_err());
+        assert!(parse_and_validate_memory_and_cpus(None, Some("256m"), None, None).is_err());
     }
 
     #[test]
     fn parse_and_validate_memory_and_cpus_rejects_a_swap_value_smaller_than_memory() {
-        assert!(parse_and_validate_memory_and_cpus(Some("256m"), Some("128m"), None).is_err());
+        assert!(
+            parse_and_validate_memory_and_cpus(Some("256m"), Some("128m"), None, None).is_err()
+        );
     }
 
     #[test]
     fn parse_and_validate_memory_and_cpus_accepts_unlimited_swap() {
-        assert!(parse_and_validate_memory_and_cpus(Some("128m"), Some("-1"), None).is_ok());
+        assert!(parse_and_validate_memory_and_cpus(Some("128m"), Some("-1"), None, None).is_ok());
     }
 
     #[test]
     fn parse_and_validate_memory_and_cpus_rejects_zero_or_negative_cpus() {
-        assert!(parse_and_validate_memory_and_cpus(None, None, Some(0.0)).is_err());
-        assert!(parse_and_validate_memory_and_cpus(None, None, Some(-1.0)).is_err());
-        assert!(parse_and_validate_memory_and_cpus(None, None, Some(f64::NAN)).is_err());
+        assert!(parse_and_validate_memory_and_cpus(None, None, None, Some(0.0)).is_err());
+        assert!(parse_and_validate_memory_and_cpus(None, None, None, Some(-1.0)).is_err());
+        assert!(parse_and_validate_memory_and_cpus(None, None, None, Some(f64::NAN)).is_err());
+    }
+
+    /// `--memory-reservation` (0401): parsed the same way `--memory`
+    /// is (same `parse_memory_limit` grammar), with no relationship
+    /// check against `--memory` at all -- a reservation given without
+    /// a hard limit, or one numerically larger than it, is equally
+    /// valid, matching real `docker`/`podman`'s own identical
+    /// zero-validation-beyond-parsing behavior.
+    #[test]
+    fn parse_and_validate_memory_and_cpus_parses_memory_reservation_independently_of_memory() {
+        let (_, _, reservation) =
+            parse_and_validate_memory_and_cpus(None, None, Some("64m"), None).unwrap();
+        assert_eq!(reservation, Some(64 * 1024 * 1024));
+        // Larger than a given `--memory` is accepted too -- no
+        // relationship check at all, unlike `--memory-swap`.
+        let (_, _, reservation) =
+            parse_and_validate_memory_and_cpus(Some("32m"), None, Some("64m"), None).unwrap();
+        assert_eq!(reservation, Some(64 * 1024 * 1024));
     }
 
     #[test]
     fn resources_from_cli_is_none_when_nothing_was_given() {
-        assert!(resources_from_cli(None, None, None, None, None, None).is_none());
+        assert!(resources_from_cli(None, None, None, None, None, None, None).is_none());
     }
 
     #[test]
     fn resources_from_cli_translates_cpus_to_a_quota_over_a_100ms_period() {
-        let resources = resources_from_cli(None, None, Some(1.5), None, None, None).unwrap();
+        let resources = resources_from_cli(None, None, None, Some(1.5), None, None, None).unwrap();
         let cpu = resources.cpu.unwrap();
         assert_eq!(cpu.quota, Some(150_000));
         assert_eq!(cpu.period, Some(100_000));
@@ -13680,7 +13767,7 @@ mod tests {
     #[test]
     fn resources_from_cli_pids_limit_zero_or_negative_means_unlimited() {
         assert_eq!(
-            resources_from_cli(None, None, None, Some(0), None, None)
+            resources_from_cli(None, None, None, None, Some(0), None, None)
                 .unwrap()
                 .pids
                 .unwrap()
@@ -13688,7 +13775,7 @@ mod tests {
             Some(-1)
         );
         assert_eq!(
-            resources_from_cli(None, None, None, Some(-5), None, None)
+            resources_from_cli(None, None, None, None, Some(-5), None, None)
                 .unwrap()
                 .pids
                 .unwrap()
@@ -13696,7 +13783,7 @@ mod tests {
             Some(-1)
         );
         assert_eq!(
-            resources_from_cli(None, None, None, Some(42), None, None)
+            resources_from_cli(None, None, None, None, Some(42), None, None)
                 .unwrap()
                 .pids
                 .unwrap()
@@ -13708,7 +13795,7 @@ mod tests {
     #[test]
     fn resources_from_cli_combines_all_four_independently() {
         let resources =
-            resources_from_cli(Some(1024), None, Some(0.5), Some(10), None, None).unwrap();
+            resources_from_cli(Some(1024), None, None, Some(0.5), Some(10), None, None).unwrap();
         assert_eq!(resources.memory.unwrap().limit, Some(1024));
         assert_eq!(resources.cpu.unwrap().quota, Some(50_000));
         assert_eq!(resources.pids.unwrap().limit, Some(10));
@@ -13716,20 +13803,49 @@ mod tests {
 
     #[test]
     fn resources_from_cli_defaults_swap_to_twice_memory_when_unset() {
-        let resources = resources_from_cli(Some(1024), None, None, None, None, None).unwrap();
+        let resources = resources_from_cli(Some(1024), None, None, None, None, None, None).unwrap();
         assert_eq!(resources.memory.unwrap().swap, Some(2048));
     }
 
     #[test]
     fn resources_from_cli_uses_an_explicit_memory_swap_value_untouched() {
-        let resources = resources_from_cli(Some(1024), Some(1500), None, None, None, None).unwrap();
+        let resources =
+            resources_from_cli(Some(1024), Some(1500), None, None, None, None, None).unwrap();
         assert_eq!(resources.memory.unwrap().swap, Some(1500));
     }
 
     #[test]
     fn resources_from_cli_passes_through_unlimited_memory_swap() {
-        let resources = resources_from_cli(Some(1024), Some(-1), None, None, None, None).unwrap();
+        let resources =
+            resources_from_cli(Some(1024), Some(-1), None, None, None, None, None).unwrap();
         assert_eq!(resources.memory.unwrap().swap, Some(-1));
+    }
+
+    /// `--memory-reservation` (0401): the built `LinuxMemory` carries
+    /// it straight through, alongside `limit`/`swap` when those are
+    /// also given.
+    #[test]
+    fn resources_from_cli_carries_memory_reservation() {
+        let resources =
+            resources_from_cli(Some(1024), None, Some(512), None, None, None, None).unwrap();
+        let memory = resources.memory.unwrap();
+        assert_eq!(memory.limit, Some(1024));
+        assert_eq!(memory.reservation, Some(512));
+    }
+
+    /// A bare `--memory-reservation`, with no `--memory` at all, must
+    /// still produce a real `LinuxMemory` carrying just the
+    /// reservation -- the same "built from any one of several related
+    /// flags" shape `LinuxCpu` already establishes for
+    /// `--cpus`/`--cpuset-cpus`/`--cpuset-mems`. No swap default is
+    /// computed either (there's no hard limit to double).
+    #[test]
+    fn resources_from_cli_is_some_with_only_memory_reservation_given() {
+        let resources = resources_from_cli(None, None, Some(512), None, None, None, None).unwrap();
+        let memory = resources.memory.unwrap();
+        assert_eq!(memory.limit, None);
+        assert_eq!(memory.reservation, Some(512));
+        assert_eq!(memory.swap, None);
     }
 
     #[test]
@@ -13738,7 +13854,8 @@ mod tests {
         // still produce a real `LinuxCpu` carrying just the cpuset
         // fields -- pinning a container to specific CPUs/memory nodes
         // doesn't require a rate quota too.
-        let resources = resources_from_cli(None, None, None, None, Some("0-1"), Some("0")).unwrap();
+        let resources =
+            resources_from_cli(None, None, None, None, None, Some("0-1"), Some("0")).unwrap();
         let cpu = resources.cpu.unwrap();
         assert_eq!(cpu.cpus, "0-1");
         assert_eq!(cpu.mems, "0");
@@ -13748,7 +13865,8 @@ mod tests {
 
     #[test]
     fn resources_from_cli_combines_cpus_quota_with_cpuset() {
-        let resources = resources_from_cli(None, None, Some(1.5), None, Some("0-3"), None).unwrap();
+        let resources =
+            resources_from_cli(None, None, None, Some(1.5), None, Some("0-3"), None).unwrap();
         let cpu = resources.cpu.unwrap();
         assert_eq!(cpu.quota, Some(150_000));
         assert_eq!(cpu.cpus, "0-3");
@@ -13759,10 +13877,10 @@ mod tests {
     fn resources_from_cli_is_some_when_only_a_cpuset_flag_is_given() {
         // Confirms the early "nothing was given at all" check itself
         // considers `--cpuset-cpus`/`--cpuset-mems`, not just the
-        // four flags that existed before this pair -- giving only one
-        // of them must still produce `Some`, not `None`.
-        assert!(resources_from_cli(None, None, None, None, Some("0"), None).is_some());
-        assert!(resources_from_cli(None, None, None, None, None, Some("0")).is_some());
+        // other flags that existed before this pair -- giving only
+        // one of them must still produce `Some`, not `None`.
+        assert!(resources_from_cli(None, None, None, None, None, Some("0"), None).is_some());
+        assert!(resources_from_cli(None, None, None, None, None, None, Some("0")).is_some());
     }
 
     #[test]

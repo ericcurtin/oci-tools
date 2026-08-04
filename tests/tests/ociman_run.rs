@@ -3594,6 +3594,71 @@ fn run_memory_swap_flag_sets_the_real_systemd_scopes_own_swap_max() {
     );
 }
 
+/// `--memory-reservation` (0401): a real, previously-missing flag --
+/// checked the same way `--cpus`/`--memory-swap` above are, against
+/// the real systemd scope's own `MemoryLow` property (`oci_runtime_
+/// core::systemd_cgroup::resource_properties`'s own translation),
+/// given alone with no `--memory` at all (a bare soft reservation
+/// needs no hard limit to be meaningful).
+#[test]
+fn run_memory_reservation_flag_sets_the_real_systemd_scopes_own_memory_low() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/memreservation:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "--memory-reservation",
+            "64m",
+            "ociman-test/memreservation:latest",
+        ])
+        .args(["/bin/sh", "-c", "sleep 10"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run");
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    assert!(!container_id.is_empty(), "container never appeared in `ps`");
+    let status = wait_for_running(storage_dir.path(), &container_id, Duration::from_secs(20));
+    assert_eq!(status, "running", "container never reached `running`");
+    let scope_name = real_scope_name(storage_dir.path(), &container_id);
+
+    let show = Command::new("systemctl")
+        .args(["--user", "show", &scope_name, "-p", "MemoryLow", "--value"])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let memory_low = String::from_utf8_lossy(&show.stdout).trim().to_string();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(
+        memory_low, "67108864",
+        "expected the real systemd scope's own MemoryLow to reflect --memory-reservation 64m \
+         (67108864 bytes), given with no --memory at all"
+    );
+}
+
 /// `-1` (real `docker run --memory-swap -1`/`podman run --memory-swap
 /// -1`'s own "unlimited swap" convention) exercised through the real
 /// CLI, not just `resources_from_cli`'s own in-process unit tests —
