@@ -2234,8 +2234,26 @@ enum Command {
     /// matching real `docker start`/`podman start` exactly, including
     /// their own real detached-by-default behavior.
     Start {
-        /// The container's ID or `--name`.
-        id: String,
+        /// The container's ID or `--name` — omit when using
+        /// `--latest`.
+        id: Option<String>,
+        /// Start the single, real most-recently-*created* container
+        /// instead of naming one explicitly — matching real `podman
+        /// start --latest`/`-l` exactly (see [`Command::Rm::
+        /// latest`]'s own doc comment for the exact, checked-directly
+        /// `GetLatestContainer` semantics this shares verbatim).
+        /// Mutually exclusive with an explicit `ID`/`--name` —
+        /// matching real podman's own checked-directly `validateStart`
+        /// exactly (`~/git/podman/cmd/podman/containers/start.go`):
+        /// `"--latest and containers cannot be used together"` (real
+        /// podman's own further `--all`/`--filter`, and its own
+        /// multi-target `CONTAINER [CONTAINER...]` support, are a
+        /// separate, richer scope this project has never implemented
+        /// for `start` at all — a real, honest narrower-first-slice,
+        /// the same established precedent every other "first slice"
+        /// design note in this project already sets).
+        #[arg(short = 'l', long)]
+        latest: bool,
         /// Stream the container's own live output to stdout and block
         /// until it exits, this command's own exit code then becoming
         /// the container's own real exit code — matching real `docker
@@ -4440,7 +4458,24 @@ fn main() -> std::process::ExitCode {
                 size,
                 sort,
             ),
-            Some(Command::Start { id, attach }) => cmd_start(&id, attach),
+            Some(Command::Start { id, latest, attach }) => {
+                // Matches real podman's own exact wording, checked
+                // directly (`~/git/podman/cmd/podman/containers/
+                // start.go`'s own `validateStart`).
+                anyhow::ensure!(
+                    !(latest && id.is_some()),
+                    "--latest and containers cannot be used together"
+                );
+                let resolved_id = match id {
+                    Some(id) => id,
+                    None => {
+                        anyhow::ensure!(latest, "start requires at least one argument");
+                        let containers = open_container_store()?;
+                        resolve_latest_container(&containers)?
+                    }
+                };
+                cmd_start(&resolved_id, attach)
+            }
             Some(Command::Attach { id }) => cmd_attach(&id),
             Some(Command::Restart {
                 ids,

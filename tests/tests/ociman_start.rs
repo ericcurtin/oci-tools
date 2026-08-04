@@ -1549,3 +1549,112 @@ fn restart_with_multiple_explicit_ids_resolves_all_before_restarting_any() {
     ociman(storage_dir.path(), &["stop", "--time", "0", "-a"]);
     ociman(storage_dir.path(), &["rm", "-a", "-f"]);
 }
+
+/// `ociman start --latest`/`-l` (matching real `podman start --latest`
+/// exactly) starts the single, real most-recently-*created* container
+/// -- an earlier, never-started container must be left completely
+/// untouched.
+#[test]
+fn start_latest_starts_only_the_most_recently_created_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_marker_image(&store, "ociman-test/start-latest:latest", &busybox);
+
+    let older = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/start-latest:latest"],
+    );
+    assert!(older.status.success(), "{older:?}");
+    let older_id = String::from_utf8_lossy(&older.stdout).trim().to_string();
+
+    // A real, distinguishable creation-time gap.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let newer = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/start-latest:latest"],
+    );
+    assert!(newer.status.success(), "{newer:?}");
+    let newer_id = String::from_utf8_lossy(&newer.stdout).trim().to_string();
+
+    let start = ociman(storage_dir.path(), &["start", "--latest"]);
+    assert!(
+        start.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            &newer_id,
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped"
+    );
+    assert_eq!(
+        marker_contents(storage_dir.path(), &newer_id),
+        "hi\n",
+        "--latest must have started the most recently created container"
+    );
+    assert_eq!(
+        marker_contents(storage_dir.path(), &older_id),
+        "",
+        "an earlier, never-started container must be left completely untouched by --latest"
+    );
+    assert_eq!(
+        inspect_json(storage_dir.path(), &older_id)["status"],
+        "created",
+        "an earlier container must stay created, never started, by --latest"
+    );
+
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// `--latest` and an explicit container together is a real, immediate
+/// error, matching real podman's own exact wording.
+#[test]
+fn start_latest_and_explicit_id_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["start", "--latest", "some-id"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("--latest and containers cannot be used together"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Neither `--latest` nor an explicit container at all is a real,
+/// immediate error, matching real podman's own exact wording.
+#[test]
+fn start_with_no_container_and_no_latest_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["start"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("start requires at least one argument"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `start --latest` on a genuinely empty store is a real, clear
+/// error, matching real `podman start --latest`'s own `ErrNoSuchCtr`.
+#[test]
+fn start_latest_on_an_empty_store_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["start", "--latest"]);
+    assert!(!out.status.success());
+}
