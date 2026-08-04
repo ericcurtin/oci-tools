@@ -395,3 +395,101 @@ fn wait_condition_unsupported_value_is_a_clear_error() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `ociman wait --latest`/`-l` (matching real `podman wait --latest`
+/// exactly) waits on the single, real most-recently-*created*
+/// container -- an earlier container's own, genuinely different exit
+/// code must never be printed.
+#[test]
+fn wait_latest_prints_the_most_recently_created_containers_own_exit_code() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/wait-latest:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    // `ociman run`'s own exit code mirrors the container's real exit
+    // code (matching real podman/docker exactly), so a deliberately
+    // nonzero one here is not itself a test failure -- only the
+    // exact code value is checked, via `wait` below.
+    let older = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "ociman-test/wait-latest:latest",
+            "/bin/sh",
+            "-c",
+            "exit 5",
+        ],
+    );
+    assert_eq!(older.status.code(), Some(5), "{older:?}");
+
+    // A real, distinguishable creation-time gap.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let newer = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "ociman-test/wait-latest:latest",
+            "/bin/sh",
+            "-c",
+            "exit 9",
+        ],
+    );
+    assert_eq!(newer.status.code(), Some(9), "{newer:?}");
+
+    let wait = ociman(storage_dir.path(), &["wait", "--latest"]);
+    assert!(
+        wait.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&wait.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&wait.stdout).trim(),
+        "9",
+        "--latest must print the most recently created container's own exit code"
+    );
+}
+
+/// `--latest` and an explicit container together is a real, immediate
+/// error, matching real podman's own exact wording.
+#[test]
+fn wait_latest_and_explicit_id_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["wait", "--latest", "some-id"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("--latest and containers cannot be used together"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Neither `--latest` nor an explicit container at all is a real,
+/// immediate error.
+#[test]
+fn wait_with_no_container_and_no_latest_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["wait"]);
+    assert!(!out.status.success());
+}
+
+/// `wait --latest` on a genuinely empty store is a real, clear error,
+/// matching real `podman wait --latest`'s own `ErrNoSuchCtr`.
+#[test]
+fn wait_latest_on_an_empty_store_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["wait", "--latest"]);
+    assert!(!out.status.success());
+}

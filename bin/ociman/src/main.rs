@@ -3143,9 +3143,23 @@ enum Command {
     /// (still printing the exit code) for a container that has already
     /// stopped.
     Wait {
-        /// One or more container IDs/`--name`s.
-        #[arg(required = true)]
+        /// One or more container IDs/`--name`s — omit when using
+        /// `--latest`.
         ids: Vec<String>,
+        /// Wait on the single, real most-recently-*created* container
+        /// instead of naming one explicitly — matching real `podman
+        /// wait --latest`/`-l` exactly (see [`Command::Rm::latest`]'s
+        /// own doc comment for the exact, checked-directly
+        /// `GetLatestContainer` semantics this shares verbatim).
+        /// Mutually exclusive with an explicit `ID`/`--name` —
+        /// matching real podman's own exact error wording for both
+        /// directions of that restriction (checked directly, `~/git/
+        /// podman/cmd/podman/containers/wait.go`): giving neither
+        /// this nor a container at all is `"%q requires a name, id,
+        /// or the \"--latest\" flag"`, giving both together is
+        /// `"--latest and containers cannot be used together"`.
+        #[arg(short = 'l', long)]
+        latest: bool,
         /// Milliseconds to sleep between polls.
         #[arg(short, long, default_value_t = 250)]
         interval: u64,
@@ -4549,10 +4563,30 @@ fn main() -> std::process::ExitCode {
             ),
             Some(Command::Wait {
                 ids,
+                latest,
                 interval,
                 condition,
                 ignore,
-            }) => cmd_wait(&ids, interval, &condition, ignore),
+            }) => {
+                // Matches real podman's own exact wording, checked
+                // directly (`~/git/podman/cmd/podman/containers/
+                // wait.go`).
+                anyhow::ensure!(
+                    !(latest && !ids.is_empty()),
+                    "--latest and containers cannot be used together"
+                );
+                let ids: Vec<String> = if latest {
+                    let containers = open_container_store()?;
+                    vec![resolve_latest_container(&containers)?]
+                } else {
+                    anyhow::ensure!(
+                        !ids.is_empty(),
+                        "wait requires a name, id, or the \"--latest\" flag"
+                    );
+                    ids
+                };
+                cmd_wait(&ids, interval, &condition, ignore)
+            }
             Some(Command::Rename { id, name }) => cmd_rename(&id, &name),
             Some(Command::Top { positional, latest }) => {
                 // Manual disambiguation, matching real podman's own
