@@ -9347,6 +9347,23 @@ struct ContainerInspectView {
     /// modeled.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     mounts: Vec<ContainerMountView>,
+    /// This container's own currently-*effective* healthcheck (0442)
+    /// -- see [`resolve_effective_healthcheck`]'s own doc comment for
+    /// the exact precedence (`run`/`create`/`update --health-cmd`/
+    /// `--no-healthcheck` override, else the resolved base image's
+    /// own declared `HEALTHCHECK`), matching real `podman inspect`'s
+    /// own `Config.Healthcheck` field in spirit (deliberately using
+    /// this project's own pre-existing `HealthcheckConfig` shape
+    /// directly rather than a field-for-field port of podman's own
+    /// richer, differently-named one). `None` for a container with
+    /// genuinely no healthcheck at all either way -- also `None`
+    /// (never a hard inspect failure) if resolving it errors for any
+    /// reason, e.g. the base image having since been removed from
+    /// local storage -- the same "best-effort enrichment, absence
+    /// over a spurious whole-command failure" convention this view's
+    /// own `labels`/`display_status` already establish.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    healthcheck: Option<HealthcheckConfig>,
 }
 
 /// One extra (non-default) mount a container's own bundle declares --
@@ -9449,6 +9466,14 @@ impl ContainerInspectView {
             stop_timeout: resolve_stop_timeout(state, None),
             size: None,
             mounts: extra_mounts(state),
+            // Best-effort, same philosophy as `extra_mounts`'s own
+            // doc comment right below -- see `Self::healthcheck`'s
+            // own doc comment for exactly why a resolution failure
+            // (e.g. the base image having since been removed) is
+            // `None` here rather than a hard `inspect` failure.
+            healthcheck: resolve_effective_healthcheck(&state.id, state)
+                .ok()
+                .flatten(),
         }
     }
 }

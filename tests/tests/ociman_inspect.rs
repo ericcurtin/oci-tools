@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use oci_spec_types::image::ContainerConfig;
+use oci_spec_types::image::{ContainerConfig, HealthcheckConfig};
 use oci_store::Store;
 
 use oci_tools_tests::{bin_path, busybox_path, seed_image};
@@ -1103,5 +1103,188 @@ fn inspect_restart_overwrites_started_at() {
         second_started_at > first_started_at,
         "restart should overwrite started_at with a later value: {first_started_at:?} -> \
          {second_started_at:?}"
+    );
+}
+
+/// `ociman inspect`'s own new `healthcheck` field (0442): a `run`/
+/// `create --health-cmd` override takes precedence over the resolved
+/// image's own declared `HEALTHCHECK` -- matching [`resolve_
+/// effective_healthcheck`]'s own exact precedence, the same one
+/// `ociman healthcheck run`/`ociman update --health-cmd` already
+/// share.
+#[test]
+fn inspect_healthcheck_shows_a_health_cmd_override_taking_precedence_over_the_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-health-override:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            healthcheck: Some(HealthcheckConfig {
+                test: vec![
+                    "CMD".to_string(),
+                    "test".to_string(),
+                    "-f".to_string(),
+                    "/image-healthy".to_string(),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--health-cmd",
+            "test -f /cli-healthy",
+            "ociman-test/inspect-health-override:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+    let inspect = ociman(storage_dir.path(), &["inspect", &id, "--json"]);
+    assert!(inspect.status.success(), "{inspect:?}");
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(
+        view["healthcheck"]["Test"],
+        serde_json::json!(["CMD-SHELL", "test -f /cli-healthy"]),
+        "{view:?}"
+    );
+}
+
+/// With no `--health-cmd`/`--no-healthcheck` override at all, `ociman
+/// inspect`'s own `healthcheck` field falls back to the resolved
+/// image's own declared `HEALTHCHECK`.
+#[test]
+fn inspect_healthcheck_falls_back_to_the_images_own_declared_one() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-health-image:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            healthcheck: Some(HealthcheckConfig {
+                test: vec![
+                    "CMD".to_string(),
+                    "test".to_string(),
+                    "-f".to_string(),
+                    "/image-healthy".to_string(),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/inspect-health-image:latest", "true"],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+    let inspect = ociman(storage_dir.path(), &["inspect", &id, "--json"]);
+    assert!(inspect.status.success(), "{inspect:?}");
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(
+        view["healthcheck"]["Test"],
+        serde_json::json!(["CMD", "test", "-f", "/image-healthy"]),
+        "{view:?}"
+    );
+}
+
+/// A container with genuinely no healthcheck at all (neither the
+/// image nor an explicit override declares one) omits the
+/// `healthcheck` field entirely, not a `null`.
+#[test]
+fn inspect_healthcheck_field_is_absent_with_no_healthcheck_at_all() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-health-none:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/inspect-health-none:latest", "true"],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+    let inspect = ociman(storage_dir.path(), &["inspect", &id, "--json"]);
+    assert!(inspect.status.success(), "{inspect:?}");
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert!(view.get("healthcheck").is_none(), "{view:?}");
+}
+
+/// `ociman inspect`'s own `healthcheck` field reflects a *later*
+/// `ociman update --health-cmd` change too, not just what the
+/// container was originally created with -- proving this is a real,
+/// live-resolved view (`ContainerInspectView::from_state`'s own
+/// `resolve_effective_healthcheck` call), not a value snapshotted
+/// once at creation time.
+#[test]
+fn inspect_healthcheck_reflects_a_later_update_health_cmd_change() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-health-update:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/inspect-health-update:latest", "true"],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+    let before = ociman(storage_dir.path(), &["inspect", &id, "--json"]);
+    let before_view: serde_json::Value = serde_json::from_slice(&before.stdout).unwrap();
+    assert!(before_view.get("healthcheck").is_none(), "{before_view:?}");
+
+    let update = ociman(
+        storage_dir.path(),
+        &["update", "--health-cmd", "test -f /updated-healthy", &id],
+    );
+    assert!(update.status.success(), "{update:?}");
+
+    let after = ociman(storage_dir.path(), &["inspect", &id, "--json"]);
+    let after_view: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    assert_eq!(
+        after_view["healthcheck"]["Test"],
+        serde_json::json!(["CMD-SHELL", "test -f /updated-healthy"]),
+        "{after_view:?}"
     );
 }
