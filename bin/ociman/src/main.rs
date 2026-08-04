@@ -1441,7 +1441,14 @@ enum Command {
         /// Real podman's own third value, `containers=external`, is a
         /// clear, honest error instead — this project has no
         /// external/non-managed container concept to check against.
-        /// May be given more than once.
+        /// Also `id=<prefix>`/`digest=sha256:<prefix>` (ANDed
+        /// together like `before=`/`since=`, not OR'd) and
+        /// `until=<duration-or-timestamp>` (0407) — matches an image
+        /// created strictly before the given duration-ago or absolute
+        /// RFC3339 timestamp, the exact same threshold computation
+        /// `ociman ps`/`prune --filter until=` already use, reused
+        /// verbatim here; at most one value. May be given more than
+        /// once.
         #[arg(short, long = "filter")]
         filter: Vec<String>,
         /// Render one line per listed image via a Go-template-*lite*
@@ -4460,8 +4467,10 @@ fn cmd_images(
         {
             continue;
         }
-        let needs_config =
-            !filters.labels.is_empty() || before_threshold.is_some() || since_threshold.is_some();
+        let needs_config = !filters.labels.is_empty()
+            || before_threshold.is_some()
+            || since_threshold.is_some()
+            || filters.until.is_some();
         if needs_config {
             let config = store
                 .image_config(record)
@@ -4473,7 +4482,7 @@ fn cmd_images(
                     continue;
                 }
             }
-            if before_threshold.is_some() || since_threshold.is_some() {
+            if before_threshold.is_some() || since_threshold.is_some() || filters.until.is_some() {
                 let Some(created) = config
                     .created
                     .as_deref()
@@ -4485,6 +4494,14 @@ fn cmd_images(
                     continue;
                 }
                 if since_threshold.is_some_and(|t| created <= t) {
+                    continue;
+                }
+                // `until=` (0407): matches real podman's own
+                // `filterBefore`/`ComputeUntilTimestamp` composition
+                // exactly -- a strict `created < threshold` check,
+                // the same real comparison `ociman prune`/`ps
+                // --filter until=` already use.
+                if filters.until.is_some_and(|t| created >= t) {
                     continue;
                 }
             }
@@ -5256,6 +5273,38 @@ fn parse_simple_duration(s: &str) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs_f64(total_secs))
 }
 
+/// Parses an `until=<duration-or-timestamp>` `--filter` value's own
+/// right-hand side into the real threshold time itself (`now -
+/// duration`, or the absolute timestamp verbatim) — shared by
+/// `ociman prune`/`ps`/`images`'s own otherwise-identical `until=`
+/// parsing (0407), matching real podman's own shared time-parsing
+/// helper used underneath every one of `podman prune`/`ps`/`images
+/// --filter until=` alike (`~/git/podman/vendor/go.podman.io/common/
+/// pkg/filters/filters.go`'s own `ComputeUntilTimestamp` for
+/// containers, `~/git/container-libs/common/libimage/filters.go`'s
+/// own `(*Runtime).until` for images — two distinct real functions in
+/// real podman's own source, but with the identical real duration-or-
+/// RFC3339 grammar, matching this one shared parser exactly).
+/// `command`/`f` are only used for the error message, so a mistake in
+/// one caller is never misattributed to another.
+fn parse_until_filter_value(
+    command: &str,
+    f: &str,
+    rest: &str,
+) -> anyhow::Result<std::time::SystemTime> {
+    let now = std::time::SystemTime::now();
+    if let Some(duration) = parse_simple_duration(rest) {
+        Ok(now.checked_sub(duration).unwrap_or(std::time::UNIX_EPOCH))
+    } else if let Some(absolute) = oci_spec_types::time::parse_rfc3339_utc(rest) {
+        Ok(absolute)
+    } else {
+        anyhow::bail!(
+            "{command}: --filter {f:?}: invalid value for 'until' filter (expected a duration \
+             like \"24h\" or an RFC3339 timestamp)"
+        )
+    }
+}
+
 /// Parses a `label=<key>[=<value>]` or `label!=<key>[=<value>]`
 /// `--filter` value into a [`LabelFilter`] -- `None` if `f` isn't a
 /// label filter at all (letting the caller try its own other filter
@@ -5310,18 +5359,7 @@ fn parse_prune_filters(filters: &[String]) -> anyhow::Result<PruneFilters> {
                 until_values == 1,
                 "ociman prune: more than one until filter specified"
             );
-            let now = std::time::SystemTime::now();
-            let threshold = if let Some(duration) = parse_simple_duration(rest) {
-                now.checked_sub(duration).unwrap_or(std::time::UNIX_EPOCH)
-            } else if let Some(absolute) = oci_spec_types::time::parse_rfc3339_utc(rest) {
-                absolute
-            } else {
-                anyhow::bail!(
-                    "ociman prune: --filter {f:?}: invalid value for 'until' filter (expected \
-                     a duration like \"24h\" or an RFC3339 timestamp)"
-                );
-            };
-            parsed.until = Some(threshold);
+            parsed.until = Some(parse_until_filter_value("ociman prune", f, rest)?);
         } else if let Some(result) = try_parse_dangling_filter("ociman prune", f) {
             let value = result?;
             anyhow::ensure!(
@@ -5341,11 +5379,9 @@ fn parse_prune_filters(filters: &[String]) -> anyhow::Result<PruneFilters> {
 }
 
 /// Every `--filter` value `ociman images` accepts, parsed once up
-/// front -- a narrower set than `ociman prune`'s own `PruneFilters`
-/// (no `until`, which prune-specific semantics don't apply to a plain
-/// listing), matching real `podman images --filter`'s own most
-/// commonly used filters (its own help text's worked example is
-/// literally `podman images --filter dangling=true`).
+/// front, matching real `podman images --filter`'s own most commonly
+/// used filters (its own help text's worked example is literally
+/// `podman images --filter dangling=true`) plus `until=` (0407).
 #[derive(Default)]
 struct ImageFilters {
     /// `label=`/`label!=` -- OR'd together, same as `PruneFilters`.
@@ -5431,6 +5467,23 @@ struct ImageFilters {
     /// requirement since it's matching a bare hex ID, never a full
     /// algorithm-prefixed digest string.
     digest: Vec<String>,
+    /// `until=<duration-or-timestamp>` (0407) -- at most one value,
+    /// matching real podman's own identical refusal of more than one
+    /// (see `ociman ps`/`prune --filter until=`'s own identical
+    /// rule). Matches an image whose own declared creation time is
+    /// strictly before this threshold -- a real, previously-mis-
+    /// scoped gap: this struct's own doc comment used to claim
+    /// `until` was deliberately excluded here as a "prune-specific"
+    /// semantic, but real podman's own `podman images --filter
+    /// until=` genuinely exists and shares the identical underlying
+    /// time-parsing machinery `prune`'s own `until=` already does
+    /// (`~/git/container-libs/common/libimage/filters.go`'s own
+    /// `(*Runtime).until`, called from the same `compileImageFilters`
+    /// real `podman images`'s own `ListImages` uses) -- confirmed
+    /// directly against real podman's own documentation too
+    /// (`~/git/podman/docs/source/markdown/podman-images.1.md.in`:
+    /// "shows all images that are created until that time").
+    until: Option<std::time::SystemTime>,
 }
 
 /// Every real image (identified by manifest digest, not one exact
@@ -5549,13 +5602,19 @@ fn parse_image_filters(filters: &[String]) -> anyhow::Result<ImageFilters> {
                 "ociman images: --filter {f:?}: invalid value (must start with \"sha256:\")"
             );
             parsed.digest.push(value.to_string());
+        } else if let Some(rest) = f.strip_prefix("until=") {
+            anyhow::ensure!(
+                parsed.until.is_none(),
+                "ociman images: more than one until filter specified"
+            );
+            parsed.until = Some(parse_until_filter_value("ociman images", f, rest)?);
         } else {
             anyhow::bail!(
                 "ociman images: --filter {f:?} is not yet supported (only \
                  label=<key>[=<value>], label!=<key>[=<value>], dangling=true|false, \
                  before=<image>, since=<image>/after=<image>, \
                  reference=<pattern>/reference!=<pattern>, containers=true|false, \
-                 id=<prefix>, or digest=sha256:<prefix> are)"
+                 id=<prefix>, digest=sha256:<prefix>, or until=<duration-or-timestamp> are)"
             );
         }
     }
@@ -8428,18 +8487,7 @@ fn parse_ps_filters(filters: &[String]) -> anyhow::Result<PsFilters> {
                 parsed.until.is_none(),
                 "ociman ps: more than one until filter specified"
             );
-            let now = std::time::SystemTime::now();
-            let threshold = if let Some(duration) = parse_simple_duration(rest) {
-                now.checked_sub(duration).unwrap_or(std::time::UNIX_EPOCH)
-            } else if let Some(absolute) = oci_spec_types::time::parse_rfc3339_utc(rest) {
-                absolute
-            } else {
-                anyhow::bail!(
-                    "ociman ps: --filter {f:?}: invalid value for 'until' filter (expected a \
-                     duration like \"24h\" or an RFC3339 timestamp)"
-                );
-            };
-            parsed.until = Some(threshold);
+            parsed.until = Some(parse_until_filter_value("ociman ps", f, rest)?);
         } else {
             anyhow::bail!(
                 "ociman ps: --filter {f:?} is not yet supported (only status=<creating|created|\

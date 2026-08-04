@@ -444,6 +444,116 @@ fn images_filter_before_and_since_use_the_referenced_images_own_creation_time() 
     );
 }
 
+/// `ociman images --filter until=` (0407) -- a real, previously-mis-
+/// scoped gap: this struct's own doc comment used to (incorrectly)
+/// claim `until` was a deliberately excluded "prune-specific"
+/// semantic that didn't apply to a plain listing, but real `podman
+/// images --filter until=` genuinely exists (checked directly against
+/// its own documentation and source, see `docs/design/0407`). Matches
+/// real podman's own strict `created < threshold` comparison exactly,
+/// the identical rule `ociman ps`/`prune --filter until=` already
+/// established and this now shares the same parsing helper with.
+#[test]
+fn images_filter_until_matches_images_created_strictly_before_the_threshold() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/images-filter-until-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("Containerfile"),
+        "FROM ociman-test/images-filter-until-base:latest\nLABEL marker=until\n",
+    )
+    .unwrap();
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "-t",
+            "images-filter-until:latest",
+            context_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    // `until=<duration>` matches images *older* than the given
+    // duration-ago threshold (real podman's own `img.Created().
+    // Before(now - duration)`, checked directly) -- so a `24h`
+    // threshold (a day ago) must *not* match a freshly built image
+    // only a fraction of a second old, the same "keeps a freshly
+    // built ... image" property `ociman prune --filter until=`'s own
+    // equivalent test already established.
+    let list_fresh = ociman(
+        storage_dir.path(),
+        &["--json", "images", "--filter", "until=24h"],
+    );
+    assert!(
+        list_fresh.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&list_fresh.stderr)
+    );
+    let fresh: serde_json::Value = serde_json::from_slice(&list_fresh.stdout).unwrap();
+    assert!(
+        !fresh
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["reference"] == "docker.io/library/images-filter-until:latest"),
+        "a freshly built image must not match a 24h-ago threshold: {fresh:?}"
+    );
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // A short-enough threshold (1 second ago) that the image (built
+    // well over a second ago now) genuinely is older than it -- must
+    // now be found.
+    let list_old = ociman(
+        storage_dir.path(),
+        &["--json", "images", "--filter", "until=1s"],
+    );
+    assert!(list_old.status.success());
+    let old: serde_json::Value = serde_json::from_slice(&list_old.stdout).unwrap();
+    assert!(
+        old.as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["reference"] == "docker.io/library/images-filter-until:latest"),
+        "{old:?}"
+    );
+}
+
+/// `ociman images --filter until=` given more than once is a clear
+/// error, matching real podman's own identical refusal -- the same
+/// rule `ociman ps`/`prune --filter until=` already established.
+#[test]
+fn images_filter_until_rejects_more_than_one_value() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &["images", "--filter", "until=1h", "--filter", "until=2h"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("more than one until filter"),
+        "{out:?}"
+    );
+}
+
 /// `ociman images --filter reference=`/`reference!=` (0295), matching
 /// real `podman images --filter reference=`'s own checked-directly
 /// semantics exactly (`~/git/container-libs/common/libimage/
