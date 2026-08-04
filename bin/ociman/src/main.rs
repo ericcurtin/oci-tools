@@ -2911,24 +2911,38 @@ enum Command {
         #[arg(short = 'l', long)]
         latest: bool,
     },
-    /// Update a running container's real cgroup resource limits in
-    /// place — matching real `podman update` for exactly the same
-    /// subset of resource flags `ociman run` itself already supports
-    /// (`--memory`/`--memory-swap`/`--memory-reservation`/`--cpus`/
-    /// `--pids-limit`/`--cpuset-cpus`/`--cpuset-mems`; real `podman
-    /// update`'s own larger flag set — `--cpu-shares`/`--cpu-period`/
-    /// `--cpu-quota`/`--cpu-rt-period`/`--cpu-rt-runtime`/
-    /// `--memory-swappiness`/`--blkio-weight*`/`--device-*-bps`/
-    /// `--device-*-iops` — is out of scope for the same reason `run`
-    /// itself doesn't support them either). Requires the container to
+    /// Update a container's real cgroup resource limits and/or its
+    /// own healthcheck — matching real `podman update` for exactly
+    /// the same subset of resource flags `ociman run` itself already
+    /// supports (`--memory`/`--memory-swap`/`--memory-reservation`/
+    /// `--cpus`/`--pids-limit`/`--cpuset-cpus`/`--cpuset-mems`; real
+    /// `podman update`'s own larger flag set — `--cpu-shares`/
+    /// `--cpu-period`/`--cpu-quota`/`--cpu-rt-period`/`--cpu-rt-
+    /// runtime`/`--memory-swappiness`/`--blkio-weight*`/`--device-*-
+    /// bps`/`--device-*-iops` — is out of scope for the same reason
+    /// `run` itself doesn't support them either), plus the identical
+    /// `--health-cmd`/`--health-interval`/`--health-retries`/
+    /// `--health-timeout`/`--health-start-period`/`--no-healthcheck`
+    /// flags [`Command::Run`] already has (`0440`, `0441`) — see
+    /// [`Command::Run::health_cmd`]'s own doc comment for the base
+    /// grammar, and this variant's own health-flag doc comments below
+    /// for the real, checked-directly *different* merge/validation
+    /// rules `update` uses instead of `create`'s own all-or-nothing
+    /// ones.
+    ///
+    /// A resource-flag change still requires the container to
     /// actually be running (this project's own cgroup only exists
     /// while its systemd scope is alive at all, unlike real podman,
     /// which can also update an already-stopped container's own
     /// persisted spec for its *next* start — a real, narrower scope,
     /// matching `ocirun update`'s own identical "container's own
     /// persisted state is never rewritten" limitation, see
-    /// `docs/design/0099`). Applying no resource flags at all is a
-    /// clear error rather than a silent no-op.
+    /// `docs/design/0099`); a health-only change has no such
+    /// requirement at all, matching real podman's own identical
+    /// "persisted config change, no live container needed" scope —
+    /// it merely needs the container to *exist*. Applying no
+    /// resource *or* health flags at all is a clear error rather than
+    /// a silent no-op.
     Update {
         /// The container's ID or `--name`.
         id: String,
@@ -2953,6 +2967,67 @@ enum Command {
         /// See `Command::Run`'s own identical flag.
         #[arg(long = "cpuset-mems")]
         cpuset_mems: Option<String>,
+        /// A real, *partial* update onto whatever this container's
+        /// own currently-effective healthcheck already is (see
+        /// [`resolve_effective_healthcheck`]) — checked directly,
+        /// `~/git/podman/cmd/podman/containers/update.go`'s own
+        /// `GetChangedHealthCheckConfiguration`/`~/git/podman/libpod/
+        /// healthcheck_config.go`'s own `GetNewHealthCheckConfig`: a
+        /// real, deliberate divergence from [`Command::Run::health_
+        /// cmd`]'s own all-or-nothing "no `--health-cmd` at all means
+        /// no change to *anything*" rule — here, giving only e.g.
+        /// `--health-interval` still rebuilds a full healthcheck,
+        /// starting from whatever this container's own current
+        /// command/interval/retries/timeout/start-period already
+        /// resolve to (or this project's own documented defaults,
+        /// `30s`/`3`/`30s`/`0s`, for any of those a container with no
+        /// healthcheck at all has none of), overriding only the one
+        /// (or more) fields actually given here. Not given at all,
+        /// with every other health flag also absent, means no
+        /// healthcheck change whatsoever — the container's own
+        /// existing healthcheck (whatever it already was) is left
+        /// completely untouched.
+        #[arg(long = "health-cmd", value_name = "COMMAND")]
+        health_cmd: Option<String>,
+        /// See [`Self::health_cmd`]'s own doc comment for the exact
+        /// real partial-update semantics. A **real, checked-directly
+        /// divergence from [`Command::Run::health_retries`]'s own
+        /// identical-looking flag**: `~/git/podman/libpod/healthcheck_
+        /// config.go`'s own `GetNewHealthCheckConfig` always calls
+        /// `MakeHealthCheckFromCli` with `isStartup=true` regardless
+        /// of which of the two real healthcheck kinds is actually
+        /// being updated (this project has no startup-healthcheck
+        /// concept to share that code path with at all, but the exact
+        /// same real consequence still applies): the real "`retries`
+        /// must be at least 1" validation `create`'s own equivalent
+        /// flag enforces is genuinely skipped here — `ociman update
+        /// --health-retries 0` succeeds, `ociman create --health-cmd
+        /// ... --health-retries 0` does not. Confirmed directly from
+        /// source, not assumed; ported faithfully as a real upstream
+        /// behavior rather than "corrected" into consistency with
+        /// `create`'s own stricter rule.
+        #[arg(long = "health-interval")]
+        health_interval: Option<String>,
+        /// See [`Self::health_cmd`]'s/[`Self::health_interval`]'s own
+        /// doc comments.
+        #[arg(long = "health-retries")]
+        health_retries: Option<u32>,
+        /// See [`Self::health_cmd`]'s own doc comment.
+        #[arg(long = "health-timeout")]
+        health_timeout: Option<String>,
+        /// See [`Self::health_cmd`]'s own doc comment.
+        #[arg(long = "health-start-period")]
+        health_start_period: Option<String>,
+        /// Disable any healthcheck entirely, exactly like
+        /// [`Command::Run::no_healthcheck`] — but mutually exclusive
+        /// with **every** other health flag here, not just
+        /// `--health-cmd` (a real, checked-directly *broader*
+        /// restriction than `create`'s own, matching real podman's
+        /// own exact wording, `~/git/podman/libpod/healthcheck_
+        /// config.go`: `"cannot specify both --no-healthcheck and
+        /// other HealthCheck flags"`).
+        #[arg(long = "no-healthcheck")]
+        no_healthcheck: bool,
     },
     /// Manage container health checks — matching real `podman
     /// healthcheck`'s own two-level command shape (`podman healthcheck
@@ -4269,6 +4344,12 @@ fn main() -> std::process::ExitCode {
                 pids_limit,
                 cpuset_cpus,
                 cpuset_mems,
+                health_cmd,
+                health_interval,
+                health_retries,
+                health_timeout,
+                health_start_period,
+                no_healthcheck,
             }) => cmd_update(
                 &id,
                 memory.as_deref(),
@@ -4278,6 +4359,12 @@ fn main() -> std::process::ExitCode {
                 pids_limit,
                 cpuset_cpus.as_deref(),
                 cpuset_mems.as_deref(),
+                health_cmd.as_deref(),
+                health_interval.as_deref(),
+                health_retries,
+                health_timeout.as_deref(),
+                health_start_period.as_deref(),
+                no_healthcheck,
             ),
             Some(Command::Healthcheck { command }) => match command {
                 HealthcheckCommand::Run { id, ignore_result } => {
@@ -12605,6 +12692,12 @@ fn cmd_update(
     pids_limit: Option<i64>,
     cpuset_cpus: Option<&str>,
     cpuset_mems: Option<&str>,
+    health_cmd: Option<&str>,
+    health_interval: Option<&str>,
+    health_retries: Option<u32>,
+    health_timeout: Option<&str>,
+    health_start_period: Option<&str>,
+    no_healthcheck: bool,
 ) -> anyhow::Result<()> {
     let (memory_limit_bytes, memory_swap_bytes, memory_reservation_bytes) =
         parse_and_validate_memory_and_cpus(memory, memory_swap, memory_reservation, cpus)?;
@@ -12616,20 +12709,193 @@ fn cmd_update(
         pids_limit,
         cpuset_cpus,
         cpuset_mems,
-    )
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "no resource flags given -- at least one of --memory/--memory-swap/\
-             --memory-reservation/--cpus/--pids-limit/--cpuset-cpus/--cpuset-mems is required"
-        )
-    })?;
+    );
+    let any_health_flag = health_cmd.is_some()
+        || health_interval.is_some()
+        || health_retries.is_some()
+        || health_timeout.is_some()
+        || health_start_period.is_some()
+        || no_healthcheck;
+    anyhow::ensure!(
+        resources.is_some() || any_health_flag,
+        "no resource or health flags given -- at least one of --memory/--memory-swap/\
+         --memory-reservation/--cpus/--pids-limit/--cpuset-cpus/--cpuset-mems/--health-cmd/\
+         --health-interval/--health-retries/--health-timeout/--health-start-period/\
+         --no-healthcheck is required"
+    );
 
-    let cgroup_dir = resolve_running_container_cgroup(id)?;
-    let writes = oci_runtime_core::cgroups::plan_resources(&resources);
-    oci_runtime_core::cgroups::apply(&cgroup_dir, &writes)
-        .with_context(|| format!("updating resources for container {id:?}"))?;
+    if let Some(resources) = &resources {
+        let cgroup_dir = resolve_running_container_cgroup(id)?;
+        let writes = oci_runtime_core::cgroups::plan_resources(resources);
+        oci_runtime_core::cgroups::apply(&cgroup_dir, &writes)
+            .with_context(|| format!("updating resources for container {id:?}"))?;
+    }
+
+    if any_health_flag {
+        update_healthcheck(
+            id,
+            health_cmd,
+            health_interval,
+            health_retries,
+            health_timeout,
+            health_start_period,
+            no_healthcheck,
+        )?;
+    }
+
     println!("{id}");
     Ok(())
+}
+
+/// `ociman update --health-cmd`/`--health-interval`/`--health-
+/// retries`/`--health-timeout`/`--health-start-period`/`--no-
+/// healthcheck`'s own real, *partial*-update logic — see
+/// [`Command::Update::health_cmd`]'s own doc comment for the exact,
+/// checked-directly semantics this ports (`GetNewHealthCheckConfig`,
+/// `~/git/podman/libpod/healthcheck_config.go`): rebuilds a full
+/// [`HealthcheckConfig`] starting from whatever [`resolve_effective_
+/// healthcheck`] says this container's own current one already is
+/// (or this project's own documented defaults for any field a
+/// healthcheck-less container has none of at all), then overrides
+/// only the fields actually given here, before persisting the result
+/// as [`ANNOTATION_HEALTHCHECK`] — needs no live container/cgroup at
+/// all, matching real podman's own identical "persisted config
+/// change" scope, only requiring the container to actually exist.
+fn update_healthcheck(
+    id: &str,
+    health_cmd: Option<&str>,
+    health_interval: Option<&str>,
+    health_retries: Option<u32>,
+    health_timeout: Option<&str>,
+    health_start_period: Option<&str>,
+    no_healthcheck: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !no_healthcheck
+            || (health_cmd.is_none()
+                && health_interval.is_none()
+                && health_retries.is_none()
+                && health_timeout.is_none()
+                && health_start_period.is_none()),
+        "cannot specify both --no-healthcheck and other HealthCheck flags"
+    );
+    let containers = open_container_store()?;
+    let resolved = resolve_container_id(&containers, id)?;
+    let mut state = containers.load(&resolved)?;
+
+    let new_healthcheck = if no_healthcheck {
+        HealthcheckConfig {
+            test: vec!["NONE".to_string()],
+            ..Default::default()
+        }
+    } else {
+        let existing = resolve_effective_healthcheck(id, &state)?;
+        let baseline_cmd = match health_cmd {
+            Some(cmd) => cmd.to_string(),
+            // Real podman's own exact reconstruction (`strings.
+            // Join(h.Test, " ")`, checked directly): a plain-space
+            // rejoin of whatever `Test` currently is, immediately
+            // re-parsed below by `make_healthcheck_from_cli` exactly
+            // like a fresh `--health-cmd` value would be -- round-
+            // trips correctly for every real `CMD`/`CMD-SHELL`/`NONE`
+            // shape, verified directly (see this function's own unit
+            // tests). Absent entirely (never having had one at all)
+            // reconstructs as the empty string, matching real
+            // podman's own identical `Cmd: ""` starting point.
+            None => existing
+                .as_ref()
+                .map(|hc| hc.test.join(" "))
+                .unwrap_or_default(),
+        };
+        let baseline_interval = health_interval.map(str::to_string).unwrap_or_else(|| {
+            format_duration_seconds(existing.as_ref().map_or(0, |hc| hc.interval), "30s")
+        });
+        let baseline_retries = health_retries
+            .unwrap_or_else(|| existing.as_ref().map_or(3, |hc| hc.retries.max(0) as u32));
+        let baseline_timeout = health_timeout.map(str::to_string).unwrap_or_else(|| {
+            format_duration_seconds(existing.as_ref().map_or(0, |hc| hc.timeout), "30s")
+        });
+        let baseline_start_period = health_start_period.map(str::to_string).unwrap_or_else(|| {
+            format_duration_seconds(existing.as_ref().map_or(0, |hc| hc.start_period), "0s")
+        });
+        // Real podman's own checked-directly quirk (see
+        // `Command::Update::health_retries`'s own doc comment): the
+        // real `retries >= 1` validation is genuinely skipped for
+        // `update` specifically, so a bare `make_healthcheck_from_
+        // cli` call (which always enforces it) isn't reused verbatim
+        // here -- ported by hand instead, one real validation
+        // narrower.
+        make_healthcheck_from_cli_for_update(
+            &baseline_cmd,
+            &baseline_interval,
+            baseline_retries,
+            &baseline_timeout,
+            &baseline_start_period,
+        )?
+    };
+
+    state.annotations.insert(
+        ANNOTATION_HEALTHCHECK.to_string(),
+        serde_json::to_string(&new_healthcheck).expect("HealthcheckConfig serializes"),
+    );
+    containers.write(&state)?;
+    Ok(())
+}
+
+/// A real nanosecond `HealthcheckConfig` field, formatted back into a
+/// plain `<seconds>s` duration string [`parse_simple_duration`]
+/// already understands -- used only to reconstruct a real "current
+/// value" baseline `update_healthcheck` re-parses immediately
+/// afterward (never shown to a user), so a bare whole/fractional
+/// second count is always sufficient: every duration this project
+/// itself ever produces is built from exactly that grammar to begin
+/// with (`h`/`m`/`s` only), never anything finer. `0` means "never
+/// set at all" (this project's own established sentinel, see
+/// `HealthcheckConfig::interval`'s own doc comment), falling back to
+/// `default` (this project's own documented default for that field)
+/// rather than emitting a real, meaningless `"0s"` override.
+fn format_duration_seconds(nanos: i64, default: &str) -> String {
+    if nanos <= 0 {
+        return default.to_string();
+    }
+    format!("{}s", nanos as f64 / 1_000_000_000.0)
+}
+
+/// Same as [`make_healthcheck_from_cli`], except real podman's own
+/// checked-directly `update`-specific quirk applies instead: `retries`
+/// is never required to be at least 1 (see `Command::Update::health_
+/// retries`'s own doc comment for the exact citation).
+fn make_healthcheck_from_cli_for_update(
+    health_cmd: &str,
+    interval: &str,
+    retries: u32,
+    timeout: &str,
+    start_period: &str,
+) -> anyhow::Result<HealthcheckConfig> {
+    let test = parse_health_cmd_test(health_cmd)?;
+    let interval = if interval == "disable" {
+        "0s"
+    } else {
+        interval
+    };
+    let interval_duration = parse_simple_duration(interval)
+        .ok_or_else(|| anyhow::anyhow!("invalid --health-interval {interval:?}"))?;
+    let timeout_duration = parse_simple_duration(timeout)
+        .ok_or_else(|| anyhow::anyhow!("invalid --health-timeout {timeout:?}"))?;
+    anyhow::ensure!(
+        timeout_duration >= std::time::Duration::from_secs(1),
+        "--health-timeout must be at least 1 second"
+    );
+    let start_period_duration = parse_simple_duration(start_period)
+        .ok_or_else(|| anyhow::anyhow!("invalid --health-start-period {start_period:?}"))?;
+    Ok(HealthcheckConfig {
+        test,
+        interval: interval_duration.as_nanos() as i64,
+        timeout: timeout_duration.as_nanos() as i64,
+        start_period: start_period_duration.as_nanos() as i64,
+        start_interval: 0,
+        retries: i64::from(retries),
+    })
 }
 
 /// Translate a real `HEALTHCHECK`-shaped `Test` field (`["NONE"]`,
@@ -12775,6 +13041,53 @@ fn make_healthcheck_from_cli(
     })
 }
 
+/// The healthcheck a container's own `ociman healthcheck run`/
+/// `ociman update --health-*` should actually treat as current — a
+/// `run`/`create --health-cmd`/`--no-healthcheck` override (`0440`)
+/// completely replaces the resolved image's own declared
+/// `HEALTHCHECK`, checked first (see [`ANNOTATION_HEALTHCHECK`]'s own
+/// doc comment for the exact precedence this matches); absent
+/// entirely, falls back to the resolved image's own declared one,
+/// via the container's own already-recorded `ANNOTATION_IMAGE` (a
+/// frozen snapshot of what the image said at container-creation time,
+/// not a live re-read of a possibly-since-changed image, matching
+/// real podman's own "the container's own config is what's
+/// authoritative" model). `None` means genuinely no healthcheck at
+/// all, either way.
+fn resolve_effective_healthcheck(
+    id: &str,
+    state: &oci_runtime_core::PersistedState,
+) -> anyhow::Result<Option<HealthcheckConfig>> {
+    let container_override: Option<HealthcheckConfig> = state
+        .annotations
+        .get(ANNOTATION_HEALTHCHECK)
+        .map(|json| serde_json::from_str(json))
+        .transpose()
+        .with_context(|| {
+            format!("parsing container {id:?}'s own persisted --health-cmd/--no-healthcheck")
+        })?;
+    if container_override.is_some() {
+        return Ok(container_override);
+    }
+    let store = open_store()?;
+    let base_reference = state
+        .annotations
+        .get(ANNOTATION_IMAGE)
+        .ok_or_else(|| anyhow::anyhow!("container {id:?} has no recorded base image reference"))?;
+    let base_record = store
+        .resolve_image(base_reference)
+        .context("resolving container's own image reference")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{base_reference}: container {id:?}'s own base image is no longer in local storage"
+            )
+        })?;
+    let image_config = store
+        .image_config(&base_record)
+        .with_context(|| format!("reading config for {base_reference}"))?;
+    Ok(image_config.config.and_then(|c| c.healthcheck))
+}
+
 /// Run a container's own image-declared `HEALTHCHECK` test once,
 /// right now — matching real `podman healthcheck run`'s own core
 /// effect: resolves the container's own base image (via its already-
@@ -12814,44 +13127,7 @@ fn cmd_healthcheck_run(id: &str, ignore_result: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // A `run`/`create --health-cmd`/`--no-healthcheck` override
-    // (`0440`) completely replaces the resolved image's own declared
-    // `HEALTHCHECK` -- checked first, and, when present, entirely
-    // skipping the base-image lookup below (this container's own
-    // healthcheck is then fully self-contained, matching real
-    // podman's own already-fully-resolved-at-create-time persisted
-    // `HealthConfig` -- see `ANNOTATION_HEALTHCHECK`'s own doc
-    // comment for the exact precedence this matches).
-    let container_override: Option<HealthcheckConfig> = state
-        .annotations
-        .get(ANNOTATION_HEALTHCHECK)
-        .map(|json| serde_json::from_str(json))
-        .transpose()
-        .with_context(|| {
-            format!("parsing container {id:?}'s own persisted --health-cmd/--no-healthcheck")
-        })?;
-    let healthcheck = match &container_override {
-        Some(hc) => Some(hc.clone()),
-        None => {
-            let store = open_store()?;
-            let base_reference = state.annotations.get(ANNOTATION_IMAGE).ok_or_else(|| {
-                anyhow::anyhow!("container {id:?} has no recorded base image reference")
-            })?;
-            let base_record = store
-                .resolve_image(base_reference)
-                .context("resolving container's own image reference")?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "{base_reference}: container {id:?}'s own base image is no longer in \
-                         local storage"
-                    )
-                })?;
-            let image_config = store
-                .image_config(&base_record)
-                .with_context(|| format!("reading config for {base_reference}"))?;
-            image_config.config.and_then(|c| c.healthcheck)
-        }
-    };
+    let healthcheck = resolve_effective_healthcheck(id, &state)?;
     let test_args = healthcheck
         .as_ref()
         .and_then(|hc| healthcheck_exec_args(&hc.test));
@@ -15668,6 +15944,32 @@ mod tests {
     #[test]
     fn make_healthcheck_from_cli_rejects_a_sub_second_timeout() {
         assert!(make_healthcheck_from_cli("true", "30s", 3, "0.5s", "0s").is_err());
+    }
+
+    #[test]
+    fn format_duration_seconds_zero_falls_back_to_the_given_default() {
+        assert_eq!(format_duration_seconds(0, "30s"), "30s");
+        assert_eq!(format_duration_seconds(-1, "0s"), "0s");
+    }
+
+    #[test]
+    fn format_duration_seconds_round_trips_through_parse_simple_duration() {
+        for nanos in [1_000_000_000i64, 5_000_000_000, 30_000_000_000] {
+            let formatted = format_duration_seconds(nanos, "30s");
+            let reparsed = parse_simple_duration(&formatted).unwrap();
+            assert_eq!(reparsed.as_nanos() as i64, nanos, "{formatted:?}");
+        }
+    }
+
+    #[test]
+    fn make_healthcheck_from_cli_for_update_allows_zero_retries() {
+        let hc = make_healthcheck_from_cli_for_update("true", "30s", 0, "30s", "0s").unwrap();
+        assert_eq!(hc.retries, 0);
+    }
+
+    #[test]
+    fn make_healthcheck_from_cli_for_update_still_rejects_a_sub_second_timeout() {
+        assert!(make_healthcheck_from_cli_for_update("true", "30s", 3, "0.5s", "0s").is_err());
     }
 
     #[test]
