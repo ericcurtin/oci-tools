@@ -627,6 +627,110 @@ fn rm_filter_combined_with_all_or_an_explicit_id_is_a_clear_error() {
     assert!(!with_id.status.success());
 }
 
+/// `rm --latest`/`-l` (matching real `podman rm --latest` exactly,
+/// checked directly against `~/git/podman/libpod/runtime_ctr.go`'s
+/// own `GetLatestContainer`): removes only the single, real most-
+/// recently-*created* container, leaving an earlier one completely
+/// untouched -- considers every container regardless of state, not
+/// merely running ones (a `Created`, never-started one still counts,
+/// exactly like real podman's own identical rule).
+#[test]
+fn rm_latest_removes_only_the_most_recently_created_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rm-latest:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    // `run` (foreground) never prints the container's own id on
+    // success (only its own output/exit code do) -- each new id is
+    // found by diffing `ps -a -q` against what's already known, the
+    // same technique this file's own `rm_all_removes_every_stopped_
+    // container` already established. Real, already-*Stopped*
+    // containers, not bare `create`: `rm` without `--force` refuses
+    // a merely-`Created` (never-started) one too.
+    let older = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/rm-latest:latest", "true"],
+    );
+    assert!(older.status.success(), "{older:?}");
+    let older_id = String::from_utf8_lossy(&ociman(storage_dir.path(), &["ps", "-a", "-q"]).stdout)
+        .trim()
+        .to_string();
+
+    // A real, distinguishable creation-time gap -- this project's own
+    // `created` timestamp has one-second resolution (RFC3339), the
+    // same real precision `ociman_prune.rs`'s own `sleep`-then-
+    // `until=1s` tests already have to account for.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let newer = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/rm-latest:latest", "true"],
+    );
+    assert!(newer.status.success(), "{newer:?}");
+    let ps_stdout = ociman(storage_dir.path(), &["ps", "-a", "-q"]).stdout;
+    let newer_id = String::from_utf8_lossy(&ps_stdout)
+        .lines()
+        .map(str::to_string)
+        .find(|id| id != &older_id)
+        .expect("a second container (the one just run) should now exist");
+
+    let rm = ociman(storage_dir.path(), &["rm", "--latest"]);
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&rm.stdout).trim(), newer_id);
+
+    let ps_after = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert_eq!(String::from_utf8_lossy(&ps_after.stdout).trim(), older_id);
+
+    // The short flag `-l` behaves identically.
+    let rm_short = ociman(storage_dir.path(), &["rm", "-l"]);
+    assert!(rm_short.status.success(), "{rm_short:?}");
+    let ps_final = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert!(String::from_utf8_lossy(&ps_final.stdout).trim().is_empty());
+}
+
+/// `rm --latest` on a genuinely empty store is a real, clear error,
+/// matching real `podman rm --latest`'s own `ErrNoSuchCtr`.
+#[test]
+fn rm_latest_on_an_empty_store_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let rm = ociman(storage_dir.path(), &["rm", "--latest"]);
+    assert!(!rm.status.success());
+}
+
+/// `--latest` cannot be combined with an explicit id, `--cidfile`,
+/// `--all`, or `--filter` -- matching real podman's own checked-
+/// directly `validate.CheckAllLatestAndIDFile` restriction exactly.
+#[test]
+fn rm_latest_combined_with_anything_else_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let with_all = ociman(storage_dir.path(), &["rm", "--latest", "--all"]);
+    assert!(!with_all.status.success());
+
+    let with_id = ociman(storage_dir.path(), &["rm", "--latest", "some-id"]);
+    assert!(!with_id.status.success());
+
+    let with_filter = ociman(
+        storage_dir.path(),
+        &["rm", "--latest", "--filter", "label=env=prod"],
+    );
+    assert!(!with_filter.status.success());
+}
+
 /// `rm --all` without `--force` still refuses a non-stopped container
 /// (real `podman rm --all` alone, without `--force`, leaves a running
 /// container untouched too) — but every *other* container is still

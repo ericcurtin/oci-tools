@@ -2300,6 +2300,20 @@ enum Command {
         /// first slice doesn't attempt that).
         #[arg(long = "filter")]
         filter: Vec<String>,
+        /// Act on the single, real most-recently-*created* container
+        /// instead of an explicit `ID`/`--name` — matching real
+        /// `podman rm --latest`/`-l` exactly (checked directly,
+        /// `~/git/podman/libpod/runtime_ctr.go`'s own
+        /// `GetLatestContainer`: the container with the latest
+        /// `CreatedTime` among *every* container regardless of
+        /// state, not merely running ones, and a real, immediate
+        /// error — matching real podman's own `ErrNoSuchCtr` — if
+        /// none exist at all). Mutually exclusive with an explicit
+        /// `ID`/`--name`, `--cidfile`, `--all`, and `--filter` — the
+        /// same real, checked-directly restriction real podman's own
+        /// `validate.CheckAllLatestAndIDFile` already enforces.
+        #[arg(short = 'l', long)]
+        latest: bool,
     },
     /// Copy files/directories between the local filesystem and a
     /// container (running or stopped), or between two containers —
@@ -3982,7 +3996,8 @@ fn main() -> std::process::ExitCode {
                 ignore,
                 time,
                 filter,
-            }) => cmd_rm(&ids, force, all, &cidfile, ignore, time, &filter),
+                latest,
+            }) => cmd_rm(&ids, force, all, &cidfile, ignore, time, &filter, latest),
             Some(Command::Cp {
                 src,
                 dest,
@@ -9275,6 +9290,28 @@ fn resolve_container_created(
     })
 }
 
+/// Resolves to the id of the single, real most-recently-*created*
+/// container in `containers` — matching real podman's own checked-
+/// directly `Runtime.GetLatestContainer` exactly
+/// (`~/git/podman/libpod/runtime_ctr.go`): considers *every*
+/// container regardless of state (never just running ones), compared
+/// by real `CreatedTime`, and a real, immediate error (matching real
+/// podman's own `ErrNoSuchCtr`) if none exist at all. Shared by every
+/// `--latest`/`-l` this project ever grows (`ociman rm --latest`
+/// first, `0434`) so a future sibling command's own resolution can
+/// never silently drift from this one.
+fn resolve_latest_container(containers: &StateStore) -> anyhow::Result<String> {
+    containers
+        .list()
+        .context("listing containers")?
+        .into_iter()
+        .max_by_key(|state| {
+            oci_spec_types::time::parse_rfc3339_utc(&state.created).unwrap_or(std::time::UNIX_EPOCH)
+        })
+        .map(|state| state.id)
+        .ok_or_else(|| anyhow::anyhow!("--latest: no container has been created yet"))
+}
+
 /// The *earliest* creation time among every reference container in
 /// `references` -- matching real podman's own checked-directly rule
 /// for multiple `before=`/`since=` values (see `Command::Ps`'s own
@@ -9641,6 +9678,12 @@ fn format_container_size(size: &ContainerSizeView) -> String {
 /// "attempt every match, report the first real failure at the end"
 /// shape exactly but narrowed to only the containers
 /// [`matches_label_until_filters`] actually matches.
+///
+/// `--latest`/`-l` (see [`Command::Rm::latest`]'s own doc comment)
+/// resolves to [`resolve_latest_container`]'s own single id, then
+/// flows through the exact same single-target path an explicit `ID`
+/// already does — no separate removal logic of its own at all.
+#[allow(clippy::too_many_arguments)]
 fn cmd_rm(
     ids: &[String],
     force: bool,
@@ -9649,6 +9692,7 @@ fn cmd_rm(
     ignore: bool,
     time_secs: Option<u64>,
     filter: &[String],
+    latest: bool,
 ) -> anyhow::Result<()> {
     // Matches real `podman rm`'s own identical, checked-directly
     // restriction exactly (`~/git/podman/cmd/podman/containers/
@@ -9670,10 +9714,27 @@ fn cmd_rm(
         filter.is_empty() || (ids.is_empty() && cidfiles.is_empty() && !all),
         "--filter cannot be combined with a container ID/name, --cidfile, or --all"
     );
+    // `--latest`/`-l` -- matching real podman's own checked-directly
+    // `validate.CheckAllLatestAndIDFile` restriction exactly (see
+    // `Command::Rm::latest`'s own doc comment).
+    anyhow::ensure!(
+        !latest || (ids.is_empty() && cidfiles.is_empty() && !all && filter.is_empty()),
+        "--latest cannot be combined with a container ID/name, --cidfile, --all, or --filter"
+    );
     // Matches real `podman rm --force`'s own checked-directly
     // behavior exactly: forcing implies ignoring too, the same
     // convention `ociman rmi --force` already established.
     let ignore = ignore || force;
+
+    if latest {
+        let containers = open_container_store()?;
+        let id = resolve_latest_container(&containers)?;
+        if let Err(e) = remove_container(&containers, &id, force, time_secs, true) {
+            return Err(e).with_context(|| format!("removing container {id}"));
+        }
+        println!("{id}");
+        return Ok(());
+    }
 
     if !filter.is_empty() {
         let parsed = parse_label_until_filters("ociman rm", filter)?;
