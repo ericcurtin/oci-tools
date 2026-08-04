@@ -41,6 +41,54 @@ fn ociman_run_detached(
         .expect("failed to spawn ociman run")
 }
 
+/// Same as [`ociman_run_detached`], but with `--name` given *before*
+/// the image -- `RunArgs::args`'s own `trailing_var_arg = true`
+/// captures everything positional after the image into the
+/// container's own command, so `--name` must come first.
+fn ociman_run_detached_named(
+    storage_root: &Path,
+    name: &str,
+    image: &str,
+    container_args: &[&str],
+) -> std::process::Child {
+    Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_root)
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--name", name, image])
+        .args(container_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run")
+}
+
+fn wait_for_container_status_by_name(
+    storage_root: &Path,
+    name: &str,
+    want: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = ociman(storage_root, &["ps", "-a", "--json"]);
+        if out.status.success()
+            && let Ok(views) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            && let Some(entry) = views
+                .as_array()
+                .and_then(|a| a.iter().find(|e| e["name"] == name))
+        {
+            let status = entry["status"].as_str().unwrap_or_default().to_string();
+            if status == want || Instant::now() >= deadline {
+                return status;
+            }
+        } else if Instant::now() >= deadline {
+            return String::new();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn only_container_id(storage_root: &Path, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     loop {
@@ -500,4 +548,124 @@ fn stats_format_takes_priority_and_errors_on_an_unknown_field() {
     assert!(kill.status.success());
     run.wait().unwrap();
     ociman(storage_dir.path(), &["rm", &id]);
+}
+
+/// `ociman stats --latest`/`-l` (matching real `podman stats
+/// --latest` exactly) shows the single, real most-recently-*created*
+/// container's own stats -- an earlier container's own, genuinely
+/// different name must never be reported.
+#[test]
+fn stats_latest_shows_the_most_recently_created_containers_own_stats() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stats-latest:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut older = ociman_run_detached_named(
+        storage_dir.path(),
+        "stats-latest-older",
+        "ociman-test/stats-latest:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "stats-latest-older",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    // A real, distinguishable creation-time gap.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let mut newer = ociman_run_detached_named(
+        storage_dir.path(),
+        "stats-latest-newer",
+        "ociman-test/stats-latest:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "stats-latest-newer",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let stats = ociman(
+        storage_dir.path(),
+        &["stats", "--latest", "--no-stream", "--json"],
+    );
+    assert!(
+        stats.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stats.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(view["name"], "stats-latest-newer", "{view:?}");
+
+    ociman(storage_dir.path(), &["kill", "stats-latest-older"]);
+    ociman(storage_dir.path(), &["kill", "stats-latest-newer"]);
+    older.wait().ok();
+    newer.wait().ok();
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// `--latest` and an explicit container together is a real, immediate
+/// error, matching real podman's own exact wording.
+#[test]
+fn stats_latest_and_explicit_id_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["stats", "--latest", "some-id"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("--all, --latest and containers cannot be used together"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Neither `--latest` nor an explicit container at all is a real,
+/// immediate error -- this project's own honest, narrower-scope
+/// message, since real podman itself doesn't error here at all (it
+/// defaults to streaming every running container instead, a mode
+/// this project has never implemented).
+#[test]
+fn stats_with_no_container_and_no_latest_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["stats"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no container ID/name given"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `stats --latest` on a genuinely empty store is a real, clear
+/// error, matching real `podman stats --latest`'s own `ErrNoSuchCtr`.
+#[test]
+fn stats_latest_on_an_empty_store_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["stats", "--latest"]);
+    assert!(!out.status.success());
 }

@@ -3142,8 +3142,27 @@ enum Command {
     /// `--no-stream`'s one-shot sample) — see the `cmd_stats` doc
     /// comment for exactly how the stream ends.
     Stats {
-        /// The container's ID or `--name`.
-        id: String,
+        /// The container's ID or `--name` — omit when using
+        /// `--latest`.
+        id: Option<String>,
+        /// Show the single, real most-recently-*created* container's
+        /// own stats instead of naming one explicitly — matching
+        /// real `podman stats --latest`/`-l` exactly (see
+        /// [`Command::Rm::latest`]'s own doc comment for the exact,
+        /// checked-directly `GetLatestContainer` semantics this
+        /// shares verbatim). Mutually exclusive with an explicit
+        /// `ID`/`--name` — matching real podman's own checked-
+        /// directly `checkStatOptions` exactly (`~/git/podman/cmd/
+        /// podman/containers/stats.go`): `"--all, --latest and
+        /// containers cannot be used together"` (real podman's own
+        /// further `--all`, a genuinely separate, richer "stream
+        /// every running container's own stats" mode this project
+        /// has never implemented at all, isn't part of this
+        /// restriction here — a real, honest narrower-first-slice
+        /// scope, the same established precedent every other "first
+        /// slice" design note in this project already sets).
+        #[arg(short = 'l', long)]
+        latest: bool,
         /// A single, one-shot sample instead of a continuous stream
         /// — matching real `podman stats --no-stream` exactly.
         #[arg(long)]
@@ -4630,18 +4649,51 @@ fn main() -> std::process::ExitCode {
             },
             Some(Command::Stats {
                 id,
+                latest,
                 no_stream,
                 interval,
                 no_reset,
                 format,
-            }) => cmd_stats(
-                &id,
-                no_stream,
-                interval,
-                no_reset,
-                cli.global.json,
-                format.as_deref(),
-            ),
+            }) => {
+                // Matches real podman's own exact wording, checked
+                // directly (`~/git/podman/cmd/podman/containers/
+                // stats.go`'s own `checkStatOptions`).
+                anyhow::ensure!(
+                    !(latest && id.is_some()),
+                    "--all, --latest and containers cannot be used together"
+                );
+                let resolved_id = match id {
+                    Some(id) => id,
+                    None => {
+                        // Real podman's own bare `podman stats` (no
+                        // container, no `--latest`, no `--all`)
+                        // defaults to streaming *every* running
+                        // container's own stats instead of erroring
+                        // at all -- a genuinely richer mode this
+                        // project has never implemented (see
+                        // `Command::Stats::latest`'s own doc
+                        // comment), so there's no real, matching
+                        // upstream wording to cite here; this
+                        // project's own established "no target given"
+                        // convention (e.g. `ociman kill`'s identical
+                        // message shape) is used instead.
+                        anyhow::ensure!(
+                            latest,
+                            "no container ID/name given (try `ociman stats <ID>` or --latest)"
+                        );
+                        let containers = open_container_store()?;
+                        resolve_latest_container(&containers)?
+                    }
+                };
+                cmd_stats(
+                    &resolved_id,
+                    no_stream,
+                    interval,
+                    no_reset,
+                    cli.global.json,
+                    format.as_deref(),
+                )
+            }
             Some(Command::Wait {
                 ids,
                 latest,
