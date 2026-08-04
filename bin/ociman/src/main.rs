@@ -300,6 +300,27 @@ enum PsSortKey {
     Status,
 }
 
+/// `ociman images --sort`'s own sort key, matching real `podman
+/// images --sort` exactly — checked directly against `~/git/podman/
+/// cmd/podman/images/list.go`'s own `validate.Value` choice list
+/// (`created`/`id`/`repository`/`size`/`tag`, real podman's own
+/// `listFlag.sort = "created"` default applied even with no `--sort`
+/// flag given at all, matched here by [`Command::Images::sort`] being
+/// `Option<ImagesSortKey>` but `cmd_images` treating `None` exactly
+/// like `Some(Created)`). A real, deliberate asymmetry from
+/// [`PsSortKey`] (every one of *its* eight keys sorts ascending):
+/// checked directly against `sortImages`'s own `slices.SortFunc`,
+/// `created` alone sorts **descending** (newest first) — every other
+/// key here sorts ascending, matching `cmp.Compare` exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ImagesSortKey {
+    Created,
+    Id,
+    Repository,
+    Size,
+    Tag,
+}
+
 /// `ociman inspect --type`'s own resource kind, matching real `podman
 /// inspect --type`/`-t` exactly for the two kinds this project
 /// actually has (checked directly, `~/git/podman/cmd/podman/common/
@@ -1544,6 +1565,18 @@ enum Command {
         /// real, immediate error.
         #[arg(long = "format", value_name = "TEMPLATE")]
         format: Option<String>,
+        /// Sort the listed images — matching real `podman images
+        /// --sort` exactly, see [`ImagesSortKey`]'s own doc comment
+        /// for the full choice list and its own `created`-sorts-
+        /// descending, everything-else-ascending asymmetry. `None`
+        /// (no `--sort` given at all) is treated identically to
+        /// `Some(ImagesSortKey::Created)`, matching real podman's own
+        /// checked-directly default (`listFlag.sort = "created"`,
+        /// applied unconditionally before any flag parsing even
+        /// happens) — unlike [`Command::Ps::sort`] (0386), which has
+        /// no such always-on default of its own.
+        #[arg(long = "sort")]
+        sort: Option<ImagesSortKey>,
     },
     /// Remove an image from local storage, matching real `docker
     /// rmi`/`podman rmi`. Resolves by tag reference or by a real or
@@ -3827,6 +3860,9 @@ enum ImageCommand {
         /// Same as [`Command::Images::format`].
         #[arg(long = "format", value_name = "TEMPLATE")]
         format: Option<String>,
+        /// Same as [`Command::Images::sort`].
+        #[arg(long = "sort")]
+        sort: Option<ImagesSortKey>,
     },
     /// Real `podman image prune`'s own narrower equivalent of
     /// [`Command::Prune`] (`ociman prune`) — the exact same image
@@ -3966,7 +4002,8 @@ fn main() -> std::process::ExitCode {
                 quiet,
                 filter,
                 format,
-            }) => cmd_images(quiet, cli.global.json, &filter, format.as_deref()),
+                sort,
+            }) => cmd_images(quiet, cli.global.json, &filter, format.as_deref(), sort),
             Some(Command::Rmi {
                 references,
                 force,
@@ -4202,7 +4239,8 @@ fn main() -> std::process::ExitCode {
                     quiet,
                     filter,
                     format,
-                } => cmd_images(quiet, cli.global.json, &filter, format.as_deref()),
+                    sort,
+                } => cmd_images(quiet, cli.global.json, &filter, format.as_deref(), sort),
                 ImageCommand::Prune { all, filter } => {
                     cmd_image_prune(cli.global.json, all, &filter)
                 }
@@ -4343,6 +4381,10 @@ struct ImageView {
     size: u64,
     architecture: Option<String>,
     os: Option<String>,
+    /// The image config's own `created` field (RFC3339), if present --
+    /// see [`ImageSummary::created`]'s own doc comment. Used by
+    /// `ociman images`' own default/`--sort created` ordering (0438).
+    created: Option<String>,
 }
 
 impl ImageView {
@@ -4354,6 +4396,7 @@ impl ImageView {
             size: summary.size,
             architecture: summary.architecture,
             os: summary.os,
+            created: summary.created,
         }
     }
 }
@@ -5069,6 +5112,7 @@ fn cmd_images(
     json: bool,
     filter: &[String],
     format: Option<&str>,
+    sort: Option<ImagesSortKey>,
 ) -> anyhow::Result<()> {
     let store = open_store()?;
     let filters = parse_image_filters(filter)?;
@@ -5208,6 +5252,39 @@ fn cmd_images(
         let digest = view.digest.strip_prefix("sha256:").unwrap_or(&view.digest);
         digest[..digest.len().min(12)].to_string()
     };
+
+    // The exact same `<none>`/`<none>` split real podman's own
+    // `tokenRepoTag` gives an untagged image -- our own normalized
+    // reference always carries an explicit tag when tagged at all
+    // (see `Reference::parse`'s own doc comment), so this is a plain
+    // rightmost-colon split rather than a full re-parse.
+    let repo_and_tag = |view: &ImageView| -> (String, String) {
+        match &view.reference {
+            None => ("<none>".to_string(), "<none>".to_string()),
+            Some(reference) => match reference.rsplit_once(':') {
+                Some((repo, tag)) if !tag.contains('/') => (repo.to_string(), tag.to_string()),
+                _ => (reference.clone(), "<none>".to_string()),
+            },
+        }
+    };
+    // `--sort` (0438), matching real `podman images --sort` exactly
+    // (see `ImagesSortKey`'s own doc comment): real podman applies
+    // this unconditionally, defaulting to `created` even with no
+    // `--sort` flag given at all -- matched here by treating `None`
+    // identically to `Some(ImagesSortKey::Created)`.
+    match sort.unwrap_or(ImagesSortKey::Created) {
+        // Real podman's own checked-directly asymmetry: newest first,
+        // unlike every other key here.
+        ImagesSortKey::Created => views.sort_by(|a, b| b.created.cmp(&a.created)),
+        ImagesSortKey::Id => views.sort_by_key(short_digest),
+        ImagesSortKey::Repository => views.sort_by(|a, b| {
+            let (a_repo, a_tag) = repo_and_tag(a);
+            let (b_repo, b_tag) = repo_and_tag(b);
+            a_repo.cmp(&b_repo).then_with(|| a_tag.cmp(&b_tag))
+        }),
+        ImagesSortKey::Size => views.sort_by_key(|a| a.size),
+        ImagesSortKey::Tag => views.sort_by_key(|a| repo_and_tag(a).1),
+    }
 
     if let Some(template) = format {
         for view in &views {

@@ -414,11 +414,13 @@ fn images_filter_before_and_since_use_the_referenced_images_own_creation_time() 
         "--filter",
         "before=docker.io/library/img-3:latest",
     ]);
+    // Default order is newest-first (0438, matching real `podman
+    // images`' own always-on `--sort created` default).
     assert_eq!(
         before,
         vec![
-            "docker.io/library/img-1:latest".to_string(),
             "docker.io/library/img-2:latest".to_string(),
+            "docker.io/library/img-1:latest".to_string(),
         ],
         "{before:?}"
     );
@@ -433,8 +435,8 @@ fn images_filter_before_and_since_use_the_referenced_images_own_creation_time() 
     assert_eq!(
         since,
         vec![
-            "docker.io/library/img-2:latest".to_string(),
             "docker.io/library/img-3:latest".to_string(),
+            "docker.io/library/img-2:latest".to_string(),
         ],
         "{since:?}"
     );
@@ -1234,4 +1236,367 @@ fn images_format_takes_priority_and_errors_on_an_unknown_field() {
         "{}",
         String::from_utf8_lossy(&bad.stderr)
     );
+}
+
+/// `ociman images` with no `--sort` given at all defaults to
+/// newest-created-first, and an explicit `--sort created` gives the
+/// identical order — matching real `podman images`' own checked-
+/// directly always-on `listFlag.sort = "created"` default exactly
+/// (0438, see `ImagesSortKey`'s own doc comment). An image with no
+/// recorded `created` at all (`seed_image`-only, never built) sorts
+/// last, treated as the oldest possible image — the same real
+/// "absence sorts as oldest" convention `Option`'s own derived `Ord`
+/// already gives `Command::Ps::sort`'s own `Runningfor` key (0386).
+#[test]
+fn images_default_order_and_explicit_sort_created_are_both_newest_first() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/images-sort-created-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    // Three real, distinct images, spaced apart in real creation time
+    // -- same technique `images_filter_before_and_since_use_the_
+    // referenced_images_own_creation_time`'s own `build` closure
+    // already established.
+    let build = |tag: &str| {
+        let context_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            context_dir.path().join("Containerfile"),
+            format!("FROM ociman-test/images-sort-created-base:latest\nLABEL step={tag}\n"),
+        )
+        .unwrap();
+        let out = ociman(
+            storage_dir.path(),
+            &["build", "-t", tag, context_dir.path().to_str().unwrap()],
+        );
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+    };
+    build("img-x:latest");
+    build("img-y:latest");
+    build("img-z:latest");
+
+    let list_refs = |args: &[&str]| -> Vec<String> {
+        let out = ociman(storage_dir.path(), args);
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let view: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        view.as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["reference"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let expected = vec![
+        "docker.io/library/img-z:latest".to_string(),
+        "docker.io/library/img-y:latest".to_string(),
+        "docker.io/library/img-x:latest".to_string(),
+        "docker.io/ociman-test/images-sort-created-base:latest".to_string(),
+    ];
+
+    let default_order = list_refs(&["--json", "images"]);
+    assert_eq!(default_order, expected, "{default_order:?}");
+
+    let explicit_created = list_refs(&["--json", "images", "--sort", "created"]);
+    assert_eq!(explicit_created, expected, "{explicit_created:?}");
+}
+
+/// `ociman images --sort id` orders ascending by the same short,
+/// 12-hex-char digest prefix `-q`/the plain table's own `DIGEST`
+/// column already show, matching real `podman images --sort id`
+/// exactly (`imageReporter.ID()`, checked directly).
+#[test]
+fn images_sort_id_orders_ascending_by_short_digest() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/sort-id-a:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/sort-id-b:latest",
+        &busybox,
+        &["sh", "ls"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/sort-id-c:latest",
+        &busybox,
+        &["sh", "ls", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let list_digests = |args: &[&str]| -> Vec<String> {
+        let out = ociman(storage_dir.path(), args);
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let view: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        view.as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["digest"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let mut expected = list_digests(&["--json", "images"]);
+    expected.sort();
+
+    let actual = list_digests(&["--json", "images", "--sort", "id"]);
+    assert_eq!(actual, expected, "{actual:?}");
+}
+
+/// `ociman images --sort repository` orders ascending by repository,
+/// and (matching real `podman images --sort repository`'s own
+/// checked-directly tie-break exactly) ties on the same repository
+/// are broken by tag, also ascending.
+#[test]
+fn images_sort_repository_orders_ascending_and_ties_break_on_tag() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/sort-repo-zzz:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/sort-repo-aaa:zebra",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/sort-repo-aaa:alpha",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman(
+        storage_dir.path(),
+        &["--json", "images", "--sort", "repository"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let refs: Vec<String> = view
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["reference"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        refs,
+        vec![
+            "docker.io/ociman-test/sort-repo-aaa:alpha".to_string(),
+            "docker.io/ociman-test/sort-repo-aaa:zebra".to_string(),
+            "docker.io/ociman-test/sort-repo-zzz:latest".to_string(),
+        ],
+        "{refs:?}"
+    );
+}
+
+/// `ociman images --sort size` orders ascending by real byte count,
+/// matching real `podman images --sort size` exactly -- a real,
+/// checked-directly proof this is genuinely re-sorting by size, not
+/// coincidentally matching some other order: the three images' own
+/// reference names are deliberately *not* already in size order.
+#[test]
+fn images_sort_size_orders_ascending_by_byte_count() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    // Named so alphabetical ("a","b","c") order is *not* size order.
+    oci_tools_tests::seed_image_with_files(
+        &store,
+        "ociman-test/sort-size-b:latest",
+        &busybox,
+        &["sh"],
+        &[("data.bin", &[0u8; 100])],
+        ContainerConfig::default(),
+    );
+    oci_tools_tests::seed_image_with_files(
+        &store,
+        "ociman-test/sort-size-c:latest",
+        &busybox,
+        &["sh"],
+        &[("data.bin", &[0u8; 5000])],
+        ContainerConfig::default(),
+    );
+    oci_tools_tests::seed_image_with_files(
+        &store,
+        "ociman-test/sort-size-a:latest",
+        &busybox,
+        &["sh"],
+        &[("data.bin", &[0u8; 2000])],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman(storage_dir.path(), &["--json", "images", "--sort", "size"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let refs: Vec<String> = view
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["reference"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        refs,
+        vec![
+            "docker.io/ociman-test/sort-size-b:latest".to_string(),
+            "docker.io/ociman-test/sort-size-a:latest".to_string(),
+            "docker.io/ociman-test/sort-size-c:latest".to_string(),
+        ],
+        "{refs:?}"
+    );
+}
+
+/// `ociman images --sort tag` orders ascending by tag alone,
+/// regardless of repository -- matching real `podman images --sort
+/// tag` exactly.
+#[test]
+fn images_sort_tag_orders_ascending_by_tag_alone() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/sort-tag-zzz-repo:alpha",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/sort-tag-aaa-repo:zebra",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman(storage_dir.path(), &["--json", "images", "--sort", "tag"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let refs: Vec<String> = view
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["reference"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        refs,
+        vec![
+            // "alpha" < "zebra", even though its own repository
+            // ("zzz-repo") would sort *last* under `--sort
+            // repository` -- proving this genuinely sorts by tag
+            // alone, not repository-then-tag.
+            "docker.io/ociman-test/sort-tag-zzz-repo:alpha".to_string(),
+            "docker.io/ociman-test/sort-tag-aaa-repo:zebra".to_string(),
+        ],
+        "{refs:?}"
+    );
+}
+
+/// An unrecognized `--sort` value is a real, immediate clap parse
+/// error -- same shape `ociman ps --sort`'s own identical check
+/// already established (0386).
+#[test]
+fn images_sort_rejects_an_invalid_value() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["images", "--sort", "bogus"]);
+    assert!(!out.status.success());
+}
+
+/// `ociman image list --sort`/`ociman image ls --sort` (0430's own
+/// alias) accept and apply the identical `--sort` flag `ociman
+/// images` itself just gained (0438).
+#[test]
+fn image_list_sort_is_the_same_flag_images_sort_is() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/image-list-sort-b:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/image-list-sort-a:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let images = ociman(
+        storage_dir.path(),
+        &["--json", "images", "--sort", "repository"],
+    );
+    let image_list = ociman(
+        storage_dir.path(),
+        &["--json", "image", "list", "--sort", "repository"],
+    );
+    assert!(images.status.success());
+    assert!(image_list.status.success());
+    assert_eq!(images.stdout, image_list.stdout);
 }

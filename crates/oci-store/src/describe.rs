@@ -25,6 +25,12 @@ pub struct ImageSummary {
     pub architecture: Option<String>,
     /// OS from the image config, if the config blob is present.
     pub os: Option<String>,
+    /// The image config's own `created` field (RFC3339), if present --
+    /// used by `ociman images`' own default/`--sort created` ordering
+    /// (`0438`). Free to compute here: the config blob this comes from
+    /// is already parsed unconditionally for `architecture`/`os` above,
+    /// no extra blob read needed.
+    pub created: Option<String>,
 }
 
 impl Store {
@@ -75,6 +81,7 @@ impl Store {
             layer_count: manifest.layers.len(),
             architecture: config.as_ref().and_then(|c| c.architecture.clone()),
             os: config.as_ref().and_then(|c| c.os.clone()),
+            created: config.as_ref().and_then(|c| c.created.clone()),
         })
     }
 }
