@@ -40,6 +40,55 @@ fn images_quiet_prints_nothing_on_an_empty_store() {
     );
 }
 
+/// `ociman image list`/`ociman image ls` (0430) are real aliases for
+/// `ociman images` itself, matching real `podman image list`/`ls`'s
+/// own checked-directly identical `RunE`/flag set as top-level
+/// `podman images` exactly (`~/git/podman/cmd/podman/images/
+/// list.go`) -- byte-identical output for the same fixture state,
+/// not merely "close" or "similar".
+#[test]
+fn image_list_and_ls_are_byte_identical_aliases_for_images() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/image-list-alias:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let images = ociman(storage_dir.path(), &["images"]);
+    assert!(images.status.success());
+
+    let list = ociman(storage_dir.path(), &["image", "list"]);
+    assert!(
+        list.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert_eq!(list.stdout, images.stdout);
+
+    let ls = ociman(storage_dir.path(), &["image", "ls"]);
+    assert!(
+        ls.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ls.stderr)
+    );
+    assert_eq!(ls.stdout, images.stdout);
+
+    // The identical flag set works through the alias too, not just
+    // the bare default table.
+    let list_quiet = ociman(storage_dir.path(), &["image", "list", "-q"]);
+    let images_quiet = ociman(storage_dir.path(), &["images", "-q"]);
+    assert!(list_quiet.status.success());
+    assert_eq!(list_quiet.stdout, images_quiet.stdout);
+}
+
 #[test]
 fn images_quiet_prints_the_same_short_digest_the_plain_table_shows() {
     let Some(busybox) = busybox_path() else {

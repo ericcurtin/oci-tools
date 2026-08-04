@@ -2783,10 +2783,16 @@ enum Command {
         command: ContainerCommand,
     },
     /// `podman image`'s own subcommand family — see [`ImageCommand`]
-    /// for exactly which of its real subcommands this covers. Same
-    /// rationale as [`Command::Container`]'s own doc comment: `exists`
-    /// has no flat top-level alias in real docker/podman, so this
-    /// family exists solely to host it.
+    /// for exactly which of its real subcommands this covers.
+    /// `exists`/`prune` have no flat top-level alias in real docker/
+    /// podman at all (the same rationale [`Command::Container`]'s own
+    /// doc comment gives), so this family originally existed solely
+    /// to host those; `list`/`ls` (0430) is a real, genuine *alias*
+    /// for the already-existing flat [`Command::Images`] instead —
+    /// hosted here too since real `podman image list`/`ls` themselves
+    /// live under this exact same real subcommand family, not because
+    /// this project needed a new home for logic that didn't already
+    /// have one.
     Image {
         #[command(subcommand)]
         command: ImageCommand,
@@ -3660,6 +3666,28 @@ enum ImageCommand {
         /// The image's tag reference or real/short ID.
         name: String,
     },
+    /// `podman image list`'s own real alias for top-level `podman
+    /// images` — checked directly, `~/git/podman/cmd/podman/images/
+    /// list.go`: `imageListCmd` (`Aliases: []string{"ls"}`, `Parent:
+    /// imageCmd`) and `imagesCmd` (top-level) share the exact same
+    /// `RunE`/flag set verbatim, not two separately-maintained
+    /// implementations. Matched here identically: dispatches straight
+    /// into the same [`cmd_images`] `ociman images` itself already
+    /// calls, with the identical field set — see [`Command::Images`]'s
+    /// own doc comment for every flag's exact semantics, not repeated
+    /// here.
+    #[command(alias = "ls")]
+    List {
+        /// Same as [`Command::Images::quiet`].
+        #[arg(short, long)]
+        quiet: bool,
+        /// Same as [`Command::Images::filter`].
+        #[arg(short, long = "filter")]
+        filter: Vec<String>,
+        /// Same as [`Command::Images::format`].
+        #[arg(long = "format", value_name = "TEMPLATE")]
+        format: Option<String>,
+    },
     /// Real `podman image prune`'s own narrower equivalent of
     /// [`Command::Prune`] (`ociman prune`) — the exact same image
     /// removal, blob GC, and rootfs-cache GC passes
@@ -4002,6 +4030,11 @@ fn main() -> std::process::ExitCode {
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),
+                ImageCommand::List {
+                    quiet,
+                    filter,
+                    format,
+                } => cmd_images(quiet, cli.global.json, &filter, format.as_deref()),
                 ImageCommand::Prune { all, filter } => {
                     cmd_image_prune(cli.global.json, all, &filter)
                 }
