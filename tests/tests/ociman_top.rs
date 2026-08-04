@@ -235,3 +235,175 @@ fn top_on_an_unknown_container_is_a_clear_error() {
     let out = ociman(storage_dir.path(), &["top", "does-not-exist"]);
     assert!(!out.status.success());
 }
+
+/// `ociman top --latest`/`-l` (matching real `podman top --latest`
+/// exactly) shows the single, real most-recently-*created*
+/// container's own processes -- an earlier container's own, genuinely
+/// different command must never appear.
+#[test]
+fn top_latest_shows_only_the_most_recently_created_containers_own_processes() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/top-latest:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut older = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/top-latest:latest",
+        &["/bin/sh", "-c", "sleep 31"],
+    );
+    let older_id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!older_id.is_empty());
+    assert_eq!(
+        wait_for_container_status(
+            storage_dir.path(),
+            &older_id,
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    // A real, distinguishable creation-time gap.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let mut newer = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/top-latest:latest",
+        &["/bin/sh", "-c", "sleep 32"],
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let newer_id = loop {
+        let out = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+        let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        if let Some(id) = ids.iter().find(|id| *id != &older_id) {
+            break id.clone();
+        }
+        assert!(Instant::now() < deadline, "second container never appeared");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        wait_for_container_status(
+            storage_dir.path(),
+            &newer_id,
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let top = ociman(storage_dir.path(), &["top", "--latest"]);
+    assert!(
+        top.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&top.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&top.stdout);
+    assert!(
+        stdout.contains("sleep 32"),
+        "--latest must show the most recently created container's own processes: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("sleep 31"),
+        "--latest must never show an earlier container's own processes: {stdout:?}"
+    );
+
+    ociman(storage_dir.path(), &["kill", &older_id]);
+    ociman(storage_dir.path(), &["kill", &newer_id]);
+    older.wait().ok();
+    newer.wait().ok();
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// Real podman's own `top.go` has no explicit mutual-exclusivity
+/// check between `--latest` and further positional arguments at all
+/// (checked directly: `Args: cobra.ArbitraryArgs`) -- every element
+/// simply becomes a `ps` descriptor/argument when `--latest` is
+/// given, exactly like it would with an explicit container reference
+/// consumed first instead.
+#[test]
+fn top_latest_with_extra_args_passes_them_to_ps() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/top-latest-args:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/top-latest-args:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let top = ociman(storage_dir.path(), &["top", "--latest", "aux"]);
+    assert!(
+        top.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&top.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&top.stdout);
+    let header = stdout.lines().next().expect("a header line");
+    assert!(header.contains("USER"), "{header:?}");
+
+    ociman(storage_dir.path(), &["kill", &id]);
+    run.wait().ok();
+}
+
+/// Neither `--latest` nor an explicit container at all is a real,
+/// immediate error, matching real podman's own exact wording.
+#[test]
+fn top_with_no_container_and_no_latest_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["top"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("you must provide the name or id of a running container"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `top --latest` on a genuinely empty store is a real, clear error,
+/// matching real `podman top --latest`'s own `ErrNoSuchCtr`.
+#[test]
+fn top_latest_on_an_empty_store_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["top", "--latest"]);
+    assert!(!out.status.success());
+}

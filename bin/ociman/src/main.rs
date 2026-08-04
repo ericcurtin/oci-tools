@@ -3197,12 +3197,36 @@ enum Command {
     /// matching real `docker top`/`podman top`'s own `ps(1)`-passthrough
     /// mode (custom AIX-style format descriptors aren't supported).
     Top {
-        /// The container's ID or `--name`.
-        id: String,
-        /// Arguments passed straight through to the real host `ps`
-        /// binary (default: `-ef`).
+        /// The container's ID or `--name`, followed by any arguments
+        /// to pass straight through to the real host `ps` binary
+        /// (default: `-ef`) — combined into one positional list
+        /// rather than a separate `ID` field, for the identical real
+        /// reason [`Command::Exec::positional`]'s own doc comment
+        /// explains: which element is genuinely the container
+        /// reference depends on whether `--latest` was given at all,
+        /// matching real podman's own checked-directly manual
+        /// disambiguation (`~/git/podman/cmd/podman/containers/
+        /// top.go`). With `--latest` absent, the first element is the
+        /// container reference (a leading `/` stripped, the same
+        /// real docker-compatibility quirk `exec` already ports) and
+        /// every remaining element is passed to `ps`; with
+        /// `--latest`, every element here goes to `ps` instead, the
+        /// container coming from that flag alone.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        ps_args: Vec<String>,
+        positional: Vec<String>,
+        /// Show the single, real most-recently-*created* container's
+        /// own processes instead of naming one explicitly — matching
+        /// real `podman top --latest`/`-l` exactly (see
+        /// [`Command::Rm::latest`]'s own doc comment for the exact,
+        /// checked-directly `GetLatestContainer` semantics this
+        /// shares verbatim). Mutually exclusive with giving an
+        /// explicit container reference as this command's own first
+        /// positional element — matching real podman's own exact
+        /// error wording for giving neither this nor an explicit
+        /// container at all (checked directly): `"you must provide
+        /// the name or id of a running container"`.
+        #[arg(short = 'l', long)]
+        latest: bool,
     },
     /// Run an additional process inside an already-running container,
     /// joining its existing namespaces.
@@ -4530,7 +4554,23 @@ fn main() -> std::process::ExitCode {
                 ignore,
             }) => cmd_wait(&ids, interval, &condition, ignore),
             Some(Command::Rename { id, name }) => cmd_rename(&id, &name),
-            Some(Command::Top { id, ps_args }) => cmd_top(&id, &ps_args),
+            Some(Command::Top { positional, latest }) => {
+                // Manual disambiguation, matching real podman's own
+                // checked-directly `top.go` exactly -- see
+                // `Command::Top::positional`'s own doc comment.
+                let (id, ps_args) = if latest {
+                    let containers = open_container_store()?;
+                    (resolve_latest_container(&containers)?, positional)
+                } else {
+                    let mut iter = positional.into_iter();
+                    let first = iter.next().ok_or_else(|| {
+                        anyhow::anyhow!("you must provide the name or id of a running container")
+                    })?;
+                    let id = first.strip_prefix('/').unwrap_or(&first).to_string();
+                    (id, iter.collect::<Vec<String>>())
+                };
+                cmd_top(&id, &ps_args)
+            }
             Some(Command::Exec {
                 positional,
                 latest,
