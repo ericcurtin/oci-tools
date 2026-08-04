@@ -865,3 +865,123 @@ fn kill_multiple_cidfiles_are_all_merged_into_the_same_target_list() {
         "stopped"
     );
 }
+
+/// `ociman kill --latest`/`-l` (matching real `podman kill --latest`
+/// exactly) signals only the single, real most-recently-*created*
+/// container -- an earlier one, even one in the exact same running
+/// state, must be left completely untouched.
+#[test]
+fn kill_latest_kills_only_the_most_recently_created_running_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/kill-latest:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut older = ociman_run_detached_named(
+        storage_dir.path(),
+        "kill-latest-older",
+        "ociman-test/kill-latest:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-latest-older",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    // A real, distinguishable creation-time gap.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let mut newer = ociman_run_detached_named(
+        storage_dir.path(),
+        "kill-latest-newer",
+        "ociman-test/kill-latest:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-latest-newer",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let kill = ociman(storage_dir.path(), &["kill", "--latest"]);
+    assert!(
+        kill.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&kill.stderr)
+    );
+
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-latest-newer",
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped",
+        "the most recently created container should have been killed by --latest"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "kill-latest-older",
+            "running",
+            Duration::from_millis(200)
+        ),
+        "running",
+        "an earlier container must be left completely untouched by --latest"
+    );
+
+    newer.wait().ok();
+    ociman(storage_dir.path(), &["kill", "kill-latest-older"]);
+    older.wait().ok();
+}
+
+/// `kill --latest` on a genuinely empty store is a real, clear error,
+/// matching real `podman kill --latest`'s own `ErrNoSuchCtr`.
+#[test]
+fn kill_latest_on_an_empty_store_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let kill = ociman(storage_dir.path(), &["kill", "--latest"]);
+    assert!(!kill.status.success());
+}
+
+/// `--latest` cannot be combined with an explicit id, `--cidfile`, or
+/// `--all` -- matching real podman's own checked-directly
+/// `validate.CheckAllLatestAndIDFile` restriction exactly.
+#[test]
+fn kill_latest_combined_with_anything_else_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let with_all = ociman(storage_dir.path(), &["kill", "--latest", "--all"]);
+    assert!(!with_all.status.success());
+
+    let with_id = ociman(storage_dir.path(), &["kill", "--latest", "some-id"]);
+    assert!(!with_id.status.success());
+
+    let cidfile = storage_dir.path().join("cid");
+    std::fs::write(&cidfile, "whatever").unwrap();
+    let with_cidfile = ociman(
+        storage_dir.path(),
+        &["kill", "--latest", "--cidfile", cidfile.to_str().unwrap()],
+    );
+    assert!(!with_cidfile.status.success());
+}

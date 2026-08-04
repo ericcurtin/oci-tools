@@ -2809,6 +2809,26 @@ enum Command {
         /// already use. Mutually exclusive with `--all`.
         #[arg(long = "cidfile", value_name = "FILE")]
         cidfile: Vec<PathBuf>,
+        /// Kill the single, real most-recently-*created* container
+        /// instead of naming one explicitly — matching real `podman
+        /// kill --latest`/`-l` exactly (see [`Command::Rm::latest`]'s
+        /// own doc comment for the exact, checked-directly
+        /// `GetLatestContainer` semantics this shares verbatim).
+        /// Merges into the same target list an explicit `ID`/`--name`
+        /// argument and `--cidfile` already build, right after the
+        /// `--cidfile` merge — the identical `stop`/`restart
+        /// --latest` shape (`0435`/`0436`), not `pause`/`unpause
+        /// --latest`'s own separate non-tolerant branch (`0437`):
+        /// `kill`'s own single/multi-target path was already never
+        /// tolerant of an ineligible container before `--latest`
+        /// existed at all (only its own separate `--all` branch is),
+        /// so simply riding that same existing path already gives
+        /// `--latest` the correct, real, reported-error behavior for
+        /// a not-currently-killable latest container with no extra
+        /// branching needed. Mutually exclusive with an explicit
+        /// `ID`/`--name`, `--cidfile`, and `--all`.
+        #[arg(short = 'l', long)]
+        latest: bool,
     },
     /// Pause all processes in one or more running containers via the
     /// real cgroup v2 freezer — matching real `podman pause` exactly,
@@ -4357,7 +4377,8 @@ fn main() -> std::process::ExitCode {
                 signal,
                 all,
                 cidfile,
-            }) => cmd_kill(&ids, &signal, all, &cidfile),
+                latest,
+            }) => cmd_kill(&ids, &signal, all, &cidfile, latest),
             Some(Command::Pause {
                 ids,
                 all,
@@ -12215,7 +12236,13 @@ fn restart_one(
 /// command's own existing single-target convention: `RawInput`, not
 /// the resolved canonical id, same as real podman's own CLI-level
 /// `fmt.Println(r.RawInput)`).
-fn cmd_kill(ids: &[String], signal: &str, all: bool, cidfiles: &[PathBuf]) -> anyhow::Result<()> {
+fn cmd_kill(
+    ids: &[String],
+    signal: &str,
+    all: bool,
+    cidfiles: &[PathBuf],
+    latest: bool,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         cidfiles.is_empty() || !all,
         "--all and --cidfile cannot be used together"
@@ -12227,11 +12254,22 @@ fn cmd_kill(ids: &[String], signal: &str, all: bool, cidfiles: &[PathBuf]) -> an
     // all, so an unreadable cidfile is always a hard error -- the
     // same convention `pause`/`unpause --cidfile` already established
     // (0320).
+    // `--latest`/`-l` -- matching real podman's own checked-directly
+    // `validate.AddLatestFlag` restriction exactly (see
+    // `Command::Kill::latest`'s own doc comment).
+    anyhow::ensure!(
+        !latest || (ids.is_empty() && cidfiles.is_empty() && !all),
+        "--latest cannot be combined with a container ID/name, --cidfile, or --all"
+    );
     let mut ids: Vec<String> = ids.to_vec();
     for path in cidfiles {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("reading --cidfile {}", path.display()))?;
         ids.push(content.split('\n').next().unwrap_or("").to_string());
+    }
+    if latest {
+        let containers = open_container_store()?;
+        ids.push(resolve_latest_container(&containers)?);
     }
     let ids: &[String] = &ids;
 
