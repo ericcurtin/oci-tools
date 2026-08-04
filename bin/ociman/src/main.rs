@@ -2288,8 +2288,27 @@ enum Command {
     /// matching this project's own established "never accept a flag
     /// this command can't actually honor" convention.
     Attach {
-        /// The container's ID or `--name`.
-        id: String,
+        /// The container's ID or `--name` — omit when using
+        /// `--latest`.
+        id: Option<String>,
+        /// Attach to the single, real most-recently-*created*
+        /// container instead of naming one explicitly — matching
+        /// real `podman attach --latest`/`-l` exactly (see
+        /// [`Command::Rm::latest`]'s own doc comment for the exact,
+        /// checked-directly `GetLatestContainer` semantics this
+        /// shares verbatim). Checked directly, `~/git/podman/cmd/
+        /// podman/containers/attach.go`'s own `attach` function: a
+        /// real, deliberate divergence from most other siblings in
+        /// this rollout — like `ociman diff --latest` (`0448`), there
+        /// is **no** mutual-exclusivity check at all against an
+        /// explicit `ID`/`--name`; an explicit one, when given, always
+        /// wins outright regardless of this flag, never a real error.
+        /// Giving neither this nor an explicit `ID` at all is still a
+        /// real, immediate error (real podman's own exact wording:
+        /// `"attach requires the name or id of one running container
+        /// or the latest flag"`).
+        #[arg(short = 'l', long)]
+        latest: bool,
     },
     /// Restart a container: stop it first if it's currently running
     /// (same signal/timeout escalation as `ociman stop`), then start
@@ -4476,7 +4495,25 @@ fn main() -> std::process::ExitCode {
                 };
                 cmd_start(&resolved_id, attach)
             }
-            Some(Command::Attach { id }) => cmd_attach(&id),
+            Some(Command::Attach { id, latest }) => {
+                // An explicit `id` always wins over `--latest`
+                // outright, matching real podman's own checked-
+                // directly behavior exactly -- see `Command::Attach::
+                // latest`'s own doc comment.
+                let resolved_id = match id {
+                    Some(id) => id,
+                    None => {
+                        anyhow::ensure!(
+                            latest,
+                            "attach requires the name or id of one running container or the \
+                             latest flag"
+                        );
+                        let containers = open_container_store()?;
+                        resolve_latest_container(&containers)?
+                    }
+                };
+                cmd_attach(&resolved_id)
+            }
             Some(Command::Restart {
                 ids,
                 time,

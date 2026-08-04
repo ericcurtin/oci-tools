@@ -195,3 +195,199 @@ fn attach_of_an_unknown_container_is_a_clear_error() {
     let attach = ociman(storage_dir.path(), &["attach", "does-not-exist"]);
     assert!(!attach.status.success());
 }
+
+/// `ociman attach --latest`/`-l` (matching real `podman attach
+/// --latest` exactly) attaches to the single, real most-recently-
+/// *created* container -- an earlier container's own, genuinely
+/// different output must never appear.
+#[test]
+fn attach_latest_streams_the_most_recently_created_running_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/attach-latest-older:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo older-output; sleep 3".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    seed_image(
+        &store,
+        "ociman-test/attach-latest-newer:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo newer-output; sleep 3".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/attach-latest-older:latest",
+        &[],
+    );
+    let older_id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!older_id.is_empty());
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            &older_id,
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    // A real, distinguishable creation-time gap.
+    std::thread::sleep(Duration::from_secs(2));
+
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/attach-latest-newer:latest",
+        &[],
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let newer_id = loop {
+        let out = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+        let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        if let Some(id) = ids.iter().find(|id| *id != &older_id) {
+            break id.clone();
+        }
+        assert!(Instant::now() < deadline, "second container never appeared");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            &newer_id,
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    // Give the newer container's own `echo` a moment to have already
+    // produced real, captured output before attach ever reads it.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let attach = ociman(storage_dir.path(), &["attach", "--latest"]);
+    let stdout = String::from_utf8_lossy(&attach.stdout).into_owned();
+    assert!(
+        stdout.contains("newer-output"),
+        "--latest must stream the most recently created container's own output: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("older-output"),
+        "--latest must never stream an earlier container's own output: {stdout:?}"
+    );
+
+    ociman(storage_dir.path(), &["kill", &older_id]);
+    ociman(storage_dir.path(), &["kill", &newer_id]);
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// A real, deliberate divergence from most other siblings in this
+/// rollout: real podman's own checked-directly `attach` function has
+/// no mutual-exclusivity check at all between `--latest` and an
+/// explicit `ID` -- the explicit one always silently wins outright,
+/// never a real error, ported faithfully here too (the same real
+/// shape `ociman diff --latest`, `0448`, already established).
+#[test]
+fn attach_explicit_id_silently_wins_over_latest_when_both_given() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/attach-explicit-wins:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo explicit-output; exit 0".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/attach-explicit-wins:latest",
+        &[],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+
+    // `--latest` would still resolve to this exact same, only
+    // container here, but the point is that giving both together is
+    // not a real error at all.
+    let attach = ociman(storage_dir.path(), &["attach", "--latest", &id]);
+    assert!(
+        attach.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&attach.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&attach.stdout), "explicit-output\n");
+
+    ociman(storage_dir.path(), &["rm", &id]);
+}
+
+/// Neither `--latest` nor an explicit container at all is a real,
+/// immediate error, matching real podman's own exact wording.
+#[test]
+fn attach_with_no_id_and_no_latest_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["attach"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("attach requires the name or id of one running container or the latest flag"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `attach --latest` on a genuinely empty store is a real, clear
+/// error, matching real `podman attach --latest`'s own
+/// `ErrNoSuchCtr`.
+#[test]
+fn attach_latest_on_an_empty_store_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["attach", "--latest"]);
+    assert!(!out.status.success());
+}
