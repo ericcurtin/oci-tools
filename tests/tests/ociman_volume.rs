@@ -377,6 +377,108 @@ fn volume_ls_filter_after_and_since_use_the_referenced_volumes_own_creation_time
     );
 }
 
+/// `volume ls --filter dangling=true|false` (0413), matching real
+/// `podman volume ls --filter dangling=`'s own checked-directly
+/// `IsDangling` exactly -- whether any real container (running or
+/// stopped) currently uses the volume via a `--volume name:...`
+/// mount, reusing the exact same `containers_using_volume` this
+/// project's own `rm`/`prune`/`rename` dependency checks already
+/// share.
+#[test]
+fn volume_ls_filter_dangling_selects_only_unreferenced_or_only_referenced_volumes() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/volume-dangling-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    // A volume no container ever references.
+    let create_unused = ociman(storage_dir.path(), &["volume", "create", "dangling-unused"]);
+    assert!(create_unused.status.success(), "{create_unused:?}");
+
+    // A volume a real, persisted (never-started, but still recorded)
+    // container references -- `create` alone is enough, matching
+    // `containers_using_volume`'s own bundle-mount-based check, which
+    // needs no live/running process at all.
+    let create_ctr = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "dangling-in-use-ctr",
+            "-v",
+            "dangling-in-use:/data",
+            "ociman-test/volume-dangling-base:latest",
+            "true",
+        ],
+    );
+    assert!(
+        create_ctr.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create_ctr.stderr)
+    );
+
+    let list_dangling = |value: &str| -> Vec<String> {
+        let out = ociman(
+            storage_dir.path(),
+            &[
+                "volume",
+                "ls",
+                "--filter",
+                &format!("dangling={value}"),
+                "-q",
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        names.sort_unstable();
+        names
+    };
+
+    assert_eq!(list_dangling("true"), vec!["dangling-unused"]);
+    assert_eq!(list_dangling("false"), vec!["dangling-in-use"]);
+
+    // Real podman's own `0`/`1` shorthand works too.
+    assert_eq!(list_dangling("1"), vec!["dangling-unused"]);
+    assert_eq!(list_dangling("0"), vec!["dangling-in-use"]);
+
+    // Conflicting values is a clear error, matching this project's
+    // own already-established `prune`/`images --filter dangling=`
+    // convention.
+    let conflict = ociman(
+        storage_dir.path(),
+        &[
+            "volume",
+            "ls",
+            "--filter",
+            "dangling=true",
+            "--filter",
+            "dangling=false",
+        ],
+    );
+    assert!(!conflict.status.success());
+    assert!(
+        String::from_utf8_lossy(&conflict.stderr).contains("conflicting dangling filter values"),
+        "{conflict:?}"
+    );
+}
+
 /// `volume ls --format` (0335) renders one line per listed volume,
 /// reusing the exact same Go-template-*lite* engine `ociman
 /// inspect`/`ps`/`images --format` (`0332`-`0334`) already

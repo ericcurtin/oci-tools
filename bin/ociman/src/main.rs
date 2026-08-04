@@ -3199,9 +3199,24 @@ enum VolumeCommand {
         /// Function` exactly — the identical "earliest, for either
         /// key" rule `ociman ps --filter before=`/`since=` already
         /// established for containers, not `images`' own separate
-        /// earliest-for-`before`/latest-for-`since` rule). Multiple
-        /// `name=` values are OR'd together. May be given more than
-        /// once.
+        /// earliest-for-`before`/latest-for-`since` rule). Also
+        /// `dangling=true|false` (0413) — whether any real container
+        /// (running or stopped) currently uses the volume via a
+        /// `--volume name:...` mount, matching real `podman volume
+        /// ls --filter dangling=`'s own checked-directly `IsDangling`
+        /// exactly (`~/git/podman/libpod/volume.go`: no container
+        /// references it at all). Reuses the exact same shared
+        /// `try_parse_dangling_filter`/"conflicting dangling filter
+        /// values" convention `ociman prune`/`images --filter
+        /// dangling=` already established, rather than real podman's
+        /// own raw per-value-OR loop (a real, deliberate divergence:
+        /// giving both `true` and `false` together would otherwise be
+        /// a real, silent no-op matching every volume regardless,
+        /// exactly the kind of confusing input this project's own
+        /// established "conflicting values is a clear error" rule
+        /// already exists to catch for this same key everywhere
+        /// else). Multiple `name=` values are OR'd together. May be
+        /// given more than once.
         #[arg(long = "filter")]
         filter: Vec<String>,
     },
@@ -11725,14 +11740,16 @@ fn cmd_volume_ls(
         "quiet and format flags cannot be used together"
     );
     // `--filter name=<substring>` (0410)/`until=<duration-or-
-    // timestamp>` (0411)/`after=`/`since=` (0412) -- every given value
-    // parsed up front, `name=`/`after=`/`since=` values OR'd together,
-    // matching real `podman volume ls --filter`'s own combination
-    // rules (see `VolumeCommand::Ls::filter`'s own doc comment for the
-    // exact, checked-directly semantics).
+    // timestamp>` (0411)/`after=`/`since=` (0412)/`dangling=` (0413)
+    // -- every given value parsed up front, `name=`/`after=`/`since=`
+    // values OR'd together, matching real `podman volume ls
+    // --filter`'s own combination rules (see `VolumeCommand::Ls::
+    // filter`'s own doc comment for the exact, checked-directly
+    // semantics).
     let mut name_filters: Vec<String> = Vec::new();
     let mut until_filter: Option<std::time::SystemTime> = None;
     let mut after_references: Vec<String> = Vec::new();
+    let mut dangling_filter: Option<bool> = None;
     for f in filter {
         if let Some(value) = f.strip_prefix("name=") {
             anyhow::ensure!(
@@ -11755,10 +11772,18 @@ fn cmd_volume_ls(
                 "ociman volume ls: --filter {f:?} is missing a value"
             );
             after_references.push(value.to_string());
+        } else if let Some(result) = try_parse_dangling_filter("ociman volume ls", f) {
+            let value = result?;
+            anyhow::ensure!(
+                dangling_filter.is_none_or(|existing| existing == value),
+                "ociman volume ls: conflicting dangling filter values specified"
+            );
+            dangling_filter = Some(value);
         } else {
             anyhow::bail!(
                 "ociman volume ls: --filter {f:?} is not yet supported (only name=<substring>, \
-                 until=<duration-or-timestamp>, or after=<volume>/since=<volume> are)"
+                 until=<duration-or-timestamp>, after=<volume>/since=<volume>, or \
+                 dangling=true|false are)"
             );
         }
     }
@@ -11792,6 +11817,32 @@ fn cmd_volume_ls(
             oci_spec_types::time::parse_rfc3339_utc(&record.created_at)
                 .is_some_and(|created| threshold < created)
         });
+    }
+    if let Some(wanted) = dangling_filter {
+        // Matches real podman's own `IsDangling` exactly: no real
+        // container (running or stopped) currently uses the volume --
+        // reuses the exact same `containers_using_volume` this
+        // project's own `rm`/`prune`/`rename` dependency checks
+        // already establish, one call per volume, the same "no
+        // precomputed set" shape `cmd_volume_prune` itself already
+        // uses for the identical real question.
+        let containers = open_container_store()?;
+        let mut retain_error = None;
+        records.retain(|record| {
+            if retain_error.is_some() {
+                return false;
+            }
+            match containers_using_volume(&containers, &store, &record.name) {
+                Ok(dependents) => dependents.is_empty() == wanted,
+                Err(e) => {
+                    retain_error = Some(e);
+                    false
+                }
+            }
+        });
+        if let Some(e) = retain_error {
+            return Err(e);
+        }
     }
     if let Some(template) = format {
         for record in &records {
