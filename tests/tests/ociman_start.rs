@@ -1035,6 +1035,111 @@ fn restart_filter_combined_with_all_or_an_explicit_id_is_a_clear_error() {
     assert!(!with_id.status.success());
 }
 
+/// `restart --latest`/`-l` (matching real `podman restart --latest`
+/// exactly, see `Command::Rm::latest`'s own doc comment for the
+/// exact, checked-directly `GetLatestContainer` semantics this
+/// shares verbatim): acts only on the single, real most-recently-
+/// created container -- a never-started, latest one is started for
+/// the first time (its own `true` command runs and exits), leaving
+/// an earlier one completely untouched, still `created`.
+#[test]
+fn restart_latest_acts_only_on_the_most_recently_created_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/restart-latest:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let older = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "restart-latest-older",
+            "ociman-test/restart-latest:latest",
+            "true",
+        ],
+    );
+    assert!(older.status.success(), "{older:?}");
+
+    // A real, distinguishable creation-time gap -- this project's own
+    // `created` timestamp has one-second resolution (RFC3339).
+    std::thread::sleep(Duration::from_secs(2));
+
+    let newer = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "restart-latest-newer",
+            "ociman-test/restart-latest:latest",
+            "true",
+        ],
+    );
+    assert!(newer.status.success(), "{newer:?}");
+
+    let restart = ociman(storage_dir.path(), &["restart", "--latest"]);
+    assert!(
+        restart.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+
+    assert_eq!(
+        wait_for_status(
+            storage_dir.path(),
+            "restart-latest-newer",
+            "stopped",
+            Duration::from_secs(20)
+        ),
+        "stopped",
+        "the latest container should have been started for the first time"
+    );
+    assert_eq!(
+        inspect_json(storage_dir.path(), "restart-latest-older")["status"],
+        "created",
+        "an earlier container must be left completely untouched by --latest"
+    );
+}
+
+/// `restart --latest` on a genuinely empty store is a real, clear
+/// error, matching real `podman restart --latest`'s own
+/// `ErrNoSuchCtr`.
+#[test]
+fn restart_latest_on_an_empty_store_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let restart = ociman(storage_dir.path(), &["restart", "--latest"]);
+    assert!(!restart.status.success());
+}
+
+/// `--latest` cannot be combined with an explicit id, `--cidfile`,
+/// `--all`, or `--filter` -- matching real podman's own checked-
+/// directly `validate.CheckAllLatestAndIDFile` restriction exactly.
+#[test]
+fn restart_latest_combined_with_anything_else_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let with_all = ociman(storage_dir.path(), &["restart", "--latest", "--all"]);
+    assert!(!with_all.status.success());
+
+    let with_id = ociman(storage_dir.path(), &["restart", "--latest", "some-id"]);
+    assert!(!with_id.status.success());
+
+    let with_filter = ociman(
+        storage_dir.path(),
+        &["restart", "--latest", "--filter", "label=env=prod"],
+    );
+    assert!(!with_filter.status.success());
+}
+
 /// A genuinely paused container in the mix is now genuinely restarted
 /// by `--all` too (0324, closing the most-repeated "still ahead" item
 /// across six consecutive design notes) -- `cmd_restart` shares

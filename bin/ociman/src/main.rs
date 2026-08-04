@@ -2180,6 +2180,19 @@ enum Command {
         /// explains.
         #[arg(long = "filter")]
         filter: Vec<String>,
+        /// Act on the single, real most-recently-*created* container
+        /// instead of an explicit `ID`/`--name` — matching real
+        /// `podman restart --latest`/`-l` exactly (see
+        /// [`Command::Rm::latest`]'s own doc comment for the exact,
+        /// checked-directly `GetLatestContainer` semantics this
+        /// shares verbatim, `~/git/podman/cmd/podman/containers/
+        /// restart.go`'s own identical `validate.AddLatestFlag`).
+        /// Mutually exclusive with an explicit `ID`/`--name`,
+        /// `--cidfile`, `--all`, and `--filter` — the same real,
+        /// checked-directly restriction real podman's own
+        /// `validate.CheckAllLatestAndIDFile` already enforces.
+        #[arg(short = 'l', long)]
+        latest: bool,
     },
     /// Remove one or more stopped containers' storage — matching real
     /// `podman rm <ID> [ID...]` exactly. Refuses a still-running one
@@ -4000,7 +4013,8 @@ fn main() -> std::process::ExitCode {
                 all,
                 cidfile,
                 filter,
-            }) => cmd_restart(&ids, time, all, &cidfile, &filter),
+                latest,
+            }) => cmd_restart(&ids, time, all, &cidfile, &filter, latest),
             Some(Command::Rm {
                 ids,
                 force,
@@ -11524,12 +11538,20 @@ fn attach_and_wait_for_exit(containers: &StateStore, resolved: &str) -> anyhow::
 /// full container list already is, so it shares that same deferred-
 /// scope-reset handling automatically, with no filter-specific
 /// change to that logic needed at all.
+///
+/// `--latest`/`-l` (see [`Command::Restart::latest`]'s own doc
+/// comment) resolves to [`resolve_latest_container`]'s own single
+/// id, merged into the same target list an explicit `ID` already
+/// builds (the same convention `--cidfile`'s own merge already
+/// establishes) — no separate selection logic of its own at all.
+#[allow(clippy::too_many_arguments)]
 fn cmd_restart(
     ids: &[String],
     time_secs: Option<u64>,
     all: bool,
     cidfiles: &[PathBuf],
     filter: &[String],
+    latest: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         cidfiles.is_empty() || !all,
@@ -11542,6 +11564,13 @@ fn cmd_restart(
     anyhow::ensure!(
         filter.is_empty() || (ids.is_empty() && cidfiles.is_empty() && !all),
         "--filter cannot be combined with a container ID/name, --cidfile, or --all"
+    );
+    // `--latest`/`-l` -- matching real podman's own checked-directly
+    // `validate.CheckAllLatestAndIDFile` restriction exactly (see
+    // `Command::Restart::latest`'s own doc comment).
+    anyhow::ensure!(
+        !latest || (ids.is_empty() && cidfiles.is_empty() && !all && filter.is_empty()),
+        "--latest cannot be combined with a container ID/name, --cidfile, --all, or --filter"
     );
     if !filter.is_empty() {
         let parsed = parse_label_until_filters("ociman restart", filter)?;
@@ -11567,6 +11596,10 @@ fn cmd_restart(
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("reading --cidfile {}", path.display()))?;
         ids.push(content.split('\n').next().unwrap_or("").to_string());
+    }
+    if latest {
+        let containers = open_container_store()?;
+        ids.push(resolve_latest_container(&containers)?);
     }
 
     anyhow::ensure!(
