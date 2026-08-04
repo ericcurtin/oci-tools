@@ -3355,8 +3355,23 @@ enum Command {
     /// Print a container's captured stdout/stderr (combined, not kept
     /// separate — see `docs/design/0025`).
     Logs {
-        /// The container's ID or `--name`.
-        id: String,
+        /// The container's ID or `--name` — omit when using
+        /// `--latest`.
+        id: Option<String>,
+        /// Show the single, real most-recently-*created* container's
+        /// own log instead of naming one explicitly — matching real
+        /// `podman logs --latest`/`-l` exactly (see [`Command::Rm::
+        /// latest`]'s own doc comment for the exact, checked-directly
+        /// `GetLatestContainer` semantics this shares verbatim).
+        /// Mutually exclusive with an explicit `ID`/`--name` —
+        /// matching real podman's own exact error wording for both
+        /// directions of that restriction (checked directly, `~/git/
+        /// podman/cmd/podman/containers/logs.go`): `"--latest and
+        /// containers cannot be used together"`, and — giving
+        /// neither this nor an explicit container at all — `"specify
+        /// at least one container name or ID to log"`.
+        #[arg(short = 'l', long)]
+        latest: bool,
         /// Keep following the log as the container keeps producing
         /// more output, matching real `docker logs -f`/`podman
         /// logs -f` exactly: stops automatically once the container
@@ -4588,7 +4603,29 @@ fn main() -> std::process::ExitCode {
                     &args,
                 )
             }
-            Some(Command::Logs { id, follow, tail }) => cmd_logs(&id, follow, tail),
+            Some(Command::Logs {
+                id,
+                latest,
+                follow,
+                tail,
+            }) => {
+                // Matches real podman's own exact wording, checked
+                // directly (`~/git/podman/cmd/podman/containers/
+                // logs.go`).
+                anyhow::ensure!(
+                    !(latest && id.is_some()),
+                    "--latest and containers cannot be used together"
+                );
+                let resolved_id = if latest {
+                    let containers = open_container_store()?;
+                    resolve_latest_container(&containers)?
+                } else {
+                    id.ok_or_else(|| {
+                        anyhow::anyhow!("specify at least one container name or ID to log")
+                    })?
+                };
+                cmd_logs(&resolved_id, follow, tail)
+            }
             Some(Command::Save {
                 reference,
                 output,

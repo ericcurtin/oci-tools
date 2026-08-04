@@ -433,3 +433,108 @@ fn logs_tail_combined_with_follow_only_trims_the_initial_catch_up_read() {
     run.wait().unwrap();
     ociman(storage_dir.path(), &["rm", "--force", &id]);
 }
+
+/// `ociman logs --latest`/`-l` (matching real `podman logs --latest`
+/// exactly) shows the single, real most-recently-*created*
+/// container's own log -- an earlier container's own, genuinely
+/// different output must never appear.
+#[test]
+fn logs_latest_shows_the_most_recently_created_containers_own_log() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/logs-latest:latest",
+        &busybox,
+        &["sh", "echo"],
+        ContainerConfig::default(),
+    );
+
+    let older = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "ociman-test/logs-latest:latest",
+            "/bin/sh",
+            "-c",
+            "echo older-output",
+        ],
+    );
+    assert!(older.status.success(), "{older:?}");
+
+    // A real, distinguishable creation-time gap -- this project's own
+    // `created` timestamp has one-second resolution (RFC3339).
+    std::thread::sleep(Duration::from_secs(2));
+
+    let newer = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "ociman-test/logs-latest:latest",
+            "/bin/sh",
+            "-c",
+            "echo newer-output",
+        ],
+    );
+    assert!(newer.status.success(), "{newer:?}");
+
+    let logs = ociman(storage_dir.path(), &["logs", "--latest"]);
+    assert!(
+        logs.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&logs.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&logs.stdout).into_owned();
+    assert!(
+        stdout.contains("newer-output"),
+        "--latest must show the most recently created container's own log: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("older-output"),
+        "--latest must never show an earlier container's own log: {stdout:?}"
+    );
+}
+
+/// `--latest` and an explicit container together is a real, immediate
+/// error, matching real podman's own exact wording.
+#[test]
+fn logs_latest_and_explicit_id_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["logs", "--latest", "some-id"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("--latest and containers cannot be used together"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Neither `--latest` nor an explicit container at all is a real,
+/// immediate error, matching real podman's own exact wording.
+#[test]
+fn logs_with_neither_latest_nor_an_explicit_id_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["logs"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("specify at least one container name or ID to log"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `logs --latest` on a genuinely empty store is a real, clear error,
+/// matching real `podman logs --latest`'s own `ErrNoSuchCtr`.
+#[test]
+fn logs_latest_on_an_empty_store_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["logs", "--latest"]);
+    assert!(!out.status.success());
+}
