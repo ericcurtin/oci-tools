@@ -8589,3 +8589,95 @@ fn build_ulimit_with_an_unrecognized_name_is_a_clear_error() {
     );
     assert!(!build.status.success());
 }
+
+/// `ociman build --shm-size` (matching real `podman build --shm-size`
+/// exactly) applies a real, kernel-enforced tmpfs size cap to every
+/// `RUN` step's own `/dev/shm` -- the real tmpfs itself refusing a
+/// write past it with `ENOSPC`, the same real "prove the kernel
+/// enforces it" pattern `ociman run --shm-size`'s own test
+/// (`run_shm_size_actually_enforces_a_real_kernel_tmpfs_limit`)
+/// already established, ported here for `RUN` steps instead.
+#[test]
+fn build_shm_size_enforces_a_real_kernel_tmpfs_limit_for_run_steps() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-shm-size-base:latest",
+        &busybox,
+        &["sh", "dd"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-shm-size-base:latest\n\
+         RUN dd if=/dev/zero of=/dev/shm/f bs=1M count=4\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--shm-size",
+            "1m",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-shm-size-result:latest",
+        ],
+    );
+    assert!(
+        !build.status.success(),
+        "a 4 MiB write into a real 1 MiB /dev/shm during a RUN step must fail the build: {build:?}"
+    );
+}
+
+/// Without `--shm-size` at all, a `RUN` step's own `/dev/shm` keeps
+/// this project's own already-correct real default (`Spec::example`'s
+/// own `size=65536k`), matching real `docker build`/`podman build`'s
+/// own identical default -- a regression guard against `run_step_
+/// spec`'s own `--shm-size` handling accidentally always rewriting
+/// the mount even when nothing was given at all.
+#[test]
+fn build_without_shm_size_lets_a_run_step_write_well_past_one_megabyte_into_dev_shm() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-shm-size-default-base:latest",
+        &busybox,
+        &["sh", "dd"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-shm-size-default-base:latest\n\
+         RUN dd if=/dev/zero of=/dev/shm/f bs=1M count=4\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-shm-size-default-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}

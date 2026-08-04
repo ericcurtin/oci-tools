@@ -230,6 +230,7 @@ pub fn cmd_build(
     unsetenv: &[String],
     unsetlabel: &[String],
     ulimit: &[String],
+    shm_size: Option<&str>,
     quiet: bool,
     json: bool,
     timestamp: Option<i64>,
@@ -277,6 +278,14 @@ pub fn cmd_build(
         .iter()
         .map(|u| crate::parse_ulimit(u).map(crate::clamp_ulimit_to_host))
         .collect::<anyhow::Result<Vec<_>>>()?;
+
+    // `--shm-size` — same reuse-the-existing-primitive shape as
+    // `--ulimit` just above: `ociman run`/`create --shm-size`'s own
+    // `parse_memory_limit` call, reused verbatim rather than a second
+    // implementation of the identical `go-units.RAMInBytes` grammar,
+    // applied to every `RUN` step's own `/dev/shm` mount (see `run_
+    // step_spec`'s own call site via `StageContext::shm_size_bytes`).
+    let shm_size_bytes = shm_size.map(crate::parse_memory_limit).transpose()?;
 
     let instructions = oci_dockerfile::parse(&text).map_err(|e| anyhow::anyhow!(e))?;
     let (meta_args, stages) =
@@ -484,6 +493,7 @@ pub fn cmd_build(
             dockerignore: &dockerignore,
             forced_mtime: timestamp,
             rlimits: &rlimits,
+            shm_size_bytes,
         };
         let force_rootfs = copy_from_targets.contains(&stage_index);
         // `--squash`/`--squash-all` only ever apply to the target
@@ -801,6 +811,18 @@ struct StageContext<'a> {
     /// buildah/pkg/cli/common.go`): unlike `ociman run --ulimit`,
     /// there is no per-stage/per-instruction override of any kind.
     rlimits: &'a [oci_spec_types::runtime::PosixRlimit],
+    /// `--shm-size`'s own parsed byte count, if given — carried here
+    /// for the same reason `rlimits` is: every `RUN` step already
+    /// threading `stage_ctx` through can reach it without yet another
+    /// parameter of its own. Rewrites every `RUN` step's own `/dev/
+    /// shm` tmpfs mount's `size=` option in place, matching real
+    /// `podman build --shm-size` exactly (checked directly,
+    /// `~/git/podman/vendor/go.podman.io/buildah/run_common.go`'s own
+    /// `setupSpecialMountSpecChanges(spec, b.CommonBuildOpts.
+    /// ShmSize)`, called from the shared per-`RUN`-invocation setup
+    /// function): build-wide, no per-stage/per-instruction override,
+    /// the same shape `rlimits` already established.
+    shm_size_bytes: Option<i64>,
 }
 
 impl StageContext<'_> {
@@ -1439,6 +1461,7 @@ fn apply_instruction(
                 quiet,
                 stage_ctx.forced_mtime,
                 stage_ctx.rlimits,
+                stage_ctx.shm_size_bytes,
             )?;
         }
         Instruction::Copy {
@@ -1675,6 +1698,7 @@ fn run_instruction(
     quiet: bool,
     forced_mtime: Option<i64>,
     rlimits: &[oci_spec_types::runtime::PosixRlimit],
+    shm_size_bytes: Option<i64>,
 ) -> anyhow::Result<()> {
     let args = args_for_run(shell_or_exec, current_shell);
     let command_text = args.join(" ");
@@ -1715,8 +1739,15 @@ fn run_instruction(
             .with_context(|| format!("reusing cached layer for RUN {command_text}"));
     }
 
-    let spec = run_step_spec(config, rootfs, args.clone(), &arg_overlay, rlimits)
-        .with_context(|| format!("preparing RUN {command_text}"))?;
+    let spec = run_step_spec(
+        config,
+        rootfs,
+        args.clone(),
+        &arg_overlay,
+        rlimits,
+        shm_size_bytes,
+    )
+    .with_context(|| format!("preparing RUN {command_text}"))?;
     let bundle_dir = rootfs
         .parent()
         .expect("rootfs is always a `rootfs` subdirectory of its own bundle directory");
@@ -1864,6 +1895,7 @@ fn run_step_spec(
     args: Vec<String>,
     arg_overlay: &[(String, String)],
     rlimits: &[oci_spec_types::runtime::PosixRlimit],
+    shm_size_bytes: Option<i64>,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -1898,6 +1930,23 @@ fn run_step_spec(
     // already sets, reused verbatim here for a `RUN` step's own
     // process instead.
     process.rlimits = rlimits.to_vec();
+    // `--shm-size` (matching real `podman build --shm-size` exactly,
+    // see `StageContext::shm_size_bytes`'s own doc comment) — the
+    // exact same "rewrite `Spec::example()`'s own already-present
+    // `/dev/shm` tmpfs entry's own `size=` option in place" logic
+    // `ociman run/create --shm-size` (`synthesize_spec`, `main.rs`)
+    // already uses, reused here for a `RUN` step's own process
+    // instead.
+    if let Some(bytes) = shm_size_bytes
+        && let Some(shm) = spec.mounts.iter_mut().find(|m| m.destination == "/dev/shm")
+    {
+        shm.options.retain(|o| !o.starts_with("size="));
+        shm.options.push(format!("size={bytes}"));
+    }
+    let process = spec
+        .process
+        .as_mut()
+        .expect("Spec::example always sets process");
     process.env = if container_config.env.is_empty() {
         vec![crate::DEFAULT_ENV_WHEN_IMAGE_DECLARES_NONE.to_string()]
     } else {

@@ -1576,6 +1576,20 @@ enum Command {
         /// single, build-wide value.
         #[arg(long = "ulimit", value_name = "NAME=SOFT[:HARD]")]
         ulimit: Vec<String>,
+        /// Size of every `RUN` step's own `/dev/shm`, same real
+        /// `go-units.RAMInBytes` grammar as `ociman run/create
+        /// --shm-size` (reusing [`parse_memory_limit`] verbatim — see
+        /// its own doc comment) — matching real `podman build
+        /// --shm-size` exactly (checked directly, `~/git/podman/
+        /// vendor/go.podman.io/buildah/run_common.go`'s own
+        /// `setupSpecialMountSpecChanges(spec, b.CommonBuildOpts.
+        /// ShmSize)`): applies to every `RUN` step in every stage
+        /// alike, no per-stage/per-instruction override of any kind —
+        /// matching real podman's own identical single, build-wide
+        /// value, the same shape `--ulimit` just above already
+        /// established.
+        #[arg(long = "shm-size", allow_hyphen_values = true)]
+        shm_size: Option<String>,
         /// Refrain from announcing build progress — matching real
         /// `docker build -q`/`podman build --quiet` exactly (checked
         /// directly against a real installed `podman build -q`, three
@@ -4369,6 +4383,7 @@ fn main() -> std::process::ExitCode {
                 unsetenv,
                 unsetlabel,
                 ulimit,
+                shm_size,
                 quiet,
                 timestamp,
             }) => build::cmd_build(
@@ -4395,6 +4410,7 @@ fn main() -> std::process::ExitCode {
                 &unsetenv,
                 &unsetlabel,
                 &ulimit,
+                shm_size.as_deref(),
                 quiet,
                 cli.global.json,
                 timestamp,
