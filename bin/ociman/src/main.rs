@@ -3185,8 +3185,23 @@ enum VolumeCommand {
         /// `createUntilFilterVolumeFunction`, the identical shared
         /// `filters.ComputeUntilTimestamp` primitive); at most one
         /// value, matching real podman's own identical refusal of
-        /// more than one. Multiple `name=` values are OR'd together.
-        /// May be given more than once.
+        /// more than one. Also `after=<volume>`/`since=<volume>`
+        /// (0412, real checked-directly synonyms for the identical
+        /// filter — `~/git/podman/pkg/domain/filters/volumes.go`'s
+        /// own `case "after", "since":`) — matches a volume created
+        /// strictly after the *named* volume's own creation time; a
+        /// real, checked-directly asymmetry from `images`/`ps
+        /// --filter before=`/`since=`: real podman's own volume
+        /// filters have no `before=` key at all, only this one.
+        /// Multiple values use the *earliest* of all the given
+        /// reference volumes' own creation times (matching real
+        /// podman's own checked-directly `createAfterFilterVolume
+        /// Function` exactly — the identical "earliest, for either
+        /// key" rule `ociman ps --filter before=`/`since=` already
+        /// established for containers, not `images`' own separate
+        /// earliest-for-`before`/latest-for-`since` rule). Multiple
+        /// `name=` values are OR'd together. May be given more than
+        /// once.
         #[arg(long = "filter")]
         filter: Vec<String>,
     },
@@ -11652,6 +11667,50 @@ fn cmd_volume_create(name: Option<&str>, ignore: bool, json: bool) -> anyhow::Re
     Ok(())
 }
 
+/// Resolve `reference` (a volume name, `volume ls --filter after=`/
+/// `since=`'s own value) to its real, recorded creation time —
+/// matching real podman's own `runtime.LookupVolume(filterValue)`
+/// (`createAfterFilterVolumeFunction`).
+fn resolve_volume_created(
+    store: &volume::VolumeStore,
+    reference: &str,
+) -> anyhow::Result<std::time::SystemTime> {
+    let record = store
+        .get(reference)
+        .with_context(|| format!("resolving --filter after=/since= reference {reference:?}"))?
+        .ok_or_else(|| anyhow::anyhow!("--filter after=/since=: {reference}: no such volume"))?;
+    oci_spec_types::time::parse_rfc3339_utc(&record.created_at).ok_or_else(|| {
+        anyhow::anyhow!(
+            "volume {reference:?}'s own recorded creation time {:?} isn't a valid RFC3339 \
+             timestamp",
+            record.created_at
+        )
+    })
+}
+
+/// The *earliest* creation time among every reference volume in
+/// `references` — matching real podman's own checked-directly
+/// `createAfterFilterVolumeFunction` exactly (see `VolumeCommand::
+/// Ls::filter`'s own doc comment for exactly why "earliest" is
+/// correct for *both* keys here, unlike `images --filter before=`/
+/// `since=`'s own separate earliest/latest rule).
+fn earliest_referenced_volume_creation(
+    store: &volume::VolumeStore,
+    references: &[String],
+) -> anyhow::Result<std::time::SystemTime> {
+    references
+        .iter()
+        .map(|r| resolve_volume_created(store, r))
+        .try_fold(None::<std::time::SystemTime>, |earliest, created| {
+            let created = created?;
+            Ok(Some(match earliest {
+                Some(e) if e < created => e,
+                _ => created,
+            }))
+        })
+        .map(|earliest| earliest.expect("references is non-empty when this is called"))
+}
+
 fn cmd_volume_ls(
     json: bool,
     format: Option<&str>,
@@ -11666,12 +11725,14 @@ fn cmd_volume_ls(
         "quiet and format flags cannot be used together"
     );
     // `--filter name=<substring>` (0410)/`until=<duration-or-
-    // timestamp>` (0411) -- every given value parsed up front, `name=`
-    // values OR'd together, matching real `podman volume ls --filter`'s
-    // own combination rules (see `VolumeCommand::Ls::filter`'s own doc
-    // comment for the exact, checked-directly semantics).
+    // timestamp>` (0411)/`after=`/`since=` (0412) -- every given value
+    // parsed up front, `name=`/`after=`/`since=` values OR'd together,
+    // matching real `podman volume ls --filter`'s own combination
+    // rules (see `VolumeCommand::Ls::filter`'s own doc comment for the
+    // exact, checked-directly semantics).
     let mut name_filters: Vec<String> = Vec::new();
     let mut until_filter: Option<std::time::SystemTime> = None;
+    let mut after_references: Vec<String> = Vec::new();
     for f in filter {
         if let Some(value) = f.strip_prefix("name=") {
             anyhow::ensure!(
@@ -11685,14 +11746,26 @@ fn cmd_volume_ls(
                 "ociman volume ls: more than one until filter specified"
             );
             until_filter = Some(parse_until_filter_value("ociman volume ls", f, rest)?);
+        } else if let Some(value) = f
+            .strip_prefix("after=")
+            .or_else(|| f.strip_prefix("since="))
+        {
+            anyhow::ensure!(
+                !value.is_empty(),
+                "ociman volume ls: --filter {f:?} is missing a value"
+            );
+            after_references.push(value.to_string());
         } else {
             anyhow::bail!(
-                "ociman volume ls: --filter {f:?} is not yet supported (only name=<substring> \
-                 or until=<duration-or-timestamp> are)"
+                "ociman volume ls: --filter {f:?} is not yet supported (only name=<substring>, \
+                 until=<duration-or-timestamp>, or after=<volume>/since=<volume> are)"
             );
         }
     }
     let store = open_volume_store()?;
+    let after_threshold = (!after_references.is_empty())
+        .then(|| earliest_referenced_volume_creation(&store, &after_references))
+        .transpose()?;
     let mut records = store.list().context("listing volumes")?;
     if !name_filters.is_empty() {
         records.retain(|record| name_filters.iter().any(|want| record.name.contains(want)));
@@ -11708,6 +11781,16 @@ fn cmd_volume_ls(
         records.retain(|record| {
             oci_spec_types::time::parse_rfc3339_utc(&record.created_at)
                 .is_some_and(|created| created < threshold)
+        });
+    }
+    if let Some(threshold) = after_threshold {
+        // Matches real podman's own `createTime.Before(v.CreatedTime())`
+        // exactly -- the mirror image of `until=`'s own strict
+        // comparison, same "absence over fabrication" treatment for
+        // an unparseable `created_at`.
+        records.retain(|record| {
+            oci_spec_types::time::parse_rfc3339_utc(&record.created_at)
+                .is_some_and(|created| threshold < created)
         });
     }
     if let Some(template) = format {

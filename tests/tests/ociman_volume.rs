@@ -306,6 +306,77 @@ fn volume_ls_filter_until_rejects_more_than_one_value() {
     );
 }
 
+/// `volume ls --filter after=`/`since=` (0412), matching real
+/// `podman volume ls --filter after=`/`since=` exactly -- real,
+/// checked-directly synonyms for the identical filter (unlike
+/// `images`/`ps --filter before=`/`since=`, real podman's own volume
+/// filters have no `before=` key at all). Matches a volume created
+/// strictly after the *named* volume's own creation time; multiple
+/// values use the *earliest* of all the given reference volumes' own
+/// creation times, the same rule `ociman ps --filter before=`/
+/// `since=` already established for containers.
+#[test]
+fn volume_ls_filter_after_and_since_use_the_referenced_volumes_own_creation_time() {
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let create = |name: &str| {
+        let out = ociman(storage_dir.path(), &["volume", "create", name]);
+        assert!(out.status.success(), "{out:?}");
+        std::thread::sleep(Duration::from_millis(1200));
+    };
+    create("after-vol-1");
+    create("after-vol-2");
+    create("after-vol-3");
+
+    let list_names = |args: &[&str]| -> Vec<String> {
+        let out = ociman(storage_dir.path(), args);
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        names.sort_unstable();
+        names
+    };
+
+    // `after=after-vol-1`: vol-2 and vol-3.
+    let after = list_names(&["volume", "ls", "--filter", "after=after-vol-1", "-q"]);
+    assert_eq!(after, vec!["after-vol-2", "after-vol-3"], "{after:?}");
+
+    // `since=` is a real, checked-directly synonym for `after=`.
+    let since = list_names(&["volume", "ls", "--filter", "since=after-vol-1", "-q"]);
+    assert_eq!(since, after, "{since:?}");
+
+    // Multiple values: the *earliest* of vol-2/vol-3's own creation
+    // times is vol-2's -- same result as `after=after-vol-1` alone.
+    let multi = list_names(&[
+        "volume",
+        "ls",
+        "--filter",
+        "after=after-vol-2",
+        "--filter",
+        "after=after-vol-1",
+        "-q",
+    ]);
+    assert_eq!(multi, after, "{multi:?}");
+
+    // An unresolvable reference volume is a clear error.
+    let bad_ref = ociman(
+        storage_dir.path(),
+        &["volume", "ls", "--filter", "after=does-not-exist"],
+    );
+    assert!(!bad_ref.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad_ref.stderr).contains("no such volume"),
+        "{bad_ref:?}"
+    );
+}
+
 /// `volume ls --format` (0335) renders one line per listed volume,
 /// reusing the exact same Go-template-*lite* engine `ociman
 /// inspect`/`ps`/`images --format` (`0332`-`0334`) already
