@@ -242,6 +242,42 @@ fn pull_with_tls_verify_false_succeeds_against_a_real_plain_http_registry() {
     );
 }
 
+/// `pull --quiet` (0428) still pulls correctly -- the spinner only
+/// ever draws to stderr and is already automatically hidden whenever
+/// stderr isn't a real terminal (true of this whole automated
+/// suite), so there's no separately observable output difference to
+/// assert on here, the same established limitation `ociman save
+/// --quiet`/`load --quiet`'s own tests (0417) already document; what
+/// *is* real and checkable is that the flag is accepted and the pull
+/// it performs is still correct.
+#[test]
+fn pull_quiet_still_pulls_correctly() {
+    let mock = start_mock_with_a_real_image();
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let pull = ociman(
+        storage_dir.path(),
+        &[
+            "pull",
+            "--quiet",
+            "--tls-verify=false",
+            &format!("{}/testrepo:latest", mock.addr),
+        ],
+    );
+    assert!(
+        pull.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&pull.stderr)
+    );
+
+    let images = ociman(storage_dir.path(), &["images"]);
+    assert!(
+        String::from_utf8_lossy(&images.stdout).contains(&format!("{}/testrepo", mock.addr)),
+        "{}",
+        String::from_utf8_lossy(&images.stdout)
+    );
+}
+
 #[test]
 fn pull_without_tls_verify_false_refuses_plain_http_by_default() {
     let mock = start_mock_with_a_real_image();

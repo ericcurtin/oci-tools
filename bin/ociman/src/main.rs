@@ -1061,6 +1061,18 @@ enum Command {
         /// when omitted, exactly as before this flag existed.
         #[arg(long, value_name = "os/arch[/variant]")]
         platform: Option<String>,
+        /// Suppress the progress spinner — matching real `podman
+        /// pull --quiet`/`docker pull --quiet` exactly (checked
+        /// directly, `~/git/podman/cmd/podman/images/pull.go`'s own
+        /// `if !pullOptions.Quiet { ... }`, gating the identical
+        /// progress-writer pattern already established for `ociman
+        /// save --quiet`/`load --quiet`, 0417). Only ever visibly
+        /// different on a real terminal — the spinner is already
+        /// automatically hidden whenever stderr isn't one, same as
+        /// every other spinner in this project. Never affects the
+        /// final digest/`--json` output either way.
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Push an already-stored image back to its own registry/
     /// repository/tag, matching real `docker push`/`podman push`'s
@@ -3677,7 +3689,14 @@ fn main() -> std::process::ExitCode {
                 reference,
                 tls_verify,
                 platform,
-            }) => cmd_pull(&reference, tls_verify, platform.as_deref(), cli.global.json),
+                quiet,
+            }) => cmd_pull(
+                &reference,
+                tls_verify,
+                platform.as_deref(),
+                quiet,
+                cli.global.json,
+            ),
             Some(Command::Push {
                 reference,
                 tls_verify,
@@ -4121,6 +4140,7 @@ fn cmd_pull(
     reference_str: &str,
     tls_verify: bool,
     platform: Option<&str>,
+    quiet: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let reference = Reference::parse(reference_str)
@@ -4130,8 +4150,9 @@ fn cmd_pull(
         .transpose()?
         .unwrap_or_else(Platform::host);
     let store = open_store()?;
-    let record: ImageRecord = pull_unconditionally(&store, &reference, tls_verify, &platform)
-        .with_context(|| format!("pulling {reference}"))?;
+    let record: ImageRecord =
+        pull_unconditionally(&store, &reference, tls_verify, &platform, quiet)
+            .with_context(|| format!("pulling {reference}"))?;
 
     let summary = store
         .image_summary(&record)
@@ -13149,7 +13170,13 @@ fn resolve_or_pull(
         pull_policy.into(),
         tls_verify,
         platform,
-        || pull_unconditionally(store, reference, tls_verify, platform),
+        // `false`: this implicit-pull path (`ociman run --pull`/
+        // `create`/`build`'s own `FROM`/`COPY --from=`) has no
+        // `--quiet` concept of its own -- always shows the spinner,
+        // exactly as before `ociman pull --quiet` (0428) existed.
+        // Scoped deliberately, not an oversight: only `ociman pull`
+        // itself gets to silence it.
+        || pull_unconditionally(store, reference, tls_verify, platform, false),
     )
     .map_err(|e| match e {
         oci_registry::PullError::NotFoundLocally { reference } => {
@@ -13163,13 +13190,22 @@ fn resolve_or_pull(
 /// its own `pull_policy` decides one is needed — a thin wrapper around
 /// the now-shared `oci_registry::pull_unconditionally` (0204) adding
 /// back `ociman`'s own progress spinner around the real pull.
+/// `quiet` (0428) suppresses it entirely, matching real `podman pull
+/// --quiet`'s own identical progress-writer gate exactly — the same
+/// `spinner_unless_quiet` primitive `ociman save --quiet`/`load
+/// --quiet` (0417) already established and already unit-tested,
+/// reused here for its third real call site.
 fn pull_unconditionally(
     store: &Store,
     reference: &Reference,
     tls_verify: bool,
     platform: &Platform,
+    quiet: bool,
 ) -> Result<ImageRecord, oci_registry::PullError> {
-    let progress = oci_cli_common::progress::spinner(format!("pulling {}", reference.familiar()));
+    let progress = oci_cli_common::progress::spinner_unless_quiet(
+        quiet,
+        format!("pulling {}", reference.familiar()),
+    );
     let result = oci_registry::pull_unconditionally(store, reference, tls_verify, platform);
     progress.finish_and_clear();
     result
