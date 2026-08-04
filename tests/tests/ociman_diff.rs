@@ -324,3 +324,129 @@ fn diff_is_a_clear_error_for_a_rootless_overlay_rootfs_container() {
         );
     }
 }
+
+/// `ociman diff --latest`/`-l` (matching real `podman diff --latest`
+/// exactly) shows the single, real most-recently-*created*
+/// container's own diff -- an earlier container's own, genuinely
+/// different change must never appear.
+#[test]
+fn diff_latest_shows_the_most_recently_created_containers_own_diff() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let older_id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/diff-latest-older:latest",
+        "echo hi > /older-file.txt",
+        true,
+    );
+
+    // A real, distinguishable creation-time gap.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/diff-latest-newer:latest",
+        "echo hi > /newer-file.txt",
+        true,
+    );
+
+    let diff = ociman(storage_dir.path(), &["diff", "--latest"]);
+    assert!(
+        diff.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&diff.stdout);
+    assert!(
+        stdout.contains("A /newer-file.txt"),
+        "--latest must show the most recently created container's own diff: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("older-file.txt"),
+        "--latest must never show an earlier container's own diff: {stdout:?}"
+    );
+
+    // Sanity: the explicit *older* id still resolves to its own,
+    // genuinely different diff too (both containers are independent,
+    // not accidentally merged).
+    let explicit = ociman(storage_dir.path(), &["diff", &older_id]);
+    assert!(
+        explicit.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+    let explicit_stdout = String::from_utf8_lossy(&explicit.stdout);
+    assert!(
+        explicit_stdout.contains("A /older-file.txt"),
+        "{explicit_stdout:?}"
+    );
+}
+
+/// A real, deliberate divergence from every other sibling in this
+/// rollout: real podman's own checked-directly `diffRun`/`Diff` has
+/// no mutual-exclusivity check at all between `--latest` and an
+/// explicit `ID` -- the explicit one always silently wins outright,
+/// never a real error, ported faithfully here too.
+#[test]
+fn diff_explicit_id_silently_wins_over_latest_when_both_given() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let older_id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/diff-latest-explicit-wins-older:latest",
+        "echo hi > /older-file.txt",
+        true,
+    );
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let _newer_id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/diff-latest-explicit-wins-newer:latest",
+        "echo hi > /newer-file.txt",
+        true,
+    );
+
+    // `--latest` would resolve to the *newer* container, but the
+    // explicit `older_id` given alongside it must win instead.
+    let diff = ociman(storage_dir.path(), &["diff", "--latest", &older_id]);
+    assert!(
+        diff.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&diff.stdout);
+    assert!(
+        stdout.contains("A /older-file.txt"),
+        "the explicit id must win over --latest: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("newer-file.txt"),
+        "the explicit id must win over --latest: {stdout:?}"
+    );
+}
+
+/// Neither `--latest` nor an explicit container at all is a real,
+/// immediate error.
+#[test]
+fn diff_with_no_id_and_no_latest_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["diff"]);
+    assert!(!out.status.success());
+}
+
+/// `diff --latest` on a genuinely empty store is a real, clear error,
+/// matching real `podman diff --latest`'s own `ErrNoSuchCtr`.
+#[test]
+fn diff_latest_on_an_empty_store_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["diff", "--latest"]);
+    assert!(!out.status.success());
+}

@@ -2490,8 +2490,27 @@ enum Command {
     /// the one real, checked-directly gap this shares with `ociman
     /// cp` (a rootless-overlay-rootfs container isn't supported yet).
     Diff {
-        /// The container's ID or `--name`.
-        id: String,
+        /// The container's ID or `--name` — omit when using
+        /// `--latest`.
+        id: Option<String>,
+        /// Show the single, real most-recently-*created* container's
+        /// own diff instead of naming one explicitly — matching real
+        /// `podman diff --latest`/`-l` exactly (see [`Command::Rm::
+        /// latest`]'s own doc comment for the exact, checked-directly
+        /// `GetLatestContainer` semantics this shares verbatim).
+        /// Real podman's own checked-directly `diffRun` (`~/git/
+        /// podman/cmd/podman/containers/diff.go`) has no mutual-
+        /// exclusivity check at all against giving an explicit `ID`
+        /// too — an explicit one always wins outright over `--latest`
+        /// (`~/git/podman/pkg/domain/infra/abi/containers.go`'s own
+        /// `Diff`: the latest-resolved value is unconditionally
+        /// overwritten the moment any positional argument is also
+        /// given) — ported faithfully here too, rather than adding a
+        /// stricter mutual-exclusivity check real podman itself
+        /// doesn't have. Giving neither this nor an explicit `ID` at
+        /// all is a real, immediate error either way.
+        #[arg(short = 'l', long)]
+        latest: bool,
         /// Change the output format — matching real `podman
         /// diff`/`docker diff --format` exactly: checked directly
         /// (`~/git/podman/cmd/podman/diff/diff.go`), the *only* real
@@ -4382,7 +4401,24 @@ fn main() -> std::process::ExitCode {
                 dest,
                 overwrite,
             }) => cmd_cp(&src, &dest, overwrite),
-            Some(Command::Diff { id, format }) => cmd_diff(&id, cli.global.json, format.as_deref()),
+            Some(Command::Diff { id, latest, format }) => {
+                // An explicit `id` always wins over `--latest`
+                // outright, matching real podman's own checked-
+                // directly behavior exactly -- see `Command::Diff::
+                // latest`'s own doc comment.
+                let resolved_id = match id {
+                    Some(id) => id,
+                    None => {
+                        anyhow::ensure!(
+                            latest,
+                            "container must be specified: ociman diff [options] ID-NAME"
+                        );
+                        let containers = open_container_store()?;
+                        resolve_latest_container(&containers)?
+                    }
+                };
+                cmd_diff(&resolved_id, cli.global.json, format.as_deref())
+            }
             Some(Command::Mount { container }) => cmd_mount(&container),
             Some(Command::Unmount { container }) => cmd_unmount(&container),
             Some(Command::Export { id, output }) => cmd_export(&id, output.as_deref()),
