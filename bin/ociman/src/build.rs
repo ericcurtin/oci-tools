@@ -229,6 +229,7 @@ pub fn cmd_build(
     platform: Option<&str>,
     unsetenv: &[String],
     unsetlabel: &[String],
+    ulimit: &[String],
     quiet: bool,
     json: bool,
     timestamp: Option<i64>,
@@ -266,6 +267,16 @@ pub fn cmd_build(
     let dockerignore_patterns = read_ignore_patterns(context, ignorefile)?;
     let dockerignore = oci_dockerfile::DockerIgnore::compile(&dockerignore_patterns)
         .map_err(|_| anyhow::anyhow!("ociman build: invalid .dockerignore pattern"))?;
+
+    // `--ulimit` — parsed once, up front, exactly like `ociman run
+    // --ulimit` itself (`0376`): reused verbatim rather than a second
+    // implementation of the same parse-then-clamp-to-host logic, and
+    // applied to every `RUN` step's own process (see `run_step_spec`'s
+    // own call site via `StageContext::rlimits`).
+    let rlimits = ulimit
+        .iter()
+        .map(|u| crate::parse_ulimit(u).map(crate::clamp_ulimit_to_host))
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let instructions = oci_dockerfile::parse(&text).map_err(|e| anyhow::anyhow!(e))?;
     let (meta_args, stages) =
@@ -472,6 +483,7 @@ pub fn cmd_build(
             built: &built,
             dockerignore: &dockerignore,
             forced_mtime: timestamp,
+            rlimits: &rlimits,
         };
         let force_rootfs = copy_from_targets.contains(&stage_index);
         // `--squash`/`--squash-all` only ever apply to the target
@@ -779,6 +791,16 @@ struct StageContext<'a> {
     /// `record_layer`/`record_empty_history` call this stage makes
     /// (see `docs/design/0209`/`0210`).
     forced_mtime: Option<i64>,
+    /// `--ulimit`'s own parsed, already-host-clamped values — carried
+    /// here for exactly the same reason `dockerignore`/`forced_mtime`
+    /// are: every `RUN` step already threading `stage_ctx` through
+    /// (`run_instruction`/`run_step_spec`) can reach it without yet
+    /// another parameter of its own. Applied to every `RUN` step in
+    /// every stage alike, matching real `podman build --ulimit`
+    /// exactly (checked directly, `~/git/podman/vendor/go.podman.io/
+    /// buildah/pkg/cli/common.go`): unlike `ociman run --ulimit`,
+    /// there is no per-stage/per-instruction override of any kind.
+    rlimits: &'a [oci_spec_types::runtime::PosixRlimit],
 }
 
 impl StageContext<'_> {
@@ -1416,6 +1438,7 @@ fn apply_instruction(
                 current_shell,
                 quiet,
                 stage_ctx.forced_mtime,
+                stage_ctx.rlimits,
             )?;
         }
         Instruction::Copy {
@@ -1651,6 +1674,7 @@ fn run_instruction(
     current_shell: &[String],
     quiet: bool,
     forced_mtime: Option<i64>,
+    rlimits: &[oci_spec_types::runtime::PosixRlimit],
 ) -> anyhow::Result<()> {
     let args = args_for_run(shell_or_exec, current_shell);
     let command_text = args.join(" ");
@@ -1691,7 +1715,7 @@ fn run_instruction(
             .with_context(|| format!("reusing cached layer for RUN {command_text}"));
     }
 
-    let spec = run_step_spec(config, rootfs, args.clone(), &arg_overlay)
+    let spec = run_step_spec(config, rootfs, args.clone(), &arg_overlay, rlimits)
         .with_context(|| format!("preparing RUN {command_text}"))?;
     let bundle_dir = rootfs
         .parent()
@@ -1839,6 +1863,7 @@ fn run_step_spec(
     rootfs: &Path,
     args: Vec<String>,
     arg_overlay: &[(String, String)],
+    rlimits: &[oci_spec_types::runtime::PosixRlimit],
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -1867,6 +1892,12 @@ fn run_step_spec(
         .unwrap_or_else(|| "/".to_string());
     process.user.uid = uid;
     process.user.gid = gid;
+    // `--ulimit` (matching real `podman build --ulimit` exactly, see
+    // `StageContext::rlimits`'s own doc comment) — the exact same
+    // `process.rlimits` field `ociman run/create --ulimit` (`0376`)
+    // already sets, reused verbatim here for a `RUN` step's own
+    // process instead.
+    process.rlimits = rlimits.to_vec();
     process.env = if container_config.env.is_empty() {
         vec![crate::DEFAULT_ENV_WHEN_IMAGE_DECLARES_NONE.to_string()]
     } else {

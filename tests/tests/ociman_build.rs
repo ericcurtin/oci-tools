@@ -8499,3 +8499,93 @@ fn build_timestamp_makes_two_differently_timed_builds_produce_the_same_digest() 
          image digest, regardless of the real time elapsed between them"
     );
 }
+
+/// `ociman build --ulimit` (matching real `podman build --ulimit`
+/// exactly) applies a real, kernel-enforced `RLIMIT_*` to every `RUN`
+/// step -- read back via busybox `ash`'s own `ulimit -n`/`ulimit -Hn`
+/// builtins (real `getrlimit(2)` calls, not this project's own
+/// bookkeeping), the same real verification `ociman run --ulimit`'s
+/// own test (`0376`) already established, ported here for `RUN`
+/// steps instead.
+#[test]
+fn build_ulimit_sets_a_real_kernel_enforced_rlimit_for_run_steps() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-ulimit-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-ulimit-base:latest\n\
+         RUN sh -c 'ulimit -n; ulimit -Hn' > /captured-ulimit.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--ulimit",
+            "nofile=123:456",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-ulimit-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/build-ulimit-result:latest",
+            "/bin/cat",
+            "/captured-ulimit.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "123\n456\n",
+        "the real soft (ulimit -n) and hard (ulimit -Hn) RLIMIT_NOFILE inside a RUN step must \
+         genuinely differ, matching what --ulimit nofile=123:456 asked for"
+    );
+}
+
+/// An unrecognized `--ulimit` name is a clear, immediate CLI error at
+/// build time, matching real `podman build --ulimit`'s own identical
+/// eager validation.
+#[test]
+fn build_ulimit_with_an_unrecognized_name_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(context_dir.path(), "FROM scratch\n");
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--ulimit",
+            "notarealname=1",
+            context_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(!build.status.success());
+}

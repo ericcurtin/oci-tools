@@ -1560,6 +1560,22 @@ enum Command {
         /// Repeatable.
         #[arg(long = "unsetlabel", value_name = "KEY")]
         unsetlabel: Vec<String>,
+        /// Set a `RUN` step's own `RLIMIT_*` resource limit,
+        /// `NAME=soft[:hard]` (repeatable) — matching real `podman
+        /// build --ulimit` exactly (checked directly, `~/git/podman/
+        /// vendor/go.podman.io/buildah/pkg/cli/common.go`): applies to
+        /// every `RUN` step in every stage alike, reusing the exact
+        /// same real `docker`/`podman`-compatible name/value grammar
+        /// and rootless-hard-limit-clamping `ociman run/create
+        /// --ulimit` already established (`0376`; see [`parse_
+        /// ulimit`]/[`clamp_ulimit_to_host`]'s own doc comments for
+        /// the exact rules, reused verbatim here rather than a second
+        /// implementation of the same parse-then-clamp logic). Unlike
+        /// `run`/`create`, there is no per-stage/per-instruction
+        /// override of any kind — matching real podman's own identical
+        /// single, build-wide value.
+        #[arg(long = "ulimit", value_name = "NAME=SOFT[:HARD]")]
+        ulimit: Vec<String>,
         /// Refrain from announcing build progress — matching real
         /// `docker build -q`/`podman build --quiet` exactly (checked
         /// directly against a real installed `podman build -q`, three
@@ -4352,6 +4368,7 @@ fn main() -> std::process::ExitCode {
                 platform,
                 unsetenv,
                 unsetlabel,
+                ulimit,
                 quiet,
                 timestamp,
             }) => build::cmd_build(
@@ -4377,6 +4394,7 @@ fn main() -> std::process::ExitCode {
                 platform.as_deref(),
                 &unsetenv,
                 &unsetlabel,
+                &ulimit,
                 quiet,
                 cli.global.json,
                 timestamp,
