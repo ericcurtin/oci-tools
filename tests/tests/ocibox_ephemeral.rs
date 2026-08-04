@@ -75,6 +75,45 @@ fn ephemeral_runs_a_command_and_removes_the_box_afterward() {
     );
 }
 
+/// `--yes`/`-Y` is accepted for real CLI compatibility with real
+/// `distrobox ephemeral --yes`/`-Y` (inherited from `distrobox
+/// create`'s own identical flag, checked directly, `~/git/distrobox/
+/// internal/cli/ephemeral.go`) but changes nothing at all -- see
+/// `ocibox create --yes`'s own doc comment for the identical real
+/// reasoning.
+#[test]
+fn ephemeral_yes_flag_is_accepted_and_behaves_identically() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    seed_ephemeral_base(storage_dir.path(), "ocibox-test/ephemeral-yes-base:latest");
+
+    let out = ocibox(
+        storage_dir.path(),
+        &[
+            "ephemeral",
+            "--image",
+            "ocibox-test/ephemeral-yes-base:latest",
+            "--yes",
+            "--",
+            "/bin/echo",
+            "hello-ephemeral-yes",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hello-ephemeral-yes"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 #[test]
 fn ephemeral_forwards_the_containers_own_nonzero_exit_code() {
     if busybox_path().is_none() {

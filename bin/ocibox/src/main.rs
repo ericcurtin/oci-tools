@@ -90,6 +90,19 @@ enum Command {
         /// flag exactly.
         #[arg(long, short = 'p')]
         pull: bool,
+        /// Accepted for real CLI compatibility with `distrobox create
+        /// --yes`/`-Y`; has no effect. Real distrobox's own `--yes`
+        /// only ever skips one real thing: an interactive "Image not
+        /// found. Do you want to pull it now?" confirmation prompt
+        /// before an implicit pull (checked directly,
+        /// `~/git/distrobox/pkg/commands/create.go`'s own
+        /// `askPullImage`) — this project has no interactive terminal
+        /// session concept whatsoever (every invocation already
+        /// pulls silently, unconditionally, with no prompt to skip in
+        /// the first place), the same "nothing to skip" reasoning
+        /// `ocibox rm --force`'s own doc comment already gives.
+        #[arg(long = "yes", short = 'Y')]
+        yes: bool,
         /// Hostname for the box, set once at `create` time and used
         /// by every later `ocibox enter` of it — matching real
         /// `distrobox create --hostname` exactly (checked directly,
@@ -294,6 +307,18 @@ enum Command {
         /// matching `ocibox create --pull`'s own identical flag.
         #[arg(long, short = 'p')]
         pull: bool,
+        /// Accepted for real CLI compatibility with `distrobox
+        /// ephemeral --yes`/`-Y` (checked directly: `~/git/distrobox/
+        /// internal/cli/ephemeral.go` inherits every flag from its
+        /// own `create` command, `--yes`/`-Y` included); has no
+        /// effect — see `ocibox create --yes`'s own doc comment for
+        /// the identical real reasoning, doubly true here since real
+        /// distrobox's own `ephemeral` already unconditionally forces
+        /// its own equivalent internally regardless of this flag
+        /// (`~/git/distrobox/pkg/commands/ephemeral.go`: `createOpts.
+        /// NonInteractive = true`, hardcoded).
+        #[arg(long = "yes", short = 'Y')]
+        yes: bool,
         /// Hostname for the ephemeral box — matching `ocibox create
         /// --hostname`'s own identical flag, which real `distrobox
         /// ephemeral` also inherits from `distrobox create` (checked
@@ -523,6 +548,7 @@ fn main() -> std::process::ExitCode {
                 image,
                 name,
                 pull,
+                yes: _,
                 hostname,
                 home,
                 volume,
@@ -547,6 +573,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Ephemeral {
                 image,
                 pull,
+                yes: _,
                 hostname,
                 home,
                 volume,

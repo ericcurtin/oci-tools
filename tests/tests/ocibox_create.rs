@@ -77,6 +77,61 @@ fn create_extracts_a_real_rootfs_and_persists_a_box_record() {
     assert!(record["created"].as_str().is_some());
 }
 
+/// `--yes`/`-Y` is accepted for real CLI compatibility with real
+/// `distrobox create --yes`/`-Y` (checked directly, `~/git/distrobox/
+/// pkg/commands/create.go`'s own `askPullImage`) but changes nothing
+/// at all: this project has no interactive confirmation prompt to
+/// skip in the first place, the same "nothing to skip" reasoning
+/// `ocibox rm --force`'s own doc comment already gives.
+#[test]
+fn create_yes_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/create-yes:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/create-yes:latest",
+            "--name",
+            "yesbox",
+            "--yes",
+        ],
+    );
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&create.stdout).trim(), "yesbox");
+
+    // The short flag `-Y` behaves identically.
+    let create_short = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/create-yes:latest",
+            "--name",
+            "yesbox2",
+            "-Y",
+        ],
+    );
+    assert!(create_short.status.success(), "{create_short:?}");
+}
+
 #[test]
 fn create_refuses_a_name_already_in_use() {
     let Some(busybox) = busybox_path() else {
