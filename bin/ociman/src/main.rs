@@ -3274,6 +3274,21 @@ enum VolumeCommand {
         /// exists at all).
         #[arg(long)]
         ignore: bool,
+        /// Set a `key=value` label on the volume (repeatable) —
+        /// matching real `podman volume create --label`/`-l` exactly
+        /// (checked directly, `~/git/podman/cmd/podman/volumes/
+        /// create.go`'s own `parse.GetAllLabels`: a bare `key` with
+        /// no `=` at all becomes `key=""`, never a parse error).
+        /// Ignored (not merged/overwritten) when `--ignore` tolerates
+        /// an already-existing volume of this name — see
+        /// [`volume::VolumeStore::get_or_create_with_labels`]'s own
+        /// doc comment for exactly why. Real `podman volume create`
+        /// also has `--driver`/`-d` and `--opt`/`-o`; deliberately not
+        /// implemented here — this project has exactly one fixed
+        /// "local" driver with no options concept at all, so either
+        /// flag would be a pure no-op with nothing real to attach to.
+        #[arg(long = "label", short = 'l', value_name = "KEY=VALUE")]
+        label: Vec<String>,
     },
     /// List every real, currently-existing volume — matching real
     /// `docker volume ls`/`podman volume ls`.
@@ -3874,9 +3889,11 @@ fn main() -> std::process::ExitCode {
                 }
             },
             Some(Command::Volume { command }) => match command {
-                VolumeCommand::Create { name, ignore } => {
-                    cmd_volume_create(name.as_deref(), ignore, cli.global.json)
-                }
+                VolumeCommand::Create {
+                    name,
+                    ignore,
+                    label,
+                } => cmd_volume_create(name.as_deref(), ignore, &label, cli.global.json),
                 VolumeCommand::Ls {
                     format,
                     quiet,
@@ -12162,6 +12179,12 @@ struct VolumeView {
     driver: String,
     mountpoint: String,
     created_at: String,
+    /// `--label` (0424), matching real `podman volume inspect`'s own
+    /// `Labels` field — a real, empty `{}` (never absent) for a
+    /// volume created with none, the same "always present, honestly
+    /// empty" convention `ANNOTATION_LABELS`'s own doc comment already
+    /// establishes for containers/images.
+    labels: std::collections::BTreeMap<String, String>,
 }
 
 impl VolumeView {
@@ -12171,11 +12194,17 @@ impl VolumeView {
             driver: "local".to_string(),
             mountpoint: store.data_dir(&record.name).to_string_lossy().into_owned(),
             created_at: record.created_at.clone(),
+            labels: record.labels.clone(),
         }
     }
 }
 
-fn cmd_volume_create(name: Option<&str>, ignore: bool, json: bool) -> anyhow::Result<()> {
+fn cmd_volume_create(
+    name: Option<&str>,
+    ignore: bool,
+    label: &[String],
+    json: bool,
+) -> anyhow::Result<()> {
     let name = match name {
         Some(name) => {
             anyhow::ensure!(
@@ -12202,8 +12231,14 @@ fn cmd_volume_create(name: Option<&str>, ignore: bool, json: bool) -> anyhow::Re
         ignore || !store.exists(&name),
         "volume with name {name:?} already exists"
     );
+    // `--label` (0424): the same bare-`key`-means-empty-value
+    // `key=value` parsing `ociman build --label`/`run --label`
+    // already share, reused verbatim rather than a second, separate
+    // parser for the identical real grammar.
+    let labels: std::collections::BTreeMap<String, String> =
+        build::parse_key_value_pairs(label).into_iter().collect();
     let record = store
-        .get_or_create(&name)
+        .get_or_create_with_labels(&name, labels)
         .with_context(|| format!("creating volume {name:?}"))?;
     if json {
         oci_cli_common::output::print_json(&VolumeView::from_record(&store, &record))?;

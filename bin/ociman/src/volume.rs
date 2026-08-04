@@ -8,6 +8,7 @@
 //! path` bind mount, whose own host side is the *caller's* directory,
 //! never this project's own to create/track/remove.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -17,14 +18,22 @@ use serde::{Deserialize, Serialize};
 
 /// A real, on-disk named volume's own persisted metadata —
 /// deliberately narrow next to real podman's own much larger volume
-/// record (`Labels`, `Options`, `MountCount`, `NeedsCopyUp`,
-/// `NeedsChown`, `LockNumber`, ... — a real, separate driver-level
-/// bookkeeping concern this project's own single, fixed "local
-/// directory" driver has no equivalent need for).
+/// record (`Options`, `MountCount`, `NeedsCopyUp`, `NeedsChown`,
+/// `LockNumber`, ... — a real, separate driver-level bookkeeping
+/// concern this project's own single, fixed "local directory" driver
+/// has no equivalent need for). `labels` (0424) is the one exception:
+/// real, user-supplied metadata a caller can actually set and later
+/// read back, matching real `podman volume create --label`/`podman
+/// volume inspect`'s own `Labels` field exactly — `#[serde(default)]`
+/// so a `metadata.json` written by an older version of this binary
+/// (with no `labels` key at all) still reads back as a real, empty
+/// map rather than a hard parse error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct VolumeRecord {
     pub(crate) name: String,
     pub(crate) created_at: String,
+    #[serde(default)]
+    pub(crate) labels: BTreeMap<String, String>,
 }
 
 /// Real docker/podman's own volume-name validation — checked directly
@@ -111,6 +120,23 @@ impl VolumeStore {
     /// live installed `podman 4.9.3` while scoping `0406` and found
     /// to be simply wrong, corrected there instead of repeated here.
     pub(crate) fn get_or_create(&self, name: &str) -> io::Result<VolumeRecord> {
+        self.get_or_create_with_labels(name, BTreeMap::new())
+    }
+
+    /// Like [`get_or_create`](Self::get_or_create), but `labels` is
+    /// recorded on real, first-time creation (`ociman volume create
+    /// --label`, 0424) — ignored (not merged/overwritten) when the
+    /// volume already existed, matching real `podman volume create
+    /// --label`'s own behavior on an already-existing name under
+    /// `--ignore` exactly (checked directly: the pre-existing
+    /// volume's own already-recorded labels are left completely
+    /// untouched, never silently replaced by whatever `--label`
+    /// values happened to be given this time).
+    pub(crate) fn get_or_create_with_labels(
+        &self,
+        name: &str,
+        labels: BTreeMap<String, String>,
+    ) -> io::Result<VolumeRecord> {
         if let Some(existing) = self.get(name)? {
             return Ok(existing);
         }
@@ -118,6 +144,7 @@ impl VolumeStore {
         let record = VolumeRecord {
             name: name.to_string(),
             created_at: format_rfc3339_utc(std::time::SystemTime::now()),
+            labels,
         };
         fs::write(
             self.metadata_path(name),
@@ -240,9 +267,59 @@ mod tests {
         let first = store.get_or_create("myvol").unwrap();
         assert_eq!(first.name, "myvol");
         assert!(store.data_dir("myvol").is_dir());
+        assert!(first.labels.is_empty());
 
         let second = store.get_or_create("myvol").unwrap();
         assert_eq!(second.created_at, first.created_at);
+    }
+
+    #[test]
+    fn get_or_create_with_labels_records_the_given_labels_on_first_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VolumeStore::open(dir.path()).unwrap();
+        let labels = BTreeMap::from([("env".to_string(), "prod".to_string())]);
+        let record = store
+            .get_or_create_with_labels("myvol", labels.clone())
+            .unwrap();
+        assert_eq!(record.labels, labels);
+
+        // Reading it back independently confirms it was really
+        // persisted, not just returned in-memory.
+        let reloaded = store.get("myvol").unwrap().unwrap();
+        assert_eq!(reloaded.labels, labels);
+    }
+
+    #[test]
+    fn get_or_create_with_labels_leaves_an_already_existing_volumes_own_labels_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VolumeStore::open(dir.path()).unwrap();
+        let original = BTreeMap::from([("env".to_string(), "prod".to_string())]);
+        store
+            .get_or_create_with_labels("myvol", original.clone())
+            .unwrap();
+
+        // A second call with *different* labels, on an already-
+        // existing volume, must not overwrite the first.
+        let different = BTreeMap::from([("env".to_string(), "staging".to_string())]);
+        let record = store.get_or_create_with_labels("myvol", different).unwrap();
+        assert_eq!(record.labels, original);
+    }
+
+    #[test]
+    fn a_metadata_json_with_no_labels_field_at_all_reads_back_as_a_real_empty_map() {
+        // Simulates a `metadata.json` written by an older version of
+        // this binary, before `labels` existed at all.
+        let dir = tempfile::tempdir().unwrap();
+        let store = VolumeStore::open(dir.path()).unwrap();
+        fs::create_dir_all(store.data_dir("old-vol")).unwrap();
+        fs::write(
+            store.metadata_path("old-vol"),
+            r#"{"name":"old-vol","created_at":"2024-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let record = store.get("old-vol").unwrap().unwrap();
+        assert!(record.labels.is_empty());
     }
 
     #[test]

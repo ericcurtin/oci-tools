@@ -136,6 +136,96 @@ fn volume_create_ignore_flag_makes_an_existing_name_idempotent() {
     );
 }
 
+/// `volume create --label`/`-l` (matching real `podman volume create
+/// --label` exactly, checked directly against `~/git/podman/cmd/
+/// podman/volumes/create.go`'s own `parse.GetAllLabels`) records
+/// every given label, readable back via `volume inspect`; a bare
+/// `key` with no `=` at all becomes `key=""`, never a parse error --
+/// the same real, checked-directly grammar `ociman build --label`
+/// already shares.
+#[test]
+fn volume_create_label_records_every_given_label() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "volume",
+            "create",
+            "--label",
+            "env=prod",
+            "-l",
+            "bareword",
+            "labeled-vol",
+        ],
+    );
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &["volume", "inspect", "labeled-vol", "--json"],
+    );
+    assert!(inspect.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(parsed["labels"]["env"], "prod");
+    assert_eq!(parsed["labels"]["bareword"], "");
+}
+
+/// A volume created with no `--label` at all still reports a real,
+/// honestly empty `{}` for `labels` -- never absent, matching this
+/// project's own already-established "always present, honestly
+/// empty" convention for annotations.
+#[test]
+fn volume_create_with_no_label_reports_an_empty_labels_object() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    ociman(storage_dir.path(), &["volume", "create", "unlabeled-vol"]);
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &["volume", "inspect", "unlabeled-vol", "--json"],
+    );
+    assert!(inspect.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(parsed["labels"], serde_json::json!({}));
+}
+
+/// `--ignore` on an already-existing volume leaves its own,
+/// previously-recorded labels completely untouched -- new `--label`
+/// values given on this second, tolerated call never silently
+/// overwrite them.
+#[test]
+fn volume_create_ignore_on_an_existing_volume_leaves_its_labels_untouched() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    ociman(
+        storage_dir.path(),
+        &["volume", "create", "--label", "env=prod", "reused-vol"],
+    );
+
+    let create_again = ociman(
+        storage_dir.path(),
+        &[
+            "volume",
+            "create",
+            "--ignore",
+            "--label",
+            "env=staging",
+            "reused-vol",
+        ],
+    );
+    assert!(create_again.status.success(), "{create_again:?}");
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &["volume", "inspect", "reused-vol", "--json"],
+    );
+    assert!(inspect.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(parsed["labels"]["env"], "prod");
+}
+
 #[test]
 fn volume_create_with_no_name_generates_a_random_one() {
     let storage_dir = tempfile::tempdir().unwrap();
