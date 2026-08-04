@@ -197,6 +197,25 @@ struct BuildResult {
     digest: String,
 }
 
+/// The real, checked-directly proxy environment variable names
+/// `--http-proxy` (default `true`) passes through from `ociman
+/// build`'s own process environment into every `RUN` step, matching
+/// real `podman build --http-proxy` exactly (`~/git/podman/vendor/
+/// go.podman.io/common/pkg/config/config.go`'s own `ProxyEnv`):
+/// both the lowercase and uppercase spelling of `http_proxy`/
+/// `https_proxy`/`ftp_proxy`/`no_proxy`, since a real shell's own
+/// convention for which case a program actually reads varies.
+const PROXY_ENV_NAMES: &[&str] = &[
+    "http_proxy",
+    "https_proxy",
+    "ftp_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "FTP_PROXY",
+    "NO_PROXY",
+];
+
 /// Build an image from `dockerfile` (or the context directory's own
 /// `Containerfile`/`Dockerfile`, checked in that order — matching real
 /// `podman build`'s own default preference), tagging the result as
@@ -233,6 +252,7 @@ pub fn cmd_build(
     shm_size: Option<&str>,
     memory: Option<&str>,
     memory_swap: Option<&str>,
+    http_proxy: bool,
     quiet: bool,
     json: bool,
     timestamp: Option<i64>,
@@ -519,6 +539,7 @@ pub fn cmd_build(
             rlimits: &rlimits,
             shm_size_bytes,
             resources: &resources,
+            http_proxy,
         };
         let force_rootfs = copy_from_targets.contains(&stage_index);
         // `--squash`/`--squash-all` only ever apply to the target
@@ -862,6 +883,20 @@ struct StageContext<'a> {
     /// `setupSpecialMountSpecChanges`): build-wide, no per-stage/
     /// per-instruction override.
     resources: &'a Option<oci_spec_types::runtime::LinuxResources>,
+    /// `--http-proxy`'s own already-resolved value (default `true`) —
+    /// carried here for the same reason `rlimits`/`shm_size_bytes`/
+    /// `resources` are. When `true`, every `RUN` step's own process
+    /// environment gets [`PROXY_ENV_NAMES`]'s own values copied in
+    /// from `ociman build`'s own process environment (skipping any
+    /// name a `RUN` step's own persisted `ENV`/an active `ARG`
+    /// already declares — real buildah's own `configureEnvironment`
+    /// applies the proxy vars *before* merging those in, so an
+    /// explicit same-key value always wins over the host's own),
+    /// matching real `podman build --http-proxy` exactly (checked
+    /// directly, `~/git/podman/vendor/go.podman.io/buildah/
+    /// run_common.go`'s own `configureEnvironment`): build-wide, no
+    /// per-stage/per-instruction override.
+    http_proxy: bool,
 }
 
 impl StageContext<'_> {
@@ -1502,6 +1537,7 @@ fn apply_instruction(
                 stage_ctx.rlimits,
                 stage_ctx.shm_size_bytes,
                 stage_ctx.resources,
+                stage_ctx.http_proxy,
             )?;
         }
         Instruction::Copy {
@@ -1740,6 +1776,7 @@ fn run_instruction(
     rlimits: &[oci_spec_types::runtime::PosixRlimit],
     shm_size_bytes: Option<i64>,
     resources: &Option<oci_spec_types::runtime::LinuxResources>,
+    http_proxy: bool,
 ) -> anyhow::Result<()> {
     let args = args_for_run(shell_or_exec, current_shell);
     let command_text = args.join(" ");
@@ -1788,6 +1825,7 @@ fn run_instruction(
         rlimits,
         shm_size_bytes,
         resources,
+        http_proxy,
     )
     .with_context(|| format!("preparing RUN {command_text}"))?;
     let bundle_dir = rootfs
@@ -1963,6 +2001,7 @@ fn build_arg_overlay(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_step_spec(
     config: &ImageConfig,
     rootfs: &Path,
@@ -1971,6 +2010,7 @@ fn run_step_spec(
     rlimits: &[oci_spec_types::runtime::PosixRlimit],
     shm_size_bytes: Option<i64>,
     resources: &Option<oci_spec_types::runtime::LinuxResources>,
+    http_proxy: bool,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -2044,6 +2084,24 @@ fn run_step_spec(
     // expand_stage`'s own doc comment for why not).
     for (name, value) in arg_overlay {
         process.env.push(format!("{name}={value}"));
+    }
+    // `--http-proxy` (matching real `podman build --http-proxy`
+    // exactly, see `StageContext::http_proxy`'s own doc comment):
+    // copy each of `PROXY_ENV_NAMES` in from `ociman build`'s own
+    // process environment, skipping any name this `RUN` step's own
+    // environment already declares (an explicit `ENV`/active `ARG`
+    // always wins over the host's own ambient value, matching real
+    // buildah's own `configureEnvironment` ordering).
+    if http_proxy {
+        for name in PROXY_ENV_NAMES {
+            let already_declared = process
+                .env
+                .iter()
+                .any(|kv| kv.split_once('=').map(|(k, _)| k) == Some(*name));
+            if !already_declared && let Ok(value) = std::env::var(name) {
+                process.env.push(format!("{name}={value}"));
+            }
+        }
     }
     // Same real `podman`-default capability set every other real
     // container this project runs gets (see `synthesize_spec`'s own

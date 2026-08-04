@@ -1599,10 +1599,15 @@ enum Command {
         /// applies to every `RUN` step in every stage alike, no
         /// per-stage/per-instruction override of any kind — matching
         /// real podman's own identical single, build-wide value, the
-        /// same shape `--ulimit`/`--shm-size` already established. No
-        /// `--memory-reservation`/`--cpus`/`--cpuset-cpus`/
-        /// `--cpuset-mems` counterpart yet for `build` (out of scope
-        /// for this increment).
+        /// same shape `--ulimit`/`--shm-size` already established.
+        /// Real `podman build` has no `--memory-reservation`/`--cpus`
+        /// of its own at all (checked directly, `~/git/podman/vendor/
+        /// go.podman.io/buildah/pkg/cli/common.go`'s own
+        /// `CommonBuildOptions` — both are `run`/`create`/`update`-only
+        /// convenience flags with no `build` equivalent); its own
+        /// `--cpu-period`/`--cpu-quota`/`--cpu-shares`/`--cpuset-cpus`/
+        /// `--cpuset-mems` remain a real, deliberately out-of-scope gap
+        /// here for now, a natural follow-up to this same increment.
         #[arg(short = 'm', long = "memory")]
         memory: Option<String>,
         /// Total memory **+ swap** every `RUN` step's own cgroup may
@@ -1614,6 +1619,28 @@ enum Command {
         /// verbatim via [`parse_and_validate_memory_and_cpus`]).
         #[arg(long = "memory-swap", allow_hyphen_values = true)]
         memory_swap: Option<String>,
+        /// Pass the build host's own proxy environment variables
+        /// through to every `RUN` step (`http_proxy`/`https_proxy`/
+        /// `ftp_proxy`/`no_proxy`, both lower- and upper-case
+        /// spellings) — matching real `podman build --http-proxy`
+        /// exactly, default `true` (checked directly, `~/git/podman/
+        /// vendor/go.podman.io/buildah/pkg/cli/common.go`'s own
+        /// `fs.BoolVar(&flags.HTTPProxy, "http-proxy", true, ...)`,
+        /// and `~/git/podman/vendor/go.podman.io/common/pkg/config/
+        /// config.go`'s own `ProxyEnv` list): an explicit same-key
+        /// `ENV`/active `ARG` in the Containerfile always wins over
+        /// the host's own ambient value, never the other way around.
+        /// Applies to every `RUN` step in every stage alike, no
+        /// per-stage/per-instruction override, the same shape
+        /// `--ulimit`/`--shm-size`/`--memory` already established.
+        #[arg(
+            long = "http-proxy",
+            default_value_t = true,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            action = clap::ArgAction::Set
+        )]
+        http_proxy: bool,
         /// Refrain from announcing build progress — matching real
         /// `docker build -q`/`podman build --quiet` exactly (checked
         /// directly against a real installed `podman build -q`, three
@@ -4410,6 +4437,7 @@ fn main() -> std::process::ExitCode {
                 shm_size,
                 memory,
                 memory_swap,
+                http_proxy,
                 quiet,
                 timestamp,
             }) => build::cmd_build(
@@ -4439,6 +4467,7 @@ fn main() -> std::process::ExitCode {
                 shm_size.as_deref(),
                 memory.as_deref(),
                 memory_swap.as_deref(),
+                http_proxy,
                 quiet,
                 cli.global.json,
                 timestamp,

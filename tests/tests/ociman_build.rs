@@ -8754,3 +8754,201 @@ fn build_memory_swap_without_memory_is_a_clear_error() {
         String::from_utf8_lossy(&build.stderr)
     );
 }
+
+/// `ociman build --http-proxy` (default `true`, matching real `podman
+/// build --http-proxy` exactly) passes the build host's own proxy
+/// environment variables through into every `RUN` step -- captured to
+/// a file inside the `RUN` step, read back via a follow-up `run`, the
+/// same pattern already established by `build_dns_flags_synthesize_a_
+/// real_resolv_conf_for_run_steps`/`build_ulimit_sets_a_real_kernel_
+/// enforced_rlimit_for_run_steps`.
+#[test]
+fn build_http_proxy_default_passes_the_hosts_proxy_env_into_run_steps() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-http-proxy-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-http-proxy-base:latest\n\
+         RUN echo \"$http_proxy\" > /captured-proxy.txt\n",
+    );
+
+    let build = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .env("http_proxy", "http://proxy.example.test:3128")
+        .args([
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-http-proxy-result:latest",
+        ])
+        .output()
+        .expect("failed to spawn ociman build");
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/build-http-proxy-result:latest",
+            "/bin/cat",
+            "/captured-proxy.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "http://proxy.example.test:3128\n"
+    );
+}
+
+/// `ociman build --http-proxy=false` keeps the build host's own proxy
+/// environment variables out of every `RUN` step entirely, matching
+/// real `podman build --http-proxy=false` exactly.
+#[test]
+fn build_http_proxy_false_keeps_the_hosts_proxy_env_out_of_run_steps() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-no-http-proxy-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-no-http-proxy-base:latest\n\
+         RUN echo \"[$http_proxy]\" > /captured-proxy.txt\n",
+    );
+
+    let build = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .env("http_proxy", "http://proxy.example.test:3128")
+        .args([
+            "build",
+            "--http-proxy=false",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-no-http-proxy-result:latest",
+        ])
+        .output()
+        .expect("failed to spawn ociman build");
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/build-no-http-proxy-result:latest",
+            "/bin/cat",
+            "/captured-proxy.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "[]\n");
+}
+
+/// An explicit `ENV` in the Containerfile always wins over the build
+/// host's own ambient proxy value, matching real buildah's own
+/// `configureEnvironment` ordering (checked directly).
+#[test]
+fn build_explicit_env_overrides_the_hosts_own_http_proxy_value() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-http-proxy-override-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-http-proxy-override-base:latest\n\
+         ENV http_proxy=http://explicit.example.test:9999\n\
+         RUN echo \"$http_proxy\" > /captured-proxy.txt\n",
+    );
+
+    let build = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .env("http_proxy", "http://proxy.example.test:3128")
+        .args([
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-http-proxy-override-result:latest",
+        ])
+        .output()
+        .expect("failed to spawn ociman build");
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/build-http-proxy-override-result:latest",
+            "/bin/cat",
+            "/captured-proxy.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "http://explicit.example.test:9999\n"
+    );
+}
