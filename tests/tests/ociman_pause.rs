@@ -1063,3 +1063,192 @@ fn pause_and_unpause_with_multiple_explicit_ids() {
     run2.wait().unwrap();
     ociman(storage_dir.path(), &["rm", "-a", "-f"]);
 }
+
+/// `--latest`/`-l` (0437) acts only on the single, real
+/// most-recently-*created* container, exactly like `ociman rm`/
+/// `stop`/`restart --latest` already established -- an earlier
+/// container, even one in the exact same eligible state, must be left
+/// completely untouched.
+#[test]
+fn pause_and_unpause_latest_act_only_on_the_most_recently_created_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/pause-latest:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut older = ociman_run_detached_named(
+        storage_dir.path(),
+        "pause-latest-older",
+        "ociman-test/pause-latest:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-latest-older",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    // A real, distinguishable creation-time gap -- this project's own
+    // `created` timestamp has one-second resolution (RFC3339).
+    std::thread::sleep(Duration::from_secs(2));
+
+    let mut newer = ociman_run_detached_named(
+        storage_dir.path(),
+        "pause-latest-newer",
+        "ociman-test/pause-latest:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-latest-newer",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let pause = ociman(storage_dir.path(), &["pause", "--latest"]);
+    assert!(
+        pause.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&pause.stderr)
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-latest-newer",
+            "paused",
+            Duration::from_secs(5)
+        ),
+        "paused",
+        "the most recently created container should have been paused by --latest"
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-latest-older",
+            "running",
+            Duration::from_millis(200)
+        ),
+        "running",
+        "an earlier container must be left completely untouched by --latest"
+    );
+
+    let unpause = ociman(storage_dir.path(), &["unpause", "--latest"]);
+    assert!(
+        unpause.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&unpause.stderr)
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "pause-latest-newer",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running",
+        "the most recently created container should have been unpaused by --latest"
+    );
+
+    ociman(storage_dir.path(), &["stop", "--time", "0", "-a"]);
+    older.wait().unwrap();
+    newer.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// The same real, deliberate divergence from `--all`'s own tolerant
+/// skip [`pause_filter_on_a_non_running_match_is_a_real_error_unlike_
+/// all`] already covers for `--filter` applies identically to
+/// `--latest` (see `Command::Pause::latest`'s own doc comment):
+/// checked directly, real podman's own tolerant skip is gated on
+/// `options.All` specifically, never on `options.Latest` either.
+#[test]
+fn pause_latest_on_a_non_running_match_is_a_real_error_unlike_all() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/pause-latest-error:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/pause-latest-error:latest", "true"],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let pause = ociman(storage_dir.path(), &["pause", "--latest"]);
+    assert!(
+        !pause.status.success(),
+        "a never-started latest container must be a real error, not a silent skip"
+    );
+}
+
+/// `pause`/`unpause --latest` on a genuinely empty store is a real,
+/// clear error, matching real `podman pause`/`unpause --latest`'s own
+/// `ErrNoSuchCtr`.
+#[test]
+fn pause_and_unpause_latest_on_an_empty_store_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let pause = ociman(storage_dir.path(), &["pause", "--latest"]);
+    assert!(!pause.status.success());
+    let unpause = ociman(storage_dir.path(), &["unpause", "--latest"]);
+    assert!(!unpause.status.success());
+}
+
+/// `--latest` cannot be combined with an explicit id, `--cidfile`,
+/// `--all`, or `--filter` -- matching real podman's own checked-
+/// directly `validate.AddLatestFlag`/`validate.CheckAllLatestAndIDFile`
+/// restriction exactly, the same rule `ociman rm`/`stop`/`restart
+/// --latest` already established.
+#[test]
+fn pause_and_unpause_latest_combined_with_anything_else_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let pause_with_all = ociman(storage_dir.path(), &["pause", "--latest", "--all"]);
+    assert!(!pause_with_all.status.success());
+    let pause_with_id = ociman(storage_dir.path(), &["pause", "--latest", "some-id"]);
+    assert!(!pause_with_id.status.success());
+    let pause_with_filter = ociman(
+        storage_dir.path(),
+        &["pause", "--latest", "--filter", "label=env=prod"],
+    );
+    assert!(!pause_with_filter.status.success());
+
+    let unpause_with_all = ociman(storage_dir.path(), &["unpause", "--latest", "--all"]);
+    assert!(!unpause_with_all.status.success());
+    let unpause_with_id = ociman(storage_dir.path(), &["unpause", "--latest", "some-id"]);
+    assert!(!unpause_with_id.status.success());
+    let unpause_with_filter = ociman(
+        storage_dir.path(),
+        &["unpause", "--latest", "--filter", "label=env=prod"],
+    );
+    assert!(!unpause_with_filter.status.success());
+}

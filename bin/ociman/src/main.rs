@@ -2717,6 +2717,24 @@ enum Command {
         /// with an explicit `ID`/`--name`, `--cidfile`, and `--all`.
         #[arg(long = "filter")]
         filter: Vec<String>,
+        /// Act on the single, real most-recently-*created* container
+        /// instead of an explicit `ID`/`--name` — matching real
+        /// `podman pause --latest`/`-l` exactly (see
+        /// [`Command::Rm::latest`]'s own doc comment for the exact,
+        /// checked-directly `GetLatestContainer` semantics this
+        /// shares verbatim, `~/git/podman/cmd/podman/containers/
+        /// pause.go`'s own identical `validate.AddLatestFlag`). The
+        /// same real, deliberate divergence [`Self::Pause::filter`]'s
+        /// own doc comment already explains applies here too:
+        /// checked directly, real podman's own tolerant skip for a
+        /// not-actually-running match is gated on `options.All`
+        /// specifically, never on `options.Latest` — a resolved
+        /// latest container that isn't currently running is a real,
+        /// reported error here too, exactly like an explicit id
+        /// already is. Mutually exclusive with an explicit `ID`/
+        /// `--name`, `--cidfile`, `--all`, and `--filter`.
+        #[arg(short = 'l', long)]
+        latest: bool,
     },
     /// Unpause one or more containers previously frozen by `pause` —
     /// matching real `podman unpause` exactly, including its own real
@@ -2747,6 +2765,14 @@ enum Command {
         /// an explicit `ID`/`--name`, `--cidfile`, and `--all`.
         #[arg(long = "filter")]
         filter: Vec<String>,
+        /// Same as [`Command::Pause::latest`] — see its own doc
+        /// comment for the exact semantics and the real, deliberate
+        /// divergence from `--all`'s own tolerant skip, confirmed
+        /// identically for `ContainerUnpause`. Mutually exclusive
+        /// with an explicit `ID`/`--name`, `--cidfile`, `--all`, and
+        /// `--filter`.
+        #[arg(short = 'l', long)]
+        latest: bool,
     },
     /// Update a running container's real cgroup resource limits in
     /// place — matching real `podman update` for exactly the same
@@ -4084,13 +4110,15 @@ fn main() -> std::process::ExitCode {
                 all,
                 cidfile,
                 filter,
-            }) => cmd_pause(&ids, all, &cidfile, &filter),
+                latest,
+            }) => cmd_pause(&ids, all, &cidfile, &filter, latest),
             Some(Command::Unpause {
                 ids,
                 all,
                 cidfile,
                 filter,
-            }) => cmd_unpause(&ids, all, &cidfile, &filter),
+                latest,
+            }) => cmd_unpause(&ids, all, &cidfile, &filter, latest),
             Some(Command::Update {
                 id,
                 memory,
@@ -12100,8 +12128,9 @@ fn cmd_pause(
     all: bool,
     cidfiles: &[PathBuf],
     filter: &[String],
+    latest: bool,
 ) -> anyhow::Result<()> {
-    cmd_pause_or_unpause(ids, all, cidfiles, filter, true)
+    cmd_pause_or_unpause(ids, all, cidfiles, filter, latest, true)
 }
 
 /// `ociman unpause` — see [`Command::Unpause`]'s own doc comment for
@@ -12112,8 +12141,9 @@ fn cmd_unpause(
     all: bool,
     cidfiles: &[PathBuf],
     filter: &[String],
+    latest: bool,
 ) -> anyhow::Result<()> {
-    cmd_pause_or_unpause(ids, all, cidfiles, filter, false)
+    cmd_pause_or_unpause(ids, all, cidfiles, filter, latest, false)
 }
 
 /// Shared `pause`/`unpause` implementation (0320): `freeze` selects
@@ -12131,6 +12161,7 @@ fn cmd_pause_or_unpause(
     all: bool,
     cidfiles: &[PathBuf],
     filter: &[String],
+    latest: bool,
     freeze: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -12144,6 +12175,16 @@ fn cmd_pause_or_unpause(
         filter.is_empty() || (ids.is_empty() && cidfiles.is_empty() && !all),
         "--filter cannot be combined with a container ID/name, --cidfile, or --all"
     );
+    // `--latest`/`-l` -- matching real podman's own checked-directly
+    // `validate.AddLatestFlag` restriction exactly (see
+    // `Command::Pause::latest`'s own doc comment): it merges into the
+    // same explicit-target list below (never the `--all`-only
+    // tolerant-skip loop), the same shape `ociman stop`/`restart
+    // --latest` already established.
+    anyhow::ensure!(
+        !latest || (ids.is_empty() && cidfiles.is_empty() && !all && filter.is_empty()),
+        "--latest cannot be combined with a container ID/name, --cidfile, --all, or --filter"
+    );
     // Real podman's own exact semantics (`~/git/podman/cmd/podman/
     // containers/pause.go`/`unpause.go`): the file's own first line
     // only, merged into the same target list an explicit `ID`/`--name`
@@ -12155,6 +12196,10 @@ fn cmd_pause_or_unpause(
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("reading --cidfile {}", path.display()))?;
         ids.push(content.split('\n').next().unwrap_or("").to_string());
+    }
+    if latest {
+        let containers = open_container_store()?;
+        ids.push(resolve_latest_container(&containers)?);
     }
 
     anyhow::ensure!(
