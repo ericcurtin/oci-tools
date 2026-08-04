@@ -1322,6 +1322,109 @@ fn volume_prune_removes_only_unreferenced_volumes() {
     assert!(!stdout.contains("unused-vol"), "{stdout}");
 }
 
+/// `volume prune --filter label=` (matching real `podman volume
+/// prune --filter label=`'s own checked-directly narrower key set --
+/// `~/git/podman/pkg/domain/filters/volumes.go`'s own
+/// `GeneratePruneVolumeFilters`) only removes an unreferenced volume
+/// also matching, leaving a non-matching unreferenced volume
+/// completely untouched.
+#[test]
+fn volume_prune_filter_label_only_removes_a_matching_unreferenced_volume() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    ociman(
+        storage_dir.path(),
+        &[
+            "volume",
+            "create",
+            "--label",
+            "env=prod",
+            "prune-filter-match",
+        ],
+    );
+    ociman(
+        storage_dir.path(),
+        &[
+            "volume",
+            "create",
+            "--label",
+            "env=staging",
+            "prune-filter-other",
+        ],
+    );
+
+    let prune = ociman(
+        storage_dir.path(),
+        &["volume", "prune", "--filter", "label=env=prod"],
+    );
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&prune.stdout).trim(),
+        "prune-filter-match"
+    );
+
+    let ls = ociman(storage_dir.path(), &["volume", "ls", "-q"]);
+    assert_eq!(
+        String::from_utf8_lossy(&ls.stdout).trim(),
+        "prune-filter-other"
+    );
+}
+
+/// `volume prune --filter until=` reuses `volume ls --filter
+/// until=`'s own already-established threshold semantics verbatim --
+/// a freshly created volume survives `until=1h`, but is removed by
+/// `until=1s` once it's genuinely older than that (the same real
+/// `sleep`-then-`until=1s` technique `ociman_prune.rs`'s own sibling
+/// tests already establish).
+#[test]
+fn volume_prune_filter_until_removes_a_genuinely_older_volume() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    ociman(storage_dir.path(), &["volume", "create", "prune-until-vol"]);
+
+    let too_recent = ociman(
+        storage_dir.path(),
+        &["volume", "prune", "--filter", "until=1h"],
+    );
+    assert!(too_recent.status.success());
+    assert!(
+        String::from_utf8_lossy(&too_recent.stdout)
+            .trim()
+            .is_empty()
+    );
+
+    std::thread::sleep(Duration::from_secs(2));
+    let old_enough = ociman(
+        storage_dir.path(),
+        &["volume", "prune", "--filter", "until=1s"],
+    );
+    assert!(
+        old_enough.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&old_enough.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&old_enough.stdout).trim(),
+        "prune-until-vol"
+    );
+}
+
+/// Real `podman volume prune --filter` genuinely has a narrower key
+/// set than `volume ls --filter` -- `name=`/`dangling=` (both real
+/// `ls`-only keys) and `anonymous=` (a real `prune`-only key this
+/// project's volume schema has no target for at all) are all clear,
+/// immediate errors here.
+#[test]
+fn volume_prune_filter_rejects_ls_only_and_anonymous_keys() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    for filter in ["name=foo", "dangling=true", "anonymous=true"] {
+        let prune = ociman(storage_dir.path(), &["volume", "prune", "--filter", filter]);
+        assert!(!prune.status.success(), "{filter}: {prune:?}");
+    }
+}
+
 /// `ociman volume export`/`ociman volume import` (0302): a real
 /// round trip through a plain tar preserves a volume's own content
 /// byte-for-byte, matching real `podman volume export`/`podman volume

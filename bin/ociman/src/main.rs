@@ -3507,7 +3507,36 @@ enum VolumeCommand {
     /// Remove every real volume not currently referenced by any
     /// container (running or stopped) — matching real `docker volume
     /// prune`/`podman volume prune`.
-    Prune,
+    Prune {
+        /// Only remove a volume also matching every given filter —
+        /// `label=<key>[=<value>]`/`label!=<key>[=<value>]` (ANDed
+        /// together, matching real `podman volume prune --filter
+        /// label=`'s own checked-directly `MatchLabelFilters`
+        /// exactly — the identical convention `ociman volume ls
+        /// --filter label=` (0425) already established, not
+        /// `images`/`prune --filter label=`'s own OR one),
+        /// `until=<duration-or-timestamp>`, or `after=<volume>`/
+        /// `since=<volume>` — all three reusing the exact same
+        /// parsing/matching `ociman volume ls --filter` already
+        /// established verbatim (`0410`-`0413`, `0425`). Checked
+        /// directly, `~/git/podman/pkg/domain/filters/volumes.go`'s
+        /// own `GeneratePruneVolumeFilters`: real `podman volume
+        /// prune --filter` accepts exactly `after`/`since`/
+        /// `anonymous`/`label`/`label!`/`until` — a genuinely
+        /// narrower key set than `volume ls`'s own (no `name=`/
+        /// `driver=`/`scope=`/`opt=`/`dangling=`, matching that
+        /// real, checked-directly restriction exactly, not merely
+        /// this project's own choice). `anonymous=true|false` is
+        /// deliberately **not** implemented: this project's volume
+        /// schema has no anonymous-vs-named distinction anywhere at
+        /// all (every volume here is always explicitly named, the
+        /// same "no real target" reasoning several other deferred
+        /// gaps in this codebase already share) — a clear, honest
+        /// error instead of a silently-ignored key. May be given
+        /// more than once.
+        #[arg(long = "filter")]
+        filter: Vec<String>,
+    },
     /// Exit `0` if the named volume exists, `1` otherwise — matching
     /// real `podman volume exists` exactly (no output either way,
     /// checked directly against a real installed `podman volume
@@ -4058,7 +4087,7 @@ fn main() -> std::process::ExitCode {
                 }
                 VolumeCommand::Rm { name, force } => cmd_volume_rm(&name, force),
                 VolumeCommand::Rename { name, new_name } => cmd_volume_rename(&name, &new_name),
-                VolumeCommand::Prune => cmd_volume_prune(cli.global.json),
+                VolumeCommand::Prune { filter } => cmd_volume_prune(cli.global.json, &filter),
                 VolumeCommand::Exists { name } => cmd_volume_exists(&name),
                 VolumeCommand::Export { name, output } => {
                     cmd_volume_export(&name, output.as_deref())
@@ -12765,11 +12794,63 @@ fn cmd_volume_rename(name: &str, new_name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_volume_prune(json: bool) -> anyhow::Result<()> {
+fn cmd_volume_prune(json: bool, filter: &[String]) -> anyhow::Result<()> {
+    // Real, checked-directly narrower key set than `ociman volume ls
+    // --filter` -- see `VolumeCommand::Prune::filter`'s own doc
+    // comment for the exact confirmation and the `anonymous=`
+    // no-target reasoning. Every parser/matcher reused verbatim from
+    // `cmd_volume_ls`'s own already-established implementation.
+    let mut until_filter: Option<std::time::SystemTime> = None;
+    let mut after_references: Vec<String> = Vec::new();
+    let mut label_filters: Vec<LabelFilter> = Vec::new();
+    for f in filter {
+        if let Some(result) = try_parse_label_filter("ociman volume prune", f) {
+            label_filters.push(result?);
+        } else if let Some(rest) = f.strip_prefix("until=") {
+            anyhow::ensure!(
+                until_filter.is_none(),
+                "ociman volume prune: more than one until filter specified"
+            );
+            until_filter = Some(parse_until_filter_value("ociman volume prune", f, rest)?);
+        } else if let Some(value) = f
+            .strip_prefix("after=")
+            .or_else(|| f.strip_prefix("since="))
+        {
+            anyhow::ensure!(
+                !value.is_empty(),
+                "ociman volume prune: --filter {f:?} is missing a value"
+            );
+            after_references.push(value.to_string());
+        } else {
+            anyhow::bail!(
+                "ociman volume prune: --filter {f:?} is not yet supported (only \
+                 label=<key>[=<value>], label!=<key>[=<value>], until=<duration-or-timestamp>, \
+                 or after=<volume>/since=<volume> are)"
+            );
+        }
+    }
     let store = open_volume_store()?;
     let containers = open_container_store()?;
+    let after_threshold = (!after_references.is_empty())
+        .then(|| earliest_referenced_volume_creation(&store, &after_references))
+        .transpose()?;
     let mut removed = Vec::new();
     for record in store.list().context("listing volumes")? {
+        if !label_filters.is_empty() && !label_filters.iter().all(|f| f.matches(&record.labels)) {
+            continue;
+        }
+        if let Some(threshold) = until_filter
+            && !oci_spec_types::time::parse_rfc3339_utc(&record.created_at)
+                .is_some_and(|created| created < threshold)
+        {
+            continue;
+        }
+        if let Some(threshold) = after_threshold
+            && !oci_spec_types::time::parse_rfc3339_utc(&record.created_at)
+                .is_some_and(|created| threshold < created)
+        {
+            continue;
+        }
         if containers_using_volume(&containers, &store, &record.name)?.is_empty() {
             store
                 .remove(&record.name)
