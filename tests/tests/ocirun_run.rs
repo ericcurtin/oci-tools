@@ -103,6 +103,214 @@ fn run_execs_the_container_process_and_isolates_the_rootfs() {
     );
 }
 
+/// `run --no-subreaper` (matching real `runc run --no-subreaper`/
+/// `crun run --no-subreaper` exactly, checked directly against
+/// `~/git/runc/utils_linux.go`'s own `SetSubreaper(1)` call): without
+/// it (the default), `ocirun run`'s own real host process becomes the
+/// subreaper for its container's own process tree, so a grandchild
+/// orphaned while the container's own main process is still alive
+/// gets reparented directly to `ocirun` itself rather than climbing
+/// further up the real ancestor chain — a genuine, observable kernel
+/// behavior, verified end to end via `/proc/<pid>/status`'s own real
+/// `PPid` field, not assumed from the flag merely being accepted.
+///
+/// Needs the container to share the *host* pid namespace (removed
+/// from the generated rootless spec here) — with a real, separate
+/// container pid namespace (this project's own real default), a
+/// grandchild's own orphan-reparenting search can never leave that
+/// namespace at all, making the flag's effect unobservable from the
+/// host process tree regardless of whether it's set.
+#[test]
+fn run_no_subreaper_stops_a_grandchild_orphan_from_reparenting_to_ocirun() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    // The container's own main process (the outer shell, still this
+    // project's own real host-visible pid since there's no separate
+    // pid namespace here) stays alive for the whole check window; an
+    // *inner* shell backgrounds a long-lived `sleep`, records its own
+    // pid to a file inside the rootfs (readable from the host at the
+    // exact same real path, no pid namespace/overlay involved), and
+    // then exits -- orphaning the backgrounded `sleep`, exactly the
+    // real scenario `--no-subreaper` exists to control.
+    let run_with_subreaper = check_orphan_reparent_ppid(&busybox, false);
+    let run_without_subreaper = check_orphan_reparent_ppid(&busybox, true);
+
+    assert_eq!(
+        run_with_subreaper.orphan_ppid, run_with_subreaper.ocirun_pid,
+        "the default (subreaper enabled) must reparent the orphan straight to ocirun's own pid"
+    );
+    assert_ne!(
+        run_without_subreaper.orphan_ppid, run_without_subreaper.ocirun_pid,
+        "--no-subreaper must NOT reparent the orphan to ocirun's own pid"
+    );
+}
+
+struct OrphanReparentResult {
+    ocirun_pid: i32,
+    orphan_ppid: i32,
+}
+
+/// Runs one real `ocirun run` (`no_subreaper` selecting `--no-subreaper`
+/// or not), waits for the container's own inner shell to background a
+/// long-lived `sleep` and exit, reads that orphaned `sleep`'s own real
+/// `PPid` back from `/proc/<pid>/status`, then cleans up both the
+/// `ocirun` process and the orphan itself.
+fn check_orphan_reparent_ppid(busybox: &Path, no_subreaper: bool) -> OrphanReparentResult {
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(
+        dir.path(),
+        busybox,
+        &[
+            "/bin/sh",
+            "-c",
+            "sh -c 'sleep 30 & echo $! > /orphan.pid'; sleep 10",
+        ],
+    );
+    // `write_bundle` only symlinks `sh`/`echo`/`true`/`false` -- this
+    // test also needs a real, genuinely-blocking `sleep` applet.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        "busybox",
+        dir.path().join("rootfs").join("bin").join("sleep"),
+    )
+    .unwrap();
+    let config_path = dir.path().join("config.json");
+    remove_pid_namespace(&config_path);
+    // The generated rootless spec's own default `root.readonly: true`
+    // would refuse the inner shell's own `/orphan.pid` write -- this
+    // test genuinely needs a writable rootfs, unlike every other
+    // `ocirun_run.rs` test, which never writes into its own container.
+    make_root_writable(&config_path);
+
+    let id = if no_subreaper {
+        "no-subreaper-test"
+    } else {
+        "default-subreaper-test"
+    };
+    let mut args = vec!["run", id, "--root"];
+    let root = dir.path().join("state-root");
+    let root_str = root.to_str().unwrap().to_string();
+    args.push(&root_str);
+    if no_subreaper {
+        args.push("--no-subreaper");
+    }
+    let mut child = Command::new(bin_path("ocirun"))
+        .args(&args)
+        .current_dir(dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ocirun run");
+    let ocirun_pid = child.id() as i32;
+
+    let orphan_pid_path = dir.path().join("rootfs").join("orphan.pid");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let orphan_pid: i32 = loop {
+        if let Ok(contents) = std::fs::read_to_string(&orphan_pid_path)
+            && let Ok(pid) = contents.trim().parse()
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "orphan.pid never appeared in the container's own rootfs"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    // Give the kernel's own real reparenting a moment to settle, then
+    // read the orphan's own real `PPid` back from `/proc` -- the
+    // kernel's own ground truth, not a guess.
+    std::thread::sleep(Duration::from_millis(200));
+    let status = std::fs::read_to_string(format!("/proc/{orphan_pid}/status"))
+        .expect("orphaned sleep process should still be alive and visible from the host");
+    let orphan_ppid: i32 = status
+        .lines()
+        .find(|l| l.starts_with("PPid:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .expect("a real PPid line in /proc/<pid>/status");
+
+    // Clean up: kill the container's own outer shell (still sleeping,
+    // a real child of `ocirun`), `ocirun` itself (still blocked
+    // waiting on it), and the now-orphaned `sleep` directly, then
+    // reap `ocirun` so none of the three leaks past this test. A
+    // child may have already exited on its own by the time this
+    // runs -- `kill_quietly` tolerates that (`ESRCH`) rather than
+    // printing benign "no such process" noise into the test log.
+    let child_pids = String::from_utf8_lossy(
+        &Command::new("pgrep")
+            .args(["-P", &ocirun_pid.to_string()])
+            .output()
+            .map(|o| o.stdout)
+            .unwrap_or_default(),
+    )
+    .to_string();
+    for pid in child_pids.split_whitespace() {
+        if let Ok(pid) = pid.parse() {
+            kill_quietly(pid);
+        }
+    }
+    kill_quietly(ocirun_pid);
+    let _ = child.wait();
+    kill_quietly(orphan_pid);
+
+    OrphanReparentResult {
+        ocirun_pid,
+        orphan_ppid,
+    }
+}
+
+/// `SIGKILL`s `pid` directly via `libc::kill` (no external `kill(1)`
+/// subprocess, so an already-exited pid never prints benign "no such
+/// process" noise into the test log the way shelling out to the real
+/// `kill(1)` binary would) -- a real best-effort cleanup only, errors
+/// (`ESRCH`, already dead) deliberately ignored.
+fn kill_quietly(pid: i32) {
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+/// Strips the one `"type": "pid"` entry out of `config_path`'s own
+/// `linux.namespaces` array -- see this test's own doc comment for
+/// exactly why sharing the host pid namespace is required to observe
+/// `--no-subreaper`'s own real effect at all. Also swaps the real
+/// `proc` filesystem mount for a plain `rbind` of the host's own
+/// `/proc` -- mounting a fresh `procfs` requires the mounting
+/// process to *own* the target pid namespace, which a bundle sharing
+/// the host's own pid namespace (an ordinary, unprivileged user) does
+/// not.
+fn remove_pid_namespace(config_path: &Path) {
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    let namespaces = config["linux"]["namespaces"].as_array_mut().unwrap();
+    namespaces.retain(|ns| ns["type"] != "pid");
+    for mount in config["mounts"].as_array_mut().unwrap() {
+        if mount["destination"] == "/proc" {
+            mount["source"] = serde_json::json!("/proc");
+            mount["type"] = serde_json::json!("none");
+            mount["options"] = serde_json::json!(["rbind", "nosuid", "noexec", "nodev"]);
+        }
+    }
+    std::fs::write(config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+}
+
+/// Clears the generated rootless spec's own default `root.readonly:
+/// true` -- see this test's own doc comment for why a writable
+/// rootfs is genuinely needed here.
+fn make_root_writable(config_path: &Path) {
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    config["root"]["readonly"] = serde_json::json!(false);
+    std::fs::write(config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+}
+
 #[test]
 fn run_propagates_the_containers_own_exit_code() {
     let Some(busybox) = busybox_path() else {

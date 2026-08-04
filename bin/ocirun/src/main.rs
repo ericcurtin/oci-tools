@@ -211,6 +211,33 @@ enum Command {
         /// container's already-existing named ring.
         #[arg(long = "no-new-keyring")]
         no_new_keyring: bool,
+        /// Disable this process's own use of the Linux "subreaper"
+        /// attribute (`prctl(2)`'s own `PR_SET_CHILD_SUBREAPER`) while
+        /// waiting for the container to exit — matching real `runc
+        /// run --no-subreaper`/`crun run --no-subreaper` exactly
+        /// (checked directly, `~/git/runc/run.go:60-63` +
+        /// `~/git/runc/utils_linux.go:264-267`: `if r.enableSubreaper
+        /// { system.SetSubreaper(1) }` right before registering the
+        /// signal handler and blocking on the container's own exit;
+        /// `~/git/crun/src/libcrun/container.c`'s own `libcrun_
+        /// container_run_internal` does the identical
+        /// `prctl(PR_SET_CHILD_SUBREAPER, 1, ...)` unless
+        /// `LIBCRUN_RUN_OPTIONS_NO_SUBREAPER`). Being the subreaper
+        /// means any orphaned grandchild the container's own init
+        /// process leaves behind gets reparented to *this* process
+        /// instead of all the way up to the host's own real pid 1 —
+        /// real, matching upstream default behavior for both
+        /// reference runtimes; `--no-subreaper` opts back out of it
+        /// for the rare case a caller's own process tree already
+        /// relies on host-pid-1 reparenting instead. Deliberately not
+        /// offered on `ocirun create` at all — matching real runc's
+        /// own checked-directly absence there too (`create.go`'s own
+        /// flag list has no `--no-subreaper`): `create` returns
+        /// immediately without ever waiting on the container, so
+        /// setting this attribute in a process about to exit has no
+        /// real effect to opt out of in the first place.
+        #[arg(long = "no-subreaper")]
+        no_subreaper: bool,
     },
     /// Create a container: set up namespaces/mounts/cgroups and leave
     /// its process blocked, waiting for `start`. Returns once setup
@@ -708,6 +735,7 @@ fn main() -> std::process::ExitCode {
                 keep,
                 detach,
                 no_new_keyring,
+                no_subreaper,
             }) => cmd_run(
                 &root,
                 &id,
@@ -718,6 +746,7 @@ fn main() -> std::process::ExitCode {
                 keep,
                 detach,
                 no_new_keyring,
+                no_subreaper,
             ),
             Some(Command::Create {
                 id,
@@ -947,6 +976,7 @@ fn cmd_run(
     keep: bool,
     detach: bool,
     no_new_keyring: bool,
+    no_subreaper: bool,
 ) -> anyhow::Result<()> {
     let dir = bundle.unwrap_or_else(|| Path::new(".")).to_path_buf();
     tracing::debug!(container_id = id, bundle = %dir.display(), "run starting");
@@ -1033,6 +1063,7 @@ fn cmd_run(
                     no_pivot,
                     keep,
                     no_new_keyring,
+                    no_subreaper,
                 ) {
                     Ok(code) => code,
                     Err(_) => oci_runtime_core::launch::SETUP_FAILURE_EXIT_CODE,
@@ -1057,6 +1088,7 @@ fn cmd_run(
         no_pivot,
         keep,
         no_new_keyring,
+        no_subreaper,
     )?;
 
     // The container's own exit code becomes ours, matching runc/crun's
@@ -1099,7 +1131,25 @@ fn run_and_finalize(
     no_pivot: bool,
     keep: bool,
     no_new_keyring: bool,
+    no_subreaper: bool,
 ) -> anyhow::Result<i32> {
+    // Real runc's own exact placement (`~/git/runc/utils_linux.go:
+    // 264-267`): set the child-subreaper attribute right before
+    // blocking on the container's own exit, in whichever process is
+    // actually about to do that blocking — this function's own two
+    // call sites (the foreground process, or the detached `--detach`
+    // keeper fork) are exactly the two places that's true, matching
+    // `--no-subreaper`'s own real, checked-directly scope (see
+    // `Command::Run::no_subreaper`'s own doc comment for why `ocirun
+    // create` needs no equivalent flag at all). A failure here is
+    // logged and tolerated, not fatal, matching real runc's own
+    // identical `logrus.Warn(err)` (never a hard error) on the rare
+    // platform where this `prctl(2)` call itself could fail.
+    if !no_subreaper
+        && let Err(e) = rustix::process::set_child_subreaper(Some(rustix::process::getpid()))
+    {
+        tracing::warn!(error = %e, "failed to set child-subreaper attribute");
+    }
     // `launch::run` itself is just `run_reporting_pid` with a no-op
     // callback (see its own doc comment) — called directly here
     // instead so `--pid-file`'s own callback has somewhere to hook in,
