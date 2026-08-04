@@ -179,6 +179,24 @@ pub struct CriProcessConfig<'a> {
     /// that RPC for a pod without in-place vertical scaling; resources
     /// are expected to take effect at creation.
     pub resources: Option<oci_spec_types::runtime::LinuxResources>,
+    /// `ContainerConfig.linux.resources.oom_score_adj` (0400) --
+    /// already resolved by the caller (`config.linux.resources.
+    /// oom_score_adj != 0`, the proto's own documented "Default: 0
+    /// (not specified)" convention -- see `runtime_service.rs`'s own
+    /// `create_container` for exactly why `0` maps to `None` here
+    /// rather than an explicit, forced-to-zero write). Written
+    /// straight onto `process.oom_score_adj`, the exact same
+    /// [`oci_spec_types::runtime::Process`] field `ociman run/create
+    /// --oom-score-adj` (0394) already writes and `oci_runtime_core::
+    /// oom::apply` already reads back out at container-creation time
+    /// -- no new runtime primitive needed at all, only this CRI-level
+    /// plumbing. Matching real cri-o's own checked-directly scope
+    /// exactly (`~/git/cri-o/server/container_update_resources.go`'s
+    /// own literal `// TODO(runcom): OOMScoreAdj is missing` comment
+    /// confirms even real cri-o itself never re-applies this on a
+    /// later `UpdateContainerResources` call -- creation time only,
+    /// the same scope `0394` already established for `ociman`).
+    pub oom_score_adj: Option<i32>,
     /// `security_context.masked_paths`/`.readonly_paths` (0391) --
     /// appended onto this project's own existing default masked/
     /// readonly path lists (`Spec::example()`'s own `default_masked_
@@ -309,6 +327,13 @@ fn build_spec(
         capabilities.effective = cri.capabilities.clone();
         capabilities.permitted = cri.capabilities.clone();
     }
+
+    // `ContainerConfig.linux.resources.oom_score_adj` (0400) -- see
+    // `CriProcessConfig::oom_score_adj`'s own doc comment. `None` (no
+    // explicit request) leaves this unset, matching every other
+    // container this project launches (`Spec::example()`'s own
+    // default has no `oom_score_adj` of its own either).
+    process.oom_score_adj = cri.oom_score_adj;
 
     let linux = spec
         .linux
@@ -541,6 +566,7 @@ mod tests {
             mounts: &[],
             readonly_rootfs: false,
             resources: None,
+            oom_score_adj: None,
             masked_paths: &[],
             readonly_paths: &[],
             capabilities: oci_spec_types::runtime::podman_default_capabilities(),
@@ -587,6 +613,7 @@ mod tests {
             mounts: &[],
             readonly_rootfs: true,
             resources: None,
+            oom_score_adj: None,
             masked_paths: &[],
             readonly_paths: &[],
             capabilities: oci_spec_types::runtime::podman_default_capabilities(),
@@ -597,6 +624,73 @@ mod tests {
             spec.root.unwrap().readonly,
             "an explicit readonly_rootfs: true request must produce a genuinely read-only root"
         );
+    }
+
+    /// `ContainerConfig.linux.resources.oom_score_adj` (0400):
+    /// previously never read anywhere at all. `None` (the common,
+    /// unrequested case, and the proto's own documented `0` "not
+    /// specified" default already mapped to `None` by the caller)
+    /// leaves `process.oom_score_adj` unset, matching every other
+    /// container this project launches; an explicit value is written
+    /// straight through onto the same field `ociman run/create
+    /// --oom-score-adj` (0394) already writes.
+    #[test]
+    fn build_spec_writes_an_explicit_oom_score_adj_into_the_spec() {
+        let image_config = oci_spec_types::image::ContainerConfig {
+            cmd: Some(strings(&["sh"])),
+            ..Default::default()
+        };
+        let cri = CriProcessConfig {
+            command: &[],
+            args: &[],
+            envs: Vec::new(),
+            working_dir: "",
+            hostname: "oom-score-adj-test",
+            dns_servers: &[],
+            dns_searches: &[],
+            dns_options: &[],
+            mounts: &[],
+            readonly_rootfs: false,
+            resources: None,
+            oom_score_adj: Some(500),
+            masked_paths: &[],
+            readonly_paths: &[],
+            capabilities: oci_spec_types::runtime::podman_default_capabilities(),
+            sysctl: BTreeMap::new(),
+        };
+        let spec = build_spec(&cri, &image_config).unwrap();
+        assert_eq!(spec.process.unwrap().oom_score_adj, Some(500));
+    }
+
+    /// The common, unrequested case: `oom_score_adj: None` leaves the
+    /// spec's own field unset, the same as every other test in this
+    /// module never mentioning it at all.
+    #[test]
+    fn build_spec_without_an_explicit_oom_score_adj_leaves_it_unset() {
+        let image_config = oci_spec_types::image::ContainerConfig {
+            cmd: Some(strings(&["sh"])),
+            ..Default::default()
+        };
+        let cri = CriProcessConfig {
+            command: &[],
+            args: &[],
+            envs: Vec::new(),
+            working_dir: "",
+            hostname: "oom-score-adj-unset-test",
+            dns_servers: &[],
+            dns_searches: &[],
+            dns_options: &[],
+            mounts: &[],
+            readonly_rootfs: false,
+            resources: None,
+            oom_score_adj: None,
+            masked_paths: &[],
+            readonly_paths: &[],
+            capabilities: oci_spec_types::runtime::podman_default_capabilities(),
+            sysctl: BTreeMap::new(),
+        };
+        let spec = build_spec(&cri, &image_config).unwrap();
+        assert_eq!(spec.process.unwrap().oom_score_adj, None);
     }
 
     /// `ContainerConfig.linux.resources` (0390): previously never
@@ -635,6 +729,7 @@ mod tests {
             mounts: &[],
             readonly_rootfs: false,
             resources: Some(resources),
+            oom_score_adj: None,
             masked_paths: &[],
             readonly_paths: &[],
             capabilities: oci_spec_types::runtime::podman_default_capabilities(),
@@ -670,6 +765,7 @@ mod tests {
             mounts: &[],
             readonly_rootfs: false,
             resources: None,
+            oom_score_adj: None,
             masked_paths: &[],
             readonly_paths: &[],
             capabilities: oci_spec_types::runtime::podman_default_capabilities(),
@@ -703,6 +799,7 @@ mod tests {
             mounts: &[],
             readonly_rootfs: false,
             resources: None,
+            oom_score_adj: None,
             masked_paths: &["/extra/masked".to_string()],
             readonly_paths: &["/extra/readonly".to_string()],
             capabilities: oci_spec_types::runtime::podman_default_capabilities(),
@@ -761,6 +858,7 @@ mod tests {
             mounts: &[],
             readonly_rootfs: false,
             resources: None,
+            oom_score_adj: None,
             masked_paths: &[],
             readonly_paths: &[],
             capabilities: oci_spec_types::runtime::podman_default_capabilities(),
@@ -807,6 +905,7 @@ mod tests {
             mounts: &[],
             readonly_rootfs: false,
             resources: None,
+            oom_score_adj: None,
             masked_paths: &[],
             readonly_paths: &[],
             capabilities: requested.clone(),
@@ -846,6 +945,7 @@ mod tests {
             mounts: &[],
             readonly_rootfs: false,
             resources: None,
+            oom_score_adj: None,
             masked_paths: &[],
             readonly_paths: &[],
             capabilities: oci_spec_types::runtime::podman_default_capabilities(),

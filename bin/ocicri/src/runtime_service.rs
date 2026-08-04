@@ -1511,6 +1511,24 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             .as_ref()
             .and_then(|l| l.resources.as_ref())
             .map(linux_container_resources_to_oci);
+        // `ContainerConfig.linux.resources.oom_score_adj` (0400): the
+        // proto's own documented "Default: 0 (not specified)"
+        // convention (the same one every other `LinuxContainerResources`
+        // field already gets, e.g. `cpu_shares`/`cpu_period`) is
+        // honored here too -- a literal `0` leaves the process's own
+        // real, inherited `oom_score_adj` untouched rather than
+        // unconditionally forcing it to `0`, matching this project's
+        // own already-established convention for every other field on
+        // this same struct rather than real cri-o's own literal,
+        // unconditional passthrough (`SpecSetProcessOOMScoreAdj`,
+        // checked directly -- a difference with no observable effect
+        // for the overwhelmingly common "not specified" case, and
+        // strictly more consistent for the rare explicit-zero one).
+        let oom_score_adj = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.resources.as_ref())
+            .and_then(|r| (r.oom_score_adj != 0).then_some(r.oom_score_adj as i32));
         // `security_context.masked_paths`/`.readonly_paths` (0391),
         // resolved the same way `readonly_rootfs` just above is;
         // empty (the common case, and the only reachable case for a
@@ -1590,6 +1608,7 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
                 mounts: &mounts,
                 readonly_rootfs,
                 resources,
+                oom_score_adj,
                 masked_paths,
                 readonly_paths,
                 capabilities,
@@ -2044,10 +2063,17 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
     /// *limit* value whenever swap accounting is available at all and
     /// never actually reads `GetMemorySwapLimitInBytes()` -- honoring
     /// what the caller actually asked for is more correct than
-    /// replicating that). `oom_score_adj`/`hugepage_limits`/`unified`
-    /// have no home yet (no oom-score-adj write path, no hugetlb
-    /// support, no raw-cgroup-v2-file passthrough anywhere in this
-    /// project) and are honestly ignored rather than silently
+    /// replicating that). `unified` is applied too, strictly after
+    /// the structured writes just below (0398). `oom_score_adj` is
+    /// deliberately *not* re-applied here even though `CreateContainer`
+    /// now honors it at creation time (0400): real cri-o's own checked
+    /// `toOCIResources` has a literal `// TODO(runcom): OOMScoreAdj is
+    /// missing` comment, confirming even real cri-o itself never
+    /// re-applies this on a later `UpdateContainerResources` call
+    /// either -- matching that exact scope rather than inventing a
+    /// live-update path no real reference implementation has.
+    /// `hugepage_limits` has no home yet (no hugetlb support anywhere
+    /// in this project) and is honestly ignored rather than silently
     /// mis-applied -- matching `oci_runtime_core::cgroups`' own
     /// existing, narrower-than-the-full-spec scope.
     async fn update_container_resources(

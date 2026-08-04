@@ -567,6 +567,84 @@ async fn create_container_applies_the_sandboxs_own_sysctls_to_a_real_running_con
         .unwrap();
 }
 
+/// `ContainerConfig.linux.resources.oom_score_adj` (`docs/design/
+/// 0400`): a real, explicit non-zero value must land in the started
+/// container's own real `/proc/1/oom_score_adj` -- previously read
+/// nowhere at all, so a pod's own explicit request was silently
+/// dropped. Read via `/proc/1/` (the container's own init process,
+/// inside its own pid namespace), not `/proc/self/` -- unlike
+/// `ociman run --oom-score-adj`'s own equivalent test (where the
+/// timed command genuinely *is* the container's own init process,
+/// `execve`d in place, which inherits whatever `oom_score_adj` was
+/// already set), `ExecSync` here runs a *separate*, freshly forked
+/// process only joining the container's namespaces -- it was never
+/// the one `oci_runtime_core::oom::apply` adjusted at container-
+/// creation time, so its own `/proc/self` would read back `0`
+/// regardless of whether this feature actually works. Needs no live
+/// cgroup at all (unlike `resources`' other fields), so this doesn't
+/// need the `systemd_user_session_available` gate `create_container_
+/// resources_take_effect_at_creation_without_a_later_update_call`
+/// needs.
+#[tokio::test]
+async fn create_container_oom_score_adj_sets_a_real_value() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let mut config = container_config("oom-score-adj-test", 0);
+    config.command = vec!["/bin/sleep".to_string(), "300".to_string()];
+    config.linux = Some(oci_cri_types::LinuxContainerConfig {
+        resources: Some(oci_cri_types::LinuxContainerResources {
+            oom_score_adj: 500,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+
+    let response = client
+        .exec_sync(oci_cri_types::ExecSyncRequest {
+            container_id: container_id.clone(),
+            cmd: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "cat /proc/1/oom_score_adj".to_string(),
+            ],
+            timeout: 0,
+        })
+        .await
+        .expect("ExecSync failed")
+        .into_inner();
+    assert_eq!(response.exit_code, 0, "{response:?}");
+    assert_eq!(String::from_utf8_lossy(&response.stdout).trim(), "500");
+
+    client
+        .stop_container(oci_cri_types::StopContainerRequest {
+            container_id,
+            timeout: 0,
+        })
+        .await
+        .unwrap();
+}
+
 /// With no `dns_config` at all (real kubelet's own common case for a
 /// pod with no special DNS policy, and `crictl`'s own bare default),
 /// the real host's own `/etc/resolv.conf` is copied verbatim into the
