@@ -1288,3 +1288,117 @@ fn inspect_healthcheck_reflects_a_later_update_health_cmd_change() {
         "{after_view:?}"
     );
 }
+
+/// `ociman inspect --latest`/`-l` (matching real `podman inspect
+/// --latest` exactly) inspects the single, real most-recently-
+/// *created* container -- an earlier container's own, genuinely
+/// different name must never be reported.
+#[test]
+fn inspect_latest_shows_the_most_recently_created_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/inspect-latest:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let older = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "inspect-latest-older",
+            "ociman-test/inspect-latest:latest",
+            "true",
+        ],
+    );
+    assert!(older.status.success(), "{older:?}");
+
+    // A real, distinguishable creation-time gap.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let newer = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "inspect-latest-newer",
+            "ociman-test/inspect-latest:latest",
+            "true",
+        ],
+    );
+    assert!(newer.status.success(), "{newer:?}");
+    let newer_id = String::from_utf8_lossy(&newer.stdout).trim().to_string();
+
+    let inspect = ociman(storage_dir.path(), &["inspect", "--latest"]);
+    assert!(
+        inspect.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(view["name"], "inspect-latest-newer", "{view:?}");
+    assert_eq!(view["id"], newer_id, "{view:?}");
+}
+
+/// `--latest` and an explicit reference together is a real, immediate
+/// error, matching real podman's own exact wording -- a real,
+/// deliberate divergence from `ociman diff --latest` (`0448`), which
+/// has no such check at all.
+#[test]
+fn inspect_latest_combined_with_an_explicit_reference_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["inspect", "--latest", "some-id"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("--latest and arguments cannot be used together"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `--latest --type image` is a real, immediate error, matching real
+/// podman's own exact wording -- an image has no "most recently
+/// created" resolution concept `--latest` could ever mean here.
+#[test]
+fn inspect_latest_combined_with_type_image_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &["inspect", "--latest", "--type", "image"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("latest is not supported for type"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Neither `--latest` nor an explicit reference at all is a real,
+/// immediate error.
+#[test]
+fn inspect_with_no_reference_and_no_latest_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let out = ociman(storage_dir.path(), &["inspect"]);
+    assert!(!out.status.success());
+}
+
+/// `inspect --latest` on a genuinely empty store is a real, clear
+/// error, matching real `podman inspect --latest`'s own
+/// `ErrNoSuchCtr`.
+#[test]
+fn inspect_latest_on_an_empty_store_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["inspect", "--latest"]);
+    assert!(!out.status.success());
+}

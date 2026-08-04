@@ -1906,8 +1906,27 @@ enum Command {
     /// its own manifest digest, the same short ID `ociman images`'
     /// own `DIGEST` column prints) if no such container exists.
     Inspect {
-        /// A container's ID/`--name`, or an image reference.
-        reference: String,
+        /// A container's ID/`--name`, or an image reference — omit
+        /// when using `--latest`.
+        reference: Option<String>,
+        /// Inspect the single, real most-recently-*created* container
+        /// instead of naming one explicitly — matching real `podman
+        /// inspect --latest`/`-l` exactly (see [`Command::Rm::
+        /// latest`]'s own doc comment for the exact, checked-directly
+        /// `GetLatestContainer` semantics this shares verbatim).
+        /// Checked directly, `~/git/podman/cmd/podman/inspect/
+        /// inspect.go`'s own `inspect` function: a real, immediate
+        /// error combined with an explicit `reference` at all
+        /// (`"--latest and arguments cannot be used together"` —
+        /// unlike `ociman diff --latest`, `0448`, which has no such
+        /// check), a real, immediate error combined with `--type
+        /// image` specifically (`"latest is not supported for type
+        /// \"image\""`), and — with `--type` left at its own default
+        /// (`all`) — resolves as if `--type container` had been
+        /// given instead, never falling back to an image the way a
+        /// plain `all` lookup otherwise would.
+        #[arg(short = 'l', long)]
+        latest: bool,
         /// Render a single field via a Go-template-*lite* string
         /// instead of printing the full JSON (`--format`/`-f`,
         /// matching real `podman inspect --format`/`docker inspect
@@ -4332,16 +4351,42 @@ fn main() -> std::process::ExitCode {
             },
             Some(Command::Inspect {
                 reference,
+                latest,
                 format,
                 size,
                 inspect_type,
-            }) => cmd_inspect(
-                &reference,
-                cli.global.json,
-                format.as_deref(),
-                size,
-                inspect_type,
-            ),
+            }) => {
+                // Matches real podman's own exact wording, checked
+                // directly (`~/git/podman/cmd/podman/inspect/
+                // inspect.go`).
+                anyhow::ensure!(
+                    !(latest && inspect_type == InspectType::Image),
+                    "latest is not supported for type \"image\""
+                );
+                anyhow::ensure!(
+                    !(latest && reference.is_some()),
+                    "--latest and arguments cannot be used together"
+                );
+                let (resolved_reference, effective_type) = if latest {
+                    let containers = open_container_store()?;
+                    (
+                        resolve_latest_container(&containers)?,
+                        InspectType::Container,
+                    )
+                } else {
+                    (
+                        reference.ok_or_else(|| anyhow::anyhow!("no names or ids specified"))?,
+                        inspect_type,
+                    )
+                };
+                cmd_inspect(
+                    &resolved_reference,
+                    cli.global.json,
+                    format.as_deref(),
+                    size,
+                    effective_type,
+                )
+            }
             Some(Command::Run {
                 args,
                 rm,
