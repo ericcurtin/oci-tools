@@ -670,3 +670,46 @@ fn build_copy_from_without_tls_verify_false_refuses_plain_http_by_default() {
     );
     assert!(!build.status.success());
 }
+
+/// `ociman pull IMAGE [IMAGE...]` (0484): real docker/podman's own
+/// variadic multi-image shape -- every given reference is attempted
+/// independently, continuing past an earlier one's own failure
+/// rather than aborting the whole call (checked directly, `~/git/
+/// podman/cmd/podman/images/pull.go`'s own `imagePull`: a plain loop
+/// over `args`, accumulating errors via `utils.OutputErrors` rather
+/// than stopping at the first one). A deliberately-empty second
+/// reference fails to even parse (no network needed to prove that
+/// failure) -- the first, real, valid reference against the mock
+/// registry must still succeed and be stored, while the whole call
+/// still exits non-zero overall.
+#[test]
+fn pull_accepts_multiple_images_and_continues_past_an_earlier_failure() {
+    let mock = start_mock_with_a_real_image();
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let pull = ociman(
+        storage_dir.path(),
+        &[
+            "pull",
+            "--tls-verify=false",
+            &format!("{}/testrepo:latest", mock.addr),
+            "",
+        ],
+    );
+    assert!(
+        !pull.status.success(),
+        "the empty second reference must still fail the overall call"
+    );
+    assert!(
+        String::from_utf8_lossy(&pull.stdout).lines().count() == 1,
+        "the first, valid reference must still print its own digest: {}",
+        String::from_utf8_lossy(&pull.stdout)
+    );
+
+    let images = ociman(storage_dir.path(), &["images"]);
+    assert!(
+        String::from_utf8_lossy(&images.stdout).contains(&format!("{}/testrepo", mock.addr)),
+        "the first, valid reference must still be genuinely pulled and stored: {}",
+        String::from_utf8_lossy(&images.stdout)
+    );
+}

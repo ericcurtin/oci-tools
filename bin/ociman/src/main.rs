@@ -1249,9 +1249,22 @@ struct RunArgs {
 enum Command {
     /// Pull an image from a registry into local storage.
     Pull {
-        /// Image reference, e.g. `ubuntu`, `ubuntu:24.04`, or
-        /// `quay.io/foo/bar@sha256:...`.
-        reference: String,
+        /// One or more image references, e.g. `ubuntu`,
+        /// `ubuntu:24.04`, or `quay.io/foo/bar@sha256:...` — matching
+        /// real `docker pull`/`podman pull`'s own real `IMAGE
+        /// [IMAGE...]` variadic shape exactly (checked directly,
+        /// `~/git/podman/cmd/podman/images/pull.go`'s own
+        /// `cobra.MinimumNArgs(1)`/`imagePull`): every one is
+        /// attempted independently, continuing past an earlier one's
+        /// own failure rather than aborting the whole call — the
+        /// same "continue past individual failures, report a
+        /// combined error only at the end" convention `ociman rmi`
+        /// already established for its own multi-reference case. A
+        /// real, previously-unnoticed gap this project's own original
+        /// single-reference-only `Pull` had (see `docs/design/0481`'s
+        /// own "still out of scope" note).
+        #[arg(required = true)]
+        references: Vec<String>,
         /// Require HTTPS and verify certificates when contacting
         /// registries (matching real `docker pull`/`podman pull`'s
         /// own `--tls-verify` exactly, including its own flexible
@@ -4911,8 +4924,9 @@ enum ImageCommand {
     /// the identical field set — see [`Command::Pull`]'s own doc
     /// comment for the exact semantics, not repeated here.
     Pull {
-        /// Same as [`Command::Pull::reference`].
-        reference: String,
+        /// Same as [`Command::Pull::references`].
+        #[arg(required = true)]
+        references: Vec<String>,
         /// Same as [`Command::Pull::tls_verify`].
         #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         tls_verify: bool,
@@ -5048,12 +5062,12 @@ fn main() -> std::process::ExitCode {
                  arrives with later milestones)"
             ),
             Some(Command::Pull {
-                reference,
+                references,
                 tls_verify,
                 platform,
                 quiet,
             }) => cmd_pull(
-                &reference,
+                &references,
                 tls_verify,
                 platform.as_deref(),
                 quiet,
@@ -5575,12 +5589,12 @@ fn main() -> std::process::ExitCode {
                     ignore,
                 } => cmd_rmi(&references, force, all, ignore, cli.global.json),
                 ImageCommand::Pull {
-                    reference,
+                    references,
                     tls_verify,
                     platform,
                     quiet,
                 } => cmd_pull(
-                    &reference,
+                    &references,
                     tls_verify,
                     platform.as_deref(),
                     quiet,
@@ -5922,31 +5936,60 @@ impl ImageView {
 }
 
 fn cmd_pull(
-    reference_str: &str,
+    reference_strs: &[String],
     tls_verify: bool,
     platform: Option<&str>,
     quiet: bool,
     json: bool,
 ) -> anyhow::Result<()> {
-    let reference = Reference::parse(reference_str)
-        .with_context(|| format!("parsing image reference {reference_str:?}"))?;
+    // Matches real podman's own exact semantics, checked directly
+    // (`~/git/podman/cmd/podman/images/pull.go`'s own `imagePull`):
+    // every given reference is attempted independently, continuing
+    // past an earlier one's own failure rather than aborting the
+    // whole call -- the same "continue past individual failures,
+    // report a combined error only at the end" convention `cmd_rmi`
+    // already established for its own multi-reference case.
     let platform = platform
         .map(|p| build::parse_platform_spec("ociman pull", p))
         .transpose()?
         .unwrap_or_else(Platform::host);
     let store = open_store()?;
-    let record: ImageRecord =
-        pull_unconditionally(&store, &reference, tls_verify, &platform, quiet)
-            .with_context(|| format!("pulling {reference}"))?;
 
-    let summary = store
-        .image_summary(&record)
-        .with_context(|| format!("reading back manifest for {reference}"))?;
-    if json {
-        oci_cli_common::output::print_json(&ImageView::from_summary(summary))?;
-    } else {
-        println!("{}", record.manifest_digest);
+    let mut views = Vec::with_capacity(reference_strs.len());
+    let mut had_error = false;
+    for reference_str in reference_strs {
+        let pulled = (|| -> anyhow::Result<ImageView> {
+            let reference = Reference::parse(reference_str)
+                .with_context(|| format!("parsing image reference {reference_str:?}"))?;
+            let record: ImageRecord =
+                pull_unconditionally(&store, &reference, tls_verify, &platform, quiet)
+                    .with_context(|| format!("pulling {reference}"))?;
+            let summary = store
+                .image_summary(&record)
+                .with_context(|| format!("reading back manifest for {reference}"))?;
+            if !json {
+                println!("{}", record.manifest_digest);
+            }
+            Ok(ImageView::from_summary(summary))
+        })();
+        match pulled {
+            Ok(view) => views.push(view),
+            Err(e) => {
+                had_error = true;
+                eprintln!("error pulling {reference_str}: {e:#}");
+            }
+        }
     }
+
+    if json {
+        if let [view] = views.as_slice() {
+            oci_cli_common::output::print_json(view)?;
+        } else {
+            oci_cli_common::output::print_json(&views)?;
+        }
+    }
+
+    anyhow::ensure!(!had_error, "one or more images failed to be pulled");
     Ok(())
 }
 
