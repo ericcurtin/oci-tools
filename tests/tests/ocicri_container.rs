@@ -2510,6 +2510,175 @@ async fn stop_container_honors_the_images_stopsignal() {
     );
 }
 
+/// `ContainerConfig.stop_signal` (`docs/design/0483`): a real, explicit
+/// per-request override wins over the image's own declared
+/// `STOPSIGNAL` — matching real cri-o's own checked-directly
+/// `setupContainerRuntimeAndStopSignal` exactly. The container's own
+/// USR2 trap exit code (44, distinct from the image's own USR1-trap
+/// 43 `stop_container_honors_the_images_stopsignal` already proves)
+/// confirms which signal actually arrived.
+#[tokio::test]
+async fn stop_container_honors_an_explicit_cri_stop_signal_override() {
+    let Some((storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let stopsignal_image = "docker.io/ocicri-test/stopsignal-override:latest";
+    let busybox = busybox_path().unwrap();
+    let store = Store::open(storage.path()).unwrap();
+    seed_image(
+        &store,
+        stopsignal_image,
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig {
+            stop_signal: Some("SIGTERM".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let mut config = container_config("usr2-override-stopper", 0);
+    config.image = Some(ImageSpec {
+        image: stopsignal_image.to_string(),
+        ..Default::default()
+    });
+    config.stop_signal = oci_cri_types::Signal::Sigusr2 as i32;
+    config.command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "trap 'exit 44' USR2; trap 'exit 21' TERM; touch /ready; while true; do sleep 0.2; done"
+            .to_string(),
+    ];
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id,
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+    let ready = bundle_dir(storage.path(), &container_id).join("rootfs/ready");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "traps never installed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    client
+        .stop_container(oci_cri_types::StopContainerRequest {
+            container_id: container_id.clone(),
+            timeout: 30,
+        })
+        .await
+        .expect("StopContainer failed");
+    let status = wait_for_state(&mut client, &container_id, ContainerState::ContainerExited).await;
+    assert_eq!(
+        status.exit_code, 44,
+        "the USR2 trap's own exit code proves the explicit CRI override (not the image's own \
+         SIGTERM) was sent: {status:?}"
+    );
+}
+
+/// `ContainerConfig.stop_signal` left at its own real, default
+/// `RUNTIME_DEFAULT` (`0`, what an omitted field always deserializes
+/// to) means no override was given at all — falls through to the
+/// image's own declared `STOPSIGNAL` unchanged, the exact same
+/// pre-0483 behavior `stop_container_honors_the_images_stopsignal`
+/// already proves; this test only exists to make that "no accidental
+/// override at the default" guarantee explicit and named on its own.
+#[tokio::test]
+async fn stop_container_with_the_default_cri_stop_signal_falls_back_to_the_images_stopsignal() {
+    let Some((storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let stopsignal_image = "docker.io/ocicri-test/stopsignal-default:latest";
+    let busybox = busybox_path().unwrap();
+    let store = Store::open(storage.path()).unwrap();
+    seed_image(
+        &store,
+        stopsignal_image,
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig {
+            stop_signal: Some("SIGUSR1".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let mut config = container_config("runtime-default-stopper", 0);
+    config.image = Some(ImageSpec {
+        image: stopsignal_image.to_string(),
+        ..Default::default()
+    });
+    assert_eq!(
+        config.stop_signal,
+        oci_cri_types::Signal::RuntimeDefault as i32,
+        "container_config()'s own default must leave stop_signal unset"
+    );
+    config.command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "trap 'exit 43' USR1; trap 'exit 21' TERM; touch /ready; while true; do sleep 0.2; done"
+            .to_string(),
+    ];
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id,
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+    let ready = bundle_dir(storage.path(), &container_id).join("rootfs/ready");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "traps never installed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    client
+        .stop_container(oci_cri_types::StopContainerRequest {
+            container_id: container_id.clone(),
+            timeout: 30,
+        })
+        .await
+        .expect("StopContainer failed");
+    let status = wait_for_state(&mut client, &container_id, ContainerState::ContainerExited).await;
+    assert_eq!(
+        status.exit_code, 43,
+        "with no explicit override, the image's own STOPSIGNAL must still be used: {status:?}"
+    );
+}
+
 /// `ContainerConfig.mounts` (0304): a plain bind mount translates
 /// into a real OCI spec `Mount` entry -- matching real cri-o's own
 /// `["rbind", "rprivate"]` option pair for the private-propagation

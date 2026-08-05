@@ -1668,9 +1668,31 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             finished_at_nanos: None,
             exit_code: None,
             log_path,
-            // The image's own STOPSIGNAL (0244) -- image_config was
-            // already read above for the bundle spec.
-            stop_signal: image_config.stop_signal.clone().filter(|s| !s.is_empty()),
+            // `ContainerConfig.stop_signal` (0483) -- a real, explicit
+            // per-request override, checked directly against real
+            // cri-o's own `setupContainerRuntimeAndStopSignal`
+            // (`~/git/cri-o/server/container_create.go:1587-1591`):
+            // "Determine the stop signal for the container. If a
+            // custom stop signal is provided via CRI API, use it.
+            // Otherwise, fall back to the image's default stop signal
+            // as defined in its configuration" (a real, intentional,
+            // KEP-backed feature, not incidental --
+            // `kubernetes/enhancements#4960`). `RUNTIME_DEFAULT` (`0`,
+            // the proto's own documented "not specified" value, and
+            // what an omitted field always deserializes to) means no
+            // override was given at all -- falls through to the
+            // image's own `STOPSIGNAL` (0244) unchanged, the only
+            // path this project's own `stop_signal` field ever had
+            // before this increment. `as_str_name()` produces the
+            // identical `SIGTERM`/`SIGUSR1`-shaped string this
+            // field's own `Option<String>` already stores and
+            // `oci_runtime_core::signal::parse` already consumes at
+            // `StopContainer` time -- no changes needed there at all.
+            stop_signal: cri::Signal::try_from(config.stop_signal)
+                .ok()
+                .filter(|signal| *signal != cri::Signal::RuntimeDefault)
+                .map(|signal| signal.as_str_name().to_string())
+                .or_else(|| image_config.stop_signal.clone().filter(|s| !s.is_empty())),
             // `LinuxPodSandboxConfig.cgroup_parent` (0467) -- a plain
             // proto3 scalar field (never wrapped in its own
             // `Option`, unlike a message-typed one), so an absent
