@@ -534,3 +534,80 @@ fn enter_of_an_unknown_box_is_a_clear_error() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `ocibox enter`'s own default behavior (a real, previously-missing
+/// merge this project's `enter` has never performed before now):
+/// the box's own `PATH` gets the real *host*'s own `$PATH` merged in,
+/// not just whatever the box's own image declared -- matching real
+/// `distrobox enter`'s own identical default (`--clean-path` is the
+/// opt-*out*, checked directly, `~/git/distrobox/internal/cli/
+/// enter.go`'s own `clean-path`/`"c"` flag, default `false`).
+#[test]
+fn enter_merges_the_real_hosts_own_path_into_the_boxs_own_by_default() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+
+    let out = Command::new(bin_path("ocibox"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .env("PATH", "/home/user/.local/bin:/usr/bin")
+        .args(["enter", "testbox", "--", "/bin/sh", "-c", "echo $PATH"])
+        .output()
+        .expect("failed to spawn ocibox enter");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "/home/user/.local/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/sbin:/bin\n",
+        "expected the real host PATH given to `ocibox enter` itself to be merged into the \
+         box's own, with only the still-missing standard dirs appended and the whole thing \
+         FHS-reordered"
+    );
+}
+
+/// `ocibox enter --clean-path`/`-c` (matching real `distrobox enter
+/// --clean-path` exactly) resets `PATH` to the bare FHS standard,
+/// discarding the real host `PATH` given to `ocibox enter` itself
+/// entirely -- proving the flag actually reaches `enter_spec`, not
+/// just that it parses.
+#[test]
+fn enter_clean_path_resets_to_the_bare_fhs_standard_ignoring_the_real_host_path() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+
+    let out = Command::new(bin_path("ocibox"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .env("PATH", "/home/user/.local/bin:/usr/bin")
+        .args([
+            "enter",
+            "--clean-path",
+            "testbox",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo $PATH",
+        ])
+        .output()
+        .expect("failed to spawn ocibox enter");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n",
+    );
+}

@@ -280,6 +280,18 @@ enum Command {
         /// defaults to a shell (see this command's own doc comment)
         /// if empty.
         command: Vec<String>,
+        /// Reset `PATH` inside the box to the bare FHS standard
+        /// (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
+        /// /bin`), matching real `distrobox enter --clean-path`/`-c`
+        /// exactly (checked directly, `~/git/distrobox/internal/cli/
+        /// enter.go`'s own `clean-path`/`"c"` flag, default `false`).
+        /// Without it (the default, and a real, previously-missing
+        /// behavior this closes at the same time — see `build_
+        /// container_path`'s own doc comment): the real host's own
+        /// `$PATH` is merged into the box's own, not just the box's
+        /// bare image-declared one.
+        #[arg(long = "clean-path", short = 'c')]
+        clean_path: bool,
     },
     /// Create a temporary box, run one command (or a default shell)
     /// inside it, and always remove it again afterward — matching
@@ -569,7 +581,11 @@ fn main() -> std::process::ExitCode {
                 rm_home: _,
                 all,
             }) => cmd_rm(&names, all),
-            Some(Command::Enter { name, command }) => cmd_enter(&name, &command),
+            Some(Command::Enter {
+                name,
+                command,
+                clean_path,
+            }) => cmd_enter(&name, &command, clean_path),
             Some(Command::Ephemeral {
                 image,
                 pull,
@@ -993,6 +1009,100 @@ fn cmd_list(json: bool) -> anyhow::Result<()> {
 const DEFAULT_ENV_WHEN_BOX_DECLARES_NONE: &str =
     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// The six real FHS standard directories every `PATH` this project
+/// builds always ends up containing at least once — matching real
+/// distrobox's own identical list exactly (`~/git/distrobox/pkg/
+/// containermanager/containermanager.go`'s own `BuildContainerPath`).
+const STANDARD_PATH_DIRS: &[&str] = &[
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+];
+
+/// Builds the real `PATH` value `ocibox enter` gives the box's own
+/// process — a direct, checked-directly port of real distrobox's own
+/// `BuildContainerPath`/`reorderFHSPath` (`~/git/distrobox/pkg/
+/// containermanager/containermanager.go:179-241`), reached from every
+/// real container-manager backend distrobox itself has (`docker.go`/
+/// `podman.go`'s own identical `BuildContainerPath(cleanPath, os.
+/// Getenv("PATH"), containerConfig.ContainerPath)` call), not just
+/// one of several — this project has only ever had one backend, so
+/// there is nothing to fan this out to.
+///
+/// `--clean-path` (`clean_path: true`) always wins outright: a bare
+/// join of [`STANDARD_PATH_DIRS`], discarding both `host_path` and
+/// `container_path` entirely. Otherwise: with no real host `PATH` at
+/// all (this project's own `ocibox enter` process always has one in
+/// practice, unlike a literal empty override, but ported faithfully
+/// for the identical edge case real distrobox itself handles), falls
+/// back to the box's own already-declared `container_path` if it has
+/// one, else the bare standard-dirs join too. With a real host
+/// `PATH`, merges it with whichever of the six standard directories
+/// aren't already present as a whole `:`-delimited segment (a
+/// literal substring match would wrongly reject e.g. `/opt/usr/bin`
+/// as already containing `/usr/bin`; splitting on `:` first, matching
+/// real distrobox's own regex anchoring, avoids that), then
+/// re-orders the result so each `/usr/local/*` directory always
+/// precedes its own `/usr/*` counterpart (`reorder_fhs_path`) —
+/// distrobox's own wrapper scripts live under `/usr/local/*` and must
+/// win when a name collides.
+fn build_container_path(clean_path: bool, host_path: Option<&str>, container_path: &str) -> String {
+    let standard_join = || STANDARD_PATH_DIRS.join(":");
+    if clean_path {
+        return standard_join();
+    }
+    let Some(host_path) = host_path.filter(|p| !p.is_empty()) else {
+        return if container_path.is_empty() {
+            standard_join()
+        } else {
+            container_path.to_string()
+        };
+    };
+    let host_segments: Vec<&str> = host_path.split(':').collect();
+    let mut merged = host_path.to_string();
+    for standard_dir in STANDARD_PATH_DIRS {
+        if !host_segments.contains(standard_dir) {
+            merged.push(':');
+            merged.push_str(standard_dir);
+        }
+    }
+    reorder_fhs_path(&merged)
+}
+
+/// See [`build_container_path`]'s own doc comment for why this
+/// exists — a direct port of real distrobox's own `reorderFHSPath`.
+fn reorder_fhs_path(path: &str) -> String {
+    let mut reordered: Vec<&str> = Vec::new();
+    for segment in path.split(':') {
+        match segment {
+            "/usr/local/bin" | "/usr/local/sbin" => {
+                // Skipped here; re-inserted right before its own
+                // `/usr/*` counterpart below (or, if that counterpart
+                // never appears at all, prepended afterward instead).
+            }
+            "/usr/bin" => {
+                reordered.push("/usr/local/bin");
+                reordered.push("/usr/bin");
+            }
+            "/usr/sbin" => {
+                reordered.push("/usr/local/sbin");
+                reordered.push("/usr/sbin");
+            }
+            other => reordered.push(other),
+        }
+    }
+    let mut result = reordered.join(":");
+    for local_dir in ["/usr/local/bin", "/usr/local/sbin"] {
+        if !result.split(':').any(|segment| segment == local_dir) {
+            result = format!("{local_dir}:{result}");
+        }
+    }
+    result
+}
+
 /// Picks a default command to run when `ocibox enter` is given no
 /// explicit `COMMAND`: `/bin/bash` if the box's own rootfs has one,
 /// else `/bin/sh`, else a clear, real error naming neither — rather
@@ -1025,6 +1135,7 @@ fn default_shell_args(rootfs: &Path) -> anyhow::Result<Vec<String>> {
 fn enter_spec(
     record: &BoxRecord,
     args: Vec<String>,
+    clean_path: bool,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -1105,6 +1216,32 @@ fn enter_spec(
     } else {
         record.env.clone()
     };
+    // `--clean-path`/`-c` and the real host-`$PATH`-merge-into-box
+    // default (matching real `distrobox enter --clean-path` exactly,
+    // see `build_container_path`'s own doc comment): the box's own
+    // already-declared `PATH` (whichever of the two branches above
+    // just set it) is this function's own `container_path` input,
+    // replaced in place — a real, previously-missing merge this
+    // project's own `ocibox enter` has never performed at all before
+    // now (every earlier session saw only the box's own bare image-
+    // declared `PATH`, host tools installed via `ocibox`'s own export
+    // mechanism notwithstanding, never the *host's* own `$PATH`
+    // itself).
+    let container_path = process
+        .env
+        .iter()
+        .find_map(|kv| kv.strip_prefix("PATH="))
+        .unwrap_or_default()
+        .to_string();
+    let new_path = build_container_path(
+        clean_path,
+        std::env::var("PATH").ok().as_deref(),
+        &container_path,
+    );
+    match process.env.iter_mut().find(|kv| kv.starts_with("PATH=")) {
+        Some(entry) => *entry = format!("PATH={new_path}"),
+        None => process.env.push(format!("PATH={new_path}")),
+    }
     process.cwd = home
         .as_ref()
         .map(|h| h.to_string_lossy().into_owned())
@@ -1162,8 +1299,8 @@ fn enter_spec(
 /// other real container this project launches uses — see this
 /// module's own doc comment and [`Command::Enter`]'s own doc comment
 /// for exactly what this first slice does and doesn't do yet.
-fn cmd_enter(name: &str, command: &[String]) -> anyhow::Result<()> {
-    let exit_code = enter_and_get_exit_code(name, command)?;
+fn cmd_enter(name: &str, command: &[String], clean_path: bool) -> anyhow::Result<()> {
+    let exit_code = enter_and_get_exit_code(name, command, clean_path)?;
     // The container's own exit code becomes ours, matching `ocirun
     // run`'s own identical real bypass of `oci_cli_common::run_main`'s
     // usual `Ok(())`-means-success mapping: exit code 0 must mean "the
@@ -1180,7 +1317,11 @@ fn cmd_enter(name: &str, command: &[String]) -> anyhow::Result<()> {
 /// (removing the ephemeral box) *after* the command inside it finishes
 /// but *before* this process actually exits, which a direct
 /// `std::process::exit` call here would make impossible.
-fn enter_and_get_exit_code(name: &str, command: &[String]) -> anyhow::Result<i32> {
+fn enter_and_get_exit_code(
+    name: &str,
+    command: &[String],
+    clean_path: bool,
+) -> anyhow::Result<i32> {
     validate_box_name(name)?;
     let box_dir = boxes_root().join(name);
     anyhow::ensure!(box_dir.is_dir(), "{name}: no such box");
@@ -1198,7 +1339,8 @@ fn enter_and_get_exit_code(name: &str, command: &[String]) -> anyhow::Result<i32
         command.to_vec()
     };
 
-    let spec = enter_spec(&record, args).with_context(|| format!("preparing spec for {name}"))?;
+    let spec = enter_spec(&record, args, clean_path)
+        .with_context(|| format!("preparing spec for {name}"))?;
     let config_path = box_dir.join(oci_runtime_core::bundle::CONFIG_FILENAME);
     std::fs::write(&config_path, serde_json::to_vec_pretty(&spec)?)
         .with_context(|| format!("writing {}", config_path.display()))?;
@@ -1382,7 +1524,10 @@ fn cmd_ephemeral(
     create_box(image, &name, pull, hostname, home, volumes, platform)
         .with_context(|| format!("creating ephemeral box {name}"))?;
 
-    let result = enter_and_get_exit_code(&name, command);
+    // Real `distrobox ephemeral` has no `--clean-path` flag of its
+    // own at all (checked directly, `~/git/distrobox/internal/cli/
+    // ephemeral.go`) -- unlike `enter`, always the default merge.
+    let result = enter_and_get_exit_code(&name, command, false);
 
     // Always attempted, regardless of whether the command inside the
     // box succeeded, failed, or `enter` itself errored outright (e.g.
@@ -2321,6 +2466,86 @@ mod tests {
     #[test]
     fn validate_box_name_rejects_empty() {
         assert!(validate_box_name("").is_err());
+    }
+
+    #[test]
+    fn build_container_path_clean_path_always_wins_ignoring_both_other_inputs() {
+        assert_eq!(
+            build_container_path(true, Some("/some/host/dir"), "/some/container/dir"),
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        );
+        assert_eq!(
+            build_container_path(true, None, ""),
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        );
+    }
+
+    #[test]
+    fn build_container_path_with_no_host_path_falls_back_to_container_path() {
+        assert_eq!(
+            build_container_path(false, None, "/container/only/path"),
+            "/container/only/path"
+        );
+        assert_eq!(
+            build_container_path(false, Some(""), "/container/only/path"),
+            "/container/only/path"
+        );
+    }
+
+    #[test]
+    fn build_container_path_with_neither_host_nor_container_path_falls_back_to_standard() {
+        assert_eq!(
+            build_container_path(false, None, ""),
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        );
+    }
+
+    #[test]
+    fn build_container_path_merges_a_real_host_path_adding_only_missing_standard_dirs() {
+        // A real, ordinary host PATH already containing some (but not
+        // all) of the six standard directories -- only the missing
+        // ones get appended, and the whole thing is FHS-reordered
+        // afterward (local-bin/-sbin always right before their own
+        // /usr counterpart).
+        let result = build_container_path(false, Some("/home/user/.local/bin:/usr/bin"), "");
+        assert_eq!(
+            result,
+            "/home/user/.local/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/sbin:/bin"
+        );
+    }
+
+    #[test]
+    fn build_container_path_never_substring_matches_a_standard_dir_inside_a_longer_segment() {
+        // `/opt/usr/bin` must not be mistaken for already containing
+        // `/usr/bin` -- matching real distrobox's own `:`-anchored
+        // regex, ported here as a real `:`-delimited segment split
+        // instead of a substring search.
+        let result = build_container_path(false, Some("/opt/usr/bin"), "");
+        assert!(
+            result.split(':').any(|s| s == "/usr/bin"),
+            "expected the real /usr/bin to still be added: {result:?}"
+        );
+    }
+
+    #[test]
+    fn reorder_fhs_path_moves_local_bin_and_sbin_right_before_their_own_usr_counterpart() {
+        assert_eq!(
+            reorder_fhs_path("/sbin:/usr/bin:/bin:/usr/sbin"),
+            "/sbin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin"
+        );
+    }
+
+    #[test]
+    fn reorder_fhs_path_prepends_a_local_dir_missing_its_own_usr_counterpart() {
+        // `/usr/bin`/`/usr/sbin` are both absent here, so neither
+        // `/usr/local/bin` nor `/usr/local/sbin` had anywhere to be
+        // reinserted during the main pass -- matching real
+        // distrobox's own identical "prepend any still-missing local
+        // dir afterward" fallback.
+        assert_eq!(
+            reorder_fhs_path("/some/other/dir"),
+            "/usr/local/sbin:/usr/local/bin:/some/other/dir"
+        );
     }
 
     #[test]
