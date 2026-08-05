@@ -648,3 +648,209 @@ fn unmount_with_nothing_given_at_all_is_a_clear_error() {
         String::from_utf8_lossy(&unmount.stderr)
     );
 }
+
+/// `ociman mount CONTAINER CONTAINER...` (multiple explicit targets)
+/// — matching real `podman mount`'s own multi-id support exactly.
+/// Each container's own real root path is printed (never the
+/// `<id>\t<path>` bare-mode table), in the same order given.
+#[test]
+fn mount_accepts_multiple_explicit_containers() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let first = seed_and_run_stopped_container_named(
+        storage_dir.path(),
+        "ociman-test/mount-multi-first:latest",
+        "mount-multi-first",
+        true,
+    );
+    let second = seed_and_run_stopped_container_named(
+        storage_dir.path(),
+        "ociman-test/mount-multi-second:latest",
+        "mount-multi-second",
+        true,
+    );
+
+    let mount = ociman(storage_dir.path(), &["mount", &first, &second]);
+    assert!(
+        mount.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&mount.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&mount.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let first_rootfs = storage_dir
+        .path()
+        .join("containers")
+        .join(&first)
+        .join("rootfs");
+    let second_rootfs = storage_dir
+        .path()
+        .join("containers")
+        .join(&second)
+        .join("rootfs");
+    assert_eq!(
+        lines,
+        vec![
+            first_rootfs.display().to_string(),
+            second_rootfs.display().to_string()
+        ]
+    );
+}
+
+/// A real, two-phase resolution: every explicit target is resolved
+/// before anything is printed, so one unknown container among several
+/// aborts the whole call rather than partially succeeding — matching
+/// `cmd_unmount`'s own identical multi-id convention (`0471`).
+#[test]
+fn mount_with_one_unknown_container_among_several_aborts_before_printing_any() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let first = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/mount-abort:latest",
+        "exit 0",
+        true,
+    );
+
+    let mount = ociman(storage_dir.path(), &["mount", &first, "does-not-exist"]);
+    assert!(!mount.status.success());
+    assert!(
+        mount.stdout.is_empty(),
+        "stdout: {}",
+        String::from_utf8_lossy(&mount.stdout)
+    );
+}
+
+/// `ociman mount --all`/`-a` — matching real `podman mount --all`
+/// exactly: each container's own real root path is printed (never the
+/// bare-mode table), continuing past the one real rootless-overlay-
+/// rootfs gap container instead of aborting the whole sweep.
+#[test]
+fn mount_all_prints_every_containers_own_root_path() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let first = seed_and_run_stopped_container_named(
+        storage_dir.path(),
+        "ociman-test/mount-all-first:latest",
+        "mount-all-first",
+        true,
+    );
+    let second = seed_and_run_stopped_container_named(
+        storage_dir.path(),
+        "ociman-test/mount-all-second:latest",
+        "mount-all-second",
+        true,
+    );
+
+    let mount = ociman(storage_dir.path(), &["mount", "--all"]);
+    assert!(
+        mount.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&mount.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&mount.stdout);
+    let mut lines: Vec<&str> = stdout.lines().collect();
+    lines.sort();
+    let first_rootfs = storage_dir
+        .path()
+        .join("containers")
+        .join(&first)
+        .join("rootfs")
+        .display()
+        .to_string();
+    let second_rootfs = storage_dir
+        .path()
+        .join("containers")
+        .join(&second)
+        .join("rootfs")
+        .display()
+        .to_string();
+    let mut expected = vec![first_rootfs.as_str(), second_rootfs.as_str()];
+    expected.sort();
+    assert_eq!(lines, expected);
+}
+
+/// `ociman mount --latest`/`-l` — matching real `podman mount
+/// --latest` exactly.
+#[test]
+fn mount_latest_targets_the_most_recently_created_container() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let _first = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/mount-latest-first:latest",
+        "exit 0",
+        true,
+    );
+    std::thread::sleep(Duration::from_millis(1200));
+    let second = seed_and_run_stopped_container_named(
+        storage_dir.path(),
+        "ociman-test/mount-latest-second:latest",
+        "mount-latest-second",
+        true,
+    );
+
+    let mount = ociman(storage_dir.path(), &["mount", "--latest"]);
+    assert!(
+        mount.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&mount.stderr)
+    );
+    let printed = String::from_utf8_lossy(&mount.stdout).trim().to_string();
+    let expected = storage_dir
+        .path()
+        .join("containers")
+        .join(&second)
+        .join("rootfs");
+    assert_eq!(std::path::PathBuf::from(&printed), expected);
+}
+
+#[test]
+fn mount_all_and_latest_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let mount = ociman(storage_dir.path(), &["mount", "--all", "--latest"]);
+    assert!(!mount.status.success());
+    assert!(
+        String::from_utf8_lossy(&mount.stderr)
+            .contains("--all and --latest cannot be used together"),
+        "{}",
+        String::from_utf8_lossy(&mount.stderr)
+    );
+}
+
+#[test]
+fn mount_all_with_an_explicit_container_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let mount = ociman(storage_dir.path(), &["mount", "--all", "some-container"]);
+    assert!(!mount.status.success());
+    assert!(
+        String::from_utf8_lossy(&mount.stderr).contains("no arguments are needed with --all"),
+        "{}",
+        String::from_utf8_lossy(&mount.stderr)
+    );
+}
+
+#[test]
+fn mount_latest_with_an_explicit_container_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let mount = ociman(storage_dir.path(), &["mount", "--latest", "some-container"]);
+    assert!(!mount.status.success());
+    assert!(
+        String::from_utf8_lossy(&mount.stderr)
+            .contains("--latest and containers cannot be used together"),
+        "{}",
+        String::from_utf8_lossy(&mount.stderr)
+    );
+}

@@ -2902,29 +2902,72 @@ enum Command {
     /// (`resolve_container_root`'s own doc comment) — a clear error,
     /// not a silently wrong path, for that one case.
     ///
-    /// With no `CONTAINER` at all, lists every currently-mounted
-    /// container instead — matching real `podman mount`'s own
-    /// identical bare-invocation mode exactly (checked directly,
-    /// `~/git/podman/cmd/podman/containers/mount.go`'s own doc
-    /// comment: *"Lists all mounted containers mount points if no
-    /// container is specified"*, and its own default `{{.ID}}\t
-    /// {{.Path}}` per-line output with no header row). Since this
-    /// project's own containers have no separate mount step to
-    /// distinguish a "mounted" one from an "unmounted" one at all
-    /// (the same reasoning above), every existing container is
-    /// honestly always "mounted" — except the one real, already-
-    /// documented rootless-overlay-rootfs gap case above, which is
-    /// silently skipped here rather than aborting the whole listing
-    /// (a single container this project genuinely can't resolve a
-    /// root path for shouldn't hide every other one's). Sorted by
-    /// creation time ascending, matching this project's own
-    /// established `ps` default order — real podman's own bare-mode
-    /// order is an unspecified storage-iteration order with no
-    /// documented guarantee to match instead.
+    /// With no `CONTAINER` at all (and no `--all`/`--latest` either),
+    /// lists every currently-mounted container instead — matching
+    /// real `podman mount`'s own identical bare-invocation mode
+    /// exactly (checked directly, `~/git/podman/cmd/podman/
+    /// containers/mount.go`'s own doc comment: *"Lists all mounted
+    /// containers mount points if no container is specified"*, and
+    /// its own default `{{.ID}}\t{{.Path}}` per-line output with no
+    /// header row). Since this project's own containers have no
+    /// separate mount step to distinguish a "mounted" one from an
+    /// "unmounted" one at all (the same reasoning above), every
+    /// existing container is honestly always "mounted" — except the
+    /// one real, already-documented rootless-overlay-rootfs gap case
+    /// above, which is silently skipped here rather than aborting the
+    /// whole listing (a single container this project genuinely
+    /// can't resolve a root path for shouldn't hide every other
+    /// one's). Sorted by creation time ascending, matching this
+    /// project's own established `ps` default order — real podman's
+    /// own bare-mode order is an unspecified storage-iteration order
+    /// with no documented guarantee to match instead.
+    ///
+    /// Accepts multiple `CONTAINER`s, `--all`, or `--latest` too —
+    /// matching real `podman mount`'s own exact argument-validation
+    /// rules (checked directly, `~/git/podman/cmd/podman/validate/
+    /// args.go`'s own `CheckAllLatestAndIDFile`, used with
+    /// `ignoreArgLen=true`, plus `mount.go`'s own extra manual
+    /// `--latest`-vs-explicit-container check inside its `RunE`):
+    /// `--all` and `--latest` together is `"--all and --latest cannot
+    /// be used together"`; `--all` with an explicit container is
+    /// `"no arguments are needed with --all"`; `--latest` with an
+    /// explicit container is `"--latest and containers cannot be used
+    /// together"`. **A real, checked-directly output-shape
+    /// divergence from the bare-listing case above**: with any
+    /// `CONTAINER`/`--all`/`--latest` given, only each one's own real
+    /// root path is printed (one per line, no id, no tab) — the exact
+    /// same plain output the original single-`CONTAINER` case always
+    /// had — never the `{{.ID}}\t{{.Path}}` table, which is reserved
+    /// for the truly bare invocation alone (checked directly,
+    /// `mount.go`'s own `mount()`: `if len(args) > 0 || mountOpts.
+    /// Latest || mountOpts.All { ...print just r.Path... }`, an
+    /// entirely separate branch from the bare-mode table print
+    /// further down). `--all` tolerates the one real rootless-
+    /// overlay-rootfs gap case per container (skips it, continues
+    /// with every other one, reports a combined error at the end —
+    /// matching `kill --all`'s own already-established "continue past
+    /// individual failures" convention) instead of the bare listing's
+    /// own silent skip; two or more explicit `CONTAINER`s instead
+    /// follow the two-phase "resolve everything first, abort before
+    /// printing anything if any one fails" convention `unmount`
+    /// (`0471`) already established.
     Mount {
-        /// The container's ID or `--name` — omit to list every
-        /// currently-mounted container instead.
-        container: Option<String>,
+        /// One or more container IDs/`--name`s — omit to list every
+        /// currently-mounted container, or use `--all`/`--latest`.
+        containers: Vec<String>,
+        /// Mount (print the real root path of) every existing
+        /// container — matching real `podman mount --all`/`-a`
+        /// exactly.
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Mount (print the real root path of) the single, real
+        /// most-recently-*created* container instead of naming one
+        /// explicitly — matching real `podman mount --latest`/`-l`
+        /// exactly (see [`Command::Rm::latest`]'s own doc comment for
+        /// the exact, checked-directly `GetLatestContainer` semantics
+        /// this shares verbatim).
+        #[arg(short = 'l', long)]
+        latest: bool,
     },
     /// A real no-op — matching real `podman unmount`'s own identical
     /// behavior for the one storage-driver case this project's own
@@ -4980,7 +5023,11 @@ fn main() -> std::process::ExitCode {
                 };
                 cmd_diff(&resolved_id, cli.global.json, format.as_deref())
             }
-            Some(Command::Mount { container }) => cmd_mount(container.as_deref()),
+            Some(Command::Mount {
+                containers,
+                all,
+                latest,
+            }) => cmd_mount(&containers, all, latest),
             Some(Command::Unmount {
                 containers,
                 all,
@@ -11489,29 +11536,100 @@ fn cmd_diff(id: &str, json: bool, format: Option<&str>) -> anyhow::Result<()> {
 /// or stopped container alike. With `container` absent, lists every
 /// currently-mounted container instead — see [`Command::Mount`]'s own
 /// doc comment for the exact bare-mode semantics.
-fn cmd_mount(container: Option<&str>) -> anyhow::Result<()> {
-    let Some(container) = container else {
+fn cmd_mount(ids: &[String], all: bool, latest: bool) -> anyhow::Result<()> {
+    // Matches real podman's own exact wording and check order, checked
+    // directly (`~/git/podman/cmd/podman/validate/args.go`'s own
+    // `CheckAllLatestAndIDFile`, plus `mount.go`'s own extra manual
+    // `RunE` check for the third rule below).
+    anyhow::ensure!(
+        !(all && latest),
+        "--all and --latest cannot be used together"
+    );
+    anyhow::ensure!(
+        !(all && !ids.is_empty()),
+        "no arguments are needed with --all"
+    );
+    anyhow::ensure!(
+        !(latest && !ids.is_empty()),
+        "--latest and containers cannot be used together"
+    );
+
+    if all {
+        // Continue past an individual rootless-overlay-rootfs gap
+        // container rather than aborting the whole sweep, reporting a
+        // combined error only at the end -- matching `cmd_kill --all`'s
+        // own already-established "continue past individual failures"
+        // convention (a real, checked-directly divergence from the
+        // bare-listing mode's own silent skip, see this command's own
+        // doc comment).
         let containers = open_container_store()?;
         let mut states = containers.list().context("listing containers")?;
         states.sort_by(|a, b| a.created.cmp(&b.created));
+        let mut first_error = None;
         for state in states {
-            let bundle_dir = containers.container_dir(&state.id);
-            // Silently skipped, not a hard error for the whole
-            // listing -- see `Command::Mount`'s own doc comment.
-            if rootfs_setup::upper_dir(&bundle_dir).exists() {
-                continue;
+            match resolve_container_root(&state.id, "mount") {
+                Ok((root, _state)) => println!("{}", root.display()),
+                Err(e) => {
+                    eprintln!("error mounting {}: {e:#}", state.id);
+                    first_error.get_or_insert(e);
+                }
             }
-            let id = if state.id.len() > 12 {
-                &state.id[..12]
-            } else {
-                &state.id
-            };
-            println!("{id}\t{}", state.rootfs);
+        }
+        return match first_error {
+            Some(e) => Err(e.context("mounting containers")),
+            None => Ok(()),
+        };
+    }
+
+    if latest {
+        let containers = open_container_store()?;
+        let id = resolve_latest_container(&containers)?;
+        let (root, _state) = resolve_container_root(&id, "mount")?;
+        println!("{}", root.display());
+        return Ok(());
+    }
+
+    if let [id] = ids {
+        let (root, _state) = resolve_container_root(id, "mount")?;
+        println!("{}", root.display());
+        return Ok(());
+    }
+
+    if !ids.is_empty() {
+        // Two or more explicit targets: resolve every one first,
+        // aborting the whole call before printing anything if any of
+        // them don't exist (or hit the rootless-overlay-rootfs gap) --
+        // matching `cmd_unmount`'s own identical two-phase convention
+        // for a plain multi-id command (`0471`).
+        let mut roots = Vec::with_capacity(ids.len());
+        for id in ids {
+            roots.push(resolve_container_root(id, "mount")?.0);
+        }
+        for root in roots {
+            println!("{}", root.display());
         }
         return Ok(());
-    };
-    let (root, _state) = resolve_container_root(container, "mount")?;
-    println!("{}", root.display());
+    }
+
+    // The truly bare invocation: list every currently-mounted
+    // container instead -- see this command's own doc comment.
+    let containers = open_container_store()?;
+    let mut states = containers.list().context("listing containers")?;
+    states.sort_by(|a, b| a.created.cmp(&b.created));
+    for state in states {
+        let bundle_dir = containers.container_dir(&state.id);
+        // Silently skipped, not a hard error for the whole listing --
+        // see `Command::Mount`'s own doc comment.
+        if rootfs_setup::upper_dir(&bundle_dir).exists() {
+            continue;
+        }
+        let id = if state.id.len() > 12 {
+            &state.id[..12]
+        } else {
+            &state.id
+        };
+        println!("{id}\t{}", state.rootfs);
+    }
     Ok(())
 }
 
