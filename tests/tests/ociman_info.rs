@@ -192,3 +192,47 @@ fn info_format_of_an_unknown_field_is_a_clear_error() {
         String::from_utf8_lossy(&bad.stderr)
     );
 }
+
+/// `ociman system info` (0485) is a real, genuine alias for `ociman
+/// info` itself, matching real `podman system info`'s own checked-
+/// directly identical `RunE`/flag set as top-level `podman info`
+/// exactly (`~/git/podman/cmd/podman/system/info.go`) -- the same
+/// real values for the same fixture state (except `host.mem_free`,
+/// this report's own one genuinely live, moment-to-moment-varying
+/// field -- `info_json_reports_real_sane_host_values`'s own identical
+/// "present and sane, never an exact value" treatment).
+#[test]
+fn system_info_is_a_byte_identical_alias_for_info() {
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let info = ociman(storage_dir.path(), &["info", "--json"]);
+    assert!(info.status.success());
+    let mut info_view: serde_json::Value = serde_json::from_slice(&info.stdout).unwrap();
+
+    let alias = ociman(storage_dir.path(), &["system", "info", "--json"]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    let mut alias_view: serde_json::Value = serde_json::from_slice(&alias.stdout).unwrap();
+
+    for view in [&mut info_view, &mut alias_view] {
+        view["host"]["mem_free"] = serde_json::Value::Null;
+    }
+    assert_eq!(alias_view, info_view);
+
+    // The identical flag set works through the alias too, not just
+    // the bare default output.
+    let info_format = ociman(
+        storage_dir.path(),
+        &["info", "--format", "{{.host.os_arch}}"],
+    );
+    let alias_format = ociman(
+        storage_dir.path(),
+        &["system", "info", "--format", "{{.host.os_arch}}"],
+    );
+    assert!(info_format.status.success());
+    assert!(alias_format.status.success());
+    assert_eq!(alias_format.stdout, info_format.stdout);
+}

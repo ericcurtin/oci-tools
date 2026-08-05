@@ -1317,3 +1317,61 @@ fn prune_filter_conflicting_dangling_values_is_a_clear_error() {
     );
     assert!(!out.status.success());
 }
+
+/// `ociman system prune` (0485) is a real, genuine alias for `ociman
+/// prune` itself -- matching the fact that real podman's own `system
+/// prune` is this real command's *only* real home at all (no bare
+/// top-level `podman prune` exists, checked directly, `~/git/podman/
+/// cmd/podman/system/prune.go`) -- byte-identical output for the same
+/// scenario replayed in two separately-seeded stores.
+#[test]
+fn system_prune_is_a_byte_identical_alias_for_prune() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let run_scenario = |args: &[&str]| {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(storage_dir.path()).unwrap();
+        seed_image(
+            &store,
+            "ociman-test/system-prune-alias:latest",
+            &busybox,
+            &["sh"],
+            ContainerConfig::default(),
+        );
+        let record = store
+            .resolve_image("docker.io/ociman-test/system-prune-alias:latest")
+            .unwrap()
+            .unwrap();
+        let manifest = store.image_manifest(&record).unwrap();
+        let layer_digest = manifest.layers[0].digest.clone();
+
+        let rmi = ociman(
+            storage_dir.path(),
+            &["rmi", "ociman-test/system-prune-alias:latest"],
+        );
+        assert!(rmi.status.success(), "{rmi:?}");
+
+        let mut full_args = vec!["--json"];
+        full_args.extend_from_slice(args);
+        let prune = ociman(storage_dir.path(), &full_args);
+        assert!(
+            prune.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&prune.stderr)
+        );
+        let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+        (view, layer_digest)
+    };
+
+    let (via_top_level, digest_top_level) = run_scenario(&["prune"]);
+    let (via_alias, digest_alias) = run_scenario(&["system", "prune"]);
+    assert_eq!(via_top_level, via_alias);
+    assert_eq!(digest_top_level, digest_alias);
+    assert!(
+        via_alias["blobs_removed"].as_u64().unwrap() > 0,
+        "{via_alias:?}"
+    );
+}

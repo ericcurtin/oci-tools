@@ -4214,21 +4214,21 @@ enum HealthcheckCommand {
 }
 
 /// `ociman system`'s own subcommands — matching real `podman system`'s
-/// own real subset this project implements so far: `df`, `reset`.
-/// Real podman's own remaining subcommands (`connection`/`events`/
-/// `migrate`/`renumber`/`service`) are out of scope for now (no
-/// daemon, no remote API, no lock-numbering/storage-migration concept
-/// at all). `info` already exists as this project's own top-level
-/// `ociman info` (matching real podman's own identical top-level alias
-/// for it), and `prune` (real `podman system prune`) already exists as
-/// this project's own top-level `ociman prune` instead — a real,
-/// deliberate divergence, not a port of an identical real alias:
-/// checked directly, real podman has *no* bare top-level `podman
-/// prune` at all (`podman prune` itself is an "unrecognized command"
-/// error) — this project's own flat-top-level convention for it
-/// predates `system` even having a subcommand family of its own
-/// (`ociman prune` since `0111`/`0117`, well before this enum's own
-/// first member, `system df`, `0263`).
+/// own real subset this project implements so far: `df`, `reset`,
+/// `prune` (0485), `info` (0485). Real podman's own remaining
+/// subcommands (`connection`/`events`/`migrate`/`renumber`/`service`)
+/// are out of scope for now (no daemon, no remote API, no
+/// lock-numbering/storage-migration concept at all). `info` is a real,
+/// genuine *alias* for the already-existing flat [`Command::Info`]
+/// (matching real podman's own identical top-level-plus-nested pair
+/// for it, see [`SystemCommand::Info`]'s own doc comment); `prune`
+/// (real `podman system prune`) is this real command's *only* real
+/// home at all — checked directly, real podman has *no* bare
+/// top-level `podman prune` anywhere (`podman prune` itself is an
+/// "unrecognized command" error) — this project's own flat-top-level
+/// [`Command::Prune`] (`0111`/`0117`, predating this whole `system`
+/// family) is the deliberate divergence, not this one; see
+/// [`SystemCommand::Prune`]'s own doc comment.
 #[derive(Debug, clap::Subcommand)]
 enum SystemCommand {
     /// Real disk usage across images, containers, and local volumes —
@@ -4287,6 +4287,47 @@ enum SystemCommand {
         /// gives).
         #[arg(long, short = 'f')]
         force: bool,
+    },
+    /// `podman system prune`'s own real nested home for what this
+    /// project already exposes as the flat top-level [`Command::
+    /// Prune`] — checked directly, `~/git/podman/cmd/podman/system/
+    /// prune.go:22-53`: `pruneCommand` is registered with `Parent:
+    /// systemCmd` **and nowhere else at all** — real podman has *no*
+    /// bare top-level `podman prune` (confirmed directly: grepped
+    /// every `prune`-named command file in the whole `cmd/podman`
+    /// tree — `containers`/`images`/`networks`/`pods`/`system`/
+    /// `volumes`, each nested under its own real family, none
+    /// top-level). So unlike the `image`/`container` alias families
+    /// (`0430`/`0431`, a byte-identical *second* registration of an
+    /// already-real top-level command), this is the real command's
+    /// *only* real home — this project's own flat `ociman prune`
+    /// (`0111`/`0117`, predating this whole `system` family) is the
+    /// deliberate divergence, not this one. Dispatches straight into
+    /// the same [`cmd_prune`] `ociman prune` itself already calls,
+    /// with the identical field set — see [`Command::Prune`]'s own
+    /// doc comment for the exact semantics, not repeated here.
+    Prune {
+        /// Same as [`Command::Prune::all`].
+        #[arg(short, long)]
+        all: bool,
+        /// Same as [`Command::Prune::filter`].
+        #[arg(long = "filter")]
+        filter: Vec<String>,
+    },
+    /// `podman system info`'s own real alias for top-level `podman
+    /// info` — checked directly, `~/git/podman/cmd/podman/system/
+    /// info.go:22-40`/`53-64`: `systemInfoCommand` (`Parent:
+    /// systemCmd`) and `infoCommand` (top-level) share the exact same
+    /// `Args`/`Use`/`Short`/`Long`/`RunE`/`ValidArgsFunction` verbatim
+    /// — the identical alias shape `0430`-`0482` already established
+    /// repeatedly for `ociman image`/`container`. Dispatches straight
+    /// into the same [`cmd_info`] `ociman info` itself already calls,
+    /// with the identical field set — see [`Command::Info`]'s own doc
+    /// comment for the exact semantics, not repeated here.
+    Info {
+        /// Same as [`Command::Info::format`].
+        #[arg(long = "format", short = 'f', value_name = "TEMPLATE")]
+        format: Option<String>,
     },
 }
 
@@ -5206,6 +5247,8 @@ fn main() -> std::process::ExitCode {
             Some(Command::System { command }) => match command {
                 SystemCommand::Df { verbose } => cmd_system_df(cli.global.json, verbose),
                 SystemCommand::Reset { force: _ } => cmd_system_reset(),
+                SystemCommand::Prune { all, filter } => cmd_prune(cli.global.json, all, &filter),
+                SystemCommand::Info { format } => cmd_info(cli.global.json, format.as_deref()),
             },
             Some(Command::Inspect {
                 reference,
