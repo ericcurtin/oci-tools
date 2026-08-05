@@ -5028,6 +5028,42 @@ enum ContainerCommand {
         #[arg(short = 'l', long)]
         latest: bool,
     },
+    /// `podman container restart`'s own real alias for the already-
+    /// existing flat [`Command::Restart`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/restart.go:23-93`:
+    /// `containerRestartCommand` (`Parent: containerCmd`) and
+    /// top-level `restartCommand` share the exact same `Use`/`Short`/
+    /// `Long`/`RunE`/`Args`/`ValidArgsFunction`, and both get the
+    /// identical flag set applied via the one shared
+    /// `restartFlags(cmd)` helper plus `validate.AddLatestFlag` -- a
+    /// byte-identical alias, the same shape [`Self::Kill`] (`0492`)
+    /// already established. Dispatches into the same [`cmd_restart`]
+    /// `ociman restart` itself already calls, with the identical
+    /// field set -- see [`Command::Restart`]'s own doc comment for
+    /// the exact semantics (including this project's own honestly
+    /// narrower first-slice scope: no `--running`, matching real
+    /// podman's own additional flag this project has never
+    /// implemented for the top-level command either), not repeated
+    /// here.
+    Restart {
+        /// Same as [`Command::Restart::ids`].
+        ids: Vec<String>,
+        /// Same as [`Command::Restart::time`].
+        #[arg(short, long)]
+        time: Option<u64>,
+        /// Same as [`Command::Restart::all`].
+        #[arg(short, long)]
+        all: bool,
+        /// Same as [`Command::Restart::cidfile`].
+        #[arg(long = "cidfile", value_name = "FILE")]
+        cidfile: Vec<PathBuf>,
+        /// Same as [`Command::Restart::filter`].
+        #[arg(long = "filter")]
+        filter: Vec<String>,
+        /// Same as [`Command::Restart::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -5921,6 +5957,14 @@ fn main() -> std::process::ExitCode {
                     filter,
                     latest,
                 } => cmd_unpause(&ids, all, &cidfile, &filter, latest),
+                ContainerCommand::Restart {
+                    ids,
+                    time,
+                    all,
+                    cidfile,
+                    filter,
+                    latest,
+                } => cmd_restart(&ids, time, all, &cidfile, &filter, latest),
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),

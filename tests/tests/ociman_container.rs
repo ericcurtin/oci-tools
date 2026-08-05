@@ -8,9 +8,10 @@
 //! (`docs/design/0490`, the same byte-identical-alias shape for
 //! `ociman stop`), `start` (`docs/design/0491`, the same shape again
 //! for `ociman start`), `kill` (`docs/design/0492`, the same shape
-//! again for `ociman kill`), and `pause`/`unpause` (`docs/design/
-//! 0493`, the same shape again for `ociman pause`/`ociman unpause`)
-//! — see `ociman_ps.rs`/`ociman_stop.rs`/`ociman_start.rs`/
+//! again for `ociman kill`), `pause`/`unpause` (`docs/design/0493`,
+//! the same shape again for `ociman pause`/`ociman unpause`), and
+//! `restart` (`docs/design/0494`, the same shape again for `ociman
+//! restart`) — see `ociman_ps.rs`/`ociman_stop.rs`/`ociman_start.rs`/
 //! `ociman_kill.rs`/`ociman_pause.rs` for each top-level command's
 //! own much larger test suite; this file only proves each alias
 //! itself is byte-identical, not the aliased command's own full
@@ -1102,6 +1103,63 @@ fn container_pause_and_unpause_are_byte_identical_aliases_for_top_level_pause_an
     assert_eq!(
         wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(5)),
         "running"
+    );
+
+    // Clean up the still-running container so the temp dir doesn't
+    // leak a live process past this test.
+    let _ = ociman(storage_dir.path(), &["kill", &id]);
+}
+
+/// `ociman container restart` (0494) is a real, byte-identical alias
+/// for the top-level `ociman restart`, matching real `podman
+/// container restart`'s own checked-directly identical `Use`/`Short`/
+/// `Long`/`RunE`/`Args`/`ValidArgsFunction` (and identical
+/// `restartFlags`-applied flag set) as top-level `podman restart`
+/// exactly (`~/git/podman/cmd/podman/containers/restart.go:23-93`).
+/// Full `restart` semantics (multi-id, `--all`, `--cidfile`,
+/// `--filter`, `--latest`, `--time`) are already exhaustively tested
+/// against the top-level command in `ociman_start.rs`/
+/// `ociman_stop.rs`; this only proves the alias itself reaches the
+/// identical function with the identical fields.
+#[test]
+fn container_restart_is_a_byte_identical_alias_for_top_level_restart() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-restart-alias:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/container-restart-alias:latest",
+        &["sleep", "30"],
+    );
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let alias = ociman(storage_dir.path(), &["container", "restart", &id]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running",
+        "the container should genuinely be running again after a real restart"
     );
 
     // Clean up the still-running container so the temp dir doesn't
