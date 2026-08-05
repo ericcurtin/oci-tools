@@ -13,14 +13,15 @@
 //! `restart` (`docs/design/0494`, the same shape again for `ociman
 //! restart`), `rename` (`docs/design/0495`, the same shape again for
 //! `ociman rename`, with no flags at all), `wait` (`docs/design/
-//! 0496`, the same shape again for `ociman wait`), and `top`
-//! (`docs/design/0497`, the same shape again for `ociman top`) — see
-//! `ociman_ps.rs`/`ociman_stop.rs`/`ociman_start.rs`/
+//! 0496`, the same shape again for `ociman wait`), `top`
+//! (`docs/design/0497`, the same shape again for `ociman top`), and
+//! `logs` (`docs/design/0498`, the same shape again for `ociman
+//! logs`) — see `ociman_ps.rs`/`ociman_stop.rs`/`ociman_start.rs`/
 //! `ociman_kill.rs`/`ociman_pause.rs`/`ociman_rename.rs`/
-//! `ociman_wait.rs`/`ociman_top.rs` for each top-level command's own
-//! much larger test suite; this file only proves each alias itself
-//! is byte-identical, not the aliased command's own full semantics
-//! again.
+//! `ociman_wait.rs`/`ociman_top.rs`/`ociman_logs.rs` for each
+//! top-level command's own much larger test suite; this file only
+//! proves each alias itself is byte-identical, not the aliased
+//! command's own full semantics again.
 //!
 //! `ociman container prune` removes every real, non-running container
 //! (this project's own `Created`/`Stopped`, never `Running`/`Paused`,
@@ -1353,4 +1354,56 @@ fn container_top_is_a_byte_identical_alias_for_top_level_top() {
     // Clean up the still-running container so the temp dir doesn't
     // leak a live process past this test.
     let _ = ociman(storage_dir.path(), &["kill", &id]);
+}
+
+/// `ociman container logs` (0498) is a real, byte-identical alias for
+/// the top-level `ociman logs`, matching real `podman container
+/// logs`'s own checked-directly identical `Use`/`Short`/`Long`/
+/// `Args`/`RunE`/`ValidArgsFunction` (and identical `logsFlags`-
+/// applied flag set) as top-level `podman logs` exactly (`~/git/
+/// podman/cmd/podman/containers/logs.go:34-73`). Full `logs`
+/// semantics (`--follow`, `--tail`, `--latest`, combined stdout/
+/// stderr capture) are already exhaustively tested against the
+/// top-level command in `ociman_logs.rs`; this only proves the alias
+/// itself reaches the identical function with the identical fields.
+#[test]
+fn container_logs_is_a_byte_identical_alias_for_top_level_logs() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-logs-alias:latest",
+        &busybox,
+        &["sh", "echo"],
+        ContainerConfig::default(),
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "ociman-test/container-logs-alias:latest",
+            "/bin/sh",
+            "-c",
+            "echo line-from-stdout; echo line-from-stderr 1>&2",
+        ],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+
+    let alias = ociman(storage_dir.path(), &["container", "logs", &id]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&alias.stdout);
+    assert!(stdout.contains("line-from-stdout"), "got: {stdout:?}");
+    assert!(stdout.contains("line-from-stderr"), "got: {stdout:?}");
 }

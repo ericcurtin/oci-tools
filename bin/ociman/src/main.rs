@@ -5141,6 +5141,39 @@ enum ContainerCommand {
         #[arg(short = 'l', long)]
         latest: bool,
     },
+    /// `podman container logs`'s own real alias for the already-
+    /// existing flat [`Command::Logs`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/logs.go:34-73`:
+    /// `containerLogsCommand` (`Parent: containerCmd`) and top-level
+    /// `logsCommand` share the exact same `Use`/`Short`/`Long`/
+    /// `Args`/`RunE`/`ValidArgsFunction`, and both get the identical
+    /// flag set applied via the one shared `logsFlags(cmd)` helper
+    /// (`--follow`/`-f`, `--since`, `--until`, `--tail`,
+    /// `--timestamps`/`-t`, `--color`, `--names`/`-n`, and the hidden
+    /// `--details`) plus `validate.AddLatestFlag` -- a byte-identical
+    /// alias, the same shape [`Self::Kill`] (`0492`) already
+    /// established. Dispatches into the same [`cmd_logs`] `ociman
+    /// logs` itself already calls, replaying the identical
+    /// `--latest`/explicit-id resolution the top-level
+    /// [`Command::Logs`] arm already has -- see [`Command::Logs`]'s
+    /// own doc comment for the exact semantics (including this
+    /// project's own honestly narrower first-slice scope: no
+    /// `--since`/`--until`/`--timestamps`/`--color`/`--names`/
+    /// `--details`, or multi-container support, matching the
+    /// top-level command's own identical gap), not repeated here.
+    Logs {
+        /// Same as [`Command::Logs::id`].
+        id: Option<String>,
+        /// Same as [`Command::Logs::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+        /// Same as [`Command::Logs::follow`].
+        #[arg(short, long)]
+        follow: bool,
+        /// Same as [`Command::Logs::tail`].
+        #[arg(long)]
+        tail: Option<usize>,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -6089,6 +6122,30 @@ fn main() -> std::process::ExitCode {
                         (id, iter.collect::<Vec<String>>())
                     };
                     cmd_top(&id, &ps_args)
+                }
+                ContainerCommand::Logs {
+                    id,
+                    latest,
+                    follow,
+                    tail,
+                } => {
+                    // Matches real podman's own exact wording, checked
+                    // directly (`~/git/podman/cmd/podman/containers/
+                    // logs.go`) -- the identical check the top-level
+                    // `Command::Logs` arm already has.
+                    anyhow::ensure!(
+                        !(latest && id.is_some()),
+                        "--latest and containers cannot be used together"
+                    );
+                    let resolved_id = if latest {
+                        let containers = open_container_store()?;
+                        resolve_latest_container(&containers)?
+                    } else {
+                        id.ok_or_else(|| {
+                            anyhow::anyhow!("specify at least one container name or ID to log")
+                        })?
+                    };
+                    cmd_logs(&resolved_id, follow, tail)
                 }
             },
             Some(Command::Image { command }) => match command {
