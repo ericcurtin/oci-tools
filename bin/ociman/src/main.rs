@@ -5116,6 +5116,31 @@ enum ContainerCommand {
         #[arg(long)]
         ignore: bool,
     },
+    /// `podman container top`'s own real alias for the already-
+    /// existing flat [`Command::Top`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/top.go:26-46`: `containerTopCommand`
+    /// (`Parent: containerCmd`) and top-level `topCommand` share the
+    /// exact same `Use`/`Short`/`Long`/`RunE`/`ValidArgsFunction`
+    /// (`top` has no `Args` override either, like `wait` -- plain
+    /// `cobra.ArbitraryArgs`), and both get the identical
+    /// `topFlags(cmd.Flags())` (the hidden, bash-completion-only
+    /// `--list-descriptors`, deliberately not ported here either,
+    /// matching this project's own already-established convention of
+    /// skipping internal/hidden flags with no equivalent) plus
+    /// `validate.AddLatestFlag` -- a byte-identical alias, the same
+    /// shape [`Self::Kill`] (`0492`) already established. Dispatches
+    /// into the same [`cmd_top`] `ociman top` itself already calls,
+    /// replaying the identical manual disambiguation the top-level
+    /// [`Command::Top`] arm already has -- see [`Command::Top`]'s own
+    /// doc comment for the exact semantics, not repeated here.
+    Top {
+        /// Same as [`Command::Top::positional`].
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        positional: Vec<String>,
+        /// Same as [`Command::Top::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -6044,6 +6069,26 @@ fn main() -> std::process::ExitCode {
                         ids
                     };
                     cmd_wait(&ids, interval, &condition, ignore)
+                }
+                ContainerCommand::Top { positional, latest } => {
+                    // Manual disambiguation, matching real podman's
+                    // own checked-directly `top.go` exactly -- the
+                    // identical logic the top-level `Command::Top`
+                    // arm already has.
+                    let (id, ps_args) = if latest {
+                        let containers = open_container_store()?;
+                        (resolve_latest_container(&containers)?, positional)
+                    } else {
+                        let mut iter = positional.into_iter();
+                        let first = iter.next().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "you must provide the name or id of a running container"
+                            )
+                        })?;
+                        let id = first.strip_prefix('/').unwrap_or(&first).to_string();
+                        (id, iter.collect::<Vec<String>>())
+                    };
+                    cmd_top(&id, &ps_args)
                 }
             },
             Some(Command::Image { command }) => match command {

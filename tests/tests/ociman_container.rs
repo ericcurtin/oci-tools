@@ -12,13 +12,15 @@
 //! the same shape again for `ociman pause`/`ociman unpause`),
 //! `restart` (`docs/design/0494`, the same shape again for `ociman
 //! restart`), `rename` (`docs/design/0495`, the same shape again for
-//! `ociman rename`, with no flags at all), and `wait` (`docs/design/
-//! 0496`, the same shape again for `ociman wait`) — see
+//! `ociman rename`, with no flags at all), `wait` (`docs/design/
+//! 0496`, the same shape again for `ociman wait`), and `top`
+//! (`docs/design/0497`, the same shape again for `ociman top`) — see
 //! `ociman_ps.rs`/`ociman_stop.rs`/`ociman_start.rs`/
 //! `ociman_kill.rs`/`ociman_pause.rs`/`ociman_rename.rs`/
-//! `ociman_wait.rs` for each top-level command's own much larger test
-//! suite; this file only proves each alias itself is byte-identical,
-//! not the aliased command's own full semantics again.
+//! `ociman_wait.rs`/`ociman_top.rs` for each top-level command's own
+//! much larger test suite; this file only proves each alias itself
+//! is byte-identical, not the aliased command's own full semantics
+//! again.
 //!
 //! `ociman container prune` removes every real, non-running container
 //! (this project's own `Created`/`Stopped`, never `Running`/`Paused`,
@@ -1293,4 +1295,62 @@ fn container_wait_is_a_byte_identical_alias_for_top_level_wait() {
         String::from_utf8_lossy(&alias.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&alias.stdout).trim(), "42");
+}
+
+/// `ociman container top` (0497) is a real, byte-identical alias for
+/// the top-level `ociman top`, matching real `podman container top`'s
+/// own checked-directly identical `Use`/`Short`/`Long`/`RunE`/
+/// `ValidArgsFunction` (and identical `topFlags`-applied flag set) as
+/// top-level `podman top` exactly (`~/git/podman/cmd/podman/
+/// containers/top.go:26-46`). Full `top` semantics (real `ps(1)`
+/// passthrough, extra arguments, `--latest`) are already exhaustively
+/// tested against the top-level command in `ociman_top.rs`; this only
+/// proves the alias itself reaches the identical function with the
+/// identical fields.
+#[test]
+fn container_top_is_a_byte_identical_alias_for_top_level_top() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-top-alias:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/container-top-alias:latest",
+        &["sleep", "30"],
+    );
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let alias = ociman(storage_dir.path(), &["container", "top", &id]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&alias.stdout);
+    let header = stdout.lines().next().expect("a header line");
+    assert!(header.contains("PID"), "{header:?}");
+    assert!(
+        stdout.contains("sleep 30"),
+        "expected the container's own real command: {stdout:?}"
+    );
+
+    // Clean up the still-running container so the temp dir doesn't
+    // leak a live process past this test.
+    let _ = ociman(storage_dir.path(), &["kill", &id]);
 }
