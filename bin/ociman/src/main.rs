@@ -548,6 +548,39 @@ struct RunArgs {
     /// and the same rootless delegation caveat, as `--cpuset-cpus`.
     #[arg(long = "cpuset-mems")]
     cpuset_mems: Option<String>,
+    /// Limit the CPU CFS (Completely Fair Scheduler) period, in
+    /// microseconds, for the container's own cgroup — matching real
+    /// `podman run --cpu-period` exactly (checked directly,
+    /// `~/git/podman/docs/source/markdown/podman-run.1.md.in`/
+    /// `cmd/podman/common/create.go`'s own `cpuPeriodFlagName`).
+    /// An explicit `--cpu-period`/`--cpu-quota` always wins over
+    /// `--cpus`'s own derived quota/period pair when both are somehow
+    /// given at once (see [`resources_from_cli`]'s own doc comment)
+    /// — real docker/podman apply zero validation of their own
+    /// beyond parsing, matching this project's own already-
+    /// established "no syntax validation, kernel rejects a bad
+    /// value" philosophy for `--cpuset-cpus`/`--cpuset-mems`.
+    #[arg(long = "cpu-period")]
+    cpu_period: Option<u64>,
+    /// Limit the CPU CFS quota, in microseconds per `--cpu-period`
+    /// (defaulting to the kernel's own 100ms if `--cpu-period` isn't
+    /// also given), for the container's own cgroup — matching real
+    /// `podman run --cpu-quota` exactly. Same "real, raw CFS value,
+    /// no conversion, wins over `--cpus`" shape as `--cpu-period`
+    /// just above.
+    #[arg(long = "cpu-quota")]
+    cpu_quota: Option<i64>,
+    /// CPU shares (relative weight vs. other cgroups) for the
+    /// container's own cgroup, matching real `docker run
+    /// --cpu-shares`/`podman run --cpu-shares`/`-c` exactly (checked
+    /// directly, `~/git/podman/cmd/podman/common/create.go`'s own
+    /// `cpuSharesFlagName`/`"c"`). Reaches the exact same `LinuxCpu.
+    /// shares`/`systemd_cgroup`'s own `CPUWeight` translation
+    /// `ociman build --cpu-shares` (`0458`) already established —
+    /// this was previously the one CLI flag missing to reach it from
+    /// `run`/`create`/`update` too.
+    #[arg(short = 'c', long = "cpu-shares")]
+    cpu_shares: Option<u64>,
     /// Set a resource limit for the container's own process,
     /// repeatable — matching real `docker run --ulimit`/`podman run
     /// --ulimit` exactly: `NAME=soft[:hard]`, `-1` for either value
@@ -3207,12 +3240,13 @@ enum Command {
     /// own healthcheck — matching real `podman update` for exactly
     /// the same subset of resource flags `ociman run` itself already
     /// supports (`--memory`/`--memory-swap`/`--memory-reservation`/
-    /// `--cpus`/`--pids-limit`/`--cpuset-cpus`/`--cpuset-mems`; real
-    /// `podman update`'s own larger flag set — `--cpu-shares`/
-    /// `--cpu-period`/`--cpu-quota`/`--cpu-rt-period`/`--cpu-rt-
-    /// runtime`/`--memory-swappiness`/`--blkio-weight*`/`--device-*-
-    /// bps`/`--device-*-iops` — is out of scope for the same reason
-    /// `run` itself doesn't support them either), plus the identical
+    /// `--cpus`/`--pids-limit`/`--cpuset-cpus`/`--cpuset-mems`/
+    /// `--cpu-period`/`--cpu-quota`/`--cpu-shares`; real `podman
+    /// update`'s own larger remaining flag set — `--cpu-rt-period`/
+    /// `--cpu-rt-runtime`/`--memory-swappiness`/`--blkio-weight*`/
+    /// `--device-*-bps`/`--device-*-iops` — is out of scope for the
+    /// same reason `run` itself doesn't support them either), plus
+    /// the identical
     /// `--health-cmd`/`--health-interval`/`--health-retries`/
     /// `--health-timeout`/`--health-start-period`/`--no-healthcheck`
     /// flags [`Command::Run`] already has (`0440`, `0441`) — see
@@ -3259,6 +3293,17 @@ enum Command {
         /// See `Command::Run`'s own identical flag.
         #[arg(long = "cpuset-mems")]
         cpuset_mems: Option<String>,
+        /// See `Command::Run`'s own identical flag — matching real
+        /// `podman update --cpu-period` exactly (checked directly,
+        /// `~/git/podman/docs/source/markdown/podman-update.1.md.in`).
+        #[arg(long = "cpu-period")]
+        cpu_period: Option<u64>,
+        /// See `Command::Run`'s own identical flag.
+        #[arg(long = "cpu-quota")]
+        cpu_quota: Option<i64>,
+        /// See `Command::Run`'s own identical flag.
+        #[arg(short = 'c', long = "cpu-shares")]
+        cpu_shares: Option<u64>,
         /// A real, *partial* update onto whatever this container's
         /// own currently-effective healthcheck already is (see
         /// [`resolve_effective_healthcheck`]) — checked directly,
@@ -4850,6 +4895,9 @@ fn main() -> std::process::ExitCode {
                 pids_limit,
                 cpuset_cpus,
                 cpuset_mems,
+                cpu_period,
+                cpu_quota,
+                cpu_shares,
                 health_cmd,
                 health_interval,
                 health_retries,
@@ -4865,6 +4913,9 @@ fn main() -> std::process::ExitCode {
                 pids_limit,
                 cpuset_cpus.as_deref(),
                 cpuset_mems.as_deref(),
+                cpu_period,
+                cpu_quota,
+                cpu_shares,
                 health_cmd.as_deref(),
                 health_interval.as_deref(),
                 health_retries,
@@ -8856,6 +8907,9 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             args.pids_limit,
             args.cpuset_cpus.as_deref(),
             args.cpuset_mems.as_deref(),
+            args.cpu_period,
+            args.cpu_quota,
+            args.cpu_shares,
             seccomp,
             no_new_privileges,
             capabilities,
@@ -13394,6 +13448,9 @@ fn cmd_update(
     pids_limit: Option<i64>,
     cpuset_cpus: Option<&str>,
     cpuset_mems: Option<&str>,
+    cpu_period: Option<u64>,
+    cpu_quota: Option<i64>,
+    cpu_shares: Option<u64>,
     health_cmd: Option<&str>,
     health_interval: Option<&str>,
     health_retries: Option<u32>,
@@ -13411,13 +13468,9 @@ fn cmd_update(
         pids_limit,
         cpuset_cpus,
         cpuset_mems,
-        // `ociman update` has no raw `--cpu-period`/`--cpu-quota`/
-        // `--cpu-shares` of its own (only `--cpus`, above) -- these
-        // three are `ociman build`-only, see `resources_from_cli`'s
-        // own doc comment.
-        None,
-        None,
-        None,
+        cpu_period,
+        cpu_quota,
+        cpu_shares,
     );
     let any_health_flag = health_cmd.is_some()
         || health_interval.is_some()
@@ -14971,6 +15024,9 @@ fn synthesize_spec(
     pids_limit: Option<i64>,
     cpuset_cpus: Option<&str>,
     cpuset_mems: Option<&str>,
+    cpu_period: Option<u64>,
+    cpu_quota: Option<i64>,
+    cpu_shares: Option<u64>,
     seccomp: Option<oci_spec_types::runtime::LinuxSeccomp>,
     no_new_privileges: bool,
     capabilities: Vec<String>,
@@ -15167,13 +15223,9 @@ fn synthesize_spec(
         pids_limit,
         cpuset_cpus,
         cpuset_mems,
-        // `ociman run`/`create` have no raw `--cpu-period`/
-        // `--cpu-quota`/`--cpu-shares` of their own (only `--cpus`,
-        // above) -- these three are `ociman build`-only, see
-        // `resources_from_cli`'s own doc comment.
-        None,
-        None,
-        None,
+        cpu_period,
+        cpu_quota,
+        cpu_shares,
     );
     // `--cgroup-conf` (0398): needs a real `Some(LinuxResources)` to
     // live on even when no other resource flag was given at all (the
@@ -15514,22 +15566,28 @@ fn parse_and_validate_memory_and_cpus(
     ))
 }
 
-/// Build a `LinuxResources` from `ociman run`'s own `--memory`/
-/// `--memory-swap`/`--memory-reservation`/`--cpus`/`--pids-limit`/
-/// `--cpuset-cpus`/`--cpuset-mems` flags, plus `ociman build`'s own
-/// separate, raw `--cpu-period`/`--cpu-quota`/`--cpu-shares` (real
-/// `podman build` has no `--cpus` convenience flag of its own at all
-/// — checked directly, `~/git/podman/vendor/go.podman.io/buildah/
+/// Build a `LinuxResources` from `ociman run`/`create`/`update`'s own
+/// `--memory`/`--memory-swap`/`--memory-reservation`/`--cpus`/
+/// `--pids-limit`/`--cpuset-cpus`/`--cpuset-mems`/`--cpu-period`/
+/// `--cpu-quota`/`--cpu-shares` flags (`ociman build` shares this same
+/// function too, but has no `--cpus` convenience flag of its own at
+/// all — checked directly, `~/git/podman/vendor/go.podman.io/buildah/
 /// pkg/cli/common.go`'s own `CommonBuildOptions` — only the raw CFS
-/// values, unlike `run`/`create`'s own float-to-quota conversion).
-/// `None` if none of the ten were given at all (leaving `spec.linux.
-/// resources` untouched, exactly as before any of these flags
-/// existed). An explicit `cpu_period`/`cpu_quota` always wins over a
-/// `cpus`-derived one when somehow both are given (never happens in
-/// practice today: `run`/`create`/`update` only ever pass `cpus`,
-/// `build` only ever passes `cpu_period`/`cpu_quota`/`cpu_shares` —
-/// kept orthogonal so this function stays the *one* place either
-/// path ends up, rather than two separate `LinuxCpu` builders).
+/// values, unlike `run`/`create`/`update`'s own float-to-quota
+/// conversion, *and* their own real `--cpu-period`/`--cpu-quota`/
+/// `--cpu-shares`, added later than `--cpus` itself but confirmed
+/// directly to be real, matching flags on `podman run`/`create`/
+/// `update` all three, `~/git/podman/docs/source/markdown/podman-run
+/// .1.md.in`/`podman-update.1.md.in`). `None` if none of the ten were
+/// given at all (leaving `spec.linux.resources` untouched, exactly as
+/// before any of these flags existed). An explicit `cpu_period`/
+/// `cpu_quota` always wins over a `cpus`-derived one when both are
+/// given at once (a real, reachable combination now, not just a
+/// theoretical one: `ociman run --cpus 1 --cpu-quota 200000` is a
+/// real, valid combination on real `podman run` too, checked
+/// directly) — kept orthogonal so this function stays the *one*
+/// place either path ends up, rather than two separate `LinuxCpu`
+/// builders.
 #[allow(clippy::too_many_arguments)]
 fn resources_from_cli(
     memory_limit_bytes: Option<i64>,
@@ -17155,11 +17213,12 @@ mod tests {
 
     #[test]
     fn resources_from_cli_prefers_an_explicit_cpu_quota_and_period_over_a_cpus_derived_one() {
-        // Never actually happens from any real call site today (`run`/
-        // `create`/`update` only ever pass `cpus`; `build` only ever
-        // passes `cpu_period`/`cpu_quota`/`cpu_shares`) -- but this
-        // function's own doc comment promises the raw value wins if
-        // somehow both are given, so pin that behavior down directly.
+        // A real, reachable combination on `run`/`create`/`update`
+        // themselves now (both `--cpus` and `--cpu-period`/
+        // `--cpu-quota` are real flags there, checked directly against
+        // real podman) -- this function's own doc comment promises
+        // the raw value wins when both are given, pinned down
+        // directly here.
         let resources = resources_from_cli(
             None,
             None,

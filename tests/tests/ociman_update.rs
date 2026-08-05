@@ -267,6 +267,71 @@ fn update_changes_the_real_live_cgroup_limits_of_a_running_container() {
     child.wait().ok();
 }
 
+/// `ociman update --cpu-period`/`--cpu-quota`/`--cpu-shares` --
+/// previously only reachable from `ociman build` (`0458`); this
+/// project's own `update` had no CLI flag of its own reaching
+/// `resources_from_cli`'s already-existing raw `cpu_period`/
+/// `cpu_quota`/`cpu_shares` parameters until now. Same real, raw-
+/// cgroupfs-file verification as `update_changes_the_real_live_
+/// cgroup_limits_of_a_running_container`'s own `--cpus`/`cpu.max`
+/// check above, for the real values instead of a `--cpus`-derived
+/// pair.
+#[test]
+fn update_cpu_period_quota_and_shares_writes_the_real_cgroup_files() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/update-cpu-raw:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+    let mut child = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/update-cpu-raw:latest",
+        &["-d", "sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20));
+
+    let update = ociman(
+        storage_dir.path(),
+        &[
+            "update",
+            "--cpu-period",
+            "200000",
+            "--cpu-quota",
+            "50000",
+            "--cpu-shares",
+            "1024",
+            &id,
+        ],
+    );
+    assert!(
+        update.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+
+    let cgroup_dir = real_cgroup_dir_for(storage_dir.path(), &id);
+    let cpu_max = std::fs::read_to_string(cgroup_dir.join("cpu.max")).unwrap();
+    assert_eq!(cpu_max.trim(), "50000 200000");
+    let cpu_weight = std::fs::read_to_string(cgroup_dir.join("cpu.weight")).unwrap();
+    // The cgroup v1 `cpu.shares` default (1024) converts to the
+    // cgroup v2 `cpu.weight` default (100), matching real docker's/
+    // podman's own identical conversion.
+    assert_eq!(cpu_weight.trim(), "100");
+
+    ociman(storage_dir.path(), &["kill", &id]);
+    child.wait().ok();
+}
+
 /// `ociman update --health-cmd` (0441) needs no live container at
 /// all -- a `created`-but-never-`start`ed container can still have
 /// its healthcheck updated, matching real podman's own identical
