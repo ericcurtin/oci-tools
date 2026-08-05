@@ -2050,9 +2050,21 @@ enum Command {
         /// image ID (the same short ID `ociman images`' own `DIGEST`
         /// column prints).
         source: String,
-        /// The new reference to create (or overwrite), e.g.
-        /// `myrepo/myimage:v2`.
-        target: String,
+        /// One or more new references to create (or overwrite), e.g.
+        /// `myrepo/myimage:v2` — matching real `docker tag`/`podman
+        /// tag`'s own real `TARGET_NAME [TARGET_NAME...]` variadic
+        /// shape exactly (checked directly, `~/git/podman/cmd/podman/
+        /// images/tag.go`'s own `cobra.MinimumNArgs(2)`, i.e. `IMAGE`
+        /// plus at least one target): applied one at a time, in the
+        /// order given, a later target failing to parse or write
+        /// leaves every earlier, already-tagged one in place rather
+        /// than rolling them all back (`~/git/podman/pkg/domain/
+        /// infra/abi/images.go`'s own identical sequential `Tag`
+        /// loop). A real, previously-unnoticed gap this project's own
+        /// original single-target-only `Tag` had (see `docs/design/
+        /// 0478`'s own "still out of scope" note).
+        #[arg(required = true)]
+        targets: Vec<String>,
     },
     /// Remove one or more names from a locally-stored image without
     /// touching its underlying blobs at all — matching real `docker
@@ -4811,8 +4823,9 @@ enum ImageCommand {
     Tag {
         /// Same as [`Command::Tag::source`].
         source: String,
-        /// Same as [`Command::Tag::target`].
-        target: String,
+        /// Same as [`Command::Tag::targets`].
+        #[arg(required = true)]
+        targets: Vec<String>,
     },
     /// `podman image untag`'s own real alias for top-level `podman
     /// untag` — checked directly, `~/git/podman/cmd/podman/images/
@@ -4979,7 +4992,7 @@ fn main() -> std::process::ExitCode {
                 all,
                 ignore,
             }) => cmd_rmi(&references, force, all, ignore, cli.global.json),
-            Some(Command::Tag { source, target }) => cmd_tag(&source, &target, cli.global.json),
+            Some(Command::Tag { source, targets }) => cmd_tag(&source, &targets, cli.global.json),
             Some(Command::Untag { image, references }) => cmd_untag(&image, &references),
             Some(Command::History {
                 reference,
@@ -5357,7 +5370,9 @@ fn main() -> std::process::ExitCode {
                 ImageCommand::Prune { all, filter } => {
                     cmd_image_prune(cli.global.json, all, &filter)
                 }
-                ImageCommand::Tag { source, target } => cmd_tag(&source, &target, cli.global.json),
+                ImageCommand::Tag { source, targets } => {
+                    cmd_tag(&source, &targets, cli.global.json)
+                }
                 ImageCommand::Untag { image, references } => cmd_untag(&image, &references),
             },
             Some(Command::Stats {
@@ -6890,9 +6905,12 @@ struct TagResult {
 /// so there's nothing extra to check here: `podman tag <id> <new-tag>`
 /// against a real installed `podman` works exactly the same way,
 /// checked directly, no `--force` concept involved either.
-fn cmd_tag(source_str: &str, target_str: &str, json: bool) -> anyhow::Result<()> {
-    let target = Reference::parse(target_str)
-        .with_context(|| format!("parsing image reference {target_str:?}"))?;
+fn cmd_tag(source_str: &str, target_strs: &[String], json: bool) -> anyhow::Result<()> {
+    // Matches real podman's own exact wording, checked directly
+    // (`~/git/podman/cmd/podman/images/tag.go`'s own `cobra.
+    // MinimumNArgs(2)`, i.e. at least one `TARGET_NAME` beyond
+    // `IMAGE` itself).
+    anyhow::ensure!(!target_strs.is_empty(), "tag requires at least one target");
 
     let store = open_store()?;
     let record = resolve_image_by_reference_or_id(&store, source_str)?
@@ -6900,20 +6918,41 @@ fn cmd_tag(source_str: &str, target_str: &str, json: bool) -> anyhow::Result<()>
         .record()
         .clone();
 
-    store
-        .put_image(&ImageRecord {
-            reference: target.to_string(),
-            manifest_digest: record.manifest_digest,
-        })
-        .with_context(|| format!("tagging {} as {target}", record.reference))?;
+    // Real podman's own identical sequential loop, checked directly
+    // (`~/git/podman/pkg/domain/infra/abi/images.go`'s own `Tag`:
+    // `for _, tag := range tags { if err := image.Tag(tag); err !=
+    // nil { return err } }`) -- a later target failing to parse or
+    // write leaves every earlier, already-successful one in place
+    // rather than rolling them all back; this project's own
+    // established single/array `--json` convention (`cmd_rmi`'s own
+    // `RmiOutcome`/`RmiResult` pair) is followed too: a lone target
+    // prints its own bare result, multiple print a JSON array.
+    let mut results = Vec::with_capacity(target_strs.len());
+    for target_str in target_strs {
+        let target = Reference::parse(target_str)
+            .with_context(|| format!("parsing image reference {target_str:?}"))?;
+        store
+            .put_image(&ImageRecord {
+                reference: target.to_string(),
+                manifest_digest: record.manifest_digest.clone(),
+            })
+            .with_context(|| format!("tagging {} as {target}", record.reference))?;
+        if json {
+            results.push(TagResult {
+                source: record.reference.clone(),
+                target: target.to_string(),
+            });
+        } else {
+            println!("{target}");
+        }
+    }
 
     if json {
-        oci_cli_common::output::print_json(&TagResult {
-            source: record.reference,
-            target: target.to_string(),
-        })?;
-    } else {
-        println!("{target}");
+        if let [result] = results.as_slice() {
+            oci_cli_common::output::print_json(result)?;
+        } else {
+            oci_cli_common::output::print_json(&results)?;
+        }
     }
     Ok(())
 }

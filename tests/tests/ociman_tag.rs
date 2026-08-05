@@ -221,6 +221,118 @@ fn tag_json_reports_the_canonical_source_and_target() {
     assert_eq!(view["target"], "docker.io/library/tag-json-out:v1");
 }
 
+/// `ociman tag IMAGE TARGET_NAME [TARGET_NAME...]` (0479) -- real
+/// docker/podman's own variadic multi-target shape, checked directly
+/// (`~/git/podman/cmd/podman/images/tag.go`'s own `cobra.
+/// MinimumNArgs(2)`, `~/git/podman/pkg/domain/infra/abi/images.go`'s
+/// own sequential `Tag` loop): every given target ends up pointing at
+/// the exact same source manifest digest, applied in the order given,
+/// one line printed per successfully tagged target.
+#[test]
+fn tag_accepts_multiple_targets_in_one_call() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/tag-multi:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let source_record = store
+        .resolve_image("docker.io/ociman-test/tag-multi:latest")
+        .unwrap()
+        .unwrap();
+
+    let tag = ociman(
+        storage_dir.path(),
+        &[
+            "tag",
+            "ociman-test/tag-multi:latest",
+            "tag-multi-a:v1",
+            "tag-multi-b:v1",
+            "tag-multi-c:v1",
+        ],
+    );
+    assert!(
+        tag.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&tag.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&tag.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "docker.io/library/tag-multi-a:v1",
+            "docker.io/library/tag-multi-b:v1",
+            "docker.io/library/tag-multi-c:v1",
+        ]
+    );
+    for target in ["tag-multi-a:v1", "tag-multi-b:v1", "tag-multi-c:v1"] {
+        let record = store
+            .resolve_image(&format!("docker.io/library/{target}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.manifest_digest, source_record.manifest_digest);
+    }
+}
+
+/// A later target failing to parse leaves every earlier,
+/// already-tagged one in place -- matching real podman's own
+/// identical sequential "stop at first failure, don't roll back"
+/// semantics (`~/git/podman/pkg/domain/infra/abi/images.go`'s own
+/// `Tag` loop).
+#[test]
+fn tag_with_a_later_invalid_target_leaves_earlier_ones_tagged() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/tag-multi-partial:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let tag = ociman(
+        storage_dir.path(),
+        &[
+            "tag",
+            "ociman-test/tag-multi-partial:latest",
+            "tag-multi-partial-good:v1",
+            "",
+        ],
+    );
+    assert!(!tag.status.success());
+    assert!(
+        store
+            .resolve_image("docker.io/library/tag-multi-partial-good:v1")
+            .unwrap()
+            .is_some(),
+        "the earlier, valid target must still be tagged despite the later failure"
+    );
+}
+
+/// `ociman tag IMAGE` with no target at all is a real, immediate
+/// error, matching real podman's own `cobra.MinimumNArgs(2)`.
+#[test]
+fn tag_with_no_target_at_all_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let tag = ociman(storage_dir.path(), &["tag", "ociman-test/whatever:latest"]);
+    assert!(!tag.status.success());
+}
+
 /// Real docker/podman rule, checked directly: `tag`'s own source
 /// resolves by image ID too, not just a tag reference -- the exact
 /// short digest `ociman images`' own `DIGEST` column already prints.
