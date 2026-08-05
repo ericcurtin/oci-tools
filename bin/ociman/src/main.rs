@@ -5229,6 +5229,48 @@ enum ContainerCommand {
         #[arg(long)]
         overwrite: bool,
     },
+    /// `podman container commit`'s own real alias for the already-
+    /// existing flat [`Command::Commit`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/commit.go:19-98`:
+    /// `containerCommitCommand` (`Parent: containerCmd`) and
+    /// top-level `commitCommand` share the exact same `Use`/`Short`/
+    /// `Long`/`Args`/`RunE`/`ValidArgsFunction`, and both get the
+    /// identical flag set applied via the one shared `commitFlags
+    /// (cmd)` helper (`--change`/`-c`, `--config`, `--format`/`-f`,
+    /// `--iidfile`, `--message`/`-m`, `--author`/`-a`, `--pause`/`-p`,
+    /// `--quiet`/`-q`, `--squash`/`-s`, `--include-volumes`) -- a
+    /// byte-identical alias, the same shape [`Self::Kill`] (`0492`)
+    /// already established. Dispatches into the same [`cmd_commit`]
+    /// `ociman commit` itself already calls, with the identical
+    /// field set -- see [`Command::Commit`]'s own doc comment for
+    /// the exact semantics (including this project's own honestly
+    /// narrower first-slice scope: no `--config`/`--format`/
+    /// `--quiet`/`--include-volumes`, matching the top-level
+    /// command's own identical gap), not repeated here.
+    Commit {
+        /// Same as [`Command::Commit::container`].
+        container: String,
+        /// Same as [`Command::Commit::image`].
+        image: Option<String>,
+        /// Same as [`Command::Commit::author`].
+        #[arg(short, long)]
+        author: Option<String>,
+        /// Same as [`Command::Commit::message`].
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Same as [`Command::Commit::pause`].
+        #[arg(short, long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        pause: bool,
+        /// Same as [`Command::Commit::change`].
+        #[arg(short, long = "change")]
+        change: Vec<String>,
+        /// Same as [`Command::Commit::squash`].
+        #[arg(short = 's', long)]
+        squash: bool,
+        /// Same as [`Command::Commit::iidfile`].
+        #[arg(long = "iidfile", value_name = "PATH")]
+        iidfile: Option<PathBuf>,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -6225,6 +6267,26 @@ fn main() -> std::process::ExitCode {
                     dest,
                     overwrite,
                 } => cmd_cp(&src, &dest, overwrite),
+                ContainerCommand::Commit {
+                    container,
+                    image,
+                    author,
+                    message,
+                    pause,
+                    change,
+                    squash,
+                    iidfile,
+                } => cmd_commit(
+                    &container,
+                    image.as_deref(),
+                    author.as_deref(),
+                    message.as_deref(),
+                    pause,
+                    &change,
+                    squash,
+                    iidfile.as_deref(),
+                    cli.global.json,
+                ),
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),

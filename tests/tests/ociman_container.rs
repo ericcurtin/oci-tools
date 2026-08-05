@@ -21,14 +21,16 @@
 //! `ociman diff` was already scoped container-only from the start,
 //! matching real `podman container diff`'s own narrower scope
 //! rather than real top-level `podman diff`'s broader auto-detect
-//! one), and `cp` (`docs/design/0500`, the same byte-identical-alias
-//! shape again for `ociman cp`) — see `ociman_ps.rs`/
+//! one), `cp` (`docs/design/0500`, the same byte-identical-alias
+//! shape again for `ociman cp`), and `commit` (`docs/design/0501`,
+//! the same shape again for `ociman commit`) — see `ociman_ps.rs`/
 //! `ociman_stop.rs`/`ociman_start.rs`/`ociman_kill.rs`/
 //! `ociman_pause.rs`/`ociman_rename.rs`/`ociman_wait.rs`/
-//! `ociman_top.rs`/`ociman_logs.rs`/`ociman_diff.rs`/`ociman_cp.rs`
-//! for each top-level command's own much larger test suite; this
-//! file only proves each alias itself is byte-identical, not the
-//! aliased command's own full semantics again.
+//! `ociman_top.rs`/`ociman_logs.rs`/`ociman_diff.rs`/`ociman_cp.rs`/
+//! `ociman_commit.rs` for each top-level command's own much larger
+//! test suite; this file only proves each alias itself is
+//! byte-identical, not the aliased command's own full semantics
+//! again.
 //!
 //! `ociman container prune` removes every real, non-running container
 //! (this project's own `Created`/`Stopped`, never `Running`/`Paused`,
@@ -1559,5 +1561,103 @@ fn container_cp_is_a_byte_identical_alias_for_top_level_cp() {
     assert_eq!(
         std::fs::read_to_string(&in_container).unwrap(),
         "hello from host"
+    );
+}
+
+/// `ociman container commit` (0501) is a real, byte-identical alias
+/// for the top-level `ociman commit`, matching real `podman
+/// container commit`'s own checked-directly identical `Use`/`Short`/
+/// `Long`/`Args`/`RunE`/`ValidArgsFunction` (and identical
+/// `commitFlags`-applied flag set) as top-level `podman commit`
+/// exactly (`~/git/podman/cmd/podman/containers/commit.go:19-98`).
+/// Full `commit` semantics (`--author`/`--message`/`--pause`/
+/// `--change`/`--squash`/`--iidfile`, the rootless-overlay gap) are
+/// already exhaustively tested against the top-level command in
+/// `ociman_commit.rs`; this only proves the alias itself reaches the
+/// identical function with the identical fields.
+#[test]
+fn container_commit_is_a_byte_identical_alias_for_top_level_commit() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    // `commit` doesn't support this project's own rootless-overlay
+    // rootfs optimization yet -- force the real, full-extraction
+    // path instead, matching `ociman_commit.rs`'s own established
+    // `seed_and_run_stopped_container` convention.
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let busybox = busybox_path().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-commit-alias:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo hi > /new-file.txt; exit 0".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/container-commit-alias:latest"],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+
+    let alias = ociman(
+        storage_dir.path(),
+        &[
+            "container",
+            "commit",
+            "--author",
+            "Someone <someone@example.com>",
+            &id,
+            "ociman-test/container-commit-result:latest",
+        ],
+    );
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&alias.stdout);
+    assert!(
+        stdout.contains("tagged: docker.io/ociman-test/container-commit-result:latest"),
+        "stdout: {stdout:?}"
+    );
+
+    let run2 = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/container-commit-result:latest",
+            "/bin/busybox",
+            "cat",
+            "/new-file.txt",
+        ],
+    );
+    assert!(
+        run2.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run2.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run2.stdout),
+        "hi\n",
+        "the committed image's own new layer should contain the file the original container added"
     );
 }
