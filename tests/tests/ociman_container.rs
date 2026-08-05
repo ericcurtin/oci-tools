@@ -14,11 +14,17 @@
 //! restart`), `rename` (`docs/design/0495`, the same shape again for
 //! `ociman rename`, with no flags at all), `wait` (`docs/design/
 //! 0496`, the same shape again for `ociman wait`), `top`
-//! (`docs/design/0497`, the same shape again for `ociman top`), and
+//! (`docs/design/0497`, the same shape again for `ociman top`),
 //! `logs` (`docs/design/0498`, the same shape again for `ociman
-//! logs`) — see `ociman_ps.rs`/`ociman_stop.rs`/`ociman_start.rs`/
+//! logs`), and `diff` (`docs/design/0499` -- a genuine, no-forcing-
+//! needed byte-identical alias, since this project's own top-level
+//! `ociman diff` was already scoped container-only from the start,
+//! matching real `podman container diff`'s own narrower scope
+//! rather than real top-level `podman diff`'s broader auto-detect
+//! one) — see `ociman_ps.rs`/`ociman_stop.rs`/`ociman_start.rs`/
 //! `ociman_kill.rs`/`ociman_pause.rs`/`ociman_rename.rs`/
-//! `ociman_wait.rs`/`ociman_top.rs`/`ociman_logs.rs` for each
+//! `ociman_wait.rs`/`ociman_top.rs`/`ociman_logs.rs`/
+//! `ociman_diff.rs` for each
 //! top-level command's own much larger test suite; this file only
 //! proves each alias itself is byte-identical, not the aliased
 //! command's own full semantics again.
@@ -1406,4 +1412,71 @@ fn container_logs_is_a_byte_identical_alias_for_top_level_logs() {
     let stdout = String::from_utf8_lossy(&alias.stdout);
     assert!(stdout.contains("line-from-stdout"), "got: {stdout:?}");
     assert!(stdout.contains("line-from-stderr"), "got: {stdout:?}");
+}
+
+/// `ociman container diff` (0499) is a real, genuine byte-identical
+/// alias for the top-level `ociman diff` -- needing no "forced type"
+/// wrapping at all, unlike `0488`'s `inspect`: this project's own
+/// top-level `ociman diff` was already scoped container-only from the
+/// start (see [`Command::Diff`]'s own doc comment), matching real
+/// `podman container diff`'s own narrower scope exactly (checked
+/// directly, `~/git/podman/cmd/podman/containers/diff.go:15-49`:
+/// `diffCmd`'s own `diffRun` sets `diffOpts.Type =
+/// define.DiffContainer`, genuinely narrower than real top-level
+/// `podman diff`'s own `define.DiffAll` auto-detection, `~/git/
+/// podman/cmd/podman/diff.go`). Full `diff` semantics (`--format
+/// json`, `--latest`, explicit-id-wins-over-latest) are already
+/// exhaustively tested against the top-level command in
+/// `ociman_diff.rs`; this only proves the alias itself reaches the
+/// identical function with the identical fields.
+#[test]
+fn container_diff_is_a_byte_identical_alias_for_top_level_diff() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    // `diff` doesn't support this project's own rootless-overlay
+    // rootfs optimization yet (`docs/design/0146`) -- force the
+    // real, full-extraction path instead, matching `ociman_diff.rs`'s
+    // own established `seed_and_run_stopped_container` convention.
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-diff-alias:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo hi > /new-file.txt; rm /bin/sh".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/container-diff-alias:latest"],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+
+    let alias = ociman(storage_dir.path(), &["container", "diff", &id]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&alias.stdout);
+    assert!(stdout.contains("A /new-file.txt"), "stdout: {stdout:?}");
+    assert!(stdout.contains("D /bin/sh"), "stdout: {stdout:?}");
 }

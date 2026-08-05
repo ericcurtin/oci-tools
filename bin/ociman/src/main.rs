@@ -5174,6 +5174,36 @@ enum ContainerCommand {
         #[arg(long)]
         tail: Option<usize>,
     },
+    /// `podman container diff`'s own real alias for the already-
+    /// existing flat [`Command::Diff`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/diff.go:15-49`: `diffCmd`
+    /// (`Parent: containerCmd`) has its own `diffRun` unconditionally
+    /// set `diffOpts.Type = define.DiffContainer` before calling the
+    /// shared `diff.Diff` -- a genuinely *narrower* scope than real
+    /// top-level `podman diff`'s own `diffRun` (`~/git/podman/cmd/
+    /// podman/diff.go`), which instead sets `define.DiffAll` (auto-
+    /// detecting container-or-image). This project's own top-level
+    /// [`Command::Diff`] was already, from the start, scoped to match
+    /// real `podman container diff`'s own narrower container-only
+    /// behavior exactly (see its own doc comment) -- so unlike
+    /// [`ImageCommand::Inspect`] (`0482`)/[`Self::Inspect`] (`0488`),
+    /// this alias needs no forcing at all: it's already a plain,
+    /// genuine byte-identical alias with the identical field set,
+    /// dispatching into the exact same [`cmd_diff`] `ociman diff`
+    /// itself already calls, replaying the identical "explicit id
+    /// always wins over `--latest`" resolution the top-level
+    /// [`Command::Diff`] arm already has -- see [`Command::Diff`]'s
+    /// own doc comment for the exact semantics, not repeated here.
+    Diff {
+        /// Same as [`Command::Diff::id`].
+        id: Option<String>,
+        /// Same as [`Command::Diff::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+        /// Same as [`Command::Diff::format`].
+        #[arg(long = "format", value_name = "FORMAT")]
+        format: Option<String>,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -6146,6 +6176,24 @@ fn main() -> std::process::ExitCode {
                         })?
                     };
                     cmd_logs(&resolved_id, follow, tail)
+                }
+                ContainerCommand::Diff { id, latest, format } => {
+                    // An explicit `id` always wins over `--latest`
+                    // outright, matching real podman's own checked-
+                    // directly behavior exactly -- the identical logic
+                    // the top-level `Command::Diff` arm already has.
+                    let resolved_id = match id {
+                        Some(id) => id,
+                        None => {
+                            anyhow::ensure!(
+                                latest,
+                                "container must be specified: ociman diff [options] ID-NAME"
+                            );
+                            let containers = open_container_store()?;
+                            resolve_latest_container(&containers)?
+                        }
+                    };
+                    cmd_diff(&resolved_id, cli.global.json, format.as_deref())
                 }
             },
             Some(Command::Image { command }) => match command {
