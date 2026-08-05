@@ -2900,15 +2900,31 @@ enum Command {
     /// Works on a running or stopped container alike; shares `cp`/
     /// `diff`/`export`/`commit`'s own rootless-overlay-rootfs gap
     /// (`resolve_container_root`'s own doc comment) — a clear error,
-    /// not a silently wrong path, for that one case. Real podman also
-    /// supports a bare `podman mount` (no `CONTAINER`) listing every
-    /// currently-mounted container; deliberately deferred for this
-    /// first slice, the same narrower-first-slice precedent
-    /// `ContainerCommand::Prune`'s own deferred `--filter` already
-    /// used.
+    /// not a silently wrong path, for that one case.
+    ///
+    /// With no `CONTAINER` at all, lists every currently-mounted
+    /// container instead — matching real `podman mount`'s own
+    /// identical bare-invocation mode exactly (checked directly,
+    /// `~/git/podman/cmd/podman/containers/mount.go`'s own doc
+    /// comment: *"Lists all mounted containers mount points if no
+    /// container is specified"*, and its own default `{{.ID}}\t
+    /// {{.Path}}` per-line output with no header row). Since this
+    /// project's own containers have no separate mount step to
+    /// distinguish a "mounted" one from an "unmounted" one at all
+    /// (the same reasoning above), every existing container is
+    /// honestly always "mounted" — except the one real, already-
+    /// documented rootless-overlay-rootfs gap case above, which is
+    /// silently skipped here rather than aborting the whole listing
+    /// (a single container this project genuinely can't resolve a
+    /// root path for shouldn't hide every other one's). Sorted by
+    /// creation time ascending, matching this project's own
+    /// established `ps` default order — real podman's own bare-mode
+    /// order is an unspecified storage-iteration order with no
+    /// documented guarantee to match instead.
     Mount {
-        /// The container's ID or `--name`.
-        container: String,
+        /// The container's ID or `--name` — omit to list every
+        /// currently-mounted container instead.
+        container: Option<String>,
     },
     /// A real no-op — matching real `podman unmount`'s own identical
     /// behavior for the one storage-driver case this project's own
@@ -4931,7 +4947,7 @@ fn main() -> std::process::ExitCode {
                 };
                 cmd_diff(&resolved_id, cli.global.json, format.as_deref())
             }
-            Some(Command::Mount { container }) => cmd_mount(&container),
+            Some(Command::Mount { container }) => cmd_mount(container.as_deref()),
             Some(Command::Unmount { container }) => cmd_unmount(&container),
             Some(Command::Export { id, output }) => cmd_export(&id, output.as_deref()),
             Some(Command::Commit {
@@ -11432,8 +11448,30 @@ fn cmd_diff(id: &str, json: bool, format: Option<&str>) -> anyhow::Result<()> {
 /// there, nothing to mount" reasoning. Shares `cp`/`diff`/`export`/
 /// `commit`'s own rootless-overlay-rootfs gap via
 /// [`resolve_container_root`], which also already accepts a running
-/// or stopped container alike.
-fn cmd_mount(container: &str) -> anyhow::Result<()> {
+/// or stopped container alike. With `container` absent, lists every
+/// currently-mounted container instead — see [`Command::Mount`]'s own
+/// doc comment for the exact bare-mode semantics.
+fn cmd_mount(container: Option<&str>) -> anyhow::Result<()> {
+    let Some(container) = container else {
+        let containers = open_container_store()?;
+        let mut states = containers.list().context("listing containers")?;
+        states.sort_by(|a, b| a.created.cmp(&b.created));
+        for state in states {
+            let bundle_dir = containers.container_dir(&state.id);
+            // Silently skipped, not a hard error for the whole
+            // listing -- see `Command::Mount`'s own doc comment.
+            if rootfs_setup::upper_dir(&bundle_dir).exists() {
+                continue;
+            }
+            let id = if state.id.len() > 12 {
+                &state.id[..12]
+            } else {
+                &state.id
+            };
+            println!("{id}\t{}", state.rootfs);
+        }
+        return Ok(());
+    };
     let (root, _state) = resolve_container_root(container, "mount")?;
     println!("{}", root.display());
     Ok(())
