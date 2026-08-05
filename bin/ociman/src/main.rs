@@ -3639,21 +3639,31 @@ enum Command {
     /// podman at all (the same rationale [`Command::Container`]'s own
     /// doc comment gives), so this family originally existed solely
     /// to host those; `list`/`ls` (0430), `tag`/`untag` (0478),
-    /// `history`/`rm` (0480), and `pull`/`push`/`save`/`load` (0481)
-    /// are each real, genuine *aliases* for the already-existing flat
-    /// [`Command::Images`]/[`Command::Tag`]/[`Command::Untag`]/
-    /// [`Command::History`]/[`Command::Rmi`]/[`Command::Pull`]/
-    /// [`Command::Push`]/[`Command::Save`]/[`Command::Load`] instead
-    /// — hosted here too since real `podman image list`/`ls`/`tag`/
-    /// `untag`/`history`/`rm`/`pull`/`push`/`save`/`load` themselves
-    /// live under this exact same real subcommand family, not
-    /// because this project needed a new home for logic that didn't
-    /// already have one (real podman's own naming for the `rm`/`rmi`
-    /// pair specifically is the reverse of what "nested vs. top-
-    /// level" might suggest — see [`ImageCommand::Rm`]'s own doc
-    /// comment). Real podman also nests `import`/`inspect`/`mount`/
-    /// `unmount`/`diff` the identical way — a real, deliberately
-    /// deferred gap for a future increment, not yet ported.
+    /// `history`/`rm` (0480), `pull`/`push`/`save`/`load` (0481), and
+    /// `import`/`inspect` (0482) are each real, genuine *aliases* for
+    /// the already-existing flat [`Command::Images`]/[`Command::
+    /// Tag`]/[`Command::Untag`]/[`Command::History`]/[`Command::
+    /// Rmi`]/[`Command::Pull`]/[`Command::Push`]/[`Command::Save`]/
+    /// [`Command::Load`]/[`Command::Import`]/[`Command::Inspect`]
+    /// instead — hosted here too since real `podman image list`/
+    /// `ls`/`tag`/`untag`/`history`/`rm`/`pull`/`push`/`save`/`load`/
+    /// `import`/`inspect` themselves live under this exact same real
+    /// subcommand family, not because this project needed a new home
+    /// for logic that didn't already have one (real podman's own
+    /// naming for the `rm`/`rmi` pair specifically is the reverse of
+    /// what "nested vs. top-level" might suggest — see
+    /// [`ImageCommand::Rm`]'s own doc comment; `image inspect`
+    /// specifically is forced to image-only resolution via
+    /// [`InspectType::Image`], never falling back to a container —
+    /// see [`ImageCommand::Inspect`]'s own doc comment). Real podman
+    /// also nests `mount`/`unmount`/`diff` under this same family —
+    /// each genuinely more involved than a pure alias (`mount`/
+    /// `unmount` there alias the *container* mount/unmount commands,
+    /// a cross-concept aliasing shape; `image diff` computes a real,
+    /// new "image vs. its own parent layer" comparison this project
+    /// has no equivalent logic for at all, unlike `ociman diff`'s
+    /// own container-only scope) — real, deliberately deferred gaps
+    /// for a future increment, not yet ported.
     Image {
         #[command(subcommand)]
         command: ImageCommand,
@@ -4970,6 +4980,57 @@ enum ImageCommand {
         #[arg(short, long)]
         quiet: bool,
     },
+    /// `podman image import`'s own real alias for top-level `podman
+    /// import` — checked directly, `~/git/podman/cmd/podman/images/
+    /// import.go`: `imageImportCommand` (`Parent: imageCmd`) and
+    /// `importCommand` (top-level) share the exact same `Use`/
+    /// `Short`/`Long`/`RunE`/`Args`/`ValidArgsFunction` verbatim, plus
+    /// `importFlags` registered on both. Dispatches straight into the
+    /// same [`cmd_import`] `ociman import` itself already calls, with
+    /// the identical field set — see [`Command::Import`]'s own doc
+    /// comment for the exact semantics, not repeated here.
+    Import {
+        /// Same as [`Command::Import::path`].
+        path: String,
+        /// Same as [`Command::Import::reference`].
+        reference: Option<String>,
+        /// Same as [`Command::Import::message`].
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+        /// Same as [`Command::Import::change`].
+        #[arg(short = 'c', long = "change", value_name = "INSTRUCTION")]
+        change: Vec<String>,
+        /// Same as [`Command::Import::os`].
+        #[arg(long)]
+        os: Option<String>,
+        /// Same as [`Command::Import::arch`].
+        #[arg(long)]
+        arch: Option<String>,
+    },
+    /// `podman image inspect`'s own real alias for the already-
+    /// existing flat [`Command::Inspect`], forced to image-only
+    /// resolution — checked directly, `~/git/podman/cmd/podman/
+    /// images/inspect.go`: `inspectCmd` (`Parent: imageCmd`)
+    /// unconditionally sets `inspectOpts.Type = common.ImageType`
+    /// before calling the exact same shared `inspect.Inspect`
+    /// top-level `podman inspect --type image` also reaches — never
+    /// falling back to a container the way this project's own
+    /// top-level default resolution otherwise would, and with none of
+    /// `--latest`/`--size`/`--type` exposed at all (checked directly:
+    /// `images/inspect.go`'s own `init()` registers only `--format`/
+    /// `-f`, unlike the richer top-level flag set `inspect.go`
+    /// registers). Dispatches into the same [`cmd_inspect`] with
+    /// [`InspectType::Image`] hardcoded, not a user-facing choice
+    /// here.
+    Inspect {
+        /// Same as [`Command::Inspect::reference`], but always
+        /// required — real `podman image inspect` has no `--latest`
+        /// fallback for a missing one at all.
+        reference: String,
+        /// Same as [`Command::Inspect::format`].
+        #[arg(long = "format", short = 'f', value_name = "TEMPLATE")]
+        format: Option<String>,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -5550,6 +5611,29 @@ fn main() -> std::process::ExitCode {
                 ImageCommand::Load { input, quiet } => {
                     cmd_load(input.as_deref(), quiet, cli.global.json)
                 }
+                ImageCommand::Import {
+                    path,
+                    reference,
+                    message,
+                    change,
+                    os,
+                    arch,
+                } => cmd_import(
+                    &path,
+                    reference.as_deref(),
+                    message.as_deref(),
+                    &change,
+                    os.as_deref(),
+                    arch.as_deref(),
+                    cli.global.json,
+                ),
+                ImageCommand::Inspect { reference, format } => cmd_inspect(
+                    &reference,
+                    cli.global.json,
+                    format.as_deref(),
+                    false,
+                    InspectType::Image,
+                ),
             },
             Some(Command::Stats {
                 id,

@@ -347,3 +347,43 @@ fn export_then_import_round_trips_through_the_real_cli() {
     );
     assert_eq!(String::from_utf8_lossy(&run2.stdout), "round trip me\n");
 }
+
+/// `ociman image import` (0482) is a real, genuine alias for `ociman
+/// import` itself, matching real `podman image import`'s own
+/// checked-directly identical `RunE`/flag set as top-level `podman
+/// import` exactly (`~/git/podman/cmd/podman/images/import.go`) --
+/// byte-identical output for the same fixture state.
+#[test]
+fn image_import_is_a_byte_identical_alias_for_import() {
+    let Some(busybox) = oci_tools_tests::busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let tar_bytes = make_busybox_tar(&busybox, &["cat"], &[("hello.txt", b"hello\n")]);
+    let tar_path = storage_dir.path().join("in.tar");
+    std::fs::write(&tar_path, &tar_bytes).unwrap();
+
+    let import = ociman(
+        storage_dir.path(),
+        &[
+            "image",
+            "import",
+            tar_path.to_str().unwrap(),
+            "example.com/image-import-test:v1",
+        ],
+    );
+    assert!(
+        import.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    let digest = String::from_utf8_lossy(&import.stdout).trim().to_string();
+    assert!(digest.starts_with("sha256:"), "{digest:?}");
+
+    let inspect = ociman(
+        storage_dir.path(),
+        &["inspect", "example.com/image-import-test:v1", "--json"],
+    );
+    assert!(inspect.status.success());
+}

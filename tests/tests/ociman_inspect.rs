@@ -1402,3 +1402,74 @@ fn inspect_latest_on_an_empty_store_is_a_clear_error() {
     let out = ociman(storage_dir.path(), &["inspect", "--latest"]);
     assert!(!out.status.success());
 }
+
+/// `ociman image inspect` (0482) is a real, genuine alias for
+/// `ociman inspect --type image`, matching real `podman image
+/// inspect`'s own checked-directly identical behavior exactly
+/// (`~/git/podman/cmd/podman/images/inspect.go`: unconditionally
+/// forces `inspectOpts.Type = common.ImageType`) -- never falling
+/// back to (or even considering) a container of the exact same name,
+/// the same real "image-only" behavior `inspect_type_image_never_
+/// resolves_a_container_of_the_same_name` already proves for the
+/// top-level `--type image` flag.
+#[test]
+fn image_inspect_is_a_byte_identical_alias_for_inspect_type_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/image-inspect-alias:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "image-inspect-alias-shared-name",
+            "ociman-test/image-inspect-alias:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    // Byte-identical to the already-established `--type image` flag,
+    // for the same real image reference.
+    let via_type_flag = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "--type",
+            "image",
+            "ociman-test/image-inspect-alias:latest",
+        ],
+    );
+    let via_alias = ociman(
+        storage_dir.path(),
+        &["image", "inspect", "ociman-test/image-inspect-alias:latest"],
+    );
+    assert!(via_type_flag.status.success());
+    assert!(
+        via_alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&via_alias.stderr)
+    );
+    assert_eq!(via_alias.stdout, via_type_flag.stdout);
+
+    // Never resolves the container of the exact same name.
+    let alias_on_container_name = ociman(
+        storage_dir.path(),
+        &["image", "inspect", "image-inspect-alias-shared-name"],
+    );
+    assert!(!alias_on_container_name.status.success());
+    assert!(
+        String::from_utf8_lossy(&alias_on_container_name.stderr).contains("no such image"),
+        "{alias_on_container_name:?}"
+    );
+}
