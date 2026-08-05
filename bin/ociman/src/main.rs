@@ -4943,6 +4943,34 @@ enum ContainerCommand {
         #[arg(short, long)]
         attach: bool,
     },
+    /// `podman container kill`'s own real alias for the already-
+    /// existing flat [`Command::Kill`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/kill.go:20-46`: `containerKillCommand`
+    /// (`Parent: containerCmd`) and top-level `killCommand` share the
+    /// exact same `Use`/`Short`/`Long`/`RunE`/`Args`/
+    /// `ValidArgsFunction`, and both get the identical flag set
+    /// applied via the one shared `killFlags(cmd)` helper plus
+    /// `validate.AddLatestFlag` -- a byte-identical alias, the same
+    /// shape [`Self::Stop`] (`0490`) already established. Dispatches
+    /// into the same [`cmd_kill`] `ociman kill` itself already calls,
+    /// with the identical field set -- see [`Command::Kill`]'s own
+    /// doc comment for the exact semantics, not repeated here.
+    Kill {
+        /// Same as [`Command::Kill::ids`].
+        ids: Vec<String>,
+        /// Same as [`Command::Kill::signal`].
+        #[arg(short, long, default_value = "KILL")]
+        signal: String,
+        /// Same as [`Command::Kill::all`].
+        #[arg(short, long)]
+        all: bool,
+        /// Same as [`Command::Kill::cidfile`].
+        #[arg(long = "cidfile", value_name = "FILE")]
+        cidfile: Vec<PathBuf>,
+        /// Same as [`Command::Kill::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -5815,6 +5843,13 @@ fn main() -> std::process::ExitCode {
                     };
                     cmd_start(&resolved_id, attach)
                 }
+                ContainerCommand::Kill {
+                    ids,
+                    signal,
+                    all,
+                    cidfile,
+                    latest,
+                } => cmd_kill(&ids, &signal, all, &cidfile, latest),
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),

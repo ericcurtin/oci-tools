@@ -6,11 +6,13 @@
 //! resolution), `rm` (`docs/design/0489`, a real, byte-identical
 //! alias for the top-level `ociman rm` itself), `stop`
 //! (`docs/design/0490`, the same byte-identical-alias shape for
-//! `ociman stop`), and `start` (`docs/design/0491`, the same shape
-//! again for `ociman start`) — see `ociman_ps.rs`/`ociman_stop.rs`/
-//! `ociman_start.rs` for each top-level command's own much larger
-//! test suite; this file only proves each alias itself is byte-
-//! identical, not the aliased command's own full semantics again.
+//! `ociman stop`), `start` (`docs/design/0491`, the same shape again
+//! for `ociman start`), and `kill` (`docs/design/0492`, the same
+//! shape again for `ociman kill`) — see `ociman_ps.rs`/
+//! `ociman_stop.rs`/`ociman_start.rs`/`ociman_kill.rs` for each
+//! top-level command's own much larger test suite; this file only
+//! proves each alias itself is byte-identical, not the aliased
+//! command's own full semantics again.
 //!
 //! `ociman container prune` removes every real, non-running container
 //! (this project's own `Created`/`Stopped`, never `Running`/`Paused`,
@@ -923,4 +925,113 @@ fn container_start_latest_and_explicit_id_together_is_a_clear_error() {
             .contains("--latest and containers cannot be used together"),
         "{alias:?}"
     );
+}
+
+/// `ociman container kill` (0492) is a real, byte-identical alias for
+/// the top-level `ociman kill`, matching real `podman container
+/// kill`'s own checked-directly identical `Use`/`Short`/`Long`/
+/// `RunE`/`Args`/`ValidArgsFunction` (and identical `killFlags`-
+/// applied flag set) as top-level `podman kill` exactly (`~/git/
+/// podman/cmd/podman/containers/kill.go:20-46`). Full `kill`
+/// semantics (multi-id, `--all`, `--cidfile`, `--latest`) are already
+/// exhaustively tested against the top-level command in
+/// `ociman_kill.rs`; this only proves the alias itself reaches the
+/// identical function with the identical fields.
+#[test]
+fn container_kill_is_a_byte_identical_alias_for_top_level_kill() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-kill-alias:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/container-kill-alias:latest",
+        &["sleep", "30"],
+    );
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    // No `--signal` given at all -- real `podman kill`'s own default
+    // is `KILL`, not `TERM`.
+    let alias = ociman(storage_dir.path(), &["container", "kill", &id]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&alias.stdout).trim(), id);
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "stopped", Duration::from_secs(20)),
+        "stopped"
+    );
+}
+
+/// The alias's own flag set works too, not just the bare form —
+/// `--signal`/`-s` sends exactly that signal (never escalating,
+/// unlike `stop`), matching the top-level `ociman kill --signal`'s
+/// own already-established behavior exactly.
+#[test]
+fn container_kill_signal_flag_works_through_the_alias() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-kill-signal:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/container-kill-signal:latest",
+        &["sleep", "30"],
+    );
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    // `sleep`, as a pid-namespace's own init, ignores an unhandled-
+    // default-action `TERM` outright (the same real, already-
+    // established finding `ociman_kill.rs`'s own identical test
+    // relies on) -- `kill --signal TERM` never escalates, so the
+    // container should genuinely still be running afterward.
+    let alias = ociman(
+        storage_dir.path(),
+        &["container", "kill", "--signal", "TERM", &id],
+    );
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(inspect_json(storage_dir.path(), &id)["status"], "running");
+
+    // Clean up the still-running container so the temp dir doesn't
+    // leak a live process past this test.
+    let _ = ociman(storage_dir.path(), &["kill", &id]);
 }
