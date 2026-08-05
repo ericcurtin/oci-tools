@@ -1425,6 +1425,137 @@ fn export_app_extra_flags_are_inserted_before_a_field_code() {
     );
 }
 
+/// `export --bin --enter-flags` (0486) is inserted between the box
+/// name and the `--` separator -- matching real `distrobox export
+/// --enter-flags`'s own identical `container_command_suffix` shape
+/// exactly (checked directly, `~/git/distrobox/internal/inside-
+/// distrobox/assets/distrobox-export`).
+#[test]
+fn export_bin_enter_flags_are_inserted_between_the_box_name_and_the_separator() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--bin",
+            "/bin/echo",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+            "--enter-flags",
+            "--clean-path",
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let contents = std::fs::read_to_string(export_dir.path().join("echo")).unwrap();
+    assert!(
+        contents.contains("exec ocibox enter testbox --clean-path -- '/bin/echo' \"$@\""),
+        "{contents:?}"
+    );
+}
+
+/// `export --bin --enter-flags --extra-flags` together compose
+/// correctly: `--enter-flags` before the `--` separator,
+/// `--extra-flags` after it -- matching real distrobox's own
+/// identical composition of `container_command_prefix`/
+/// `container_command_suffix`.
+#[test]
+fn export_bin_enter_flags_and_extra_flags_compose_correctly() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--bin",
+            "/bin/echo",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+            "--enter-flags",
+            "--clean-path",
+            "--extra-flags",
+            "-n",
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let contents = std::fs::read_to_string(export_dir.path().join("echo")).unwrap();
+    assert!(
+        contents.contains("exec ocibox enter testbox --clean-path -- '/bin/echo' -n \"$@\""),
+        "{contents:?}"
+    );
+}
+
+/// `export --app --enter-flags` (0486) is inserted between the box
+/// name and the `--` separator in the rewritten `Exec=` line -- the
+/// same real distrobox `container_command_prefix` shape `--bin`'s own
+/// identical test proves.
+#[test]
+fn export_app_enter_flags_are_inserted_between_the_box_name_and_the_separator() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(&storage_dir, "testbox", SAMPLE_DESKTOP_FILE);
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+            "--enter-flags",
+            "--clean-path",
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let contents =
+        std::fs::read_to_string(export_dir.path().join("testbox-myapp.desktop")).unwrap();
+    assert!(
+        contents
+            .lines()
+            .any(|l| l.starts_with("Exec=ocibox enter testbox --clean-path -- ")),
+        "{contents:?}"
+    );
+}
+
 /// `export --app --extra-flags` has no effect at all when the
 /// `Exec=` line has no field code to insert before -- a real, crude
 /// limitation of real distrobox's own `sed`-based implementation this

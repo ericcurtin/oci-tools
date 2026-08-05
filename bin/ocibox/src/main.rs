@@ -501,6 +501,38 @@ enum Command {
         /// `--extra-flags` silently has no effect there either).
         #[arg(long = "extra-flags", value_name = "FLAGS", allow_hyphen_values = true)]
         extra_flags: Option<String>,
+        /// Flags to add to the `ocibox enter` call the exported
+        /// command/application itself invokes (`--enter-flags`,
+        /// matching real `distrobox export`'s own identical flag —
+        /// checked directly, `~/git/distrobox/internal/inside-
+        /// distrobox/assets/distrobox-export:179-181,243-264,291,332`):
+        /// inserted between the box name and the `--` separator, for
+        /// both `--bin` and `--app` alike (real distrobox's own
+        /// identical `container_command_prefix`/`container_command_
+        /// suffix` shape covers both cases with the same string). Real
+        /// distrobox's own short form is the literal two-letter,
+        /// single-dash token `-nf` (a plain shell-argument string
+        /// comparison in its own hand-rolled parser, not a getopt-
+        /// style single-char short flag at all) — clap's own `short`
+        /// mechanism only ever accepts one character, so that exact
+        /// spelling has no faithful equivalent here; long-only rather
+        /// than inventing a subtly wrong single-character stand-in.
+        /// Real distrobox's own version additionally *filters out*
+        /// any given `--root`/`-r`/`--name`/`-n` (printing a warning:
+        /// the export wrapper already sets those two automatically) —
+        /// this project's own `ocibox enter` has no equivalent flags
+        /// to collide with at all (its own box name is a plain
+        /// positional, never a `--name`/`-n` flag, and this project
+        /// has no rootful/rootless distinction to have a `--root`/
+        /// `-r` flag for in the first place), so there is nothing to
+        /// filter here — a real, honest scope simplification, not an
+        /// oversight. A real, previously-deferred gap (`docs/design/
+        /// 0330`'s own "still ahead" note, at the time correctly
+        /// blocked on `ocibox enter` having no flags of its own worth
+        /// forwarding at all — resolved once `--clean-path` (`0468`)
+        /// gave it one).
+        #[arg(long = "enter-flags", value_name = "FLAGS", allow_hyphen_values = true)]
+        enter_flags: Option<String>,
     },
     /// Generate (or `--delete`) a real, standalone desktop launcher
     /// for entering a whole box — matching real `distrobox generate-
@@ -657,6 +689,7 @@ fn main() -> std::process::ExitCode {
                 list_apps,
                 list_binaries,
                 extra_flags,
+                enter_flags,
             }) => cmd_export(
                 &box_name,
                 ExportArgs {
@@ -668,6 +701,7 @@ fn main() -> std::process::ExitCode {
                     list_apps,
                     list_binaries,
                     extra_flags: extra_flags.as_deref(),
+                    enter_flags: enter_flags.as_deref(),
                 },
             ),
             Some(Command::GenerateEntry {
@@ -1779,6 +1813,7 @@ struct ExportArgs<'a> {
     list_apps: bool,
     list_binaries: bool,
     extra_flags: Option<&'a str>,
+    enter_flags: Option<&'a str>,
 }
 
 fn cmd_export(box_name: &str, args: ExportArgs) -> anyhow::Result<()> {
@@ -1791,6 +1826,7 @@ fn cmd_export(box_name: &str, args: ExportArgs) -> anyhow::Result<()> {
         list_apps,
         list_binaries,
         extra_flags,
+        enter_flags,
     } = args;
     if list_apps || list_binaries {
         anyhow::ensure!(
@@ -1817,8 +1853,11 @@ fn cmd_export(box_name: &str, args: ExportArgs) -> anyhow::Result<()> {
             delete,
             export_label,
             extra_flags,
+            enter_flags,
         ),
-        (None, Some(bin)) => cmd_export_bin(box_name, bin, export_path, delete, extra_flags),
+        (None, Some(bin)) => {
+            cmd_export_bin(box_name, bin, export_path, delete, extra_flags, enter_flags)
+        }
     }
 }
 
@@ -1836,6 +1875,7 @@ fn cmd_export_bin(
     export_path: Option<&Path>,
     delete: bool,
     extra_flags: Option<&str>,
+    enter_flags: Option<&str>,
 ) -> anyhow::Result<()> {
     validate_box_name(box_name)?;
     let box_dir = boxes_root().join(box_name);
@@ -1899,8 +1939,13 @@ fn cmd_export_bin(
     // template exactly (`container_command_suffix="'${exported_bin}'
     // ${extra_flags} \"\$@\""`).
     let extra = extra_flags.map(|f| format!(" {f}")).unwrap_or_default();
+    // `--enter-flags`, if given, is inserted between the box name and
+    // the `--` separator -- matching real distrobox's own identical
+    // `container_command_suffix`/`enter` line shape exactly (see
+    // `Command::Export::enter_flags`'s own doc comment).
+    let enter = enter_flags.map(|f| format!(" {f}")).unwrap_or_default();
     let script = format!(
-        "#!/bin/sh\n# {EXPORT_MARKER}\n# box: {box_name}\nexec ocibox enter {box_name} -- '{bin}'{extra} \"$@\"\n"
+        "#!/bin/sh\n# {EXPORT_MARKER}\n# box: {box_name}\nexec ocibox enter {box_name}{enter} -- '{bin}'{extra} \"$@\"\n"
     );
     std::fs::write(&dest_file, script)
         .with_context(|| format!("writing {}", dest_file.display()))?;
@@ -2237,6 +2282,7 @@ fn rewrite_desktop_file(
     home: &Path,
     label: &str,
     extra_flags: Option<&str>,
+    enter_flags: Option<&str>,
 ) -> String {
     let mut out = format!("# {APP_EXPORT_MARKER}\n# box: {box_name}\n");
     for line in content.lines() {
@@ -2260,7 +2306,13 @@ fn rewrite_desktop_file(
                 }
                 _ => rest.to_string(),
             };
-            out.push_str(&format!("Exec=ocibox enter {box_name} -- {rest}\n"));
+            // `--enter-flags`, if given, is inserted between the box
+            // name and the `--` separator -- matching real
+            // distrobox's own identical `container_command_prefix`
+            // shape exactly (see `Command::Export::enter_flags`'s own
+            // doc comment).
+            let enter = enter_flags.map(|f| format!(" {f}")).unwrap_or_default();
+            out.push_str(&format!("Exec=ocibox enter {box_name}{enter} -- {rest}\n"));
             continue;
         }
         if let Some(new_icon) = icon_rewrite
@@ -2410,6 +2462,7 @@ fn cmd_export_app(
     delete: bool,
     export_label: Option<&str>,
     extra_flags: Option<&str>,
+    enter_flags: Option<&str>,
 ) -> anyhow::Result<()> {
     validate_box_name(box_name)?;
     let box_dir = boxes_root().join(box_name);
@@ -2497,6 +2550,7 @@ fn cmd_export_app(
             &home,
             &label,
             extra_flags,
+            enter_flags,
         );
         let dest_name = exported_desktop_file_name(box_name, src)?;
         let dest_file = export_dir.join(&dest_name);
