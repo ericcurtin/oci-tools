@@ -338,9 +338,22 @@ enum Command {
     /// warning, never masking the command's own real result.
     Ephemeral {
         /// Image reference to base the box on (`--image`/`-i`,
-        /// matching `ocibox create`'s own identical flag).
+        /// matching `ocibox create`'s own identical flag) — mutually
+        /// exclusive with `--clone`; exactly one of the two must be
+        /// given.
         #[arg(long = "image", short = 'i', value_name = "REFERENCE")]
-        image: String,
+        image: Option<String>,
+        /// Same as `ocibox create --clone`/`-c` — matching real
+        /// `distrobox ephemeral`'s own identical inherited flag
+        /// (checked directly, `~/git/distrobox/internal/cli/
+        /// ephemeral.go`'s own comment: *"inherited create flags
+        /// (e.g. -c/--clone)"*). A real, previously-deferred gap
+        /// (`docs/design/0476`'s own "still out of scope" section,
+        /// closed here): `ocibox create --clone` landed first, this
+        /// wires the identical, already-fully-working [`clone_box`]
+        /// path into `ephemeral` too.
+        #[arg(long = "clone", short = 'c', value_name = "SOURCE_BOX")]
+        clone: Option<String>,
         /// Pull `--image` even if a local copy already exists,
         /// matching `ocibox create --pull`'s own identical flag.
         #[arg(long, short = 'p')]
@@ -616,6 +629,7 @@ fn main() -> std::process::ExitCode {
             }) => cmd_enter(&name, &command, clean_path),
             Some(Command::Ephemeral {
                 image,
+                clone,
                 pull,
                 yes: _,
                 hostname,
@@ -624,7 +638,8 @@ fn main() -> std::process::ExitCode {
                 platform,
                 command,
             }) => cmd_ephemeral(
-                &image,
+                image.as_deref(),
+                clone.as_deref(),
                 pull,
                 hostname.as_deref(),
                 home.as_deref(),
@@ -1661,7 +1676,8 @@ fn unique_random_box_name() -> anyhow::Result<String> {
 /// namespace/mount/launch code was needed to build it at all.
 #[allow(clippy::too_many_arguments)]
 fn cmd_ephemeral(
-    image: &str,
+    image: Option<&str>,
+    clone: Option<&str>,
     pull: bool,
     hostname: Option<&str>,
     home: Option<&Path>,
@@ -1670,24 +1686,14 @@ fn cmd_ephemeral(
     command: &[String],
 ) -> anyhow::Result<()> {
     let name = unique_random_box_name()?;
-    // Real `distrobox ephemeral` does inherit `--clone` too (checked
-    // directly, `~/git/distrobox/internal/cli/ephemeral.go`'s own
-    // comment: "inherited create flags (e.g. -c/--clone)") -- a real,
-    // deliberately deferred gap for this project's own first slice
-    // (`ocibox create --clone` alone, not yet `ephemeral`), so `None`
-    // here always, never reachable from `ocibox ephemeral`'s own CLI
-    // surface yet.
-    create_box(
-        Some(image),
-        None,
-        &name,
-        pull,
-        hostname,
-        home,
-        volumes,
-        platform,
-    )
-    .with_context(|| format!("creating ephemeral box {name}"))?;
+    // `--clone` (0477, closing `0476`'s own deferred gap): real
+    // `distrobox ephemeral` does inherit it too (checked directly,
+    // `~/git/distrobox/internal/cli/ephemeral.go`'s own comment:
+    // "inherited create flags (e.g. -c/--clone)") -- the exact same
+    // `create_box`/`clone_box` path `ocibox create --clone` already
+    // established, no new logic needed here at all.
+    create_box(image, clone, &name, pull, hostname, home, volumes, platform)
+        .with_context(|| format!("creating ephemeral box {name}"))?;
 
     // Real `distrobox ephemeral` has no `--clean-path` flag of its
     // own at all (checked directly, `~/git/distrobox/internal/cli/

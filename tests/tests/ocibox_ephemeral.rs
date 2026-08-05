@@ -301,3 +301,108 @@ fn ephemeral_of_an_unresolvable_image_is_a_clear_error_and_leaves_no_box_behind(
         "a failed ephemeral create should leave no box directory behind at all"
     );
 }
+
+/// `ocibox ephemeral --clone`/`-c` (0477, closing `0476`'s own
+/// deferred gap): real `distrobox ephemeral` inherits `--clone` from
+/// `distrobox create` too (checked directly, `~/git/distrobox/
+/// internal/cli/ephemeral.go`). A real, already-existing box's own
+/// current rootfs (including a write made after its own creation) is
+/// visible from inside the ephemeral clone, and the clone is still
+/// fully removed afterward while the real, persistent source box
+/// survives completely untouched.
+#[test]
+fn ephemeral_clone_sees_the_source_boxs_own_current_state_and_still_cleans_up() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    seed_ephemeral_base(
+        storage_dir.path(),
+        "ocibox-test/ephemeral-clone-base:latest",
+    );
+
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/ephemeral-clone-base:latest",
+            "--name",
+            "ephemeral-clone-source",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let source_rootfs = storage_dir
+        .path()
+        .join("boxes")
+        .join("ephemeral-clone-source")
+        .join("rootfs");
+    std::fs::write(source_rootfs.join("marker.txt"), b"from the source box").unwrap();
+
+    let out = ocibox(
+        storage_dir.path(),
+        &[
+            "ephemeral",
+            "--clone",
+            "ephemeral-clone-source",
+            "--",
+            "/bin/cat",
+            "/marker.txt",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("from the source box"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // The real, persistent source box survives, completely untouched
+    // -- only its own ephemeral clone was ever removed.
+    let boxes: Vec<String> = std::fs::read_dir(storage_dir.path().join("boxes"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(boxes, vec!["ephemeral-clone-source"]);
+    assert!(source_rootfs.join("marker.txt").exists());
+}
+
+/// `--image` and `--clone` together, or neither at all, are both
+/// clear, immediate errors -- matching `ocibox create`'s own
+/// identical validation.
+#[test]
+fn ephemeral_requires_exactly_one_of_image_or_clone() {
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let neither = ocibox(storage_dir.path(), &["ephemeral"]);
+    assert!(!neither.status.success());
+    assert!(
+        String::from_utf8_lossy(&neither.stderr)
+            .contains("exactly one of --image or --clone must be given"),
+        "{}",
+        String::from_utf8_lossy(&neither.stderr)
+    );
+
+    let both = ocibox(
+        storage_dir.path(),
+        &[
+            "ephemeral",
+            "--image",
+            "ocibox-test/whatever:latest",
+            "--clone",
+            "whatever",
+        ],
+    );
+    assert!(!both.status.success());
+    assert!(
+        String::from_utf8_lossy(&both.stderr)
+            .contains("exactly one of --image or --clone must be given"),
+        "{}",
+        String::from_utf8_lossy(&both.stderr)
+    );
+}
