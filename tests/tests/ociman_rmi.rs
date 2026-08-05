@@ -1150,3 +1150,43 @@ fn rmi_all_removes_a_digest_with_both_multiple_tags_and_an_untagged_sibling() {
     );
     assert!(store.resolve_image(&sentinel).unwrap().is_none());
 }
+
+/// `ociman image rm` (0480) is a real, genuine alias for `ociman
+/// rmi` itself -- matching real `podman image rm`'s own checked-
+/// directly identical `RunE`/flag set as top-level `podman rmi`
+/// exactly (`~/git/podman/cmd/podman/images/rm.go`; note real
+/// podman's own naming for this specific pair is the reverse of what
+/// "nested vs. top-level" might otherwise suggest -- `rm` is the
+/// nested one, `rmi` the top-level one).
+#[test]
+fn image_rm_is_a_byte_identical_alias_for_rmi() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/image-rm-alias:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let rm = ociman(
+        storage_dir.path(),
+        &["image", "rm", "ociman-test/image-rm-alias:latest"],
+    );
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/image-rm-alias:latest")
+            .unwrap()
+            .is_none()
+    );
+}

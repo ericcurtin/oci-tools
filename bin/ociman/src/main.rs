@@ -3638,17 +3638,20 @@ enum Command {
     /// `exists`/`prune` have no flat top-level alias in real docker/
     /// podman at all (the same rationale [`Command::Container`]'s own
     /// doc comment gives), so this family originally existed solely
-    /// to host those; `list`/`ls` (0430), `tag` (0478), and `untag`
-    /// (0478) are each real, genuine *aliases* for the already-
-    /// existing flat [`Command::Images`]/[`Command::Tag`]/
-    /// [`Command::Untag`] instead — hosted here too since real
-    /// `podman image list`/`ls`/`tag`/`untag` themselves live under
-    /// this exact same real subcommand family, not because this
-    /// project needed a new home for logic that didn't already have
-    /// one. Real podman also nests `history`/`push`/`pull`/`rm`/
-    /// `save`/`load`/`import`/`inspect`/`mount`/`unmount`/`diff` the
-    /// identical way — a real, deliberately deferred gap for a future
-    /// increment, not yet ported.
+    /// to host those; `list`/`ls` (0430), `tag`/`untag` (0478), and
+    /// `history`/`rm` (0480) are each real, genuine *aliases* for the
+    /// already-existing flat [`Command::Images`]/[`Command::Tag`]/
+    /// [`Command::Untag`]/[`Command::History`]/[`Command::Rmi`]
+    /// instead — hosted here too since real `podman image list`/
+    /// `ls`/`tag`/`untag`/`history`/`rm` themselves live under this
+    /// exact same real subcommand family, not because this project
+    /// needed a new home for logic that didn't already have one
+    /// (real podman's own naming for the `rm`/`rmi` pair specifically
+    /// is the reverse of what "nested vs. top-level" might suggest —
+    /// see [`ImageCommand::Rm`]'s own doc comment). Real podman also
+    /// nests `push`/`pull`/`save`/`load`/`import`/`inspect`/`mount`/
+    /// `unmount`/`diff` the identical way — a real, deliberately
+    /// deferred gap for a future increment, not yet ported.
     Image {
         #[command(subcommand)]
         command: ImageCommand,
@@ -4842,6 +4845,51 @@ enum ImageCommand {
         #[arg(trailing_var_arg = true)]
         references: Vec<String>,
     },
+    /// `podman image history`'s own real alias for top-level `podman
+    /// history` — checked directly, `~/git/podman/cmd/podman/images/
+    /// history.go`: `imageHistoryCmd` (`Parent: imageCmd`) and
+    /// `historyCmd` (top-level) share the exact same `Args`/`Use`/
+    /// `Short`/`Long`/`ValidArgsFunction`/`RunE` verbatim, plus
+    /// `historyFlags` registered on both. Dispatches straight into
+    /// the same [`cmd_history`] `ociman history` itself already
+    /// calls, with the identical field set — see [`Command::
+    /// History`]'s own doc comment for the exact semantics, not
+    /// repeated here.
+    History {
+        /// Same as [`Command::History::reference`].
+        reference: String,
+        /// Same as [`Command::History::format`].
+        #[arg(long = "format", value_name = "TEMPLATE")]
+        format: Option<String>,
+        /// Same as [`Command::History::no_trunc`].
+        #[arg(long = "no-trunc")]
+        no_trunc: bool,
+    },
+    /// `podman image rm`'s own real alias for top-level `podman rmi`
+    /// — checked directly, `~/git/podman/cmd/podman/images/rm.go`:
+    /// **real podman's own naming is the reverse of what the parent/
+    /// top-level split elsewhere in this same file might suggest** —
+    /// `rmCmd` (`Use: "rm ..."`) is the one registered with `Parent:
+    /// imageCmd` (giving `podman image rm`), while `rmiCmd` (`Use:
+    /// "rmi ..."`, sharing `RunE`/`Short`/`Long`/`ValidArgsFunction`
+    /// with `rmCmd` verbatim) is the separate, top-level `podman
+    /// rmi`. Dispatches straight into the same [`cmd_rmi`] `ociman
+    /// rmi` itself already calls, with the identical field set — see
+    /// [`Command::Rmi`]'s own doc comment for the exact semantics,
+    /// not repeated here.
+    Rm {
+        /// Same as [`Command::Rmi::references`].
+        references: Vec<String>,
+        /// Same as [`Command::Rmi::force`].
+        #[arg(short, long)]
+        force: bool,
+        /// Same as [`Command::Rmi::all`].
+        #[arg(short, long)]
+        all: bool,
+        /// Same as [`Command::Rmi::ignore`].
+        #[arg(short, long)]
+        ignore: bool,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -5374,6 +5422,17 @@ fn main() -> std::process::ExitCode {
                     cmd_tag(&source, &targets, cli.global.json)
                 }
                 ImageCommand::Untag { image, references } => cmd_untag(&image, &references),
+                ImageCommand::History {
+                    reference,
+                    format,
+                    no_trunc,
+                } => cmd_history(&reference, cli.global.json, format.as_deref(), no_trunc),
+                ImageCommand::Rm {
+                    references,
+                    force,
+                    all,
+                    ignore,
+                } => cmd_rmi(&references, force, all, ignore, cli.global.json),
             },
             Some(Command::Stats {
                 id,

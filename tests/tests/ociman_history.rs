@@ -406,3 +406,85 @@ fn history_format_takes_priority_and_errors_on_an_unknown_field() {
         String::from_utf8_lossy(&bad.stderr)
     );
 }
+
+/// `ociman image history` (0480) is a real, genuine alias for
+/// `ociman history` itself, matching real `podman image history`'s
+/// own checked-directly identical `RunE`/flag set as top-level
+/// `podman history` exactly (`~/git/podman/cmd/podman/images/
+/// history.go`) -- byte-identical output for the same fixture state.
+#[test]
+fn image_history_is_a_byte_identical_alias_for_history() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/image-history-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/image-history-base:latest\n\
+         RUN echo hello > /marker.txt\n\
+         ENV FOO=bar\n",
+    );
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/image-history-result:latest",
+        ],
+    );
+    assert!(build.status.success(), "{build:?}");
+
+    let history = ociman(
+        storage_dir.path(),
+        &["history", "ociman-test/image-history-result:latest"],
+    );
+    assert!(history.status.success());
+
+    let alias = ociman(
+        storage_dir.path(),
+        &[
+            "image",
+            "history",
+            "ociman-test/image-history-result:latest",
+        ],
+    );
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(alias.stdout, history.stdout);
+
+    // The identical flag set works through the alias too.
+    let alias_no_trunc = ociman(
+        storage_dir.path(),
+        &[
+            "image",
+            "history",
+            "ociman-test/image-history-result:latest",
+            "--no-trunc",
+        ],
+    );
+    let history_no_trunc = ociman(
+        storage_dir.path(),
+        &[
+            "history",
+            "ociman-test/image-history-result:latest",
+            "--no-trunc",
+        ],
+    );
+    assert!(alias_no_trunc.status.success());
+    assert_eq!(alias_no_trunc.stdout, history_no_trunc.stdout);
+}
