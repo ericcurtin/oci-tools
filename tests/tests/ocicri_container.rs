@@ -460,6 +460,41 @@ async fn create_container_writes_a_real_etc_hosts_mapping_its_own_hostname_to_lo
     );
 }
 
+/// A real `/etc/hostname` file, containing the exact same value
+/// passed to `sethostname(2)` (`spec.hostname`) -- a real,
+/// previously-unnoticed gap found while researching `ociman build
+/// --no-hostname` (`docs/design/0459`), closed here in the same
+/// increment that adds it for `ociman run`/`create` too, reusing the
+/// same new `oci_runtime_core::etc_hosts::write_etc_hostname`
+/// primitive.
+#[tokio::test]
+async fn create_container_writes_a_real_etc_hostname_matching_the_sandboxs_own_hostname() {
+    let Some((storage, _socket, _server, mut client, sandbox_id, mut sandbox_config)) =
+        setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    sandbox_config.hostname = "hostname-file-test".to_string();
+
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(container_config("hostname-file-test", 0)),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+
+    let hostname_content = std::fs::read_to_string(
+        bundle_dir(storage.path(), &container_id).join("rootfs/etc/hostname"),
+    )
+    .expect("a real /etc/hostname should have been written into the extracted rootfs");
+    assert_eq!(hostname_content, "hostname-file-test\n");
+}
+
 /// A real `/etc/resolv.conf` (0297, closing `0296`'s own "still
 /// ahead"), matching real cri-o's own `ParseDNSOptions` exactly
 /// (checked directly against `~/git/cri-o/internal/lib/sandbox/

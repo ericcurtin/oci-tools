@@ -453,6 +453,18 @@ fn prepare_in(
         .context("writing /etc/hosts")
         .map_err(PrepareError::Other)?;
 
+    // A real `/etc/hostname` (a real, previously-unnoticed gap found
+    // while researching `ociman build --no-hostname`, `docs/design/
+    // 0459`'s own "still out of scope" note, fixed for `ociman run`/
+    // `create` in the same increment that adds this): the exact same
+    // value already passed to `sethostname(2)` just below (`spec.
+    // hostname = Some(cri.hostname.to_string())`) — checked directly,
+    // `~/git/podman/libpod/container_internal_linux.go`'s own
+    // `c.writeStringToRundir("hostname", c.Hostname()+"\n")`.
+    oci_runtime_core::etc_hosts::write_etc_hostname(&rootfs, cri.hostname)
+        .context("writing /etc/hostname")
+        .map_err(PrepareError::Other)?;
+
     // A real `/etc/resolv.conf` (0297, closing `0296`'s own "still
     // ahead"), matching real cri-o's own `ParseDNSOptions` exactly:
     // the sandbox's own explicit DNS config if given, else a straight

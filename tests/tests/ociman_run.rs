@@ -2134,6 +2134,117 @@ fn run_writes_a_default_etc_hosts_with_no_add_host_flag_at_all() {
     assert!(hosts.contains("hosts-default-test"), "hosts: {hosts:?}");
 }
 
+/// A real `/etc/hostname` file, containing the exact same value
+/// passed to `sethostname(2)` (`spec.hostname`, visible via `hostname`
+/// itself) -- a real, previously-unnoticed gap (this project's own
+/// containers set the UTS namespace's own hostname but never wrote
+/// the separate `/etc/hostname` *file* real `docker`/`podman`
+/// containers also always have, checked directly against
+/// `~/git/podman/libpod/container_internal_linux.go`'s own
+/// `c.writeStringToRundir("hostname", c.Hostname()+"\n")`) -- a
+/// program that reads the file directly (rather than calling
+/// `gethostname(2)`) needs this to see the right value at all.
+#[test]
+fn run_writes_a_real_etc_hostname_matching_the_uts_namespaces_own_hostname() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/etc-hostname:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let out = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "--hostname",
+            "my-custom-hostname",
+            "ociman-test/etc-hostname:latest",
+        ])
+        .args(["/bin/cat", "/etc/hostname"])
+        .output()
+        .expect("failed to spawn ociman run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "my-custom-hostname\n");
+}
+
+/// With no `--hostname` given at all, `/etc/hostname` defaults to the
+/// container's own id -- the exact same real default `spec.hostname`
+/// itself already has (`synthesize_spec`'s own `hostname.unwrap_or
+/// (id)`), matching real `docker`/`podman`'s own documented default
+/// ("will be set to the container ID").
+#[test]
+fn run_without_hostname_flag_etc_hostname_defaults_to_the_containers_own_id() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/etc-hostname-default:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "ociman-test/etc-hostname-default:latest",
+            "/bin/sh",
+            "-c",
+            "sleep 10",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run");
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    assert!(!container_id.is_empty(), "container never appeared in `ps`");
+    let status = wait_for_running(storage_dir.path(), &container_id, Duration::from_secs(20));
+    assert_eq!(status, "running", "container never reached `running`");
+
+    let exec = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["exec", &container_id, "/bin/cat", "/etc/hostname"])
+        .output()
+        .expect("failed to spawn ociman exec");
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        exec.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&exec.stdout),
+        format!("{container_id}\n")
+    );
+}
+
 /// `--add-host name[;name2]:IP` (repeatable) adds a real, extra
 /// `/etc/hosts` entry, taking precedence over (able to suppress) the
 /// built-in `localhost` entries when it reuses that same name.

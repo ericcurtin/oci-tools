@@ -9296,3 +9296,136 @@ fn build_no_hosts_leaves_the_base_images_own_etc_hosts_completely_untouched() {
          with no synthesized localhost/--add-host entries added at all"
     );
 }
+
+/// With no `--no-hostname` given at all, every `RUN` step gets a
+/// real, synthesized `/etc/hostname` -- a real, previously-unnoticed
+/// gap this project's own `RUN` steps have never closed until now
+/// (see `docs/design/0459`'s own "still out of scope" note). Always
+/// empty (a real, separately-scoped limitation, documented directly
+/// in `Command::Build::no_hostname`'s own doc comment: this project's
+/// `ImageConfig` models no persisted-across-`FROM` hostname field at
+/// all), the same literal value real buildah's own default resolves
+/// to for the overwhelming majority of real Containerfiles too.
+#[test]
+fn build_without_no_hostname_writes_a_real_empty_etc_hostname_for_run_steps() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-hostname-default-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-hostname-default-base:latest\n\
+         RUN cat /etc/hostname > /hostname-snapshot.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-hostname-default-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/build-hostname-default-result:latest",
+            "/bin/cat",
+            "/hostname-snapshot.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "\n");
+}
+
+/// `ociman build --no-hostname` (matching real `podman build
+/// --no-hostname` exactly) skips synthesizing a real `/etc/hostname`
+/// for every `RUN` step entirely -- a `RUN` step then sees whatever
+/// `/etc/hostname` the base image's own rootfs already has, completely
+/// untouched.
+#[test]
+fn build_no_hostname_leaves_the_base_images_own_etc_hostname_completely_untouched() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    let base_hostname = b"from-the-base-image\n";
+    seed_image_with_files(
+        &store,
+        "ociman-test/build-no-hostname-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        &[("etc/hostname", base_hostname)],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-no-hostname-base:latest\n\
+         RUN cat /etc/hostname > /hostname-snapshot.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--no-hostname",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-no-hostname-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/build-no-hostname-result:latest",
+            "/bin/cat",
+            "/hostname-snapshot.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).into_owned().as_bytes(),
+        base_hostname,
+        "the RUN step should have seen the base image's own /etc/hostname verbatim"
+    );
+}

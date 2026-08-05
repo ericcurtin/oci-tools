@@ -120,6 +120,27 @@ pub fn write_etc_hosts(root: &Path, own_names: &[&str], add_host: &[String]) -> 
     Ok(())
 }
 
+/// Write a real `/etc/hostname` file into `root` (same effective-root
+/// convention as [`write_etc_hosts`]) — a real, checked-directly gap
+/// found while researching `ociman build --no-hostname` (`0459`'s own
+/// "deliberately still out of scope" note): every real container
+/// engine bind-mounts (real `docker`/`podman`) or, here, directly
+/// writes (matching this crate's own already-established simpler
+/// approach for `/etc/hosts`/`/etc/resolv.conf`) a real `/etc/
+/// hostname` file containing the container's own hostname, separate
+/// from the UTS namespace's own `sethostname(2)` value (`spec.
+/// hostname`) — a program that reads the *file* directly (rather
+/// than calling `gethostname(2)`) needs this to see the right value
+/// at all; checked directly, `~/git/podman/libpod/container_internal_
+/// linux.go`'s own `c.writeStringToRundir("hostname", c.Hostname()+
+/// "\n")` writes exactly this, the same value also passed to
+/// `sethostname(2)`.
+pub fn write_etc_hostname(root: &Path, hostname: &str) -> io::Result<()> {
+    let etc_dir = root.join("etc");
+    std::fs::create_dir_all(&etc_dir)?;
+    std::fs::write(etc_dir.join("hostname"), format!("{hostname}\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +254,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = write_etc_hosts(dir.path(), &["myhost"], &["bad".to_string()]).unwrap_err();
         assert!(err.to_string().contains("--add-host"));
+    }
+
+    #[test]
+    fn write_etc_hostname_writes_the_given_name_with_a_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        write_etc_hostname(dir.path(), "my-container").unwrap();
+        let content = std::fs::read_to_string(dir.path().join("etc/hostname")).unwrap();
+        assert_eq!(content, "my-container\n");
+    }
+
+    #[test]
+    fn write_etc_hostname_creates_a_missing_etc_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!dir.path().join("etc").exists());
+        write_etc_hostname(dir.path(), "my-container").unwrap();
+        assert!(dir.path().join("etc").is_dir());
+    }
+
+    #[test]
+    fn write_etc_hostname_with_an_empty_hostname_still_writes_a_real_bare_newline() {
+        // Real buildah's own default for a `RUN` step with no
+        // meaningfully-set `Config.Hostname` (`ociman build` has no
+        // persisted config-level hostname of its own at all yet --
+        // see `docs/design/0459`'s own "deliberately still out of
+        // scope" note): still a real write, not skipped.
+        let dir = tempfile::tempdir().unwrap();
+        write_etc_hostname(dir.path(), "").unwrap();
+        let content = std::fs::read_to_string(dir.path().join("etc/hostname")).unwrap();
+        assert_eq!(content, "\n");
     }
 }

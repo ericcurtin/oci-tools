@@ -259,6 +259,7 @@ pub fn cmd_build(
     cpu_shares: Option<u64>,
     http_proxy: bool,
     no_hosts: bool,
+    no_hostname: bool,
     quiet: bool,
     json: bool,
     timestamp: Option<i64>,
@@ -594,6 +595,7 @@ pub fn cmd_build(
             pull_policy,
             add_host,
             no_hosts,
+            no_hostname,
             dns,
             dns_search,
             dns_option,
@@ -978,6 +980,7 @@ fn build_stage(
     pull_policy: crate::PullPolicy,
     add_host: &[String],
     no_hosts: bool,
+    no_hostname: bool,
     dns: &[String],
     dns_search: &[String],
     dns_option: &[String],
@@ -1103,6 +1106,27 @@ fn build_stage(
         if !no_hosts {
             oci_runtime_core::etc_hosts::write_etc_hosts(&rootfs_dir, &[], add_host)
                 .context("writing /etc/hosts for the build container")?;
+        }
+        // `--no-hostname` (0459's own "still out of scope" note, now
+        // closed): matching real `podman build --no-hostname` exactly
+        // (checked directly, `~/git/podman/vendor/go.podman.io/
+        // buildah/run_linux.go`'s own `!options.NoHostname` gate) --
+        // reuses the same new `oci_runtime_core::etc_hosts::write_
+        // etc_hostname` primitive `ociman run`/`create`/`ocicri` were
+        // also just given, real buildah's own `Builder.Hostname()`
+        // value (`Docker.Config.Hostname`) written verbatim. This
+        // project's own `ImageConfig`/`ContainerConfig` model no
+        // equivalent persisted-across-`FROM` hostname field at all
+        // yet (a real, separately-scoped gap: no Containerfile
+        // instruction or `--build-arg`-like flag could ever set one
+        // here even if this did model it) -- so the value is always
+        // an empty string, the same literal value real buildah's own
+        // default resolves to for the overwhelming majority of real
+        // Containerfiles too (a base image's own `Config.Hostname` is
+        // essentially never set in practice).
+        if !no_hostname {
+            oci_runtime_core::etc_hosts::write_etc_hostname(&rootfs_dir, "")
+                .context("writing /etc/hostname for the build container")?;
         }
         // A real `/etc/resolv.conf` (0298, 0299): a verbatim copy of
         // this host's own by default -- a real `RUN apt-get update`/

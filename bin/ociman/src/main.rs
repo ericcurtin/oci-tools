@@ -1717,6 +1717,26 @@ enum Command {
         /// `--shm-size`/`--memory` already established.
         #[arg(long = "no-hosts")]
         no_hosts: bool,
+        /// Skip synthesizing a real `/etc/hostname` for every `RUN`
+        /// step entirely, matching real `podman build --no-hostname`
+        /// exactly (checked directly, `~/git/podman/vendor/
+        /// go.podman.io/buildah/run_linux.go`'s own `!options.
+        /// NoHostname` gate): every `RUN` step then sees whatever
+        /// `/etc/hostname` the base image's own rootfs already has
+        /// (or none at all) completely untouched instead. This
+        /// project's own default (a real, previously-unnoticed gap,
+        /// found while researching this exact flag — see `docs/
+        /// design/0459`'s own "still out of scope" note, closed in
+        /// the same increment as this flag) writes an always-empty
+        /// `/etc/hostname` value, since `ImageConfig`/`ContainerConfig`
+        /// model no persisted-across-`FROM` hostname field of their
+        /// own at all yet — the same literal value real buildah's
+        /// own default resolves to for the overwhelming majority of
+        /// real Containerfiles too. Applies to every `RUN` step in
+        /// every stage alike, no per-stage/per-instruction override,
+        /// the same shape `--no-hosts` just above already established.
+        #[arg(long = "no-hostname")]
+        no_hostname: bool,
         /// Refrain from announcing build progress — matching real
         /// `docker build -q`/`podman build --quiet` exactly (checked
         /// directly against a real installed `podman build -q`, three
@@ -4520,6 +4540,7 @@ fn main() -> std::process::ExitCode {
                 cpu_shares,
                 http_proxy,
                 no_hosts,
+                no_hostname,
                 quiet,
                 timestamp,
             }) => build::cmd_build(
@@ -4556,6 +4577,7 @@ fn main() -> std::process::ExitCode {
                 cpu_shares,
                 http_proxy,
                 no_hosts,
+                no_hostname,
                 quiet,
                 cli.global.json,
                 timestamp,
@@ -8717,6 +8739,20 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
         }
         oci_runtime_core::etc_hosts::write_etc_hosts(&write_root, &own_names, &args.add_host)
             .context("writing /etc/hosts")?;
+        // A real `/etc/hostname` (a real, previously-unnoticed gap
+        // found while researching `ociman build --no-hostname`,
+        // `docs/design/0459`'s own "still out of scope" note): every
+        // real container engine's own container gets this file too,
+        // containing the exact same value passed to `sethostname(2)`
+        // (`spec.hostname`, computed the identical way just below in
+        // `synthesize_spec` -- `effective_hostname` here is that same
+        // value, recomputed identically rather than threaded back out
+        // of `synthesize_spec` itself, since this call site already
+        // needs it independently for `own_names` above) -- checked
+        // directly, `~/git/podman/libpod/container_internal_linux.go`'s
+        // own `c.writeStringToRundir("hostname", c.Hostname()+"\n")`.
+        oci_runtime_core::etc_hosts::write_etc_hostname(&write_root, effective_hostname)
+            .context("writing /etc/hostname")?;
         // A real `/etc/resolv.conf` (0298), matching real podman's own
         // checked-directly behavior for a container with no private
         // network namespace of its own (`~/git/container-libs/common/
