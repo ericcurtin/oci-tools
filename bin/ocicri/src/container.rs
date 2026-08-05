@@ -108,6 +108,20 @@ pub struct ContainerRecord {
     /// means no logging.
     #[serde(default)]
     pub log_path: Option<String>,
+    /// The sandbox config's own `linux.cgroup_parent` (real CRI
+    /// field, `LinuxPodSandboxConfig.cgroup_parent` — the proto's own
+    /// comment: "the container runtime can convert it to systemd
+    /// semantics if needed", exactly the `Slice=` translation
+    /// `ociman run/create --cgroup-parent` (`0465`) already
+    /// established), captured at `CreateContainer` time from the
+    /// request's own `sandbox_config` (never re-sent to the later,
+    /// separate re-exec'd launcher process this needs to reach —
+    /// see `launcher.rs`'s own module doc comment for that split).
+    /// `None` (also for pre-0467 records, and the overwhelmingly
+    /// common case of no `cgroup_parent` given at all) means no
+    /// `Slice=` override.
+    #[serde(default)]
+    pub cgroup_parent: Option<String>,
     /// The image's own declared `STOPSIGNAL` (0244), captured at
     /// create time (the same moment the image config is already read
     /// for the bundle spec) — `StopContainer`'s graceful phase sends
@@ -194,6 +208,7 @@ mod tests {
             exit_code: None,
             log_path: None,
             stop_signal: None,
+            cgroup_parent: None,
         }
     }
 

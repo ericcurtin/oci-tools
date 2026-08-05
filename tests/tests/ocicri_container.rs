@@ -1986,6 +1986,72 @@ async fn update_container_resources_changes_the_real_live_cgroup() {
         .unwrap();
 }
 
+/// `LinuxPodSandboxConfig.cgroup_parent` (`0467`, closing `0465`'s
+/// own "still out of scope" note for `ocicri`) sets the real
+/// transient scope's own `Slice=` unit property -- previously never
+/// read at all. The scope name is deterministic (`ocicri-
+/// <container_id>.scope`, `launcher.rs`'s own fixed convention), so
+/// this queries it directly rather than discovering it by pattern the
+/// way `ociman build`'s own equivalent test has to.
+#[tokio::test]
+async fn create_container_cgroup_parent_sets_the_real_systemd_scopes_own_slice_property() {
+    let Some((_storage, _socket, _server, mut client, sandbox_id, mut sandbox_config)) =
+        setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    sandbox_config.linux = Some(oci_cri_types::LinuxPodSandboxConfig {
+        cgroup_parent: "app.slice".to_string(),
+        ..Default::default()
+    });
+
+    let mut config = container_config("cgroup-parent-test", 0);
+    config.command = vec!["/bin/sleep".to_string(), "300".to_string()];
+    let container_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+    client
+        .start_container(oci_cri_types::StartContainerRequest {
+            container_id: container_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &container_id, ContainerState::ContainerRunning).await;
+
+    let scope_name = format!("ocicri-{container_id}.scope");
+    let show = Command::new("systemctl")
+        .args(["--user", "show", &scope_name, "-p", "Slice", "--value"])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let slice = String::from_utf8_lossy(&show.stdout).trim().to_string();
+
+    client
+        .stop_container(oci_cri_types::StopContainerRequest {
+            container_id,
+            timeout: 0,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        slice, "app.slice",
+        "expected the real systemd scope's own Slice to reflect \
+         LinuxPodSandboxConfig.cgroup_parent = \"app.slice\""
+    );
+}
+
 /// `ContainerConfig.linux.resources` (`docs/design/0390`): a real,
 /// explicit resources request must already be in effect the moment a
 /// container starts, with no separate `UpdateContainerResources` call

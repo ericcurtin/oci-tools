@@ -215,11 +215,23 @@ pub fn main(args: &[String]) -> ! {
 fn run(args: &[String]) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
-    let (bundle_dir, container_id, log_path) = match args {
-        [bundle_dir, container_id] => (bundle_dir, container_id, None),
-        [bundle_dir, container_id, log_path] => (bundle_dir, container_id, Some(log_path)),
-        _ => anyhow::bail!("usage: ocicri {LAUNCH_ARGV1} <BUNDLE_DIR> <CONTAINER_ID> [LOG_PATH]"),
+    // Always exactly four positional slots now (0467, adding
+    // `cgroup_parent` alongside the pre-existing `log_path`): an
+    // empty string in either optional slot means "not given" (a real
+    // bundle directory/container id/log path/systemd slice name is
+    // never legitimately empty, so this is an unambiguous sentinel,
+    // not a real value this project would ever need to distinguish
+    // from "absent"). This is `ocicri`'s own private re-exec
+    // protocol between `StartContainer` and this same binary, freely
+    // reshaped with every increment — never a public CLI surface.
+    let [bundle_dir, container_id, log_path, cgroup_parent] = args else {
+        anyhow::bail!(
+            "usage: ocicri {LAUNCH_ARGV1} <BUNDLE_DIR> <CONTAINER_ID> [LOG_PATH] [CGROUP_PARENT] \
+             (pass an empty string for either optional slot when absent)"
+        );
     };
+    let log_path = (!log_path.is_empty()).then_some(log_path);
+    let cgroup_parent = (!cgroup_parent.is_empty()).then_some(cgroup_parent.as_str());
     let dir = Path::new(bundle_dir);
 
     // Detach from the server's own session/process group, so a
@@ -288,18 +300,17 @@ fn run(args: &[String]) -> anyhow::Result<()> {
                     .as_ref()
                     .and_then(|l| l.resources.clone())
                     .map(Box::new),
-                // Real CRI *does* have an equivalent
-                // (`LinuxPodSandboxConfig.cgroup_parent`, `crates/
-                // oci-cri-types/proto/api.proto`'s own field 1, "the
-                // container runtime can convert it to systemd
-                // semantics if needed" -- exactly this project's own
-                // new `Slice=` translation), but reading it out of
-                // the sandbox config and threading it through here is
-                // a real, deliberately deferred gap, not fixed in the
-                // same increment that adds `--cgroup-parent` to
-                // `ociman run`/`create` (see `docs/design/0465`'s own
-                // "still out of scope" note).
-                parent_slice: None,
+                // `LinuxPodSandboxConfig.cgroup_parent` (real CRI
+                // field, `crates/oci-cri-types/proto/api.proto`'s own
+                // field 1, "the container runtime can convert it to
+                // systemd semantics if needed" -- exactly this
+                // project's own `Slice=` translation, `0465`):
+                // captured at `CreateContainer` time onto the
+                // container's own persisted record (the sandbox
+                // config itself is never re-sent to this later,
+                // separate re-exec'd process), passed here as this
+                // process's own fourth argv slot.
+                parent_slice: cgroup_parent.map(str::to_string),
             },
             // No attach/interactive concept at this layer (real CRI
             // streaming attach is its own future RPC). Output goes to

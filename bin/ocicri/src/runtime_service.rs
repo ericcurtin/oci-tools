@@ -1661,6 +1661,16 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             // The image's own STOPSIGNAL (0244) -- image_config was
             // already read above for the bundle spec.
             stop_signal: image_config.stop_signal.clone().filter(|s| !s.is_empty()),
+            // `LinuxPodSandboxConfig.cgroup_parent` (0467) -- a plain
+            // proto3 scalar field (never wrapped in its own
+            // `Option`, unlike a message-typed one), so an absent
+            // `linux` block or an empty string both correctly become
+            // `None` here.
+            cgroup_parent: sandbox_config
+                .linux
+                .as_ref()
+                .map(|l| l.cgroup_parent.clone())
+                .filter(|s| !s.is_empty()),
         };
         if let Err(e) = container::save(&root, &record) {
             // Never leave an orphaned bundle behind a failed record
@@ -1722,13 +1732,20 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
         command
             .arg(crate::launcher::LAUNCH_ARGV1)
             .arg(&bundle_dir)
-            .arg(&record.id);
-        // The CRI log path (0242), when kubelet configured one -- the
-        // launcher wires the container's stdout/stderr into its own
-        // logger process writing the real CRI-format file there.
-        if let Some(log_path) = &record.log_path {
-            command.arg(log_path);
-        }
+            .arg(&record.id)
+            // The CRI log path (0242), when kubelet configured one --
+            // the launcher wires the container's stdout/stderr into
+            // its own logger process writing the real CRI-format
+            // file there. An empty string means "none" (`launcher::
+            // run`'s own doc comment on why this is unambiguous).
+            .arg(record.log_path.as_deref().unwrap_or(""))
+            // `LinuxPodSandboxConfig.cgroup_parent` (0467), captured
+            // onto the record at `CreateContainer` time -- the
+            // sandbox config itself is never re-sent to this later,
+            // separate re-exec'd process, so the record is this
+            // process's only way to reach it. Same empty-string-means
+            // -"none" convention as the log path just above.
+            .arg(record.cgroup_parent.as_deref().unwrap_or(""));
         let mut child = command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
