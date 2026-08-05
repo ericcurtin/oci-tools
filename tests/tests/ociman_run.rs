@@ -3798,6 +3798,87 @@ fn run_blkio_weight_sets_the_real_systemd_scopes_own_io_weight() {
     );
 }
 
+/// `--cpu-rt-period`/`--cpu-rt-runtime` -- previously only reachable
+/// from `ocirun update --cpu-rt-period`/`--cpu-rt-runtime`'s own
+/// raw-cgroupfs driver (`0356`); this project's own `ociman run`/
+/// `create`/`update` had no CLI flag reaching `resources_from_cli`'s
+/// already-existing `cpu_rt_period`/`cpu_rt_runtime` parameters at
+/// all until now. Accepted without error, matching real `docker run`/
+/// `podman run --cpu-rt-period`/`--cpu-rt-runtime`'s own identical
+/// flags -- but genuinely never translated into any systemd property
+/// at all (cgroup v2 has no realtime-scheduling controller), the same
+/// honest "accepted on parse, never acted on" status both real
+/// reference runtimes themselves have here too: `CPUQuotaPerSecUSec`
+/// stays completely empty, proving neither flag was ever mistaken for
+/// `--cpu-quota`/`--cpu-period` internally.
+#[test]
+fn run_cpu_rt_flags_are_accepted_but_set_no_real_systemd_property_at_all() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cpu-rt:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "--cpu-rt-period",
+            "1000000",
+            "--cpu-rt-runtime",
+            "950000",
+            "ociman-test/cpu-rt:latest",
+        ])
+        .args(["/bin/sh", "-c", "sleep 10"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run");
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    assert!(!container_id.is_empty(), "container never appeared in `ps`");
+    let status = wait_for_running(storage_dir.path(), &container_id, Duration::from_secs(20));
+    assert_eq!(status, "running", "container never reached `running`");
+    let scope_name = real_scope_name(storage_dir.path(), &container_id);
+
+    let show = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            &scope_name,
+            "-p",
+            "CPUQuotaPerSecUSec",
+            "--value",
+        ])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let quota = String::from_utf8_lossy(&show.stdout).trim().to_string();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(
+        quota, "infinity",
+        "--cpu-rt-period/--cpu-rt-runtime must never set CPUQuotaPerSecUSec at all -- \
+         systemd's own default value for a scope with no real quota set is \"infinity\""
+    );
+}
+
 /// Same technique as the `--cpus` test above (query the real systemd
 /// scope's own resource property rather than trying to prove kernel
 /// enforcement directly), for `--memory-swap`: a *combined*

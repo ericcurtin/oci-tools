@@ -581,6 +581,24 @@ struct RunArgs {
     /// `run`/`create`/`update` too.
     #[arg(short = 'c', long = "cpu-shares")]
     cpu_shares: Option<u64>,
+    /// Realtime-scheduling period, in microseconds, matching real
+    /// `podman run/create/update --cpu-rt-period` exactly (checked
+    /// directly, `~/git/podman/cmd/podman/common/create.go`'s own
+    /// `cpuRtPeriodFlagName`). Accepted and stored, but a real,
+    /// honest no-op at cgroup-application time on a cgroup-v2-only
+    /// host like this project's own (`oci_spec_types::runtime::
+    /// LinuxCpu::realtime_period`'s own doc comment: cgroup v2 has
+    /// no realtime-scheduling controller at all) — the exact same
+    /// "accepted on parse, never acted on" status `ocirun update
+    /// --cpu-rt-period` (`0356`) already established for `ocirun`,
+    /// now reachable from `ociman` too.
+    #[arg(long = "cpu-rt-period")]
+    cpu_rt_period: Option<u64>,
+    /// Realtime-scheduling runtime, in microseconds, matching real
+    /// `podman run/create/update --cpu-rt-runtime` exactly. Same
+    /// real, honest cgroup-v2 no-op status as `--cpu-rt-period` above.
+    #[arg(long = "cpu-rt-runtime", allow_hyphen_values = true)]
+    cpu_rt_runtime: Option<i64>,
     /// Block IO weight (relative weight vs. other cgroups) for the
     /// container's own cgroup, real spec-documented `[10-1000]`
     /// range (cgroup v1 convention, no CLI-side validation beyond
@@ -1647,14 +1665,15 @@ enum Command {
         /// per-stage/per-instruction override of any kind — matching
         /// real podman's own identical single, build-wide value, the
         /// same shape `--ulimit`/`--shm-size` already established.
-        /// Real `podman build` has no `--memory-reservation`/`--cpus`
-        /// of its own at all (checked directly, `~/git/podman/vendor/
-        /// go.podman.io/buildah/pkg/cli/common.go`'s own
-        /// `CommonBuildOptions` — both are `run`/`create`/`update`-only
-        /// convenience flags with no `build` equivalent); its own
-        /// `--cpu-period`/`--cpu-quota`/`--cpu-shares` remain a real,
-        /// deliberately out-of-scope gap here for now (`--cpuset-cpus`/
-        /// `--cpuset-mems` are implemented just below).
+        /// Real `podman build` has no `--memory-reservation`/`--cpus`/
+        /// `--cpu-rt-period`/`--cpu-rt-runtime` of its own at all
+        /// (checked directly, `~/git/podman/vendor/go.podman.io/
+        /// buildah/pkg/cli/common.go`'s own `CommonBuildOptions` —
+        /// all four are `run`/`create`/`update`-only convenience/
+        /// realtime-scheduling flags with no `build` equivalent); its
+        /// own `--cpu-period`/`--cpu-quota`/`--cpu-shares` (`0458`)
+        /// and `--cpuset-cpus`/`--cpuset-mems` (`0457`) are both
+        /// implemented, just below.
         #[arg(short = 'm', long = "memory")]
         memory: Option<String>,
         /// Total memory **+ swap** every `RUN` step's own cgroup may
@@ -3319,6 +3338,14 @@ enum Command {
         #[arg(short = 'c', long = "cpu-shares")]
         cpu_shares: Option<u64>,
         /// See `Command::Run`'s own identical flag — matching real
+        /// `podman update --cpu-rt-period` exactly (checked directly,
+        /// `~/git/podman/docs/source/markdown/podman-update.1.md.in`).
+        #[arg(long = "cpu-rt-period")]
+        cpu_rt_period: Option<u64>,
+        /// See `Command::Run`'s own identical flag.
+        #[arg(long = "cpu-rt-runtime", allow_hyphen_values = true)]
+        cpu_rt_runtime: Option<i64>,
+        /// See `Command::Run`'s own identical flag — matching real
         /// `podman update --blkio-weight` exactly (checked directly,
         /// `~/git/podman/docs/source/markdown/podman-update.1.md.in`).
         #[arg(long = "blkio-weight")]
@@ -4917,6 +4944,8 @@ fn main() -> std::process::ExitCode {
                 cpu_period,
                 cpu_quota,
                 cpu_shares,
+                cpu_rt_period,
+                cpu_rt_runtime,
                 blkio_weight,
                 health_cmd,
                 health_interval,
@@ -4936,6 +4965,8 @@ fn main() -> std::process::ExitCode {
                 cpu_period,
                 cpu_quota,
                 cpu_shares,
+                cpu_rt_period,
+                cpu_rt_runtime,
                 blkio_weight,
                 health_cmd.as_deref(),
                 health_interval.as_deref(),
@@ -8931,6 +8962,8 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             args.cpu_period,
             args.cpu_quota,
             args.cpu_shares,
+            args.cpu_rt_period,
+            args.cpu_rt_runtime,
             args.blkio_weight,
             seccomp,
             no_new_privileges,
@@ -13473,6 +13506,8 @@ fn cmd_update(
     cpu_period: Option<u64>,
     cpu_quota: Option<i64>,
     cpu_shares: Option<u64>,
+    cpu_rt_period: Option<u64>,
+    cpu_rt_runtime: Option<i64>,
     blkio_weight: Option<u16>,
     health_cmd: Option<&str>,
     health_interval: Option<&str>,
@@ -13494,6 +13529,8 @@ fn cmd_update(
         cpu_period,
         cpu_quota,
         cpu_shares,
+        cpu_rt_period,
+        cpu_rt_runtime,
         blkio_weight,
     );
     let any_health_flag = health_cmd.is_some()
@@ -15051,6 +15088,8 @@ fn synthesize_spec(
     cpu_period: Option<u64>,
     cpu_quota: Option<i64>,
     cpu_shares: Option<u64>,
+    cpu_rt_period: Option<u64>,
+    cpu_rt_runtime: Option<i64>,
     blkio_weight: Option<u16>,
     seccomp: Option<oci_spec_types::runtime::LinuxSeccomp>,
     no_new_privileges: bool,
@@ -15251,6 +15290,8 @@ fn synthesize_spec(
         cpu_period,
         cpu_quota,
         cpu_shares,
+        cpu_rt_period,
+        cpu_rt_runtime,
         blkio_weight,
     );
     // `--cgroup-conf` (0398): needs a real `Some(LinuxResources)` to
@@ -15595,18 +15636,26 @@ fn parse_and_validate_memory_and_cpus(
 /// Build a `LinuxResources` from `ociman run`/`create`/`update`'s own
 /// `--memory`/`--memory-swap`/`--memory-reservation`/`--cpus`/
 /// `--pids-limit`/`--cpuset-cpus`/`--cpuset-mems`/`--cpu-period`/
-/// `--cpu-quota`/`--cpu-shares` flags (`ociman build` shares this same
-/// function too, but has no `--cpus` convenience flag of its own at
-/// all — checked directly, `~/git/podman/vendor/go.podman.io/buildah/
-/// pkg/cli/common.go`'s own `CommonBuildOptions` — only the raw CFS
-/// values, unlike `run`/`create`/`update`'s own float-to-quota
-/// conversion, *and* their own real `--cpu-period`/`--cpu-quota`/
-/// `--cpu-shares`, added later than `--cpus` itself but confirmed
-/// directly to be real, matching flags on `podman run`/`create`/
-/// `update` all three, `~/git/podman/docs/source/markdown/podman-run
-/// .1.md.in`/`podman-update.1.md.in`). `None` if none of the ten were
-/// given at all (leaving `spec.linux.resources` untouched, exactly as
-/// before any of these flags existed). An explicit `cpu_period`/
+/// `--cpu-quota`/`--cpu-shares`/`--cpu-rt-period`/`--cpu-rt-runtime`/
+/// `--blkio-weight` flags (`ociman build` shares this same function
+/// too, but has no `--cpus`/`--cpu-rt-period`/`--cpu-rt-runtime`/
+/// `--blkio-weight` convenience flags of its own at all — checked
+/// directly, `~/git/podman/vendor/go.podman.io/buildah/pkg/cli/
+/// common.go`'s own `CommonBuildOptions` — only the raw CFS values,
+/// unlike `run`/`create`/`update`'s own float-to-quota conversion,
+/// *and* their own real `--cpu-period`/`--cpu-quota`/`--cpu-shares`,
+/// added later than `--cpus` itself but confirmed directly to be
+/// real, matching flags on `podman run`/`create`/`update` all three,
+/// `~/git/podman/docs/source/markdown/podman-run.1.md.in`/`podman-
+/// update.1.md.in`). `cpu_rt_period`/`cpu_rt_runtime` are accepted
+/// and stored but never translated into any real cgroup write by
+/// either driver — a real, honest no-op on this project's own
+/// cgroup-v2-only target, the exact same status `ocirun update
+/// --cpu-rt-period`/`--cpu-rt-runtime` (`0356`) already established
+/// (see `LinuxCpu::realtime_period`'s own doc comment). `None` if
+/// none of the thirteen were given at all (leaving `spec.linux.
+/// resources` untouched, exactly as before any of these flags
+/// existed). An explicit `cpu_period`/
 /// `cpu_quota` always wins over a `cpus`-derived one when both are
 /// given at once (a real, reachable combination now, not just a
 /// theoretical one: `ociman run --cpus 1 --cpu-quota 200000` is a
@@ -15626,6 +15675,8 @@ fn resources_from_cli(
     cpu_period: Option<u64>,
     cpu_quota: Option<i64>,
     cpu_shares: Option<u64>,
+    cpu_rt_period: Option<u64>,
+    cpu_rt_runtime: Option<i64>,
     blkio_weight: Option<u16>,
 ) -> Option<oci_spec_types::runtime::LinuxResources> {
     if memory_limit_bytes.is_none()
@@ -15635,6 +15686,8 @@ fn resources_from_cli(
         && cpu_period.is_none()
         && cpu_quota.is_none()
         && cpu_shares.is_none()
+        && cpu_rt_period.is_none()
+        && cpu_rt_runtime.is_none()
         && cpuset_cpus.is_none()
         && cpuset_mems.is_none()
         && blkio_weight.is_none()
@@ -15691,6 +15744,8 @@ fn resources_from_cli(
         || cpu_period.is_some()
         || cpu_quota.is_some()
         || cpu_shares.is_some()
+        || cpu_rt_period.is_some()
+        || cpu_rt_runtime.is_some()
     {
         Some(oci_spec_types::runtime::LinuxCpu {
             // An explicit `cpu_quota`/`cpu_period` (`ociman build`'s
@@ -15704,6 +15759,18 @@ fn resources_from_cli(
             shares: cpu_shares,
             cpus: cpuset_cpus.unwrap_or_default().to_string(),
             mems: cpuset_mems.unwrap_or_default().to_string(),
+            // `--cpu-rt-period`/`--cpu-rt-runtime`: accepted and
+            // stored, matching real `podman run/create/update
+            // --cpu-rt-period`/`--cpu-rt-runtime` exactly, but a real,
+            // honest no-op at cgroup-application time on a cgroup-v2-
+            // only host like this project's own -- the exact same
+            // "accepted on parse, never acted on" status `ocirun
+            // update --cpu-rt-period`/`--cpu-rt-runtime` (`0356`)
+            // already established for these same two fields (see
+            // `LinuxCpu::realtime_period`'s own doc comment: cgroup
+            // v2 has no realtime-scheduling controller at all).
+            realtime_period: cpu_rt_period,
+            realtime_runtime: cpu_rt_runtime,
             ..Default::default()
         })
     } else {
@@ -16881,7 +16948,7 @@ mod tests {
     fn resources_from_cli_is_none_when_nothing_was_given() {
         assert!(
             resources_from_cli(
-                None, None, None, None, None, None, None, None, None, None, None
+                None, None, None, None, None, None, None, None, None, None, None, None, None,
             )
             .is_none()
         );
@@ -16894,6 +16961,8 @@ mod tests {
             None,
             None,
             Some(1.5),
+            None,
+            None,
             None,
             None,
             None,
@@ -16923,6 +16992,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
             .pids
@@ -16943,6 +17014,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
             .pids
@@ -16957,6 +17030,8 @@ mod tests {
                 None,
                 None,
                 Some(42),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -16986,6 +17061,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(resources.memory.unwrap().limit, Some(1024));
@@ -16997,6 +17074,8 @@ mod tests {
     fn resources_from_cli_defaults_swap_to_twice_memory_when_unset() {
         let resources = resources_from_cli(
             Some(1024),
+            None,
+            None,
             None,
             None,
             None,
@@ -17026,6 +17105,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(resources.memory.unwrap().swap, Some(1500));
@@ -17036,6 +17117,8 @@ mod tests {
         let resources = resources_from_cli(
             Some(1024),
             Some(-1),
+            None,
+            None,
             None,
             None,
             None,
@@ -17059,6 +17142,8 @@ mod tests {
             Some(1024),
             None,
             Some(512),
+            None,
+            None,
             None,
             None,
             None,
@@ -17094,6 +17179,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         let memory = resources.memory.unwrap();
@@ -17120,6 +17207,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         let cpu = resources.cpu.unwrap();
@@ -17138,6 +17227,8 @@ mod tests {
             Some(1.5),
             None,
             Some("0-3"),
+            None,
+            None,
             None,
             None,
             None,
@@ -17170,6 +17261,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .is_some()
         );
@@ -17182,6 +17275,8 @@ mod tests {
                 None,
                 None,
                 Some("0"),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -17209,6 +17304,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .is_some()
         );
@@ -17223,6 +17320,8 @@ mod tests {
                 None,
                 None,
                 Some(20_000),
+                None,
+                None,
                 None,
                 None,
             )
@@ -17241,15 +17340,93 @@ mod tests {
                 None,
                 Some(512),
                 None,
+                None,
+                None,
             )
             .is_some()
         );
     }
 
     #[test]
+    fn resources_from_cli_is_some_when_only_a_cpu_rt_flag_is_given() {
+        // Same "nothing was given" check, now covering `ociman run/
+        // create/update`'s own `--cpu-rt-period`/`--cpu-rt-runtime`
+        // too, each independently -- accepted and stored even though
+        // neither driver ever acts on them (cgroup v2 has no
+        // realtime-scheduling controller).
+        assert!(
+            resources_from_cli(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(1_000_000),
+                None,
+                None,
+            )
+            .is_some()
+        );
+        assert!(
+            resources_from_cli(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(950_000),
+                None,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn resources_from_cli_carries_cpu_rt_period_and_runtime_verbatim_never_acted_on() {
+        // `ociman run/create/update --cpu-rt-period`/`--cpu-rt-
+        // runtime`: accepted and stored into `LinuxCpu.realtime_
+        // period`/`.realtime_runtime` verbatim, matching real `ocirun
+        // update --cpu-rt-period`/`--cpu-rt-runtime` (`0356`)'s own
+        // identical "accepted on parse, never acted on" status for
+        // a cgroup-v2-only host.
+        let resources = resources_from_cli(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(1_000_000),
+            Some(950_000),
+            None,
+        )
+        .unwrap();
+        let cpu = resources.cpu.unwrap();
+        assert_eq!(cpu.realtime_period, Some(1_000_000));
+        assert_eq!(cpu.realtime_runtime, Some(950_000));
+    }
+
+    #[test]
     fn resources_from_cli_is_some_when_only_blkio_weight_is_given() {
         assert!(
             resources_from_cli(
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -17286,6 +17463,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some(500),
         )
         .unwrap();
@@ -17309,6 +17488,8 @@ mod tests {
             Some(50_000),
             Some(25_000),
             Some(512),
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -17336,6 +17517,8 @@ mod tests {
             None,
             Some(200_000),
             Some(150_000),
+            None,
+            None,
             None,
             None,
         )

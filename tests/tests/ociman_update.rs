@@ -332,6 +332,74 @@ fn update_cpu_period_quota_and_shares_writes_the_real_cgroup_files() {
     child.wait().ok();
 }
 
+/// `ociman update --cpu-rt-period`/`--cpu-rt-runtime` -- previously
+/// only reachable from `ocirun update --cpu-rt-period`/`--cpu-rt-
+/// runtime`'s own raw-cgroupfs driver (`0356`); this project's own
+/// `ociman update` had no CLI flag reaching `resources_from_cli`'s
+/// already-existing `cpu_rt_period`/`cpu_rt_runtime` parameters at
+/// all until now. Same real, honest "accepted without error, but
+/// writes nothing to any real cgroup file at all" verification
+/// `ocirun update`'s own identical test
+/// (`update_cpu_rt_flags_are_accepted_but_write_nothing_to_any_real_
+/// cgroup_file`, `tests/tests/ocirun_update.rs`) already established
+/// -- cgroup v2 has no realtime-scheduling controller at all, the
+/// same honest no-op status both real `runc`/`crun` themselves have
+/// here too.
+#[test]
+fn update_cpu_rt_flags_are_accepted_but_write_nothing_to_any_real_cgroup_file() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/update-cpu-rt:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+    let mut child = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/update-cpu-rt:latest",
+        &["-d", "sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20));
+
+    let cgroup_dir = real_cgroup_dir_for(storage_dir.path(), &id);
+    let before = std::fs::read_to_string(cgroup_dir.join("cpu.max")).unwrap();
+
+    let update = ociman(
+        storage_dir.path(),
+        &[
+            "update",
+            "--cpu-rt-period",
+            "1000000",
+            "--cpu-rt-runtime",
+            "950000",
+            &id,
+        ],
+    );
+    assert!(
+        update.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(cgroup_dir.join("cpu.max")).unwrap(),
+        before,
+        "cpu.max must stay completely untouched -- --cpu-rt-period/--cpu-rt-runtime have no \
+         real cgroup v2 effect at all"
+    );
+
+    ociman(storage_dir.path(), &["kill", &id]);
+    child.wait().ok();
+}
+
 /// `ociman update --health-cmd` (0441) needs no live container at
 /// all -- a `created`-but-never-`start`ed container can still have
 /// its healthcheck updated, matching real podman's own identical

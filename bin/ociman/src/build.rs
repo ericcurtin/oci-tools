@@ -353,10 +353,13 @@ pub fn cmd_build(
         cpu_period,
         cpu_quota,
         cpu_shares,
-        // Real `podman build` has no `--blkio-weight` of its own at
-        // all (checked directly, absent from buildah's own
-        // `CommonBuildOptions`) -- a `run`/`create`/`update`-only
-        // flag, unlike every other parameter here.
+        // Real `podman build` has no `--cpu-rt-period`/`--cpu-rt-
+        // runtime`/`--blkio-weight` of its own at all either (checked
+        // directly, absent from buildah's own `CommonBuildOptions`)
+        // -- all three `run`/`create`/`update`-only flags, unlike
+        // every other parameter here.
+        None,
+        None,
         None,
     );
 
