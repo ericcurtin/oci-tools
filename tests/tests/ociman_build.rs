@@ -8960,6 +8960,36 @@ fn systemd_user_session_available() -> bool {
         .is_ok_and(|out| !out.stdout.is_empty())
 }
 
+/// Every `wait_for_build_scope` caller in this file identifies its
+/// own live scope purely by *pattern* (`ociman-build-*.scope`, see
+/// that function's own doc comment for why there's no exact name to
+/// look up ahead of time) rather than by exact name the way `ociman
+/// run`/`create`'s own tests can — so two such tests running
+/// concurrently (`cargo test`'s own default) could each observe the
+/// *other*'s scope instead of their own. A single, real, blocking
+/// `flock` (released automatically, even on a panic mid-test, once
+/// the returned guard's own `File` drops at the end of the calling
+/// test's scope) serializes every caller of `wait_for_build_scope`
+/// against every other one, the simplest correct fix short of a
+/// deeper per-scope pid/cgroup correlation this crate doesn't need
+/// anywhere else. Reuses `ociboot_build_image.rs`'s own already-
+/// established `rustix::fs::flock` pattern, a plain *blocking* lock
+/// here (not that fixture's own non-blocking "skip if busy" one,
+/// since a build-scope test genuinely needs to wait its turn, not
+/// silently no-op).
+fn lock_build_scope_tests() -> std::fs::File {
+    let path = std::env::temp_dir().join("oci-tools-build-scope-test.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .expect("failed to open the build-scope test lock file");
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+        .expect("failed to acquire the build-scope test lock");
+    lock
+}
+
 /// Poll `systemctl --user list-units` for the one `ociman-build-*
 /// .scope` unit a live `RUN` step's own transient scope creates —
 /// unlike `ociman run`/`create`'s own persisted container state (see
@@ -8971,6 +9001,9 @@ fn systemd_user_session_available() -> bool {
 /// `ociman-build-` prefix instead (see `run_instruction`'s own
 /// `cgroup_setup` construction), safe to rely on since no other
 /// command in this project ever creates a scope under that prefix.
+/// Every caller must hold [`lock_build_scope_tests`]'s own guard for
+/// the whole test, since this alone can't tell two genuinely
+/// concurrent scopes apart.
 fn wait_for_build_scope(timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     loop {
@@ -9018,6 +9051,7 @@ fn build_cpuset_flags_set_the_real_systemd_scopes_own_allowed_cpus_property() {
         eprintln!("skipping: no reachable `systemd --user` session");
         return;
     }
+    let _lock = lock_build_scope_tests();
     let storage_dir = tempfile::tempdir().unwrap();
     let store = Store::open(storage_dir.path()).unwrap();
     seed_image(
@@ -9089,5 +9123,103 @@ fn build_cpuset_flags_set_the_real_systemd_scopes_own_allowed_cpus_property() {
 
     assert_eq!(allowed_cpus, "0-1");
     assert_eq!(allowed_mems, "0");
+    assert!(status.success(), "ociman build itself should still succeed");
+}
+
+/// `ociman build --cpu-period`/`--cpu-quota`/`--cpu-shares` (matching
+/// real `podman build --cpu-period`/`--cpu-quota`/`--cpu-shares`/`-c`
+/// exactly) set the real transient systemd scope's own
+/// `CPUQuotaPerSecUSec`/`CPUWeight` properties for every `RUN` step --
+/// the same real, live-property discovery-by-pattern technique
+/// `build_cpuset_flags_set_the_real_systemd_scopes_own_allowed_cpus_
+/// property` already established, and the same real `--cpu-period
+/// 100000 --cpu-quota 150000` (1.5 CPUs over the real 100ms period)
+/// numbers `ociman run --cpus 1.5`'s own test already confirmed
+/// render as `1.500000s`.
+#[test]
+fn build_cpu_period_quota_and_shares_set_the_real_systemd_scopes_own_properties() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let _lock = lock_build_scope_tests();
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-cpu-quota-base:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-cpu-quota-base:latest\n\
+         RUN sleep 5\n",
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "build",
+            "--cpu-period",
+            "100000",
+            "--cpu-quota",
+            "150000",
+            "--cpu-shares",
+            "1024",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-cpu-quota-result:latest",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman build");
+
+    let scope_name = wait_for_build_scope(Duration::from_secs(10));
+
+    let show_quota = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            &scope_name,
+            "-p",
+            "CPUQuotaPerSecUSec",
+            "--value",
+        ])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let quota = String::from_utf8_lossy(&show_quota.stdout)
+        .trim()
+        .to_string();
+    let show_weight = Command::new("systemctl")
+        .args(["--user", "show", &scope_name, "-p", "CPUWeight", "--value"])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let weight = String::from_utf8_lossy(&show_weight.stdout)
+        .trim()
+        .to_string();
+
+    let status = child.wait().expect("failed to wait on ociman build");
+
+    assert_eq!(
+        quota, "1.500000s",
+        "expected the real systemd scope's own CPUQuotaPerSecUSec to reflect \
+         --cpu-period 100000 --cpu-quota 150000"
+    );
+    assert_eq!(
+        weight, "100",
+        "expected the real systemd scope's own CPUWeight to reflect --cpu-shares 1024 \
+         (the cgroup v1 default, converted to weight 100)"
+    );
     assert!(status.success(), "ociman build itself should still succeed");
 }

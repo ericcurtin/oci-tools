@@ -254,6 +254,9 @@ pub fn cmd_build(
     memory_swap: Option<&str>,
     cpuset_cpus: Option<&str>,
     cpuset_mems: Option<&str>,
+    cpu_period: Option<u64>,
+    cpu_quota: Option<i64>,
+    cpu_shares: Option<u64>,
     http_proxy: bool,
     quiet: bool,
     json: bool,
@@ -311,24 +314,29 @@ pub fn cmd_build(
     // step_spec`'s own call site via `StageContext::shm_size_bytes`).
     let shm_size_bytes = shm_size.map(crate::parse_memory_limit).transpose()?;
 
-    // `--memory`/`--memory-swap`/`--cpuset-cpus`/`--cpuset-mems` —
-    // same reuse-the-existing-primitive shape as `--ulimit`/
-    // `--shm-size` above: `ociman run`/`create`'s own `parse_and_
-    // validate_memory_and_cpus` (validation included: `--memory-swap`
-    // requires `--memory`, and must be at least as large) and
-    // `resources_from_cli` (spec construction), reused verbatim
-    // rather than a second implementation of either. No
-    // `--memory-reservation`/`--cpus` counterpart at all for `build`
-    // (real `podman build` has neither -- both are `run`/`create`/
-    // `update`-only convenience flags, checked directly, see `0456`'s
-    // own doc comment) -- passed as `None` here, same as `resources_
-    // from_cli`'s own already-established "not every caller needs
-    // every field" shape. `--cpuset-cpus`/`--cpuset-mems` need no
-    // parsing/validation of their own at all (same as `ociman run/
-    // create`'s own identical flags): passed straight through as
-    // plain strings, the kernel/`oci_runtime_core::systemd_cgroup`'s
-    // own translation layer rejects a malformed value, never this
-    // CLI layer.
+    // `--memory`/`--memory-swap`/`--cpuset-cpus`/`--cpuset-mems`/
+    // `--cpu-period`/`--cpu-quota`/`--cpu-shares` — same reuse-the-
+    // existing-primitive shape as `--ulimit`/`--shm-size` above:
+    // `ociman run`/`create`'s own `parse_and_validate_memory_and_cpus`
+    // (validation included: `--memory-swap` requires `--memory`, and
+    // must be at least as large) and `resources_from_cli` (spec
+    // construction), reused verbatim rather than a second
+    // implementation of either. No `--memory-reservation`/`--cpus`
+    // counterpart at all for `build` (real `podman build` has
+    // neither -- both are `run`/`create`/`update`-only convenience
+    // flags, checked directly, see `0456`'s own doc comment) --
+    // passed as `None` here. `--cpuset-cpus`/`--cpuset-mems`/
+    // `--cpu-period`/`--cpu-quota`/`--cpu-shares` need no parsing/
+    // validation of their own at all (matching real `docker`/
+    // `podman`'s own identical minimal-CLI-validation philosophy):
+    // passed straight through, the kernel/`oci_runtime_core::
+    // systemd_cgroup`'s own translation layer rejects a malformed
+    // value, never this CLI layer. Unlike `run`/`create`'s own
+    // `--cpus`-float convenience flag (which `resources_from_cli`
+    // converts into a quota/period pair itself), `build` passes the
+    // real, raw CFS values directly -- see `resources_from_cli`'s own
+    // doc comment for why real `podman build` has no `--cpus` of its
+    // own at all to begin with.
     let (build_memory_limit_bytes, build_memory_swap_bytes, _) =
         crate::parse_and_validate_memory_and_cpus(memory, memory_swap, None, None)?;
     let resources = crate::resources_from_cli(
@@ -339,6 +347,9 @@ pub fn cmd_build(
         None,
         cpuset_cpus,
         cpuset_mems,
+        cpu_period,
+        cpu_quota,
+        cpu_shares,
     );
 
     let instructions = oci_dockerfile::parse(&text).map_err(|e| anyhow::anyhow!(e))?;

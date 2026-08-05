@@ -1662,6 +1662,43 @@ enum Command {
         /// delegation caveat, as `--cpuset-cpus` just above.
         #[arg(long = "cpuset-mems")]
         cpuset_mems: Option<String>,
+        /// Limit the CPU CFS (Completely Fair Scheduler) period, in
+        /// microseconds, for every `RUN` step's own cgroup — matching
+        /// real `podman build --cpu-period` exactly (checked directly,
+        /// `~/git/podman/vendor/go.podman.io/buildah/pkg/cli/
+        /// common.go`). Unlike `ociman run/create --cpus`'s own
+        /// float-to-quota conversion (`resources_from_cli`'s own doc
+        /// comment explains why real `podman build` has no `--cpus`
+        /// of its own at all), this is the real, raw CFS value,
+        /// reused verbatim by [`resources_from_cli`] with no
+        /// conversion of its own. No syntax validation beyond
+        /// clap's own integer parsing, matching real `docker`/
+        /// `podman`'s own identical minimal-CLI-validation philosophy
+        /// (the kernel itself rejects an unusable value at cgroup-
+        /// write time, same as `--cpuset-cpus`/`--cpuset-mems`).
+        #[arg(long = "cpu-period")]
+        cpu_period: Option<u64>,
+        /// Limit the CPU CFS quota, in microseconds per `--cpu-period`
+        /// (defaulting to the kernel's own 100ms if `--cpu-period`
+        /// isn't also given), for every `RUN` step's own cgroup —
+        /// matching real `podman build --cpu-quota` exactly. Same
+        /// "real, raw CFS value, no conversion" shape as
+        /// `--cpu-period` just above.
+        #[arg(long = "cpu-quota")]
+        cpu_quota: Option<i64>,
+        /// CPU shares (relative weight vs. other cgroups) for every
+        /// `RUN` step's own cgroup, matching real `podman build
+        /// --cpu-shares`/`-c` exactly (checked directly, `~/git/
+        /// podman/vendor/go.podman.io/buildah/pkg/cli/common.go`'s
+        /// own `fs.Uint64VarP(&flags.CPUShares, "cpu-shares", "c",
+        /// ...)`). This project's own `ociman run/create` don't have
+        /// an equivalent flag of their own yet at all (a real,
+        /// separately-scoped gap — `LinuxCpu.shares` was already
+        /// modeled and already reaches `systemd_cgroup`'s own
+        /// `CPUWeight` translation, just never reachable from any CLI
+        /// flag before this increment).
+        #[arg(short = 'c', long = "cpu-shares")]
+        cpu_shares: Option<u64>,
         /// Refrain from announcing build progress — matching real
         /// `docker build -q`/`podman build --quiet` exactly (checked
         /// directly against a real installed `podman build -q`, three
@@ -4460,6 +4497,9 @@ fn main() -> std::process::ExitCode {
                 memory_swap,
                 cpuset_cpus,
                 cpuset_mems,
+                cpu_period,
+                cpu_quota,
+                cpu_shares,
                 http_proxy,
                 quiet,
                 timestamp,
@@ -4492,6 +4532,9 @@ fn main() -> std::process::ExitCode {
                 memory_swap.as_deref(),
                 cpuset_cpus.as_deref(),
                 cpuset_mems.as_deref(),
+                cpu_period,
+                cpu_quota,
+                cpu_shares,
                 http_proxy,
                 quiet,
                 cli.global.json,
@@ -13280,6 +13323,13 @@ fn cmd_update(
         pids_limit,
         cpuset_cpus,
         cpuset_mems,
+        // `ociman update` has no raw `--cpu-period`/`--cpu-quota`/
+        // `--cpu-shares` of its own (only `--cpus`, above) -- these
+        // three are `ociman build`-only, see `resources_from_cli`'s
+        // own doc comment.
+        None,
+        None,
+        None,
     );
     let any_health_flag = health_cmd.is_some()
         || health_interval.is_some()
@@ -15029,6 +15079,13 @@ fn synthesize_spec(
         pids_limit,
         cpuset_cpus,
         cpuset_mems,
+        // `ociman run`/`create` have no raw `--cpu-period`/
+        // `--cpu-quota`/`--cpu-shares` of their own (only `--cpus`,
+        // above) -- these three are `ociman build`-only, see
+        // `resources_from_cli`'s own doc comment.
+        None,
+        None,
+        None,
     );
     // `--cgroup-conf` (0398): needs a real `Some(LinuxResources)` to
     // live on even when no other resource flag was given at all (the
@@ -15371,9 +15428,21 @@ fn parse_and_validate_memory_and_cpus(
 
 /// Build a `LinuxResources` from `ociman run`'s own `--memory`/
 /// `--memory-swap`/`--memory-reservation`/`--cpus`/`--pids-limit`/
-/// `--cpuset-cpus`/`--cpuset-mems` flags, `None` if none of the seven
-/// were given at all (leaving `spec.linux.resources` untouched,
-/// exactly as before any of these flags existed).
+/// `--cpuset-cpus`/`--cpuset-mems` flags, plus `ociman build`'s own
+/// separate, raw `--cpu-period`/`--cpu-quota`/`--cpu-shares` (real
+/// `podman build` has no `--cpus` convenience flag of its own at all
+/// — checked directly, `~/git/podman/vendor/go.podman.io/buildah/
+/// pkg/cli/common.go`'s own `CommonBuildOptions` — only the raw CFS
+/// values, unlike `run`/`create`'s own float-to-quota conversion).
+/// `None` if none of the ten were given at all (leaving `spec.linux.
+/// resources` untouched, exactly as before any of these flags
+/// existed). An explicit `cpu_period`/`cpu_quota` always wins over a
+/// `cpus`-derived one when somehow both are given (never happens in
+/// practice today: `run`/`create`/`update` only ever pass `cpus`,
+/// `build` only ever passes `cpu_period`/`cpu_quota`/`cpu_shares` —
+/// kept orthogonal so this function stays the *one* place either
+/// path ends up, rather than two separate `LinuxCpu` builders).
+#[allow(clippy::too_many_arguments)]
 fn resources_from_cli(
     memory_limit_bytes: Option<i64>,
     memory_swap_bytes: Option<i64>,
@@ -15382,11 +15451,17 @@ fn resources_from_cli(
     pids_limit: Option<i64>,
     cpuset_cpus: Option<&str>,
     cpuset_mems: Option<&str>,
+    cpu_period: Option<u64>,
+    cpu_quota: Option<i64>,
+    cpu_shares: Option<u64>,
 ) -> Option<oci_spec_types::runtime::LinuxResources> {
     if memory_limit_bytes.is_none()
         && memory_reservation_bytes.is_none()
         && cpus.is_none()
         && pids_limit.is_none()
+        && cpu_period.is_none()
+        && cpu_quota.is_none()
+        && cpu_shares.is_none()
         && cpuset_cpus.is_none()
         && cpuset_mems.is_none()
     {
@@ -15431,14 +15506,28 @@ fn resources_from_cli(
     // with `period` always `100 * time.Millisecond`).
     const CPU_PERIOD_USEC: u64 = 100_000;
     // `LinuxCpu` is built whenever *any* of `--cpus`/`--cpuset-cpus`/
-    // `--cpuset-mems` is given, not just `--cpus` -- a caller who only
-    // wants to pin a container to specific CPUs/memory nodes, with no
-    // quota at all, still needs a real `LinuxCpu` to carry `cpus`/
-    // `mems` into the spec.
-    let cpu = if cpus.is_some() || cpuset_cpus.is_some() || cpuset_mems.is_some() {
+    // `--cpuset-mems`/`--cpu-period`/`--cpu-quota`/`--cpu-shares` is
+    // given, not just `--cpus` -- a caller who only wants to pin a
+    // container to specific CPUs/memory nodes, with no quota at all,
+    // still needs a real `LinuxCpu` to carry `cpus`/`mems` into the
+    // spec.
+    let cpu = if cpus.is_some()
+        || cpuset_cpus.is_some()
+        || cpuset_mems.is_some()
+        || cpu_period.is_some()
+        || cpu_quota.is_some()
+        || cpu_shares.is_some()
+    {
         Some(oci_spec_types::runtime::LinuxCpu {
-            quota: cpus.map(|cpus| (cpus * CPU_PERIOD_USEC as f64).round() as i64),
-            period: cpus.map(|_| CPU_PERIOD_USEC),
+            // An explicit `cpu_quota`/`cpu_period` (`ociman build`'s
+            // own raw `--cpu-quota`/`--cpu-period`) always wins over
+            // the `cpus`-derived pair (`ociman run/create/update`'s
+            // own `--cpus`) -- see this function's own doc comment
+            // for why the two never actually collide in practice.
+            quota: cpu_quota
+                .or_else(|| cpus.map(|cpus| (cpus * CPU_PERIOD_USEC as f64).round() as i64)),
+            period: cpu_period.or_else(|| cpus.map(|_| CPU_PERIOD_USEC)),
+            shares: cpu_shares,
             cpus: cpuset_cpus.unwrap_or_default().to_string(),
             mems: cpuset_mems.unwrap_or_default().to_string(),
             ..Default::default()
@@ -16603,12 +16692,27 @@ mod tests {
 
     #[test]
     fn resources_from_cli_is_none_when_nothing_was_given() {
-        assert!(resources_from_cli(None, None, None, None, None, None, None).is_none());
+        assert!(
+            resources_from_cli(None, None, None, None, None, None, None, None, None, None)
+                .is_none()
+        );
     }
 
     #[test]
     fn resources_from_cli_translates_cpus_to_a_quota_over_a_100ms_period() {
-        let resources = resources_from_cli(None, None, None, Some(1.5), None, None, None).unwrap();
+        let resources = resources_from_cli(
+            None,
+            None,
+            None,
+            Some(1.5),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let cpu = resources.cpu.unwrap();
         assert_eq!(cpu.quota, Some(150_000));
         assert_eq!(cpu.period, Some(100_000));
@@ -16617,35 +16721,79 @@ mod tests {
     #[test]
     fn resources_from_cli_pids_limit_zero_or_negative_means_unlimited() {
         assert_eq!(
-            resources_from_cli(None, None, None, None, Some(0), None, None)
-                .unwrap()
-                .pids
-                .unwrap()
-                .limit,
+            resources_from_cli(
+                None,
+                None,
+                None,
+                None,
+                Some(0),
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+            .unwrap()
+            .pids
+            .unwrap()
+            .limit,
             Some(-1)
         );
         assert_eq!(
-            resources_from_cli(None, None, None, None, Some(-5), None, None)
-                .unwrap()
-                .pids
-                .unwrap()
-                .limit,
+            resources_from_cli(
+                None,
+                None,
+                None,
+                None,
+                Some(-5),
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+            .unwrap()
+            .pids
+            .unwrap()
+            .limit,
             Some(-1)
         );
         assert_eq!(
-            resources_from_cli(None, None, None, None, Some(42), None, None)
-                .unwrap()
-                .pids
-                .unwrap()
-                .limit,
+            resources_from_cli(
+                None,
+                None,
+                None,
+                None,
+                Some(42),
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+            .unwrap()
+            .pids
+            .unwrap()
+            .limit,
             Some(42)
         );
     }
 
     #[test]
     fn resources_from_cli_combines_all_four_independently() {
-        let resources =
-            resources_from_cli(Some(1024), None, None, Some(0.5), Some(10), None, None).unwrap();
+        let resources = resources_from_cli(
+            Some(1024),
+            None,
+            None,
+            Some(0.5),
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(resources.memory.unwrap().limit, Some(1024));
         assert_eq!(resources.cpu.unwrap().quota, Some(50_000));
         assert_eq!(resources.pids.unwrap().limit, Some(10));
@@ -16653,21 +16801,55 @@ mod tests {
 
     #[test]
     fn resources_from_cli_defaults_swap_to_twice_memory_when_unset() {
-        let resources = resources_from_cli(Some(1024), None, None, None, None, None, None).unwrap();
+        let resources = resources_from_cli(
+            Some(1024),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(resources.memory.unwrap().swap, Some(2048));
     }
 
     #[test]
     fn resources_from_cli_uses_an_explicit_memory_swap_value_untouched() {
-        let resources =
-            resources_from_cli(Some(1024), Some(1500), None, None, None, None, None).unwrap();
+        let resources = resources_from_cli(
+            Some(1024),
+            Some(1500),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(resources.memory.unwrap().swap, Some(1500));
     }
 
     #[test]
     fn resources_from_cli_passes_through_unlimited_memory_swap() {
-        let resources =
-            resources_from_cli(Some(1024), Some(-1), None, None, None, None, None).unwrap();
+        let resources = resources_from_cli(
+            Some(1024),
+            Some(-1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(resources.memory.unwrap().swap, Some(-1));
     }
 
@@ -16676,8 +16858,19 @@ mod tests {
     /// also given.
     #[test]
     fn resources_from_cli_carries_memory_reservation() {
-        let resources =
-            resources_from_cli(Some(1024), None, Some(512), None, None, None, None).unwrap();
+        let resources = resources_from_cli(
+            Some(1024),
+            None,
+            Some(512),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let memory = resources.memory.unwrap();
         assert_eq!(memory.limit, Some(1024));
         assert_eq!(memory.reservation, Some(512));
@@ -16691,7 +16884,19 @@ mod tests {
     /// computed either (there's no hard limit to double).
     #[test]
     fn resources_from_cli_is_some_with_only_memory_reservation_given() {
-        let resources = resources_from_cli(None, None, Some(512), None, None, None, None).unwrap();
+        let resources = resources_from_cli(
+            None,
+            None,
+            Some(512),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let memory = resources.memory.unwrap();
         assert_eq!(memory.limit, None);
         assert_eq!(memory.reservation, Some(512));
@@ -16704,8 +16909,19 @@ mod tests {
         // still produce a real `LinuxCpu` carrying just the cpuset
         // fields -- pinning a container to specific CPUs/memory nodes
         // doesn't require a rate quota too.
-        let resources =
-            resources_from_cli(None, None, None, None, None, Some("0-1"), Some("0")).unwrap();
+        let resources = resources_from_cli(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("0-1"),
+            Some("0"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let cpu = resources.cpu.unwrap();
         assert_eq!(cpu.cpus, "0-1");
         assert_eq!(cpu.mems, "0");
@@ -16715,8 +16931,19 @@ mod tests {
 
     #[test]
     fn resources_from_cli_combines_cpus_quota_with_cpuset() {
-        let resources =
-            resources_from_cli(None, None, None, Some(1.5), None, Some("0-3"), None).unwrap();
+        let resources = resources_from_cli(
+            None,
+            None,
+            None,
+            Some(1.5),
+            None,
+            Some("0-3"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let cpu = resources.cpu.unwrap();
         assert_eq!(cpu.quota, Some(150_000));
         assert_eq!(cpu.cpus, "0-3");
@@ -16729,8 +16956,138 @@ mod tests {
         // considers `--cpuset-cpus`/`--cpuset-mems`, not just the
         // other flags that existed before this pair -- giving only
         // one of them must still produce `Some`, not `None`.
-        assert!(resources_from_cli(None, None, None, None, None, Some("0"), None).is_some());
-        assert!(resources_from_cli(None, None, None, None, None, None, Some("0")).is_some());
+        assert!(
+            resources_from_cli(
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("0"),
+                None,
+                None,
+                None,
+                None
+            )
+            .is_some()
+        );
+        assert!(
+            resources_from_cli(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("0"),
+                None,
+                None,
+                None
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn resources_from_cli_is_some_when_only_a_raw_cpu_flag_is_given() {
+        // Same "nothing was given" check, now covering `ociman
+        // build`'s own raw `--cpu-period`/`--cpu-quota`/`--cpu-shares`
+        // too, each independently.
+        assert!(
+            resources_from_cli(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(50_000),
+                None,
+                None
+            )
+            .is_some()
+        );
+        assert!(
+            resources_from_cli(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(20_000),
+                None
+            )
+            .is_some()
+        );
+        assert!(
+            resources_from_cli(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(512)
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn resources_from_cli_carries_raw_cpu_period_quota_and_shares_verbatim() {
+        // `ociman build --cpu-period`/`--cpu-quota`/`--cpu-shares`:
+        // the real, raw CFS values, passed straight through with no
+        // conversion at all -- unlike `--cpus`'s own float-to-quota
+        // computation just above.
+        let resources = resources_from_cli(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(50_000),
+            Some(25_000),
+            Some(512),
+        )
+        .unwrap();
+        let cpu = resources.cpu.unwrap();
+        assert_eq!(cpu.period, Some(50_000));
+        assert_eq!(cpu.quota, Some(25_000));
+        assert_eq!(cpu.shares, Some(512));
+    }
+
+    #[test]
+    fn resources_from_cli_prefers_an_explicit_cpu_quota_and_period_over_a_cpus_derived_one() {
+        // Never actually happens from any real call site today (`run`/
+        // `create`/`update` only ever pass `cpus`; `build` only ever
+        // passes `cpu_period`/`cpu_quota`/`cpu_shares`) -- but this
+        // function's own doc comment promises the raw value wins if
+        // somehow both are given, so pin that behavior down directly.
+        let resources = resources_from_cli(
+            None,
+            None,
+            None,
+            Some(1.5),
+            None,
+            None,
+            None,
+            Some(200_000),
+            Some(150_000),
+            None,
+        )
+        .unwrap();
+        let cpu = resources.cpu.unwrap();
+        assert_eq!(cpu.period, Some(200_000));
+        assert_eq!(cpu.quota, Some(150_000));
     }
 
     #[test]
