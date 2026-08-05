@@ -449,3 +449,78 @@ fn save_format_docker_archive_writes_manifest_json_and_flat_decompressed_files()
         assert!(layer_name.ends_with(".tar"));
     }
 }
+
+/// `ociman image save`/`image load` (0481) are real, genuine aliases
+/// for `ociman save`/`load` themselves, matching real `podman image
+/// save`/`load`'s own checked-directly identical `RunE`/flag set as
+/// their own top-level counterparts exactly (`~/git/podman/cmd/
+/// podman/images/{save,load}.go`) -- a real archive written by the
+/// alias loads back correctly through the alias too, byte-identical
+/// to the same round trip through the top-level commands.
+#[test]
+fn image_save_and_image_load_are_byte_identical_aliases() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/image-save-load-alias:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out_path = storage_dir.path().join("via-alias.tar");
+    let save = ociman(
+        storage_dir.path(),
+        &[
+            "image",
+            "save",
+            "-o",
+            out_path.to_str().unwrap(),
+            "ociman-test/image-save-load-alias:latest",
+        ],
+    );
+    assert!(
+        save.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&save.stderr)
+    );
+    let via_alias = std::fs::read(&out_path).unwrap();
+
+    let out_path_top = storage_dir.path().join("via-top-level.tar");
+    let save_top = ociman(
+        storage_dir.path(),
+        &[
+            "save",
+            "-o",
+            out_path_top.to_str().unwrap(),
+            "ociman-test/image-save-load-alias:latest",
+        ],
+    );
+    assert!(save_top.status.success(), "{save_top:?}");
+    let via_top_level = std::fs::read(&out_path_top).unwrap();
+    assert_eq!(via_alias, via_top_level);
+
+    // Load it back via the alias too, into a fresh store.
+    let fresh_storage = tempfile::tempdir().unwrap();
+    let load = ociman(
+        fresh_storage.path(),
+        &["image", "load", "-i", out_path.to_str().unwrap()],
+    );
+    assert!(
+        load.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&load.stderr)
+    );
+    let fresh_store = Store::open(fresh_storage.path()).unwrap();
+    assert!(
+        fresh_store
+            .resolve_image("docker.io/ociman-test/image-save-load-alias:latest")
+            .unwrap()
+            .is_some()
+    );
+}

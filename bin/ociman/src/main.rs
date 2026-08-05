@@ -3638,18 +3638,20 @@ enum Command {
     /// `exists`/`prune` have no flat top-level alias in real docker/
     /// podman at all (the same rationale [`Command::Container`]'s own
     /// doc comment gives), so this family originally existed solely
-    /// to host those; `list`/`ls` (0430), `tag`/`untag` (0478), and
-    /// `history`/`rm` (0480) are each real, genuine *aliases* for the
-    /// already-existing flat [`Command::Images`]/[`Command::Tag`]/
-    /// [`Command::Untag`]/[`Command::History`]/[`Command::Rmi`]
-    /// instead — hosted here too since real `podman image list`/
-    /// `ls`/`tag`/`untag`/`history`/`rm` themselves live under this
-    /// exact same real subcommand family, not because this project
-    /// needed a new home for logic that didn't already have one
-    /// (real podman's own naming for the `rm`/`rmi` pair specifically
-    /// is the reverse of what "nested vs. top-level" might suggest —
-    /// see [`ImageCommand::Rm`]'s own doc comment). Real podman also
-    /// nests `push`/`pull`/`save`/`load`/`import`/`inspect`/`mount`/
+    /// to host those; `list`/`ls` (0430), `tag`/`untag` (0478),
+    /// `history`/`rm` (0480), and `pull`/`push`/`save`/`load` (0481)
+    /// are each real, genuine *aliases* for the already-existing flat
+    /// [`Command::Images`]/[`Command::Tag`]/[`Command::Untag`]/
+    /// [`Command::History`]/[`Command::Rmi`]/[`Command::Pull`]/
+    /// [`Command::Push`]/[`Command::Save`]/[`Command::Load`] instead
+    /// — hosted here too since real `podman image list`/`ls`/`tag`/
+    /// `untag`/`history`/`rm`/`pull`/`push`/`save`/`load` themselves
+    /// live under this exact same real subcommand family, not
+    /// because this project needed a new home for logic that didn't
+    /// already have one (real podman's own naming for the `rm`/`rmi`
+    /// pair specifically is the reverse of what "nested vs. top-
+    /// level" might suggest — see [`ImageCommand::Rm`]'s own doc
+    /// comment). Real podman also nests `import`/`inspect`/`mount`/
     /// `unmount`/`diff` the identical way — a real, deliberately
     /// deferred gap for a future increment, not yet ported.
     Image {
@@ -4890,6 +4892,84 @@ enum ImageCommand {
         #[arg(short, long)]
         ignore: bool,
     },
+    /// `podman image pull`'s own real alias for top-level `podman
+    /// pull` — checked directly, `~/git/podman/cmd/podman/images/
+    /// pull.go`: `imagesPullCmd` (`Parent: imageCmd`) and `pullCmd`
+    /// (top-level) share the exact same `Args`/`Use`/`Short`/`Long`/
+    /// `RunE`/`ValidArgsFunction` verbatim. Dispatches straight into
+    /// the same [`cmd_pull`] `ociman pull` itself already calls, with
+    /// the identical field set — see [`Command::Pull`]'s own doc
+    /// comment for the exact semantics, not repeated here.
+    Pull {
+        /// Same as [`Command::Pull::reference`].
+        reference: String,
+        /// Same as [`Command::Pull::tls_verify`].
+        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        tls_verify: bool,
+        /// Same as [`Command::Pull::platform`].
+        #[arg(long, value_name = "os/arch[/variant]")]
+        platform: Option<String>,
+        /// Same as [`Command::Pull::quiet`].
+        #[arg(short, long)]
+        quiet: bool,
+    },
+    /// `podman image push`'s own real alias for top-level `podman
+    /// push` — checked directly, `~/git/podman/cmd/podman/images/
+    /// push.go`: `imagePushCmd` (`Parent: imageCmd`) and `pushCmd`
+    /// (top-level) share the exact same `Use`/`Short`/`Long`/`RunE`/
+    /// `Args`/`ValidArgsFunction` verbatim. Dispatches straight into
+    /// the same [`cmd_push`] `ociman push` itself already calls, with
+    /// the identical field set — see [`Command::Push`]'s own doc
+    /// comment for the exact semantics, not repeated here.
+    Push {
+        /// Same as [`Command::Push::reference`].
+        reference: String,
+        /// Same as [`Command::Push::tls_verify`].
+        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        tls_verify: bool,
+        /// Same as [`Command::Push::digestfile`].
+        #[arg(long = "digestfile", value_name = "PATH")]
+        digestfile: Option<PathBuf>,
+    },
+    /// `podman image save`'s own real alias for top-level `podman
+    /// save` — checked directly, `~/git/podman/cmd/podman/images/
+    /// save.go`: `imageSaveCommand` (`Parent: imageCmd`) and
+    /// `saveCommand` (top-level) share the exact same `Args`/`Use`/
+    /// `Short`/`Long`/`RunE`/`ValidArgsFunction` verbatim, plus
+    /// `saveFlags` registered on both. Dispatches straight into the
+    /// same [`cmd_save`] `ociman save` itself already calls, with the
+    /// identical field set — see [`Command::Save`]'s own doc comment
+    /// for the exact semantics, not repeated here.
+    Save {
+        /// Same as [`Command::Save::reference`].
+        reference: String,
+        /// Same as [`Command::Save::output`].
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// Same as [`Command::Save::format`].
+        #[arg(long, value_enum, default_value_t = SaveFormat::DockerArchive)]
+        format: SaveFormat,
+        /// Same as [`Command::Save::quiet`].
+        #[arg(short, long)]
+        quiet: bool,
+    },
+    /// `podman image load`'s own real alias for top-level `podman
+    /// load` — checked directly, `~/git/podman/cmd/podman/images/
+    /// load.go`: `imageLoadCommand` (`Parent: imageCmd`) and
+    /// `loadCommand` (top-level) share the exact same `Use`/`Short`/
+    /// `Long`/`RunE` verbatim, plus `loadFlags` registered on both.
+    /// Dispatches straight into the same [`cmd_load`] `ociman load`
+    /// itself already calls, with the identical field set — see
+    /// [`Command::Load`]'s own doc comment for the exact semantics,
+    /// not repeated here.
+    Load {
+        /// Same as [`Command::Load::input`].
+        #[arg(short, long, value_name = "PATH")]
+        input: Option<PathBuf>,
+        /// Same as [`Command::Load::quiet`].
+        #[arg(short, long)]
+        quiet: bool,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -5433,6 +5513,43 @@ fn main() -> std::process::ExitCode {
                     all,
                     ignore,
                 } => cmd_rmi(&references, force, all, ignore, cli.global.json),
+                ImageCommand::Pull {
+                    reference,
+                    tls_verify,
+                    platform,
+                    quiet,
+                } => cmd_pull(
+                    &reference,
+                    tls_verify,
+                    platform.as_deref(),
+                    quiet,
+                    cli.global.json,
+                ),
+                ImageCommand::Push {
+                    reference,
+                    tls_verify,
+                    digestfile,
+                } => cmd_push(
+                    &reference,
+                    tls_verify,
+                    digestfile.as_deref(),
+                    cli.global.json,
+                ),
+                ImageCommand::Save {
+                    reference,
+                    output,
+                    format,
+                    quiet,
+                } => cmd_save(
+                    &reference,
+                    output.as_deref(),
+                    format,
+                    quiet,
+                    cli.global.json,
+                ),
+                ImageCommand::Load { input, quiet } => {
+                    cmd_load(input.as_deref(), quiet, cli.global.json)
+                }
             },
             Some(Command::Stats {
                 id,

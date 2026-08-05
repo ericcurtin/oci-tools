@@ -101,3 +101,27 @@ fn push_of_an_untagged_image_is_a_clear_error() {
     let stderr = String::from_utf8_lossy(&push.stderr);
     assert!(stderr.contains("cannot push an untagged image"), "{stderr}");
 }
+
+/// `ociman image push` (0481) is a real, genuine alias for `ociman
+/// push` itself, matching real `podman image push`'s own checked-
+/// directly identical `RunE`/flag set as top-level `podman push`
+/// exactly (`~/git/podman/cmd/podman/images/push.go`) -- the same
+/// real, no-network-needed error path this file's own `push_of_an_
+/// unknown_reference_is_a_clear_error_before_any_network_attempt`
+/// already exercises.
+#[test]
+fn image_push_is_a_byte_identical_alias_for_push() {
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let push = ociman(
+        storage_dir.path(),
+        &["push", "ociman-test/never-pulled-or-built:latest"],
+    );
+    let alias = ociman(
+        storage_dir.path(),
+        &["image", "push", "ociman-test/never-pulled-or-built:latest"],
+    );
+    assert!(!push.status.success());
+    assert!(!alias.status.success());
+    assert_eq!(alias.stderr, push.stderr);
+}
