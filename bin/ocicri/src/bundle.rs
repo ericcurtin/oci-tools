@@ -163,6 +163,29 @@ pub struct CriProcessConfig<'a> {
     /// Standards "Restricted" profile), the same shape of bug 0365
     /// already fixed for `run_as_user`.
     pub readonly_rootfs: bool,
+    /// `ContainerConfig.linux.security_context.no_new_privs` --
+    /// matching real cri-o's own `SpecSetPrivileges`'s own direct,
+    /// unconditional `specgen.SetProcessNoNewPrivileges(security
+    /// Context.GetNoNewPrivs())` passthrough exactly (checked
+    /// directly, `~/git/cri-o/internal/factory/container/
+    /// container.go`; real cri-o only *logs a warning* when this
+    /// would have no effect due to a `CAP_SYS_ADMIN` capability or a
+    /// privileged container, never silently forces a different
+    /// value). Previously silently ignored: `build_spec` used to
+    /// leave `Spec::example()`'s own hardcoded `no_new_privileges:
+    /// true` default untouched regardless of what the request
+    /// actually asked for, incorrectly reasoned about in `0388`'s own
+    /// "still out of scope" section as "already the stricter, safe
+    /// posture" -- but a false `no_new_privs` (the common real-world
+    /// case: Kubernetes' own `AllowPrivilegeEscalation` defaults to
+    /// `true` unless a Pod Security Standard forces it, and ordinary
+    /// images routinely rely on setuid binaries like `sudo`/`ping`/
+    /// `mount` that break under `no_new_privileges=true`) being
+    /// silently upgraded to `true` anyway is a real, previously-
+    /// undetected divergence from a pod's own explicit intent, the
+    /// same shape of bug `0365`/`0388`/`0389` already fixed for
+    /// `run_as_user`/`readonly_rootfs`/`privileged`.
+    pub no_new_privs: bool,
     /// `ContainerConfig.linux.resources` (0390), already translated
     /// via `linux_container_resources_to_oci` into the same
     /// [`oci_spec_types::runtime::LinuxResources`] shape `ociman run`/
@@ -334,6 +357,11 @@ fn build_spec(
     // container this project launches (`Spec::example()`'s own
     // default has no `oom_score_adj` of its own either).
     process.oom_score_adj = cri.oom_score_adj;
+
+    // `security_context.no_new_privs` -- see `CriProcessConfig::
+    // no_new_privs`'s own doc comment for the exact real cri-o
+    // passthrough this matches and the bug this fixes.
+    process.no_new_privileges = cri.no_new_privs;
 
     let linux = spec
         .linux
@@ -577,6 +605,7 @@ mod tests {
             dns_options: &[],
             mounts: &[],
             readonly_rootfs: false,
+            no_new_privs: false,
             resources: None,
             oom_score_adj: None,
             masked_paths: &[],
@@ -624,6 +653,7 @@ mod tests {
             dns_options: &[],
             mounts: &[],
             readonly_rootfs: true,
+            no_new_privs: false,
             resources: None,
             oom_score_adj: None,
             masked_paths: &[],
@@ -636,6 +666,81 @@ mod tests {
             spec.root.unwrap().readonly,
             "an explicit readonly_rootfs: true request must produce a genuinely read-only root"
         );
+    }
+
+    /// `security_context.no_new_privs` -- previously silently
+    /// ignored (`build_spec` never touched `process.no_new_privileges`
+    /// at all, leaving `Spec::example()`'s own hardcoded `true`
+    /// default in place regardless of what the request actually
+    /// asked for); now genuinely honored both ways, matching real
+    /// cri-o's own direct, unconditional `specgen.
+    /// SetProcessNoNewPrivileges(securityContext.GetNoNewPrivs())`
+    /// passthrough. The `false` case is the one that actually proves
+    /// the previous bug is fixed: `Spec::example()`'s own default
+    /// would otherwise have silently smuggled a `true` through
+    /// regardless.
+    #[test]
+    fn build_spec_honors_an_explicit_no_new_privs_false_request() {
+        let image_config = oci_spec_types::image::ContainerConfig {
+            cmd: Some(strings(&["sh"])),
+            ..Default::default()
+        };
+        let cri = CriProcessConfig {
+            command: &[],
+            args: &[],
+            envs: Vec::new(),
+            working_dir: "",
+            hostname: "no-new-privs-false-test",
+            dns_servers: &[],
+            dns_searches: &[],
+            dns_options: &[],
+            mounts: &[],
+            readonly_rootfs: false,
+            no_new_privs: false,
+            resources: None,
+            oom_score_adj: None,
+            masked_paths: &[],
+            readonly_paths: &[],
+            capabilities: oci_spec_types::runtime::podman_default_capabilities(),
+            sysctl: BTreeMap::new(),
+        };
+        let spec = build_spec(&cri, &image_config).unwrap();
+        assert!(
+            !spec.process.unwrap().no_new_privileges,
+            "an explicit no_new_privs: false request must produce a genuinely false \
+             process.noNewPrivileges, not the Spec::example() default of true"
+        );
+    }
+
+    /// The `true` case: still honored correctly, matching real
+    /// cri-o's own identical passthrough for the other direction.
+    #[test]
+    fn build_spec_honors_an_explicit_no_new_privs_true_request() {
+        let image_config = oci_spec_types::image::ContainerConfig {
+            cmd: Some(strings(&["sh"])),
+            ..Default::default()
+        };
+        let cri = CriProcessConfig {
+            command: &[],
+            args: &[],
+            envs: Vec::new(),
+            working_dir: "",
+            hostname: "no-new-privs-true-test",
+            dns_servers: &[],
+            dns_searches: &[],
+            dns_options: &[],
+            mounts: &[],
+            readonly_rootfs: false,
+            no_new_privs: true,
+            resources: None,
+            oom_score_adj: None,
+            masked_paths: &[],
+            readonly_paths: &[],
+            capabilities: oci_spec_types::runtime::podman_default_capabilities(),
+            sysctl: BTreeMap::new(),
+        };
+        let spec = build_spec(&cri, &image_config).unwrap();
+        assert!(spec.process.unwrap().no_new_privileges);
     }
 
     /// `ContainerConfig.linux.resources.oom_score_adj` (0400):
@@ -663,6 +768,7 @@ mod tests {
             dns_options: &[],
             mounts: &[],
             readonly_rootfs: false,
+            no_new_privs: false,
             resources: None,
             oom_score_adj: Some(500),
             masked_paths: &[],
@@ -694,6 +800,7 @@ mod tests {
             dns_options: &[],
             mounts: &[],
             readonly_rootfs: false,
+            no_new_privs: false,
             resources: None,
             oom_score_adj: None,
             masked_paths: &[],
@@ -740,6 +847,7 @@ mod tests {
             dns_options: &[],
             mounts: &[],
             readonly_rootfs: false,
+            no_new_privs: false,
             resources: Some(resources),
             oom_score_adj: None,
             masked_paths: &[],
@@ -776,6 +884,7 @@ mod tests {
             dns_options: &[],
             mounts: &[],
             readonly_rootfs: false,
+            no_new_privs: false,
             resources: None,
             oom_score_adj: None,
             masked_paths: &[],
@@ -810,6 +919,7 @@ mod tests {
             dns_options: &[],
             mounts: &[],
             readonly_rootfs: false,
+            no_new_privs: false,
             resources: None,
             oom_score_adj: None,
             masked_paths: &["/extra/masked".to_string()],
@@ -869,6 +979,7 @@ mod tests {
             dns_options: &[],
             mounts: &[],
             readonly_rootfs: false,
+            no_new_privs: false,
             resources: None,
             oom_score_adj: None,
             masked_paths: &[],
@@ -916,6 +1027,7 @@ mod tests {
             dns_options: &[],
             mounts: &[],
             readonly_rootfs: false,
+            no_new_privs: false,
             resources: None,
             oom_score_adj: None,
             masked_paths: &[],
@@ -956,6 +1068,7 @@ mod tests {
             dns_options: &[],
             mounts: &[],
             readonly_rootfs: false,
+            no_new_privs: false,
             resources: None,
             oom_score_adj: None,
             masked_paths: &[],

@@ -1500,6 +1500,15 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
             .as_ref()
             .and_then(|l| l.security_context.as_ref())
             .is_some_and(|sc| sc.readonly_rootfs);
+        // `security_context.no_new_privs`: same resolution shape as
+        // `readonly_rootfs` just above -- see `CriProcessConfig::
+        // no_new_privs`'s own doc comment for the real cri-o
+        // passthrough this matches.
+        let no_new_privs = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref())
+            .is_some_and(|sc| sc.no_new_privs);
         // `ContainerConfig.linux.resources` (0390): translated up
         // front via the same `linux_container_resources_to_oci`
         // `UpdateContainerResources` already uses, so a container
@@ -1607,6 +1616,7 @@ impl cri::runtime_service_server::RuntimeService for RuntimeServiceImpl {
                 dns_options,
                 mounts: &mounts,
                 readonly_rootfs,
+                no_new_privs,
                 resources,
                 oom_score_adj,
                 masked_paths,

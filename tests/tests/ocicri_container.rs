@@ -2866,6 +2866,91 @@ async fn create_container_readonly_rootfs_sets_root_readonly_in_the_real_spec() 
     );
 }
 
+/// `security_context.no_new_privs` (`docs/design/0475`): a real,
+/// explicit `no_new_privs: false` request must set `process.
+/// noNewPrivileges` to genuinely `false` in the real generated
+/// `config.json` -- previously silently ignored (`build_spec` never
+/// touched this field at all, leaving `Spec::example()`'s own
+/// hardcoded `true` default in place regardless of what the request
+/// actually asked for), the same shape of bug `0365`/`0388`/`0389`
+/// already fixed for `run_as_user`/`readonly_rootfs`/`privileged`.
+/// Checked directly against the real generated spec, matching
+/// `create_container_readonly_rootfs_sets_root_readonly_in_the_real_
+/// spec`'s own identical convention.
+#[tokio::test]
+async fn create_container_no_new_privs_false_clears_the_default_true_in_the_real_spec() {
+    let Some((storage, _socket, _server, mut client, sandbox_id, sandbox_config)) = setup().await
+    else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let mut no_new_privs_false_config = container_config("no-new-privs-false-test", 0);
+    no_new_privs_false_config.linux = Some(oci_cri_types::LinuxContainerConfig {
+        security_context: Some(oci_cri_types::LinuxContainerSecurityContext {
+            no_new_privs: false,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let false_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(no_new_privs_false_config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+
+    let spec: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundle_dir(storage.path(), &false_id).join("config.json")).unwrap(),
+    )
+    .unwrap();
+    // `Process::no_new_privileges`'s own `skip_serializing_if` omits
+    // the field entirely when `false` (matching the OCI spec's own
+    // "absence means false" convention) -- so the real regression
+    // guard here is that it's genuinely *not* `true`, not a literal
+    // `false` key.
+    assert_ne!(
+        spec["process"]["noNewPrivileges"],
+        serde_json::json!(true),
+        "expected an explicit no_new_privs: false request to genuinely clear \
+         process.noNewPrivileges, not leave Spec::example()'s own hardcoded true default: \
+         {spec:?}"
+    );
+
+    // Contrast: an explicit `true` request (matching real cri-o's own
+    // other direction) still works correctly.
+    let mut no_new_privs_true_config = container_config("no-new-privs-true-test", 0);
+    no_new_privs_true_config.linux = Some(oci_cri_types::LinuxContainerConfig {
+        security_context: Some(oci_cri_types::LinuxContainerSecurityContext {
+            no_new_privs: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let true_id = client
+        .create_container(CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: Some(no_new_privs_true_config),
+            sandbox_config: Some(sandbox_config.clone()),
+        })
+        .await
+        .expect("CreateContainer failed")
+        .into_inner()
+        .container_id;
+    let true_spec: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundle_dir(storage.path(), &true_id).join("config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        true_spec["process"]["noNewPrivileges"],
+        serde_json::json!(true)
+    );
+}
+
 /// `security_context.masked_paths` (`docs/design/0391`): a real,
 /// explicit extra masked path must genuinely be masked (bind-mounted
 /// over with `/dev/null`) inside a real started container -- proven
