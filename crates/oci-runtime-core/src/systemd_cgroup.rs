@@ -71,7 +71,8 @@ use zbus::blocking::{Connection, MessageIterator};
 use zbus::zvariant::{OwnedObjectPath, Value};
 
 use crate::cgroups::{
-    convert_cpu_shares_to_weight, convert_memory_swap_to_v2, cpuset_string_to_bitmask,
+    convert_blkio_weight_to_io_weight, convert_cpu_shares_to_weight, convert_memory_swap_to_v2,
+    cpuset_string_to_bitmask,
 };
 
 const SYSTEMD_BUS_NAME: &str = "org.freedesktop.systemd1";
@@ -497,6 +498,28 @@ fn resource_properties(resources: &LinuxResources) -> Vec<(&'static str, Value<'
     {
         properties.push(("TasksMax", Value::from(limit as u64)));
     }
+    // `IOWeight` from `block_io.weight` (`--blkio-weight`'s own real
+    // `[10-1000]` cgroup-v1-style range) — matching real crun's own
+    // identical translation exactly (checked directly, `~/git/crun/
+    // src/libcrun/cgroup-systemd.c`'s own `append_io_weight`:
+    // `weight = IO_WEIGHT(resources->block_io->weight);
+    // APPEND_IO_WEIGHT(weight);`, the exact same `IO_WEIGHT`
+    // BFQ-weight-to-`io.weight` conversion this crate's own
+    // `convert_blkio_weight_to_io_weight` already implements and
+    // `ocirun update --blkio-weight`'s own raw-cgroupfs driver
+    // already uses, `docs/design/0366`) — reused verbatim here for
+    // `ociman run/create --blkio-weight`'s own systemd-scope path
+    // instead. A zero weight is skipped entirely, matching
+    // `plan_blkio`'s own identical "skip a zero weight" rule.
+    if let Some(block_io) = &resources.block_io
+        && let Some(weight) = block_io.weight
+        && weight != 0
+    {
+        properties.push((
+            "IOWeight",
+            Value::from(convert_blkio_weight_to_io_weight(weight as u64)),
+        ));
+    }
     properties
 }
 
@@ -632,6 +655,34 @@ mod tests {
         assert_eq!(*values["CPUQuotaPerSecUSec"], Value::from(500_000u64));
         assert_eq!(*values["CPUQuotaPeriodUSec"], Value::from(100_000u64));
         assert_eq!(*values["TasksMax"], Value::from(64u64));
+    }
+
+    #[test]
+    fn resource_properties_translates_block_io_weight_to_io_weight() {
+        // Same real, checked-directly `IO_WEIGHT` conversion real
+        // crun's own `append_io_weight` uses (`~/git/crun/src/
+        // libcrun/cgroup-systemd.c`) -- reusing this crate's own
+        // already-unit-tested `convert_blkio_weight_to_io_weight`
+        // verbatim, same formula `ocirun update --blkio-weight`'s own
+        // raw-cgroupfs driver already established (`docs/design/
+        // 0366`).
+        let resources = LinuxResources {
+            block_io: Some(oci_spec_types::runtime::LinuxBlockIo { weight: Some(500) }),
+            ..Default::default()
+        };
+        let properties = resource_properties(&resources);
+        assert_eq!(properties, vec![("IOWeight", Value::from(4950u64))]);
+    }
+
+    #[test]
+    fn resource_properties_skips_a_zero_block_io_weight() {
+        // Matches `plan_blkio`'s own identical "skip a zero weight"
+        // rule for the raw-cgroupfs driver.
+        let resources = LinuxResources {
+            block_io: Some(oci_spec_types::runtime::LinuxBlockIo { weight: Some(0) }),
+            ..Default::default()
+        };
+        assert_eq!(resource_properties(&resources), vec![]);
     }
 
     #[test]

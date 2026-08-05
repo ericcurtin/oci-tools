@@ -581,6 +581,20 @@ struct RunArgs {
     /// `run`/`create`/`update` too.
     #[arg(short = 'c', long = "cpu-shares")]
     cpu_shares: Option<u64>,
+    /// Block IO weight (relative weight vs. other cgroups) for the
+    /// container's own cgroup, real spec-documented `[10-1000]`
+    /// range (cgroup v1 convention, no CLI-side validation beyond
+    /// clap's own integer parsing — matching real `docker run`/
+    /// `podman run --blkio-weight`'s own identical zero-extra-
+    /// validation stance, checked directly, `~/git/podman/pkg/
+    /// specgenutil/specgen.go`'s own bare `strconv.ParseUint(b, 10,
+    /// 16)`). Reaches the exact same `LinuxBlockIo`/`plan_blkio`
+    /// (raw cgroupfs) and (new here) `systemd_cgroup`'s own
+    /// `IOWeight` translation `ocirun update --blkio-weight` (`0366`)
+    /// already established for the former — this was the one CLI
+    /// flag missing to reach it from `ociman run`/`create` at all.
+    #[arg(long = "blkio-weight")]
+    blkio_weight: Option<u16>,
     /// Set a resource limit for the container's own process,
     /// repeatable — matching real `docker run --ulimit`/`podman run
     /// --ulimit` exactly: `NAME=soft[:hard]`, `-1` for either value
@@ -3304,6 +3318,11 @@ enum Command {
         /// See `Command::Run`'s own identical flag.
         #[arg(short = 'c', long = "cpu-shares")]
         cpu_shares: Option<u64>,
+        /// See `Command::Run`'s own identical flag — matching real
+        /// `podman update --blkio-weight` exactly (checked directly,
+        /// `~/git/podman/docs/source/markdown/podman-update.1.md.in`).
+        #[arg(long = "blkio-weight")]
+        blkio_weight: Option<u16>,
         /// A real, *partial* update onto whatever this container's
         /// own currently-effective healthcheck already is (see
         /// [`resolve_effective_healthcheck`]) — checked directly,
@@ -4898,6 +4917,7 @@ fn main() -> std::process::ExitCode {
                 cpu_period,
                 cpu_quota,
                 cpu_shares,
+                blkio_weight,
                 health_cmd,
                 health_interval,
                 health_retries,
@@ -4916,6 +4936,7 @@ fn main() -> std::process::ExitCode {
                 cpu_period,
                 cpu_quota,
                 cpu_shares,
+                blkio_weight,
                 health_cmd.as_deref(),
                 health_interval.as_deref(),
                 health_retries,
@@ -8910,6 +8931,7 @@ fn prepare_container(args: &RunArgs) -> anyhow::Result<PreparedContainer> {
             args.cpu_period,
             args.cpu_quota,
             args.cpu_shares,
+            args.blkio_weight,
             seccomp,
             no_new_privileges,
             capabilities,
@@ -13451,6 +13473,7 @@ fn cmd_update(
     cpu_period: Option<u64>,
     cpu_quota: Option<i64>,
     cpu_shares: Option<u64>,
+    blkio_weight: Option<u16>,
     health_cmd: Option<&str>,
     health_interval: Option<&str>,
     health_retries: Option<u32>,
@@ -13471,6 +13494,7 @@ fn cmd_update(
         cpu_period,
         cpu_quota,
         cpu_shares,
+        blkio_weight,
     );
     let any_health_flag = health_cmd.is_some()
         || health_interval.is_some()
@@ -13481,9 +13505,9 @@ fn cmd_update(
     anyhow::ensure!(
         resources.is_some() || any_health_flag,
         "no resource or health flags given -- at least one of --memory/--memory-swap/\
-         --memory-reservation/--cpus/--pids-limit/--cpuset-cpus/--cpuset-mems/--health-cmd/\
-         --health-interval/--health-retries/--health-timeout/--health-start-period/\
-         --no-healthcheck is required"
+         --memory-reservation/--cpus/--cpu-period/--cpu-quota/--cpu-shares/--pids-limit/\
+         --cpuset-cpus/--cpuset-mems/--blkio-weight/--health-cmd/--health-interval/\
+         --health-retries/--health-timeout/--health-start-period/--no-healthcheck is required"
     );
 
     if let Some(resources) = &resources {
@@ -15027,6 +15051,7 @@ fn synthesize_spec(
     cpu_period: Option<u64>,
     cpu_quota: Option<i64>,
     cpu_shares: Option<u64>,
+    blkio_weight: Option<u16>,
     seccomp: Option<oci_spec_types::runtime::LinuxSeccomp>,
     no_new_privileges: bool,
     capabilities: Vec<String>,
@@ -15226,6 +15251,7 @@ fn synthesize_spec(
         cpu_period,
         cpu_quota,
         cpu_shares,
+        blkio_weight,
     );
     // `--cgroup-conf` (0398): needs a real `Some(LinuxResources)` to
     // live on even when no other resource flag was given at all (the
@@ -15600,6 +15626,7 @@ fn resources_from_cli(
     cpu_period: Option<u64>,
     cpu_quota: Option<i64>,
     cpu_shares: Option<u64>,
+    blkio_weight: Option<u16>,
 ) -> Option<oci_spec_types::runtime::LinuxResources> {
     if memory_limit_bytes.is_none()
         && memory_reservation_bytes.is_none()
@@ -15610,6 +15637,7 @@ fn resources_from_cli(
         && cpu_shares.is_none()
         && cpuset_cpus.is_none()
         && cpuset_mems.is_none()
+        && blkio_weight.is_none()
     {
         return None;
     }
@@ -15687,10 +15715,23 @@ fn resources_from_cli(
         // than passing whatever value was given straight through.
         limit: Some(if limit > 0 { limit } else { -1 }),
     });
+    // `--blkio-weight` (real spec's own documented `[10-1000]`
+    // cgroup-v1-style range, no CLI-side validation here either,
+    // matching real runc's/crun's own identical zero-validation
+    // stance — see `oci_runtime_core::cgroups::plan_blkio`'s own doc
+    // comment): reaches both this project's own cgroup drivers
+    // unconditionally now — `ocirun update --blkio-weight`'s already-
+    // existing raw-cgroupfs `plan_blkio`/`apply` path, and (new here)
+    // `oci_runtime_core::systemd_cgroup`'s own `IOWeight` translation
+    // for `ociman run`/`create`'s systemd-scope containers.
+    let block_io = blkio_weight.map(|weight| oci_spec_types::runtime::LinuxBlockIo {
+        weight: Some(weight),
+    });
     Some(oci_spec_types::runtime::LinuxResources {
         memory,
         cpu,
         pids,
+        block_io,
         ..Default::default()
     })
 }
@@ -16839,8 +16880,10 @@ mod tests {
     #[test]
     fn resources_from_cli_is_none_when_nothing_was_given() {
         assert!(
-            resources_from_cli(None, None, None, None, None, None, None, None, None, None)
-                .is_none()
+            resources_from_cli(
+                None, None, None, None, None, None, None, None, None, None, None
+            )
+            .is_none()
         );
     }
 
@@ -16851,6 +16894,7 @@ mod tests {
             None,
             None,
             Some(1.5),
+            None,
             None,
             None,
             None,
@@ -16877,7 +16921,8 @@ mod tests {
                 None,
                 None,
                 None,
-                None
+                None,
+                None,
             )
             .unwrap()
             .pids
@@ -16896,7 +16941,8 @@ mod tests {
                 None,
                 None,
                 None,
-                None
+                None,
+                None,
             )
             .unwrap()
             .pids
@@ -16915,7 +16961,8 @@ mod tests {
                 None,
                 None,
                 None,
-                None
+                None,
+                None,
             )
             .unwrap()
             .pids
@@ -16938,6 +16985,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(resources.memory.unwrap().limit, Some(1024));
@@ -16949,6 +16997,7 @@ mod tests {
     fn resources_from_cli_defaults_swap_to_twice_memory_when_unset() {
         let resources = resources_from_cli(
             Some(1024),
+            None,
             None,
             None,
             None,
@@ -16976,6 +17025,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(resources.memory.unwrap().swap, Some(1500));
@@ -16986,6 +17036,7 @@ mod tests {
         let resources = resources_from_cli(
             Some(1024),
             Some(-1),
+            None,
             None,
             None,
             None,
@@ -17008,6 +17059,7 @@ mod tests {
             Some(1024),
             None,
             Some(512),
+            None,
             None,
             None,
             None,
@@ -17041,6 +17093,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let memory = resources.memory.unwrap();
@@ -17066,6 +17119,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let cpu = resources.cpu.unwrap();
@@ -17084,6 +17138,7 @@ mod tests {
             Some(1.5),
             None,
             Some("0-3"),
+            None,
             None,
             None,
             None,
@@ -17113,7 +17168,8 @@ mod tests {
                 None,
                 None,
                 None,
-                None
+                None,
+                None,
             )
             .is_some()
         );
@@ -17128,7 +17184,8 @@ mod tests {
                 Some("0"),
                 None,
                 None,
-                None
+                None,
+                None,
             )
             .is_some()
         );
@@ -17150,7 +17207,8 @@ mod tests {
                 None,
                 Some(50_000),
                 None,
-                None
+                None,
+                None,
             )
             .is_some()
         );
@@ -17165,7 +17223,8 @@ mod tests {
                 None,
                 None,
                 Some(20_000),
-                None
+                None,
+                None,
             )
             .is_some()
         );
@@ -17180,10 +17239,57 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(512)
+                Some(512),
+                None,
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn resources_from_cli_is_some_when_only_blkio_weight_is_given() {
+        assert!(
+            resources_from_cli(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(500),
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn resources_from_cli_carries_blkio_weight_into_a_real_linux_block_io() {
+        // `ociman run/create/update --blkio-weight`: real spec-
+        // documented `[10-1000]` range, passed straight through with
+        // no conversion at all here -- the actual BFQ-to-`io.weight`
+        // conversion only ever happens inside each cgroup driver
+        // itself (`oci_runtime_core::cgroups::apply`'s raw-cgroupfs
+        // path, or `systemd_cgroup`'s own `IOWeight` translation),
+        // never at this CLI layer.
+        let resources = resources_from_cli(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(500),
+        )
+        .unwrap();
+        assert_eq!(resources.block_io.unwrap().weight, Some(500));
     }
 
     #[test]
@@ -17203,6 +17309,7 @@ mod tests {
             Some(50_000),
             Some(25_000),
             Some(512),
+            None,
         )
         .unwrap();
         let cpu = resources.cpu.unwrap();
@@ -17229,6 +17336,7 @@ mod tests {
             None,
             Some(200_000),
             Some(150_000),
+            None,
             None,
         )
         .unwrap();

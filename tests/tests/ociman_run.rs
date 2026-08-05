@@ -3724,6 +3724,80 @@ fn run_cpu_period_quota_and_shares_set_the_real_systemd_scopes_own_properties() 
     );
 }
 
+/// `--blkio-weight` (matching real `docker run`/`podman run
+/// --blkio-weight` exactly) -- previously only reachable from `ocirun
+/// update --blkio-weight`'s own raw-cgroupfs driver (`0366`); this
+/// project's own `ociman run`/`create` had no CLI flag reaching
+/// `oci_runtime_core::systemd_cgroup`'s own (new) `IOWeight`
+/// translation at all until now. Same real, live-property
+/// verification technique as `--cpu-shares` above: `IOWeight` reports
+/// the real, converted value back (checked directly, `500` -> `4950`,
+/// the same `convert_blkio_weight_to_io_weight` conversion `systemd_
+/// cgroup.rs`'s own unit tests already confirm) even though this dev
+/// host's own rootless `systemd --user` session doesn't delegate the
+/// `io` controller at all (`docs/design/0366`'s own already-
+/// documented finding) -- the same "property accepted/reported
+/// correctly, real enforcement not guaranteed on every host" caveat
+/// already established for `AllowedCPUs`/`cpuset` above.
+#[test]
+fn run_blkio_weight_sets_the_real_systemd_scopes_own_io_weight() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/blkio-weight:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "--blkio-weight",
+            "500",
+            "ociman-test/blkio-weight:latest",
+        ])
+        .args(["/bin/sh", "-c", "sleep 10"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run");
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    assert!(!container_id.is_empty(), "container never appeared in `ps`");
+    let status = wait_for_running(storage_dir.path(), &container_id, Duration::from_secs(20));
+    assert_eq!(status, "running", "container never reached `running`");
+    let scope_name = real_scope_name(storage_dir.path(), &container_id);
+
+    let show = Command::new("systemctl")
+        .args(["--user", "show", &scope_name, "-p", "IOWeight", "--value"])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let weight = String::from_utf8_lossy(&show.stdout).trim().to_string();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(
+        weight, "4950",
+        "expected the real systemd scope's own IOWeight to reflect --blkio-weight 500 \
+         (converted via the real BFQ-weight-to-io.weight formula)"
+    );
+}
+
 /// Same technique as the `--cpus` test above (query the real systemd
 /// scope's own resource property rather than trying to prove kernel
 /// enforcement directly), for `--memory-swap`: a *combined*

@@ -353,6 +353,11 @@ pub fn cmd_build(
         cpu_period,
         cpu_quota,
         cpu_shares,
+        // Real `podman build` has no `--blkio-weight` of its own at
+        // all (checked directly, absent from buildah's own
+        // `CommonBuildOptions`) -- a `run`/`create`/`update`-only
+        // flag, unlike every other parameter here.
+        None,
     );
 
     let instructions = oci_dockerfile::parse(&text).map_err(|e| anyhow::anyhow!(e))?;
