@@ -2021,6 +2021,145 @@ fn ps_last_overrides_visibility_and_keeps_only_the_n_most_recently_created() {
     assert!(String::from_utf8_lossy(&zero.stdout).trim().is_empty());
 }
 
+/// `ociman ps --latest`/`-l` -- real podman's own identical `--last
+/// 1` translation (checked directly,
+/// `~/git/podman/pkg/domain/infra/abi/containers.go`'s own
+/// `ContainerList`): overrides the default running-only visibility
+/// rule just like `--last`/`-n` does, keeping only the single, real
+/// most-recently-created container regardless of state.
+#[test]
+fn ps_latest_shows_only_the_most_recently_created_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-latest:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = |name: &str| {
+        let out = ociman(
+            storage_dir.path(),
+            &[
+                "create",
+                "--name",
+                name,
+                "ociman-test/ps-latest:latest",
+                "true",
+            ],
+        );
+        assert!(out.status.success(), "{out:?}");
+        std::thread::sleep(Duration::from_millis(1200));
+    };
+    create("latest1");
+    create("latest2");
+    create("latest3");
+
+    // No `-a`: every container here is merely `created` (never
+    // started), so `--latest` alone still overrides visibility, the
+    // same real behavior `--last`/`-n` already has.
+    let latest = ociman(storage_dir.path(), &["ps", "--latest", "--noheading"]);
+    assert!(
+        latest.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&latest.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&latest.stdout);
+    assert!(
+        stdout.contains("latest3") && !stdout.contains("latest1") && !stdout.contains("latest2"),
+        "expected only latest3 (the single most recent), got: {stdout:?}"
+    );
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "expected exactly one line, got: {stdout:?}"
+    );
+
+    // The short flag behaves identically.
+    let latest_short = ociman(storage_dir.path(), &["ps", "-l", "-q"]);
+    assert!(latest_short.status.success(), "{latest_short:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&latest_short.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+/// Matches real podman's own exact wording and exact threshold,
+/// checked directly (`~/git/podman/cmd/podman/containers/ps.go`'s own
+/// `checkFlags`): `--last 0 --latest` together is still a real error,
+/// even though `--last 0` alone is otherwise a no-op.
+#[test]
+fn ps_latest_combined_with_last_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let with_positive = ociman(storage_dir.path(), &["ps", "--latest", "-n", "2"]);
+    assert!(!with_positive.status.success());
+    assert!(
+        String::from_utf8_lossy(&with_positive.stderr)
+            .contains("last and latest are mutually exclusive"),
+        "{}",
+        String::from_utf8_lossy(&with_positive.stderr)
+    );
+
+    // `--last 0` alone is a no-op selection-wise, but the real
+    // validation threshold (`>= 0`, not `> 0`) still catches it
+    // combined with `--latest`.
+    let with_zero = ociman(storage_dir.path(), &["ps", "--latest", "-n", "0"]);
+    assert!(!with_zero.status.success());
+    assert!(
+        String::from_utf8_lossy(&with_zero.stderr)
+            .contains("last and latest are mutually exclusive"),
+        "{}",
+        String::from_utf8_lossy(&with_zero.stderr)
+    );
+
+    // The implicit default (`-1`) never conflicts.
+    let with_default = ociman(storage_dir.path(), &["ps", "--latest"]);
+    assert!(
+        with_default.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_default.stderr)
+    );
+}
+
+/// `ociman ps --latest` is also reachable via the `container list`/
+/// `container ls` alias, same as every other shared `Ps` flag.
+#[test]
+fn container_list_latest_is_a_byte_identical_alias_for_ps_latest() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-list-latest:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/container-list-latest:latest", "true"],
+    );
+
+    let ps = ociman(storage_dir.path(), &["ps", "--latest", "-q"]);
+    let list = ociman(storage_dir.path(), &["container", "list", "--latest", "-q"]);
+    assert!(ps.status.success(), "{ps:?}");
+    assert!(list.status.success(), "{list:?}");
+    assert_eq!(ps.stdout, list.stdout);
+}
+
 /// `ociman ps --sort` (matching real `podman ps --sort` exactly):
 /// `--sort names` orders alphabetically, a real, direct contrast with
 /// the default creation-time order.

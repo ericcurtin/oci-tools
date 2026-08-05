@@ -2464,6 +2464,29 @@ enum Command {
         /// given at all.
         #[arg(short = 'n', long = "last", default_value_t = -1, allow_hyphen_values = true)]
         last: i64,
+        /// Show only the single, real most-recently-*created*
+        /// container — matching real `podman ps --latest`/`-l`
+        /// exactly (see [`Command::Rm::latest`]'s own doc comment for
+        /// the exact, checked-directly `GetLatestContainer`-shaped
+        /// semantics this shares). **A real, checked-directly
+        /// divergence from every other `--latest`/`-l` command in
+        /// this project**: real podman doesn't resolve a container id
+        /// for this one at all — `~/git/podman/pkg/domain/infra/abi/
+        /// containers.go`'s own `ContainerList`: `if options.Latest {
+        /// options.Last = 1 }` — it is purely `--last 1` under another
+        /// name, so it shares `--last`'s own exact real "overrides the
+        /// default running-only visibility rule" behavior too (a
+        /// stopped-but-more-recently-created container still wins
+        /// over an older running one). Mutually exclusive with
+        /// `--last`/`-n` — matching real podman's own exact wording
+        /// and exact threshold (checked directly, `~/git/podman/cmd/
+        /// podman/containers/ps.go`'s own `checkFlags`: `if listOpts.
+        /// Last >= 0 && listOpts.Latest`) — a real, checked-directly
+        /// *stricter* threshold than `--last`'s own selection logic
+        /// uses (`> 0`): `--last 0 --latest` together is still an
+        /// error, even though `--last 0` alone is otherwise a no-op.
+        #[arg(short = 'l', long)]
+        latest: bool,
         /// Show each container's own full, untruncated command
         /// instead of the default 17-character-plus-`...` truncation
         /// — matching real `podman ps --no-trunc`'s own checked-
@@ -4588,6 +4611,9 @@ enum ContainerCommand {
         /// Same as [`Command::Ps::last`].
         #[arg(short = 'n', long = "last", default_value_t = -1, allow_hyphen_values = true)]
         last: i64,
+        /// Same as [`Command::Ps::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
         /// Same as [`Command::Ps::no_trunc`].
         #[arg(long = "no-trunc")]
         no_trunc: bool,
@@ -4928,6 +4954,7 @@ fn main() -> std::process::ExitCode {
                 quiet,
                 filter,
                 last,
+                latest,
                 no_trunc,
                 noheading,
                 format,
@@ -4939,6 +4966,7 @@ fn main() -> std::process::ExitCode {
                 cli.global.json,
                 &filter,
                 last,
+                latest,
                 no_trunc,
                 noheading,
                 format.as_deref(),
@@ -5196,6 +5224,7 @@ fn main() -> std::process::ExitCode {
                     quiet,
                     filter,
                     last,
+                    latest,
                     no_trunc,
                     noheading,
                     format,
@@ -5207,6 +5236,7 @@ fn main() -> std::process::ExitCode {
                     cli.global.json,
                     &filter,
                     last,
+                    latest,
                     no_trunc,
                     noheading,
                     format.as_deref(),
@@ -10693,6 +10723,7 @@ fn cmd_ps(
     json: bool,
     filter: &[String],
     last: i64,
+    latest: bool,
     no_trunc: bool,
     noheading: bool,
     format: Option<&str>,
@@ -10704,6 +10735,26 @@ fn cmd_ps(
     // -- real podman's own error also names `--namespace`, which this
     // project has no equivalent of to conflict with.
     anyhow::ensure!(!(quiet && size), "--quiet conflicts with --size");
+    // Matches real podman's own exact wording and exact threshold,
+    // checked directly (`~/git/podman/cmd/podman/containers/ps.go`'s
+    // own `checkFlags`: `if listOpts.Last >= 0 && listOpts.Latest`) --
+    // a real, checked-directly *stricter* threshold than the plain
+    // selection logic just below uses (`> 0`, not `>= 0`): `--last 0
+    // --latest` together is still a real error, even though `--last
+    // 0` alone is otherwise a no-op (see `Command::Ps::last`'s own
+    // doc comment).
+    anyhow::ensure!(
+        !(last >= 0 && latest),
+        "last and latest are mutually exclusive"
+    );
+    // Real podman's own identical translation, checked directly
+    // (`~/git/podman/pkg/domain/infra/abi/containers.go`'s own
+    // `ContainerList`: `if options.Latest { options.Last = 1 }`) --
+    // every other real behavior (overriding the running-only default,
+    // keeping only the single most-recently-created) then falls
+    // straight out of the exact same `--last`/`-n` machinery already
+    // below, no new selection logic needed at all.
+    let last = if latest { 1 } else { last };
     let filters = parse_ps_filters(filter)?;
     let containers = open_container_store()?;
     // Only opened when actually needed -- `--size` is the only reason
