@@ -3626,12 +3626,17 @@ enum Command {
     /// `exists`/`prune` have no flat top-level alias in real docker/
     /// podman at all (the same rationale [`Command::Container`]'s own
     /// doc comment gives), so this family originally existed solely
-    /// to host those; `list`/`ls` (0430) is a real, genuine *alias*
-    /// for the already-existing flat [`Command::Images`] instead —
-    /// hosted here too since real `podman image list`/`ls` themselves
-    /// live under this exact same real subcommand family, not because
-    /// this project needed a new home for logic that didn't already
-    /// have one.
+    /// to host those; `list`/`ls` (0430), `tag` (0478), and `untag`
+    /// (0478) are each real, genuine *aliases* for the already-
+    /// existing flat [`Command::Images`]/[`Command::Tag`]/
+    /// [`Command::Untag`] instead — hosted here too since real
+    /// `podman image list`/`ls`/`tag`/`untag` themselves live under
+    /// this exact same real subcommand family, not because this
+    /// project needed a new home for logic that didn't already have
+    /// one. Real podman also nests `history`/`push`/`pull`/`rm`/
+    /// `save`/`load`/`import`/`inspect`/`mount`/`unmount`/`diff` the
+    /// identical way — a real, deliberately deferred gap for a future
+    /// increment, not yet ported.
     Image {
         #[command(subcommand)]
         command: ImageCommand,
@@ -4793,6 +4798,37 @@ enum ImageCommand {
         #[arg(long = "filter")]
         filter: Vec<String>,
     },
+    /// `podman image tag`'s own real alias for top-level `podman tag`
+    /// — checked directly, `~/git/podman/cmd/podman/images/tag.go`:
+    /// `imageTagCommand` (`Parent: imageCmd`) and `tagCommand`
+    /// (top-level) share the exact same `RunE`/`Args`/
+    /// `ValidArgsFunction` verbatim, not two separately-maintained
+    /// implementations — the same real alias shape `0430`/`0431`
+    /// already established for `list`/`ls`. Dispatches straight into
+    /// the same [`cmd_tag`] `ociman tag` itself already calls, with
+    /// the identical field set — see [`Command::Tag`]'s own doc
+    /// comment for the exact semantics, not repeated here.
+    Tag {
+        /// Same as [`Command::Tag::source`].
+        source: String,
+        /// Same as [`Command::Tag::target`].
+        target: String,
+    },
+    /// `podman image untag`'s own real alias for top-level `podman
+    /// untag` — checked directly, `~/git/podman/cmd/podman/images/
+    /// untag.go`: `imageUntagCmd` (`Parent: imageCmd`) and `untagCmd`
+    /// (top-level) share the exact same `RunE`/`Args`/
+    /// `ValidArgsFunction` verbatim. Dispatches straight into the
+    /// same [`cmd_untag`] `ociman untag` itself already calls, with
+    /// the identical field set — see [`Command::Untag`]'s own doc
+    /// comment for the exact semantics, not repeated here.
+    Untag {
+        /// Same as [`Command::Untag::image`].
+        image: String,
+        /// Same as [`Command::Untag::references`].
+        #[arg(trailing_var_arg = true)]
+        references: Vec<String>,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -5321,6 +5357,8 @@ fn main() -> std::process::ExitCode {
                 ImageCommand::Prune { all, filter } => {
                     cmd_image_prune(cli.global.json, all, &filter)
                 }
+                ImageCommand::Tag { source, target } => cmd_tag(&source, &target, cli.global.json),
+                ImageCommand::Untag { image, references } => cmd_untag(&image, &references),
             },
             Some(Command::Stats {
                 id,

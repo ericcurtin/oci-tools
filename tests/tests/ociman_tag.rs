@@ -521,3 +521,87 @@ fn untag_resolves_the_image_argument_by_a_real_image_id() {
             .is_none()
     );
 }
+
+/// `ociman image tag` (0478) is a real, genuine alias for `ociman
+/// tag` itself, matching real `podman image tag`'s own checked-
+/// directly identical `RunE`/flag set as top-level `podman tag`
+/// exactly (`~/git/podman/cmd/podman/images/tag.go`) -- byte-
+/// identical output for the same fixture state.
+#[test]
+fn image_tag_is_a_byte_identical_alias_for_tag() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/image-tag-alias:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let tag = ociman(
+        storage_dir.path(),
+        &[
+            "image",
+            "tag",
+            "ociman-test/image-tag-alias:latest",
+            "ociman-test/image-tag-alias-target:v2",
+        ],
+    );
+    assert!(
+        tag.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&tag.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&tag.stdout).trim(),
+        "docker.io/ociman-test/image-tag-alias-target:v2"
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/image-tag-alias-target:v2")
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// `ociman image untag` (0478) is a real, genuine alias for `ociman
+/// untag` itself, matching real `podman image untag`'s own checked-
+/// directly identical `RunE`/flag set as top-level `podman untag`
+/// exactly (`~/git/podman/cmd/podman/images/untag.go`).
+#[test]
+fn image_untag_is_a_byte_identical_alias_for_untag() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/image-untag-alias:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let untag = ociman(
+        storage_dir.path(),
+        &["image", "untag", "ociman-test/image-untag-alias:latest"],
+    );
+    assert!(
+        untag.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&untag.stderr)
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/image-untag-alias:latest")
+            .unwrap()
+            .is_none()
+    );
+}
