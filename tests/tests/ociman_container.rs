@@ -7,12 +7,14 @@
 //! alias for the top-level `ociman rm` itself), `stop`
 //! (`docs/design/0490`, the same byte-identical-alias shape for
 //! `ociman stop`), `start` (`docs/design/0491`, the same shape again
-//! for `ociman start`), and `kill` (`docs/design/0492`, the same
-//! shape again for `ociman kill`) — see `ociman_ps.rs`/
-//! `ociman_stop.rs`/`ociman_start.rs`/`ociman_kill.rs` for each
-//! top-level command's own much larger test suite; this file only
-//! proves each alias itself is byte-identical, not the aliased
-//! command's own full semantics again.
+//! for `ociman start`), `kill` (`docs/design/0492`, the same shape
+//! again for `ociman kill`), and `pause`/`unpause` (`docs/design/
+//! 0493`, the same shape again for `ociman pause`/`ociman unpause`)
+//! — see `ociman_ps.rs`/`ociman_stop.rs`/`ociman_start.rs`/
+//! `ociman_kill.rs`/`ociman_pause.rs` for each top-level command's
+//! own much larger test suite; this file only proves each alias
+//! itself is byte-identical, not the aliased command's own full
+//! semantics again.
 //!
 //! `ociman container prune` removes every real, non-running container
 //! (this project's own `Created`/`Stopped`, never `Running`/`Paused`,
@@ -1030,6 +1032,77 @@ fn container_kill_signal_flag_works_through_the_alias() {
     );
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(inspect_json(storage_dir.path(), &id)["status"], "running");
+
+    // Clean up the still-running container so the temp dir doesn't
+    // leak a live process past this test.
+    let _ = ociman(storage_dir.path(), &["kill", &id]);
+}
+
+/// `ociman container pause`/`ociman container unpause` (0493) are
+/// real, byte-identical aliases for the top-level `ociman pause`/
+/// `ociman unpause`, matching real `podman container pause`/`unpause`'s
+/// own checked-directly identical `Use`/`Short`/`Long`/`RunE`/`Args`/
+/// `ValidArgsFunction` (and identical `pauseFlags`/`unpauseFlags`-
+/// applied flag sets) as their top-level counterparts exactly
+/// (`~/git/podman/cmd/podman/containers/pause.go:19-49`, `unpause.go:
+/// 19-49`). Full `pause`/`unpause` semantics (`--all`, `--cidfile`,
+/// `--filter`, `--latest`, the real cgroup-freezer state
+/// transitions) are already exhaustively tested against the
+/// top-level commands in `ociman_pause.rs`; this only proves each
+/// alias itself reaches the identical function with the identical
+/// fields.
+#[test]
+fn container_pause_and_unpause_are_byte_identical_aliases_for_top_level_pause_and_unpause() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-pause-alias:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/container-pause-alias:latest",
+        &["sleep", "30"],
+    );
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let pause = ociman(storage_dir.path(), &["container", "pause", &id]);
+    assert!(
+        pause.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&pause.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&pause.stdout).trim(), id);
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "paused", Duration::from_secs(5)),
+        "paused"
+    );
+
+    let unpause = ociman(storage_dir.path(), &["container", "unpause", &id]);
+    assert!(
+        unpause.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&unpause.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&unpause.stdout).trim(), id);
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(5)),
+        "running"
+    );
 
     // Clean up the still-running container so the temp dir doesn't
     // leak a live process past this test.

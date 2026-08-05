@@ -4971,6 +4971,63 @@ enum ContainerCommand {
         #[arg(short = 'l', long)]
         latest: bool,
     },
+    /// `podman container pause`'s own real alias for the already-
+    /// existing flat [`Command::Pause`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/pause.go:19-49`: `containerPauseCommand`
+    /// (`Parent: containerCmd`) and top-level `pauseCommand` share the
+    /// exact same `Use`/`Short`/`Long`/`RunE`/`Args`/
+    /// `ValidArgsFunction`, and both get the identical flag set
+    /// applied via the one shared `pauseFlags(cmd)` helper plus
+    /// `validate.AddLatestFlag` -- a byte-identical alias, the same
+    /// shape [`Self::Kill`] (`0492`) already established. Dispatches
+    /// into the same [`cmd_pause`] `ociman pause` itself already
+    /// calls, with the identical field set -- see [`Command::Pause`]'s
+    /// own doc comment for the exact semantics, not repeated here.
+    Pause {
+        /// Same as [`Command::Pause::ids`].
+        ids: Vec<String>,
+        /// Same as [`Command::Pause::all`].
+        #[arg(short, long)]
+        all: bool,
+        /// Same as [`Command::Pause::cidfile`].
+        #[arg(long = "cidfile", value_name = "FILE")]
+        cidfile: Vec<PathBuf>,
+        /// Same as [`Command::Pause::filter`].
+        #[arg(long = "filter")]
+        filter: Vec<String>,
+        /// Same as [`Command::Pause::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+    },
+    /// `podman container unpause`'s own real alias for the already-
+    /// existing flat [`Command::Unpause`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/unpause.go:19-49`:
+    /// `containerUnpauseCommand` (`Parent: containerCmd`) and
+    /// top-level `unpauseCommand` share the exact same `Use`/`Short`/
+    /// `Long`/`RunE`/`Args`/`ValidArgsFunction`, and both get the
+    /// identical flag set applied via the one shared
+    /// `unpauseFlags(cmd)` helper plus `validate.AddLatestFlag` -- the
+    /// same byte-identical-alias shape [`Self::Pause`] already
+    /// established above. Dispatches into the same [`cmd_unpause`]
+    /// `ociman unpause` itself already calls, with the identical
+    /// field set -- see [`Command::Unpause`]'s own doc comment for
+    /// the exact semantics, not repeated here.
+    Unpause {
+        /// Same as [`Command::Unpause::ids`].
+        ids: Vec<String>,
+        /// Same as [`Command::Unpause::all`].
+        #[arg(short, long)]
+        all: bool,
+        /// Same as [`Command::Unpause::cidfile`].
+        #[arg(long = "cidfile", value_name = "FILE")]
+        cidfile: Vec<PathBuf>,
+        /// Same as [`Command::Unpause::filter`].
+        #[arg(long = "filter")]
+        filter: Vec<String>,
+        /// Same as [`Command::Unpause::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -5850,6 +5907,20 @@ fn main() -> std::process::ExitCode {
                     cidfile,
                     latest,
                 } => cmd_kill(&ids, &signal, all, &cidfile, latest),
+                ContainerCommand::Pause {
+                    ids,
+                    all,
+                    cidfile,
+                    filter,
+                    latest,
+                } => cmd_pause(&ids, all, &cidfile, &filter, latest),
+                ContainerCommand::Unpause {
+                    ids,
+                    all,
+                    cidfile,
+                    filter,
+                    latest,
+                } => cmd_unpause(&ids, all, &cidfile, &filter, latest),
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),
