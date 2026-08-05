@@ -805,3 +805,90 @@ fn update_health_retries_zero_succeeds_unlike_create() {
     ociman(storage_dir.path(), &["kill", &id]);
     child.wait().ok();
 }
+
+/// `ociman update --latest`/`-l` (a real, previously-missing flag --
+/// every other single-container command already had it via the
+/// `0434`-`0452` series, but `update` was never included): targets
+/// the single, real most-recently-created container instead of
+/// naming one explicitly, matching real `podman update --latest`
+/// exactly.
+#[test]
+fn update_latest_targets_the_most_recently_created_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/update-latest:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+    let mut child = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/update-latest:latest",
+        &["-d", "sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20));
+
+    let update = ociman(
+        storage_dir.path(),
+        &["update", "--memory", "64m", "--latest"],
+    );
+    assert!(
+        update.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&update.stdout).trim(), id);
+
+    let cgroup_dir = real_cgroup_dir_for(storage_dir.path(), &id);
+    let memory_max = std::fs::read_to_string(cgroup_dir.join("memory.max")).unwrap();
+    assert_eq!(memory_max.trim(), (64 * 1024 * 1024).to_string());
+
+    ociman(storage_dir.path(), &["kill", &id]);
+    child.wait().ok();
+}
+
+/// Matches real podman's own exact wording, checked directly
+/// (`~/git/podman/cmd/podman/validate/args.go`'s own
+/// `IDOrLatestArgs`): giving both an explicit container and
+/// `--latest` together is a real, immediate error, never a silent
+/// "explicit wins" or "latest wins" resolution.
+#[test]
+fn update_latest_and_an_explicit_id_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let update = ociman(
+        storage_dir.path(),
+        &["update", "--memory", "64m", "--latest", "some-container"],
+    );
+    assert!(!update.status.success());
+    assert!(
+        String::from_utf8_lossy(&update.stderr)
+            .contains("--latest and containers cannot be used together"),
+        "{}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+}
+
+/// Matches real podman's own exact wording, checked directly
+/// (`~/git/podman/cmd/podman/validate/args.go`'s own
+/// `IDOrLatestArgs`): giving neither an explicit container nor
+/// `--latest` is a real, immediate error.
+#[test]
+fn update_with_neither_an_id_nor_latest_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let update = ociman(storage_dir.path(), &["update", "--memory", "64m"]);
+    assert!(!update.status.success());
+    assert!(
+        String::from_utf8_lossy(&update.stderr)
+            .contains("update requires a name, id, or the \"--latest\" flag"),
+        "{}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+}

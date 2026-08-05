@@ -3344,8 +3344,27 @@ enum Command {
     /// resource *or* health flags at all is a clear error rather than
     /// a silent no-op.
     Update {
-        /// The container's ID or `--name`.
-        id: String,
+        /// The container's ID or `--name` — omit when using
+        /// `--latest`.
+        id: Option<String>,
+        /// Update the single, real most-recently-*created* container
+        /// instead of naming one explicitly — matching real `podman
+        /// update --latest`/`-l` exactly (see [`Command::Rm::latest`]'s
+        /// own doc comment for the exact, checked-directly
+        /// `GetLatestContainer` semantics this shares verbatim).
+        /// Mutually exclusive with an explicit `ID`/`--name` —
+        /// matching real podman's own exact error wording for both
+        /// directions of that restriction (checked directly, `~/git/
+        /// podman/cmd/podman/validate/args.go`'s own `IDOrLatestArgs`,
+        /// used by `~/git/podman/cmd/podman/containers/update.go`):
+        /// giving neither this nor a container at all is `"%q
+        /// requires a name, id, or the \"--latest\" flag"`, giving
+        /// both together is `"--latest and containers cannot be used
+        /// together"`. A real, previously-missing flag: every other
+        /// single-container command already supports it (the
+        /// `0434`-`0452` series), but `update` was never included.
+        #[arg(short = 'l', long)]
+        latest: bool,
         /// See `Command::Run`'s own identical flag.
         #[arg(long)]
         memory: Option<String>,
@@ -4977,6 +4996,7 @@ fn main() -> std::process::ExitCode {
             }) => cmd_unpause(&ids, all, &cidfile, &filter, latest),
             Some(Command::Update {
                 id,
+                latest,
                 memory,
                 memory_swap,
                 memory_reservation,
@@ -4996,28 +5016,48 @@ fn main() -> std::process::ExitCode {
                 health_timeout,
                 health_start_period,
                 no_healthcheck,
-            }) => cmd_update(
-                &id,
-                memory.as_deref(),
-                memory_swap.as_deref(),
-                memory_reservation.as_deref(),
-                cpus,
-                pids_limit,
-                cpuset_cpus.as_deref(),
-                cpuset_mems.as_deref(),
-                cpu_period,
-                cpu_quota,
-                cpu_shares,
-                cpu_rt_period,
-                cpu_rt_runtime,
-                blkio_weight,
-                health_cmd.as_deref(),
-                health_interval.as_deref(),
-                health_retries,
-                health_timeout.as_deref(),
-                health_start_period.as_deref(),
-                no_healthcheck,
-            ),
+            }) => {
+                // Matches real podman's own exact wording, checked
+                // directly (`~/git/podman/cmd/podman/validate/
+                // args.go`'s own `IDOrLatestArgs`).
+                anyhow::ensure!(
+                    !(latest && id.is_some()),
+                    "--latest and containers cannot be used together"
+                );
+                let id = match id {
+                    Some(id) => id,
+                    None => {
+                        anyhow::ensure!(
+                            latest,
+                            "update requires a name, id, or the \"--latest\" flag"
+                        );
+                        let containers = open_container_store()?;
+                        resolve_latest_container(&containers)?
+                    }
+                };
+                cmd_update(
+                    &id,
+                    memory.as_deref(),
+                    memory_swap.as_deref(),
+                    memory_reservation.as_deref(),
+                    cpus,
+                    pids_limit,
+                    cpuset_cpus.as_deref(),
+                    cpuset_mems.as_deref(),
+                    cpu_period,
+                    cpu_quota,
+                    cpu_shares,
+                    cpu_rt_period,
+                    cpu_rt_runtime,
+                    blkio_weight,
+                    health_cmd.as_deref(),
+                    health_interval.as_deref(),
+                    health_retries,
+                    health_timeout.as_deref(),
+                    health_start_period.as_deref(),
+                    no_healthcheck,
+                )
+            }
             Some(Command::Healthcheck { command }) => match command {
                 HealthcheckCommand::Run { id, ignore_result } => {
                     cmd_healthcheck_run(&id, ignore_result)
