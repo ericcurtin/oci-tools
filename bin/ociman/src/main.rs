@@ -5204,6 +5204,31 @@ enum ContainerCommand {
         #[arg(long = "format", value_name = "FORMAT")]
         format: Option<String>,
     },
+    /// `podman container cp`'s own real alias for the already-
+    /// existing flat [`Command::Cp`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/cp.go:31-79`: `containerCpCommand`
+    /// (`Parent: containerCmd`) and top-level `cpCommand` share the
+    /// exact same `Use`/`Short`/`Long`/`Args`/`RunE`/
+    /// `ValidArgsFunction`, and both get the identical flag set
+    /// applied via the one shared `cpFlags(cmd)` helper (`--overwrite`,
+    /// plus the hidden, deprecated-NOP `--archive`/`-a`/`--extract`/
+    /// `--pause`, deliberately not ported here either, matching this
+    /// project's own already-established convention of skipping
+    /// internal/hidden/deprecated flags with no real effect) -- a
+    /// byte-identical alias, the same shape [`Self::Kill`] (`0492`)
+    /// already established. Dispatches into the same [`cmd_cp`]
+    /// `ociman cp` itself already calls, with the identical field
+    /// set -- see [`Command::Cp`]'s own doc comment for the exact
+    /// semantics, not repeated here.
+    Cp {
+        /// Same as [`Command::Cp::src`].
+        src: String,
+        /// Same as [`Command::Cp::dest`].
+        dest: String,
+        /// Same as [`Command::Cp::overwrite`].
+        #[arg(long)]
+        overwrite: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -6195,6 +6220,11 @@ fn main() -> std::process::ExitCode {
                     };
                     cmd_diff(&resolved_id, cli.global.json, format.as_deref())
                 }
+                ContainerCommand::Cp {
+                    src,
+                    dest,
+                    overwrite,
+                } => cmd_cp(&src, &dest, overwrite),
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),

@@ -16,18 +16,19 @@
 //! 0496`, the same shape again for `ociman wait`), `top`
 //! (`docs/design/0497`, the same shape again for `ociman top`),
 //! `logs` (`docs/design/0498`, the same shape again for `ociman
-//! logs`), and `diff` (`docs/design/0499` -- a genuine, no-forcing-
+//! logs`), `diff` (`docs/design/0499` -- a genuine, no-forcing-
 //! needed byte-identical alias, since this project's own top-level
 //! `ociman diff` was already scoped container-only from the start,
 //! matching real `podman container diff`'s own narrower scope
 //! rather than real top-level `podman diff`'s broader auto-detect
-//! one) — see `ociman_ps.rs`/`ociman_stop.rs`/`ociman_start.rs`/
-//! `ociman_kill.rs`/`ociman_pause.rs`/`ociman_rename.rs`/
-//! `ociman_wait.rs`/`ociman_top.rs`/`ociman_logs.rs`/
-//! `ociman_diff.rs` for each
-//! top-level command's own much larger test suite; this file only
-//! proves each alias itself is byte-identical, not the aliased
-//! command's own full semantics again.
+//! one), and `cp` (`docs/design/0500`, the same byte-identical-alias
+//! shape again for `ociman cp`) — see `ociman_ps.rs`/
+//! `ociman_stop.rs`/`ociman_start.rs`/`ociman_kill.rs`/
+//! `ociman_pause.rs`/`ociman_rename.rs`/`ociman_wait.rs`/
+//! `ociman_top.rs`/`ociman_logs.rs`/`ociman_diff.rs`/`ociman_cp.rs`
+//! for each top-level command's own much larger test suite; this
+//! file only proves each alias itself is byte-identical, not the
+//! aliased command's own full semantics again.
 //!
 //! `ociman container prune` removes every real, non-running container
 //! (this project's own `Created`/`Stopped`, never `Running`/`Paused`,
@@ -1479,4 +1480,84 @@ fn container_diff_is_a_byte_identical_alias_for_top_level_diff() {
     let stdout = String::from_utf8_lossy(&alias.stdout);
     assert!(stdout.contains("A /new-file.txt"), "stdout: {stdout:?}");
     assert!(stdout.contains("D /bin/sh"), "stdout: {stdout:?}");
+}
+
+/// `ociman container cp` (0500) is a real, byte-identical alias for
+/// the top-level `ociman cp`, matching real `podman container cp`'s
+/// own checked-directly identical `Use`/`Short`/`Long`/`Args`/`RunE`/
+/// `ValidArgsFunction` (and identical `cpFlags`-applied flag set) as
+/// top-level `podman cp` exactly (`~/git/podman/cmd/podman/
+/// containers/cp.go:31-79`). Full `cp` semantics (both directions,
+/// directories, `--overwrite`, between two containers, the rootless-
+/// overlay gap itself) are already exhaustively tested against the
+/// top-level command in `ociman_cp.rs`; this only proves the alias
+/// itself reaches the identical function with the identical fields.
+#[test]
+fn container_cp_is_a_byte_identical_alias_for_top_level_cp() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    // `cp` doesn't support this project's own rootless-overlay
+    // rootfs optimization yet -- force the real, full-extraction
+    // path instead, matching `ociman_cp.rs`'s own established
+    // `seed_and_run_stopped_container` convention.
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let busybox = busybox_path().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-cp-alias:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 0".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/container-cp-alias:latest"],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+    let rootfs = inspect_json(storage_dir.path(), &id)["rootfs"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let host_src = storage_dir.path().join("host_src.txt");
+    std::fs::write(&host_src, "hello from host").unwrap();
+
+    let alias = ociman(
+        storage_dir.path(),
+        &[
+            "container",
+            "cp",
+            host_src.to_str().unwrap(),
+            &format!("{id}:/copied.txt"),
+        ],
+    );
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    let in_container = Path::new(&rootfs).join("copied.txt");
+    assert_eq!(
+        std::fs::read_to_string(&in_container).unwrap(),
+        "hello from host"
+    );
 }
