@@ -1699,6 +1699,24 @@ enum Command {
         /// flag before this increment).
         #[arg(short = 'c', long = "cpu-shares")]
         cpu_shares: Option<u64>,
+        /// Skip synthesizing a real `/etc/hosts` for every `RUN`
+        /// step entirely, matching real `podman build --no-hosts`
+        /// exactly (checked directly, `~/git/podman/vendor/
+        /// go.podman.io/buildah/run_linux.go`'s own `!options.
+        /// NoHosts` gate around the exact same real, transient,
+        /// never-committed `/etc/hosts` write this project's own
+        /// `RUN` steps already get by default): every `RUN` step
+        /// then sees whatever `/etc/hosts` the base image's own
+        /// rootfs already has (or none at all) completely untouched
+        /// instead. Silently makes `--add-host` a no-op when both
+        /// are given at once, matching real buildah's own identical
+        /// behavior (no separate validation error for the
+        /// combination exists in its own source either). Applies to
+        /// every `RUN` step in every stage alike, no per-stage/
+        /// per-instruction override, the same shape `--ulimit`/
+        /// `--shm-size`/`--memory` already established.
+        #[arg(long = "no-hosts")]
+        no_hosts: bool,
         /// Refrain from announcing build progress — matching real
         /// `docker build -q`/`podman build --quiet` exactly (checked
         /// directly against a real installed `podman build -q`, three
@@ -4501,6 +4519,7 @@ fn main() -> std::process::ExitCode {
                 cpu_quota,
                 cpu_shares,
                 http_proxy,
+                no_hosts,
                 quiet,
                 timestamp,
             }) => build::cmd_build(
@@ -4536,6 +4555,7 @@ fn main() -> std::process::ExitCode {
                 cpu_quota,
                 cpu_shares,
                 http_proxy,
+                no_hosts,
                 quiet,
                 cli.global.json,
                 timestamp,

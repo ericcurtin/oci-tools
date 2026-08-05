@@ -9223,3 +9223,76 @@ fn build_cpu_period_quota_and_shares_set_the_real_systemd_scopes_own_properties(
     );
     assert!(status.success(), "ociman build itself should still succeed");
 }
+
+/// `ociman build --no-hosts` (matching real `podman build --no-hosts`
+/// exactly) skips synthesizing a real `/etc/hosts` for every `RUN`
+/// step entirely -- a `RUN` step then sees whatever `/etc/hosts` the
+/// base image's own rootfs already has, completely untouched, rather
+/// than this project's own default (localhost + any `--add-host`
+/// entries) `build_add_host_flag_is_visible_during_run_steps` already
+/// covers.
+#[test]
+fn build_no_hosts_leaves_the_base_images_own_etc_hosts_completely_untouched() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    let base_hosts = b"10.9.9.9\tfrom-the-base-image\n";
+    seed_image_with_files(
+        &store,
+        "ociman-test/build-no-hosts-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        &[("etc/hosts", base_hosts)],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-no-hosts-base:latest\n\
+         RUN cat /etc/hosts > /hosts-snapshot.txt\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--no-hosts",
+            "--add-host",
+            "should-never-appear.example:10.0.0.5",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-no-hosts-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/build-no-hosts-result:latest",
+            "/bin/cat",
+            "/hosts-snapshot.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).into_owned().as_bytes(),
+        base_hosts,
+        "the RUN step should have seen the base image's own /etc/hosts verbatim, \
+         with no synthesized localhost/--add-host entries added at all"
+    );
+}

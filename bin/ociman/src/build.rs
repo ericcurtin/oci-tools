@@ -258,6 +258,7 @@ pub fn cmd_build(
     cpu_quota: Option<i64>,
     cpu_shares: Option<u64>,
     http_proxy: bool,
+    no_hosts: bool,
     quiet: bool,
     json: bool,
     timestamp: Option<i64>,
@@ -592,6 +593,7 @@ pub fn cmd_build(
             tls_verify,
             pull_policy,
             add_host,
+            no_hosts,
             dns,
             dns_search,
             dns_option,
@@ -975,6 +977,7 @@ fn build_stage(
     tls_verify: bool,
     pull_policy: crate::PullPolicy,
     add_host: &[String],
+    no_hosts: bool,
     dns: &[String],
     dns_search: &[String],
     dns_option: &[String],
@@ -1085,8 +1088,22 @@ fn build_stage(
         // `ociman run`'s own call site): a build has no single, fixed
         // hostname/container-name identity of its own the way a real
         // running container does.
-        oci_runtime_core::etc_hosts::write_etc_hosts(&rootfs_dir, &[], add_host)
-            .context("writing /etc/hosts for the build container")?;
+        //
+        // `--no-hosts` (matching real `podman build --no-hosts`
+        // exactly, checked directly: `~/git/podman/vendor/
+        // go.podman.io/buildah/run_linux.go`'s own `!options.NoHosts`
+        // gate around this exact same call) skips this write entirely
+        // -- every `RUN` step then sees whatever `/etc/hosts` the base
+        // image's own rootfs already has (or none at all), completely
+        // untouched, rather than this project's own synthesized one.
+        // Silently makes `--add-host` a no-op when both are given at
+        // once, matching real buildah's own identical behavior (no
+        // separate validation error for the combination exists in its
+        // own source either).
+        if !no_hosts {
+            oci_runtime_core::etc_hosts::write_etc_hosts(&rootfs_dir, &[], add_host)
+                .context("writing /etc/hosts for the build container")?;
+        }
         // A real `/etc/resolv.conf` (0298, 0299): a verbatim copy of
         // this host's own by default -- a real `RUN apt-get update`/
         // `RUN pip install ...`-style step genuinely needs working
