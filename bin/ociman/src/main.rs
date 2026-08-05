@@ -2934,12 +2934,45 @@ enum Command {
     /// (checked directly: a real rootful `sudo podman unmount` on a
     /// container succeeds and prints its own id either way, real
     /// podman's own storage layer deciding internally whether an
-    /// actual unmount was even needed). Prints the container's own id
-    /// on success, matching real podman's own checked-directly
-    /// output.
+    /// actual unmount was even needed). Prints each container's own
+    /// id on success, matching real podman's own checked-directly
+    /// output. Accepts one or more containers, `--all`, or `--latest`
+    /// — matching real `podman unmount`'s own exact argument-
+    /// validation rules (checked directly, `~/git/podman/cmd/podman/
+    /// validate/args.go`'s own `CheckAllLatestAndIDFile`, used by
+    /// `~/git/podman/cmd/podman/containers/unmount.go`): `--all` and
+    /// `--latest` together is `"--all and --latest cannot be used
+    /// together"`; `--all` with an explicit container is `"no
+    /// arguments are needed with --all"`; `--latest` with an explicit
+    /// container is `"--latest and containers cannot be used
+    /// together"`; none of the three given at all is `"you must
+    /// provide at least one name or id"`.
     Unmount {
-        /// The container's ID or `--name`.
-        container: String,
+        /// One or more container IDs/`--name`s — omit when using
+        /// `--all`/`--latest`.
+        containers: Vec<String>,
+        /// Unmount every existing container — matching real `podman
+        /// unmount --all`/`-a` exactly. Since this project's own
+        /// containers are always already "mounted" (see this
+        /// command's own doc comment), this is unconditionally a
+        /// real, honest no-op sweep over every one, never a partial
+        /// or state-filtered subset.
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Unmount the single, real most-recently-*created* container
+        /// instead of naming one explicitly — matching real `podman
+        /// unmount --latest`/`-l` exactly (see [`Command::Rm::
+        /// latest`]'s own doc comment for the exact, checked-directly
+        /// `GetLatestContainer` semantics this shares verbatim).
+        #[arg(short = 'l', long)]
+        latest: bool,
+        /// Accepted for real CLI compatibility with real `podman
+        /// unmount --force`/`-f`, but changes nothing: this project's
+        /// own unmount is already an unconditional no-op regardless
+        /// of any forcing (the same reasoning `rm --force` on an
+        /// already-nonexistent target established).
+        #[arg(short = 'f', long)]
+        force: bool,
     },
     /// Write a container's entire current filesystem out as a real,
     /// flat tar — matching real `docker export`/`podman export`
@@ -4948,7 +4981,12 @@ fn main() -> std::process::ExitCode {
                 cmd_diff(&resolved_id, cli.global.json, format.as_deref())
             }
             Some(Command::Mount { container }) => cmd_mount(container.as_deref()),
-            Some(Command::Unmount { container }) => cmd_unmount(&container),
+            Some(Command::Unmount {
+                containers,
+                all,
+                latest,
+                force: _,
+            }) => cmd_unmount(&containers, all, latest),
             Some(Command::Export { id, output }) => cmd_export(&id, output.as_deref()),
             Some(Command::Commit {
                 container,
@@ -11484,10 +11522,63 @@ fn cmd_mount(container: Option<&str>) -> anyhow::Result<()> {
 /// no-op as any other, so there is no real gap here for that case to
 /// even trip over — only that the container itself must genuinely
 /// exist, [`resolve_container_id`]'s own already-established check.
-fn cmd_unmount(container: &str) -> anyhow::Result<()> {
+fn cmd_unmount(ids: &[String], all: bool, latest: bool) -> anyhow::Result<()> {
+    // Matches real podman's own exact wording and check order, checked
+    // directly (`~/git/podman/cmd/podman/validate/args.go`'s own
+    // `CheckAllLatestAndIDFile`, used by real `podman unmount`).
+    anyhow::ensure!(
+        !(all && latest),
+        "--all and --latest cannot be used together"
+    );
+    anyhow::ensure!(
+        !(all && !ids.is_empty()),
+        "no arguments are needed with --all"
+    );
+    anyhow::ensure!(
+        !(latest && !ids.is_empty()),
+        "--latest and containers cannot be used together"
+    );
+    anyhow::ensure!(
+        all || latest || !ids.is_empty(),
+        "you must provide at least one name or id"
+    );
+
     let containers = open_container_store()?;
-    let resolved = resolve_container_id(&containers, container)?;
-    println!("{resolved}");
+
+    if all {
+        // Every existing container is always already "mounted" (see
+        // `Command::Unmount`'s own doc comment) -- an unconditional,
+        // honest sweep, never a partial or state-filtered subset.
+        for state in containers.list().context("listing containers")? {
+            println!("{}", state.id);
+        }
+        return Ok(());
+    }
+
+    if latest {
+        println!("{}", resolve_latest_container(&containers)?);
+        return Ok(());
+    }
+
+    // The overwhelmingly common case -- exactly one target -- keeps
+    // the original, simplest possible path.
+    if let [id] = ids {
+        let resolved = resolve_container_id(&containers, id)?;
+        println!("{resolved}");
+        return Ok(());
+    }
+
+    // Two or more explicit targets: resolve every one first, aborting
+    // the whole call before printing anything if any of them don't
+    // exist at all -- matching `cmd_kill`'s own identical two-phase
+    // convention for a plain multi-id command.
+    let mut resolved_ids = Vec::with_capacity(ids.len());
+    for id in ids {
+        resolved_ids.push(resolve_container_id(&containers, id)?);
+    }
+    for resolved in resolved_ids {
+        println!("{resolved}");
+    }
     Ok(())
 }
 

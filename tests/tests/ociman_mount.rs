@@ -72,6 +72,44 @@ fn seed_and_run_stopped_container(
     id
 }
 
+/// Like [`seed_and_run_stopped_container`], but resolves the new
+/// container's own id via an explicit `--name` + `ps --filter
+/// name=...` instead of a bare `ps -a -q` — required the moment more
+/// than one container ever shares the same store at once, since a
+/// bare `ps -a -q` then prints one line *per* container, silently
+/// corrupting a plain `.trim()`'s "exactly one clean id" assumption
+/// (a real bug this module's own first multi-container test hit and
+/// fixed before landing, see `docs/design/0470`/`0471`).
+fn seed_and_run_stopped_container_named(
+    storage_root: &Path,
+    image: &str,
+    name: &str,
+    force_extract: bool,
+) -> String {
+    if force_extract {
+        std::fs::write(storage_root.join(".rootless-overlay-supported"), "false").unwrap();
+    }
+    let busybox = busybox_path().expect("busybox not found on $PATH");
+    let store = Store::open(storage_root).unwrap();
+    seed_image(&store, image, &busybox, &["sh"], ContainerConfig::default());
+    let run = ociman(
+        storage_root,
+        &["run", "--name", name, image, "sh", "-c", "exit 0"],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let ps = ociman(
+        storage_root,
+        &["ps", "-a", "-q", "--filter", &format!("name={name}")],
+    );
+    let id = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+    assert!(!id.is_empty(), "{ps:?}");
+    id
+}
+
 #[test]
 fn mount_prints_the_real_rootfs_path_of_a_stopped_container() {
     let Some(_busybox) = busybox_path() else {
@@ -413,4 +451,200 @@ fn mount_with_no_container_silently_skips_a_rootless_overlay_rootfs_container() 
             "stdout: {stdout:?}, id: {id}"
         );
     }
+}
+
+/// `ociman unmount CONTAINER CONTAINER...` (multiple explicit
+/// targets) — matching real `podman unmount`'s own multi-id support
+/// exactly. Each container's own id is printed, in the same order
+/// given.
+#[test]
+fn unmount_accepts_multiple_explicit_containers() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let first = seed_and_run_stopped_container_named(
+        storage_dir.path(),
+        "ociman-test/unmount-multi-first:latest",
+        "unmount-multi-first",
+        true,
+    );
+    let second = seed_and_run_stopped_container_named(
+        storage_dir.path(),
+        "ociman-test/unmount-multi-second:latest",
+        "unmount-multi-second",
+        true,
+    );
+
+    let unmount = ociman(storage_dir.path(), &["unmount", &first, &second]);
+    assert!(
+        unmount.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&unmount.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&unmount.stdout);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![first.as_str(), second.as_str()]
+    );
+}
+
+/// A real, two-phase resolution: every explicit target is resolved
+/// before anything is printed, so one unknown container among several
+/// aborts the whole call rather than partially succeeding — matching
+/// `cmd_kill`'s own already-established multi-id convention.
+#[test]
+fn unmount_with_one_unknown_container_among_several_aborts_before_printing_any() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let first = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/unmount-abort:latest",
+        "exit 0",
+        true,
+    );
+
+    let unmount = ociman(storage_dir.path(), &["unmount", &first, "does-not-exist"]);
+    assert!(!unmount.status.success());
+    assert!(
+        unmount.stdout.is_empty(),
+        "stdout: {}",
+        String::from_utf8_lossy(&unmount.stdout)
+    );
+}
+
+/// `ociman unmount --all`/`-a` — matching real `podman unmount --all`
+/// exactly for this project's own honest "every container is always
+/// already mounted" model: an unconditional sweep, every existing
+/// container's own id printed.
+#[test]
+fn unmount_all_prints_every_containers_own_id() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let first = seed_and_run_stopped_container_named(
+        storage_dir.path(),
+        "ociman-test/unmount-all-first:latest",
+        "unmount-all-first",
+        true,
+    );
+    let second = seed_and_run_stopped_container_named(
+        storage_dir.path(),
+        "ociman-test/unmount-all-second:latest",
+        "unmount-all-second",
+        true,
+    );
+
+    let unmount = ociman(storage_dir.path(), &["unmount", "--all"]);
+    assert!(
+        unmount.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&unmount.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&unmount.stdout);
+    let mut lines: Vec<&str> = stdout.lines().collect();
+    lines.sort();
+    let mut expected = vec![first.as_str(), second.as_str()];
+    expected.sort();
+    assert_eq!(lines, expected);
+}
+
+/// `ociman unmount --latest`/`-l` — matching real `podman unmount
+/// --latest` exactly.
+#[test]
+fn unmount_latest_targets_the_most_recently_created_container() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let _first = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/unmount-latest-first:latest",
+        "exit 0",
+        true,
+    );
+    // A real, wall-clock timestamp gap so the two containers' own
+    // `created` values are unambiguously ordered -- see `ociman_
+    // mount.rs`'s own `mount_with_no_container_lists_every_
+    // container_sorted_by_creation_time`'s identical doc comment for
+    // why 1200ms specifically.
+    std::thread::sleep(Duration::from_millis(1200));
+    let second = seed_and_run_stopped_container_named(
+        storage_dir.path(),
+        "ociman-test/unmount-latest-second:latest",
+        "unmount-latest-second",
+        true,
+    );
+
+    let unmount = ociman(storage_dir.path(), &["unmount", "--latest"]);
+    assert!(
+        unmount.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&unmount.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&unmount.stdout).trim(), second);
+}
+
+/// Matches real podman's own exact wording and check order, checked
+/// directly (`~/git/podman/cmd/podman/validate/args.go`'s own
+/// `CheckAllLatestAndIDFile`).
+#[test]
+fn unmount_all_and_latest_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let unmount = ociman(storage_dir.path(), &["unmount", "--all", "--latest"]);
+    assert!(!unmount.status.success());
+    assert!(
+        String::from_utf8_lossy(&unmount.stderr)
+            .contains("--all and --latest cannot be used together"),
+        "{}",
+        String::from_utf8_lossy(&unmount.stderr)
+    );
+}
+
+#[test]
+fn unmount_all_with_an_explicit_container_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let unmount = ociman(storage_dir.path(), &["unmount", "--all", "some-container"]);
+    assert!(!unmount.status.success());
+    assert!(
+        String::from_utf8_lossy(&unmount.stderr).contains("no arguments are needed with --all"),
+        "{}",
+        String::from_utf8_lossy(&unmount.stderr)
+    );
+}
+
+#[test]
+fn unmount_latest_with_an_explicit_container_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let unmount = ociman(
+        storage_dir.path(),
+        &["unmount", "--latest", "some-container"],
+    );
+    assert!(!unmount.status.success());
+    assert!(
+        String::from_utf8_lossy(&unmount.stderr)
+            .contains("--latest and containers cannot be used together"),
+        "{}",
+        String::from_utf8_lossy(&unmount.stderr)
+    );
+}
+
+#[test]
+fn unmount_with_nothing_given_at_all_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let unmount = ociman(storage_dir.path(), &["unmount"]);
+    assert!(!unmount.status.success());
+    assert!(
+        String::from_utf8_lossy(&unmount.stderr)
+            .contains("you must provide at least one name or id"),
+        "{}",
+        String::from_utf8_lossy(&unmount.stderr)
+    );
 }
