@@ -3,11 +3,13 @@
 //! `list`/`ls` (`docs/design/0431`, a real, genuine alias for
 //! `ociman ps` itself), `inspect` (`docs/design/0488`, a real alias
 //! for the top-level `ociman inspect` forced to container-only
-//! resolution), and `rm` (`docs/design/0489`, a real, byte-identical
-//! alias for the top-level `ociman rm` itself — see `ociman_ps.rs`
-//! for the top-level `rm`'s own much larger test suite; this file
-//! only proves the alias itself is byte-identical, not `rm`'s own
-//! full semantics again).
+//! resolution), `rm` (`docs/design/0489`, a real, byte-identical
+//! alias for the top-level `ociman rm` itself), and `stop`
+//! (`docs/design/0490`, the same byte-identical-alias shape for
+//! `ociman stop`) — see `ociman_ps.rs`/`ociman_stop.rs` for each
+//! top-level command's own much larger test suite; this file only
+//! proves each alias itself is byte-identical, not the aliased
+//! command's own full semantics again.
 //!
 //! `ociman container prune` removes every real, non-running container
 //! (this project's own `Created`/`Stopped`, never `Running`/`Paused`,
@@ -753,4 +755,101 @@ fn container_rm_force_kills_a_still_running_container_first() {
         String::from_utf8_lossy(&with_force.stderr)
     );
     assert!(all_ids(storage_dir.path()).is_empty());
+}
+
+/// `ociman container stop` (0490) is a real, byte-identical alias for
+/// the top-level `ociman stop`, matching real `podman container
+/// stop`'s own checked-directly identical `Use`/`Short`/`Long`/
+/// `RunE`/`Args`/`ValidArgsFunction` (and identical `stopFlags`-
+/// applied flag set) as top-level `podman stop` exactly (`~/git/
+/// podman/cmd/podman/containers/stop.go:36-101`). Full `stop`
+/// semantics (graceful signal/escalation, `--all`, `--cidfile`,
+/// `--ignore`, `--time`, `--signal`, `--filter`, `--latest`) are
+/// already exhaustively tested against the top-level command in
+/// `ociman_stop.rs`; this only proves the alias itself reaches the
+/// identical function with the identical fields.
+#[test]
+fn container_stop_is_a_byte_identical_alias_for_top_level_stop() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-stop-alias:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/container-stop-alias:latest",
+        &["sleep", "30"],
+    );
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let alias = ociman(storage_dir.path(), &["container", "stop", &id]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&alias.stdout).trim(), id);
+    assert_eq!(inspect_json(storage_dir.path(), &id)["status"], "stopped");
+}
+
+/// The alias's own flag set works too, not just the bare form —
+/// `--time`/`-t` (an immediate `KILL` with `0`) works through the
+/// alias exactly like the top-level `ociman stop --time`'s own
+/// already-established behavior.
+#[test]
+fn container_stop_time_flag_works_through_the_alias() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-stop-time:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/container-stop-time:latest",
+        &["sleep", "30"],
+    );
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let start = Instant::now();
+    let alias = ociman(storage_dir.path(), &["container", "stop", "-t", "0", &id]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(inspect_json(storage_dir.path(), &id)["status"], "stopped");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "a real --time 0 should stop nearly immediately, not wait out any grace period"
+    );
 }

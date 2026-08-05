@@ -4879,6 +4879,43 @@ enum ContainerCommand {
         #[arg(short = 'l', long)]
         latest: bool,
     },
+    /// `podman container stop`'s own real alias for the already-
+    /// existing flat [`Command::Stop`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/stop.go:36-101`: `containerStopCommand`
+    /// (`Parent: containerCmd`) and top-level `stopCommand` share the
+    /// exact same `Use`/`Short`/`Long`/`RunE`/`Args`/
+    /// `ValidArgsFunction`, and both get the identical flag set
+    /// applied via the one shared `stopFlags(cmd)` helper plus
+    /// `validate.AddLatestFlag` -- a byte-identical alias, the same
+    /// shape [`Self::Rm`] (`0489`) already established. Dispatches
+    /// into the same [`cmd_stop`] `ociman stop` itself already calls,
+    /// with the identical field set -- see [`Command::Stop`]'s own
+    /// doc comment for the exact semantics, not repeated here.
+    Stop {
+        /// Same as [`Command::Stop::ids`].
+        ids: Vec<String>,
+        /// Same as [`Command::Stop::time`].
+        #[arg(short, long)]
+        time: Option<u64>,
+        /// Same as [`Command::Stop::signal`].
+        #[arg(short, long)]
+        signal: Option<String>,
+        /// Same as [`Command::Stop::all`].
+        #[arg(short, long)]
+        all: bool,
+        /// Same as [`Command::Stop::cidfile`].
+        #[arg(long = "cidfile", value_name = "FILE")]
+        cidfile: Vec<PathBuf>,
+        /// Same as [`Command::Stop::ignore`].
+        #[arg(short, long)]
+        ignore: bool,
+        /// Same as [`Command::Stop::filter`].
+        #[arg(long = "filter")]
+        filter: Vec<String>,
+        /// Same as [`Command::Stop::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -5712,6 +5749,25 @@ fn main() -> std::process::ExitCode {
                     filter,
                     latest,
                 } => cmd_rm(&ids, force, all, &cidfile, ignore, time, &filter, latest),
+                ContainerCommand::Stop {
+                    ids,
+                    time,
+                    signal,
+                    all,
+                    cidfile,
+                    ignore,
+                    filter,
+                    latest,
+                } => cmd_stop(
+                    &ids,
+                    time,
+                    signal.as_deref(),
+                    all,
+                    &cidfile,
+                    ignore,
+                    &filter,
+                    latest,
+                ),
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),
