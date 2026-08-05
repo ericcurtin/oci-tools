@@ -4813,6 +4813,36 @@ enum ContainerCommand {
         #[arg(long)]
         run: bool,
     },
+    /// `podman container inspect`'s own real alias for the already-
+    /// existing flat [`Command::Inspect`], forced to container-only
+    /// resolution -- checked directly, `~/git/podman/cmd/podman/
+    /// containers/inspect.go:14-46`: `inspectCmd` (`Parent:
+    /// containerCmd`) shares the exact same flag set (`--size`/`-s`,
+    /// `--format`/`-f`, `--latest`/`-l`) as the richer top-level
+    /// `podman inspect`, but its own `inspectExec` unconditionally
+    /// sets `inspectOpts.Type = common.ContainerType` before calling
+    /// the identical shared `inspect.Inspect` -- never falling back
+    /// to an image the way this project's own top-level default
+    /// resolution otherwise would, the exact same "same flags, forced
+    /// type" shape [`ImageCommand::Inspect`] (`0482`) already
+    /// established for the image side. Dispatches into the same
+    /// [`cmd_inspect`] with [`InspectType::Container`] hardcoded, not
+    /// a user-facing choice here.
+    Inspect {
+        /// Same as [`Command::Inspect::reference`], but never falls
+        /// back to an image on a miss -- real `podman container
+        /// inspect` has no such fallback at all.
+        reference: Option<String>,
+        /// Same as [`Command::Inspect::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+        /// Same as [`Command::Inspect::format`].
+        #[arg(long = "format", short = 'f', value_name = "TEMPLATE")]
+        format: Option<String>,
+        /// Same as [`Command::Inspect::size`].
+        #[arg(short, long)]
+        size: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -5604,6 +5634,38 @@ fn main() -> std::process::ExitCode {
                     force,
                     run,
                 } => cmd_clone(&container, name.as_deref(), destroy, force, run),
+                ContainerCommand::Inspect {
+                    reference,
+                    latest,
+                    format,
+                    size,
+                } => {
+                    // Matches real podman's own exact wording,
+                    // checked directly (`~/git/podman/cmd/podman/
+                    // inspect/inspect.go`) -- the identical check the
+                    // top-level `Command::Inspect` arm already has;
+                    // its own sibling "latest is not supported for
+                    // type image" check is omitted here entirely
+                    // since this command's own type is always
+                    // `Container`, never reachable.
+                    anyhow::ensure!(
+                        !(latest && reference.is_some()),
+                        "--latest and arguments cannot be used together"
+                    );
+                    let resolved_reference = if latest {
+                        let containers = open_container_store()?;
+                        resolve_latest_container(&containers)?
+                    } else {
+                        reference.ok_or_else(|| anyhow::anyhow!("no names or ids specified"))?
+                    };
+                    cmd_inspect(
+                        &resolved_reference,
+                        cli.global.json,
+                        format.as_deref(),
+                        size,
+                        InspectType::Container,
+                    )
+                }
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),

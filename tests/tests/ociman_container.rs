@@ -1,7 +1,9 @@
 //! `ociman container` subcommand family integration tests
 //! (`docs/design/0357`): `exists` (see `ociman_exists.rs`), `prune`,
-//! and `list`/`ls` (`docs/design/0431`, a real, genuine alias for
-//! `ociman ps` itself).
+//! `list`/`ls` (`docs/design/0431`, a real, genuine alias for
+//! `ociman ps` itself), and `inspect` (`docs/design/0488`, a real
+//! alias for the top-level `ociman inspect` forced to container-only
+//! resolution).
 //!
 //! `ociman container prune` removes every real, non-running container
 //! (this project's own `Created`/`Stopped`, never `Running`/`Paused`,
@@ -447,4 +449,214 @@ fn container_prune_json_emits_an_array_of_removed_ids() {
     assert!(prune.status.success(), "{prune:?}");
     let json: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
     assert_eq!(json, serde_json::json!([id]));
+}
+
+/// `ociman container inspect` (0488) is a real, byte-identical alias
+/// for the top-level `ociman inspect --type container`, matching real
+/// `podman container inspect`'s own checked-directly identical flag
+/// set and `inspectExec`'s own unconditional `inspectOpts.Type =
+/// common.ContainerType` (`~/git/podman/cmd/podman/containers/
+/// inspect.go:43-46`) exactly.
+#[test]
+fn container_inspect_is_a_byte_identical_alias_for_top_level_inspect_forced_to_container_type() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-inspect-alias:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "ociman-test/container-inspect-alias:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+    let top_level = ociman(storage_dir.path(), &["inspect", "--type", "container", &id]);
+    assert!(top_level.status.success(), "{top_level:?}");
+
+    let alias = ociman(storage_dir.path(), &["container", "inspect", &id]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(alias.stdout, top_level.stdout);
+
+    // The identical flag set works through the alias too.
+    let top_level_fmt = ociman(
+        storage_dir.path(),
+        &["inspect", "--type", "container", "-f", "{{.id}}", &id],
+    );
+    let alias_fmt = ociman(
+        storage_dir.path(),
+        &["container", "inspect", "-f", "{{.id}}", &id],
+    );
+    assert!(alias_fmt.status.success());
+    assert_eq!(alias_fmt.stdout, top_level_fmt.stdout);
+    assert_eq!(String::from_utf8_lossy(&alias_fmt.stdout).trim(), id);
+}
+
+/// `ociman container inspect` never falls back to an image on a
+/// container miss, even when the given reference would otherwise
+/// resolve to a real one -- matching real `podman container inspect`
+/// exactly (it has no such fallback at all), the exact same
+/// "never resolves the other kind" contrast
+/// `inspect_type_container_never_resolves_an_image` already
+/// establishes for `ociman inspect --type container` itself.
+#[test]
+fn container_inspect_never_falls_back_to_an_image_on_a_container_miss() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-inspect-no-fallback:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    // No container ever created -- only the image exists.
+    let alias = ociman(
+        storage_dir.path(),
+        &[
+            "container",
+            "inspect",
+            "ociman-test/container-inspect-no-fallback:latest",
+        ],
+    );
+    assert!(!alias.status.success());
+    assert!(
+        String::from_utf8_lossy(&alias.stderr).contains("no such container"),
+        "{alias:?}"
+    );
+}
+
+/// `ociman container inspect --latest`/`-l` resolves the most
+/// recently created container, matching the top-level `ociman
+/// inspect --latest`'s own already-established behavior exactly.
+#[test]
+fn container_inspect_latest_works() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-inspect-latest:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let first = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "ociman-test/container-inspect-latest:latest",
+            "true",
+        ],
+    );
+    assert!(first.status.success(), "{first:?}");
+    // A real, wall-clock timestamp gap so the two containers' own
+    // `created` values are unambiguously ordered -- see `ociman_
+    // mount.rs`'s own `unmount_latest_targets_the_most_recently_
+    // created_container`'s identical doc comment for why 1200ms
+    // specifically.
+    std::thread::sleep(Duration::from_millis(1200));
+    let second = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "ociman-test/container-inspect-latest:latest",
+            "true",
+        ],
+    );
+    assert!(second.status.success(), "{second:?}");
+    let second_id = String::from_utf8_lossy(&second.stdout).trim().to_string();
+
+    let alias = ociman(
+        storage_dir.path(),
+        &["container", "inspect", "--latest", "-f", "{{.id}}"],
+    );
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&alias.stdout).trim(), second_id);
+
+    // `--latest` and an explicit reference together is a real error,
+    // matching the top-level `ociman inspect`'s own established rule.
+    let both = ociman(
+        storage_dir.path(),
+        &["container", "inspect", "--latest", &second_id],
+    );
+    assert!(!both.status.success());
+    assert!(
+        String::from_utf8_lossy(&both.stderr)
+            .contains("--latest and arguments cannot be used together"),
+        "{both:?}"
+    );
+}
+
+/// `ociman container inspect --size`/`-s` reports a real total file
+/// size, matching the top-level `ociman inspect --size`'s own
+/// already-established behavior exactly.
+#[test]
+fn container_inspect_size_works() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-inspect-size:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "ociman-test/container-inspect-size:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+    let alias = ociman(
+        storage_dir.path(),
+        &["container", "inspect", "--size", "--json", &id],
+    );
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&alias.stdout).unwrap();
+    assert!(
+        json["size"]["root_fs_size"].is_number(),
+        "expected a populated size field: {json:?}"
+    );
 }
