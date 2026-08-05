@@ -71,9 +71,35 @@ enum Command {
     /// refusal) rather than silently overwriting an existing box.
     Create {
         /// Image reference to base the box on (`--image`/`-i`,
-        /// matching real `distrobox create`'s own flag name exactly).
+        /// matching real `distrobox create`'s own flag name exactly)
+        /// — mutually exclusive with `--clone`; exactly one of the
+        /// two must be given.
         #[arg(long = "image", short = 'i', value_name = "REFERENCE")]
-        image: String,
+        image: Option<String>,
+        /// Clone an already-existing box's own current rootfs and
+        /// image-derived config (env, working directory) into this
+        /// new box instead of resolving `--image` — matching real
+        /// `distrobox create --clone`/`-c` exactly for this project's
+        /// own simpler "a box has no separate image-vs-container
+        /// storage at all" model (checked directly, `~/git/distrobox/
+        /// pkg/commands/create.go`'s own `clone` method: real
+        /// distrobox `podman commit`s the source container into a
+        /// brand-new image tag, then runs an ordinary `create` from
+        /// that — this project's own honest equivalent skips the
+        /// image round-trip entirely and just copies the source
+        /// box's own `rootfs/` directory directly, since there is no
+        /// separate image store to synthesize an intermediate image
+        /// in). Real distrobox's own "cannot clone a *running*
+        /// container" check has no equivalent here at all: a box has
+        /// no live, backgrounded process to be "running" in the first
+        /// place (`docs/design/0207`) — cloning is always safe.
+        /// `--hostname`/`--home`/`--volume` are independent of the
+        /// clone source, exactly like an ordinary `--image` create:
+        /// given explicitly, they override; left unset, their own
+        /// already-established defaults apply (never inherited from
+        /// the source box).
+        #[arg(long = "clone", short = 'c', value_name = "SOURCE_BOX")]
+        clone: Option<String>,
         /// Name for the box (`--name`/`-n`, matching real `distrobox
         /// create`'s own flag name exactly) — a conservative charset
         /// (letters, digits, `_`/`.`/`-`, starting with a letter or
@@ -558,6 +584,7 @@ fn main() -> std::process::ExitCode {
         match cli.command {
             Some(Command::Create {
                 image,
+                clone,
                 name,
                 pull,
                 yes: _,
@@ -566,7 +593,8 @@ fn main() -> std::process::ExitCode {
                 volume,
                 platform,
             }) => cmd_create(
-                &image,
+                image.as_deref(),
+                clone.as_deref(),
                 &name,
                 pull,
                 hostname.as_deref(),
@@ -804,7 +832,8 @@ fn validate_hostname(hostname: &str) -> anyhow::Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_create(
-    image: &str,
+    image: Option<&str>,
+    clone: Option<&str>,
     name: &str,
     pull: bool,
     hostname: Option<&str>,
@@ -812,7 +841,7 @@ fn cmd_create(
     volumes: &[String],
     platform: Option<&str>,
 ) -> anyhow::Result<()> {
-    create_box(image, name, pull, hostname, home, volumes, platform)?;
+    create_box(image, clone, name, pull, hostname, home, volumes, platform)?;
     println!("{name}");
     Ok(())
 }
@@ -826,7 +855,8 @@ fn cmd_create(
 /// without also inheriting `cmd_create`'s own final `println!`.
 #[allow(clippy::too_many_arguments)]
 fn create_box(
-    image: &str,
+    image: Option<&str>,
+    clone: Option<&str>,
     name: &str,
     pull: bool,
     hostname: Option<&str>,
@@ -834,6 +864,17 @@ fn create_box(
     volumes: &[String],
     platform: Option<&str>,
 ) -> anyhow::Result<()> {
+    // Matches real distrobox's own real underlying requirement
+    // (`~/git/distrobox/pkg/commands/create.go`'s own `make
+    // ContainerImage`: with neither given at all, it falls back to
+    // its own configured default image, a fallback this project
+    // deliberately doesn't replicate -- `--image` has always been
+    // required here) -- and `--clone`'s own new, real mutual
+    // exclusivity with it.
+    anyhow::ensure!(
+        image.is_some() != clone.is_some(),
+        "exactly one of --image or --clone must be given"
+    );
     validate_box_name(name)?;
     if let Some(hostname) = hostname {
         validate_hostname(hostname)?;
@@ -842,13 +883,6 @@ fn create_box(
         .iter()
         .map(|v| parse_box_volume(v))
         .collect::<anyhow::Result<Vec<BoxVolume>>>()?;
-    // `--platform` (0403): falls back to the real host's own default,
-    // the same `Platform::host()` this project's own image resolution
-    // already used unconditionally before this flag existed.
-    let platform = platform
-        .map(|p| oci_spec_types::image::parse_platform_spec("ocibox create/ephemeral", p))
-        .transpose()?
-        .unwrap_or_else(oci_spec_types::image::Platform::host);
 
     let box_dir = boxes_root().join(name);
     anyhow::ensure!(
@@ -856,6 +890,52 @@ fn create_box(
         "{name}: a box with this name already exists"
     );
 
+    let record_json = if let Some(source_name) = clone {
+        clone_box(source_name, &box_dir, name, hostname, home, volumes)?
+    } else {
+        let image = image.expect("validated above: exactly one of image/clone is given");
+        // `--platform` (0403): falls back to the real host's own
+        // default, the same `Platform::host()` this project's own
+        // image resolution already used unconditionally before this
+        // flag existed.
+        let platform = platform
+            .map(|p| oci_spec_types::image::parse_platform_spec("ocibox create/ephemeral", p))
+            .transpose()?
+            .unwrap_or_else(oci_spec_types::image::Platform::host);
+        create_box_from_image(
+            image, &box_dir, name, pull, hostname, home, volumes, &platform,
+        )?
+    };
+
+    let box_json_path = box_dir.join("box.json");
+    let result = (|| -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec_pretty(&record_json).context("serializing box record")?;
+        std::fs::write(&box_json_path, bytes)
+            .with_context(|| format!("writing {}", box_json_path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&box_dir);
+    }
+    result?;
+
+    Ok(())
+}
+
+/// The `--image`-driven path `create_box` always used before
+/// `--clone` existed: resolve (pulling per `pull`), extract a fresh
+/// rootfs, and build a [`BoxRecord`] from the resolved image's own
+/// config.
+#[allow(clippy::too_many_arguments)]
+fn create_box_from_image(
+    image: &str,
+    box_dir: &Path,
+    name: &str,
+    pull: bool,
+    hostname: Option<&str>,
+    home: Option<&Path>,
+    volumes: Vec<BoxVolume>,
+    platform: &oci_spec_types::image::Platform,
+) -> anyhow::Result<BoxRecord> {
     let reference =
         Reference::parse(image).with_context(|| format!("parsing image reference {image:?}"))?;
     let store =
@@ -867,8 +947,8 @@ fn create_box(
         oci_registry::PullPolicy::Missing
     };
     let record =
-        oci_registry::resolve_or_pull(&store, &reference, pull_policy, true, &platform, || {
-            oci_registry::pull_unconditionally(&store, &reference, true, &platform)
+        oci_registry::resolve_or_pull(&store, &reference, pull_policy, true, platform, || {
+            oci_registry::pull_unconditionally(&store, &reference, true, platform)
         })
         .with_context(|| format!("resolving {reference}"))?;
 
@@ -888,11 +968,11 @@ fn create_box(
         // a later `create` of the same name to trip over `box_dir`
         // already existing — best-effort, the original error is what
         // actually gets reported either way.
-        let _ = std::fs::remove_dir_all(&box_dir);
+        let _ = std::fs::remove_dir_all(box_dir);
     }
     result?;
 
-    let record_json = BoxRecord {
+    Ok(BoxRecord {
         name: name.to_string(),
         image: reference.to_string(),
         manifest_digest: record.manifest_digest.to_string(),
@@ -902,14 +982,83 @@ fn create_box(
         hostname: hostname.map(str::to_string),
         custom_home: home.map(Path::to_path_buf),
         volumes,
-    };
-    let box_json_path = box_dir.join("box.json");
-    std::fs::write(
-        &box_json_path,
-        serde_json::to_vec_pretty(&record_json).context("serializing box record")?,
-    )
-    .with_context(|| format!("writing {}", box_json_path.display()))?;
+    })
+}
 
+/// The `--clone`-driven path (see [`Command::Create::clone`]'s own
+/// doc comment for exactly why this skips the whole image round-trip
+/// `create_box_from_image` needs): copies `source_name`'s own current
+/// `rootfs/` directory verbatim into `box_dir`, and builds a
+/// [`BoxRecord`] carrying the source's own `image`/`env`/
+/// `working_dir` forward unchanged (there is no CLI override for any
+/// of those three at `create` time at all, cloned or not) alongside
+/// this call's own `hostname`/`home`/`volumes` (independent of the
+/// clone source, exactly like an ordinary `--image` create).
+fn clone_box(
+    source_name: &str,
+    box_dir: &Path,
+    name: &str,
+    hostname: Option<&str>,
+    home: Option<&Path>,
+    volumes: Vec<BoxVolume>,
+) -> anyhow::Result<BoxRecord> {
+    let source_dir = boxes_root().join(source_name);
+    let source_record: BoxRecord = {
+        let box_json_path = source_dir.join("box.json");
+        let bytes = std::fs::read(&box_json_path).with_context(|| {
+            format!("{source_name}: no such box (or its own box.json is unreadable)")
+        })?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {}", box_json_path.display()))?
+    };
+
+    let rootfs = box_dir.join("rootfs");
+    let result = copy_dir_recursive(&source_dir.join("rootfs"), &rootfs)
+        .with_context(|| format!("copying {source_name}'s own rootfs to {}", rootfs.display()));
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(box_dir);
+    }
+    result?;
+
+    Ok(BoxRecord {
+        name: name.to_string(),
+        image: source_record.image,
+        manifest_digest: source_record.manifest_digest,
+        created: oci_spec_types::time::format_rfc3339_utc(std::time::SystemTime::now()),
+        env: source_record.env,
+        working_dir: source_record.working_dir,
+        hostname: hostname.map(str::to_string),
+        custom_home: home.map(Path::to_path_buf),
+        volumes,
+    })
+}
+
+/// Recursively copies every file, directory, and symlink under `src`
+/// into `dst` (created fresh) — this project's own small, dependency-
+/// free equivalent of `cp -a`, needed since shelling out to `cp` is
+/// not one of this project's own allowed shell-outs (`ci/guards.py`).
+/// Regular files keep their source's own permission bits (`std::fs::
+/// copy` already does this on its own on Unix; set explicitly here
+/// too as a real, platform-independent guarantee rather than an
+/// implementation detail this code happens to depend on).
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if file_type.is_symlink() {
+            let target = std::fs::read_link(&src_path)?;
+            std::os::unix::fs::symlink(target, &dst_path)?;
+        } else if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+            let perms = std::fs::metadata(&src_path)?.permissions();
+            std::fs::set_permissions(&dst_path, perms)?;
+        }
+    }
     Ok(())
 }
 
@@ -1521,8 +1670,24 @@ fn cmd_ephemeral(
     command: &[String],
 ) -> anyhow::Result<()> {
     let name = unique_random_box_name()?;
-    create_box(image, &name, pull, hostname, home, volumes, platform)
-        .with_context(|| format!("creating ephemeral box {name}"))?;
+    // Real `distrobox ephemeral` does inherit `--clone` too (checked
+    // directly, `~/git/distrobox/internal/cli/ephemeral.go`'s own
+    // comment: "inherited create flags (e.g. -c/--clone)") -- a real,
+    // deliberately deferred gap for this project's own first slice
+    // (`ocibox create --clone` alone, not yet `ephemeral`), so `None`
+    // here always, never reachable from `ocibox ephemeral`'s own CLI
+    // surface yet.
+    create_box(
+        Some(image),
+        None,
+        &name,
+        pull,
+        hostname,
+        home,
+        volumes,
+        platform,
+    )
+    .with_context(|| format!("creating ephemeral box {name}"))?;
 
     // Real `distrobox ephemeral` has no `--clean-path` flag of its
     // own at all (checked directly, `~/git/distrobox/internal/cli/
