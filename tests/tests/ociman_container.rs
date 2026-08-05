@@ -9,10 +9,12 @@
 //! `ociman stop`), `start` (`docs/design/0491`, the same shape again
 //! for `ociman start`), `kill` (`docs/design/0492`, the same shape
 //! again for `ociman kill`), `pause`/`unpause` (`docs/design/0493`,
-//! the same shape again for `ociman pause`/`ociman unpause`), and
+//! the same shape again for `ociman pause`/`ociman unpause`),
 //! `restart` (`docs/design/0494`, the same shape again for `ociman
-//! restart`) — see `ociman_ps.rs`/`ociman_stop.rs`/`ociman_start.rs`/
-//! `ociman_kill.rs`/`ociman_pause.rs` for each top-level command's
+//! restart`), and `rename` (`docs/design/0495`, the same shape again
+//! for `ociman rename`, with no flags at all) — see `ociman_ps.rs`/
+//! `ociman_stop.rs`/`ociman_start.rs`/`ociman_kill.rs`/
+//! `ociman_pause.rs`/`ociman_rename.rs` for each top-level command's
 //! own much larger test suite; this file only proves each alias
 //! itself is byte-identical, not the aliased command's own full
 //! semantics again.
@@ -1165,4 +1167,75 @@ fn container_restart_is_a_byte_identical_alias_for_top_level_restart() {
     // Clean up the still-running container so the temp dir doesn't
     // leak a live process past this test.
     let _ = ociman(storage_dir.path(), &["kill", &id]);
+}
+
+/// `ociman container rename` (0495) is a real, byte-identical alias
+/// for the top-level `ociman rename`, matching real `podman container
+/// rename`'s own checked-directly identical `Use`/`Short`/`Long`/
+/// `RunE`/`Args`/`ValidArgsFunction` as top-level `podman rename`
+/// exactly (`~/git/podman/cmd/podman/containers/rename.go:11-41`) --
+/// the simplest byte-identical alias in the whole family, with no
+/// flags at all on either side. Full `rename` semantics (name
+/// validation, collision refusal, immediate usability of the new
+/// name) are already exhaustively tested against the top-level
+/// command in `ociman_rename.rs`; this only proves the alias itself
+/// reaches the identical function with the identical fields.
+#[test]
+fn container_rename_is_a_byte_identical_alias_for_top_level_rename() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-rename-alias:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "container-rename-old",
+            "ociman-test/container-rename-alias:latest",
+            "true",
+        ],
+    );
+    assert!(run.status.success(), "{run:?}");
+
+    let alias = ociman(
+        storage_dir.path(),
+        &[
+            "container",
+            "rename",
+            "container-rename-old",
+            "container-rename-new",
+        ],
+    );
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    // Real `docker`/`podman rename` print nothing at all on success.
+    assert!(alias.stdout.is_empty());
+
+    // The old name no longer resolves to anything.
+    let old_gone = ociman(
+        storage_dir.path(),
+        &["container", "exists", "container-rename-old"],
+    );
+    assert!(!old_gone.status.success());
+
+    // The new name is immediately usable wherever the old one was.
+    let rm = ociman(storage_dir.path(), &["rm", "container-rename-new"]);
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
 }

@@ -5064,6 +5064,25 @@ enum ContainerCommand {
         #[arg(short = 'l', long)]
         latest: bool,
     },
+    /// `podman container rename`'s own real alias for the already-
+    /// existing flat [`Command::Rename`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/rename.go:11-41`:
+    /// `containerRenameCommand` (`Parent: containerCmd`) and
+    /// top-level `renameCommand` share the exact same `Use`/`Short`/
+    /// `Long`/`RunE`/`Args`/`ValidArgsFunction` verbatim, with no
+    /// flags at all on either -- the simplest byte-identical alias in
+    /// the whole family, the same underlying shape [`Self::Kill`]
+    /// (`0492`) already established just with zero flags to mirror.
+    /// Dispatches into the same [`cmd_rename`] `ociman rename` itself
+    /// already calls, with the identical field set -- see
+    /// [`Command::Rename`]'s own doc comment for the exact semantics,
+    /// not repeated here.
+    Rename {
+        /// Same as [`Command::Rename::id`].
+        id: String,
+        /// Same as [`Command::Rename::name`].
+        name: String,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -5965,6 +5984,7 @@ fn main() -> std::process::ExitCode {
                     filter,
                     latest,
                 } => cmd_restart(&ids, time, all, &cidfile, &filter, latest),
+                ContainerCommand::Rename { id, name } => cmd_rename(&id, &name),
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),
