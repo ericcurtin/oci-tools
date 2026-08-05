@@ -4671,6 +4671,62 @@ enum ContainerCommand {
         #[arg(long = "filter")]
         filter: Vec<String>,
     },
+    /// Create a new, separate container from the exact same image and
+    /// effective config as an already-existing one -- matching real
+    /// `podman container clone` exactly for this project's own first,
+    /// deliberately narrower slice (checked directly, `~/git/podman/
+    /// cmd/podman/containers/clone.go`/`~/git/podman/pkg/domain/
+    /// infra/abi/containers.go`'s own `ContainerClone`): unlike real
+    /// podman's own much larger flag surface (every `create`-time
+    /// resource/health/etc. override, plus a positional `IMAGE`
+    /// argument that pulls a genuinely *different* image for the
+    /// clone), this first slice only ever clones from the exact same
+    /// image the source container itself already used
+    /// ([`ANNOTATION_IMAGE`]) -- a positional `IMAGE` override is a
+    /// real, deliberately deferred gap, not yet accepted at all. The
+    /// clone gets a fresh, independent rootfs extracted from that same
+    /// image (never a copy of the source's own current, possibly-
+    /// modified one -- matching real podman's own identical "a
+    /// genuinely new container, storage-wise" semantics), a byte-for-
+    /// byte copy of the source's own current `config.json` otherwise
+    /// (command, env, resource limits, labels, hostname, everything
+    /// already baked into it), and is always left `Created` (never
+    /// started) unless `--run` says otherwise -- the exact same "no
+    /// new runtime concept needed" reasoning `ociman create` itself
+    /// already established. Prints only the new container's own id,
+    /// matching real podman's own checked-directly bare-id output
+    /// exactly.
+    Clone {
+        /// The existing container's ID or `--name` to clone from.
+        container: String,
+        /// The new container's own name -- defaults to
+        /// `<source-name-or-id>-clone`, or `<...>-cloneN` for the
+        /// first free `N` if that's already taken too, matching real
+        /// podman's own identical checked-directly collision-
+        /// avoidance algorithm exactly (`~/git/podman/pkg/specgen/
+        /// generate/container.go`'s own `CheckName`).
+        name: Option<String>,
+        /// Remove the source container after successfully creating
+        /// the clone -- matching real `podman container clone
+        /// --destroy` exactly. Requires the source to already be
+        /// stopped, unless `--force` is also given (the same rule
+        /// `ociman rm` itself already enforces without `--force`).
+        #[arg(long)]
+        destroy: bool,
+        /// Force `--destroy` to remove the source container even
+        /// while it's still running -- matching real `podman
+        /// container clone --force`/`-f` exactly. A real, immediate
+        /// error when given without `--destroy` too (checked
+        /// directly, `clone.go`'s own `"cannot set --force without
+        /// --destroy"`).
+        #[arg(short, long)]
+        force: bool,
+        /// Start the clone (detached, never attached) immediately
+        /// after creating it -- matching real `podman container
+        /// clone --run` exactly.
+        #[arg(long)]
+        run: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -5246,6 +5302,13 @@ fn main() -> std::process::ExitCode {
                 ContainerCommand::Prune { force: _, filter } => {
                     cmd_container_prune(cli.global.json, &filter)
                 }
+                ContainerCommand::Clone {
+                    container,
+                    name,
+                    destroy,
+                    force,
+                    run,
+                } => cmd_clone(&container, name.as_deref(), destroy, force, run),
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),
@@ -10015,6 +10078,168 @@ fn cmd_container_prune(json: bool, filter: &[String]) -> anyhow::Result<()> {
         for id in &removed {
             println!("{id}");
         }
+    }
+    Ok(())
+}
+
+/// `ociman container clone` — see [`ContainerCommand::Clone`]'s own
+/// doc comment for the exact real scope and its checked-directly
+/// divergences from real podman's own much larger flag surface.
+fn cmd_clone(
+    container: &str,
+    name: Option<&str>,
+    destroy: bool,
+    force: bool,
+    run: bool,
+) -> anyhow::Result<()> {
+    // Matches real podman's own exact wording, checked directly
+    // (`~/git/podman/cmd/podman/containers/clone.go`).
+    anyhow::ensure!(!force || destroy, "cannot set --force without --destroy");
+
+    let containers = open_container_store()?;
+    let source_id = resolve_container_id(&containers, container)?;
+    let source_state = containers.load(&source_id)?;
+    let source_bundle_dir = containers.container_dir(&source_id);
+    let source_bundle = oci_runtime_core::Bundle::load(&source_bundle_dir)
+        .with_context(|| format!("loading bundle from {}", source_bundle_dir.display()))?;
+
+    let image_ref = source_state
+        .annotations
+        .get(ANNOTATION_IMAGE)
+        .with_context(|| format!("container {container:?} has no recorded image to clone from"))?
+        .clone();
+    let store = open_store()?;
+    let record = store
+        .resolve_image(&image_ref)
+        .with_context(|| format!("resolving image {image_ref:?}"))?
+        .with_context(|| {
+            format!("image {image_ref:?} (used to create container {container:?}) no longer exists")
+        })?;
+    let manifest = store
+        .image_manifest(&record)
+        .with_context(|| format!("reading manifest for {image_ref:?}"))?;
+
+    // Real podman's own identical default, checked directly
+    // (`~/git/podman/pkg/domain/infra/abi/containers.go`'s own
+    // `ContainerClone`): `<source-name-or-id>-clone`, or `-cloneN`
+    // for the first free `N` if that's already taken too (`~/git/
+    // podman/pkg/specgen/generate/container.go`'s own `CheckName`).
+    let new_name = match name {
+        Some(name) => {
+            validate_container_name(name)?;
+            anyhow::ensure!(
+                resolve_container_id(&containers, name).is_err(),
+                "container name {name:?} is already in use"
+            );
+            name.to_string()
+        }
+        None => {
+            let source_name = source_state
+                .annotations
+                .get(ANNOTATION_NAME)
+                .cloned()
+                .unwrap_or_else(|| source_id.clone());
+            let base = format!("{source_name}-clone");
+            if resolve_container_id(&containers, &base).is_err() {
+                base
+            } else {
+                let mut n = 1u64;
+                loop {
+                    let candidate = format!("{base}{n}");
+                    if resolve_container_id(&containers, &candidate).is_err() {
+                        break candidate;
+                    }
+                    n += 1;
+                }
+            }
+        }
+    };
+
+    let mut annotations = source_state.annotations.clone();
+    annotations.insert(ANNOTATION_NAME.to_string(), new_name);
+    let (new_id, mut new_state) = create_container_record(&containers, &annotations)?;
+    let new_bundle_dir = containers.container_dir(&new_id);
+    let new_rootfs_dir = new_bundle_dir.join("rootfs");
+
+    let prepared = (|| -> anyhow::Result<()> {
+        std::fs::create_dir_all(&new_rootfs_dir)
+            .with_context(|| format!("creating {}", new_rootfs_dir.display()))?;
+        // A fresh, independent rootfs extracted from the same image —
+        // never a copy of the source's own current, possibly-modified
+        // one, matching real podman's own identical "a genuinely new
+        // container, storage-wise" semantics (see this command's own
+        // doc comment). Deliberately the plain `Extract` path only,
+        // not this project's own separate rootless-overlay-rootfs
+        // optimization (`rootfs_setup`) — a real, honest scope
+        // narrowing for this first slice, not a correctness gap: the
+        // clone is still fully correct, just always the slower-but-
+        // universal extraction path.
+        for layer in &manifest.layers {
+            let compression = compression_for_media_type(&layer.media_type)
+                .with_context(|| format!("layer {}", layer.digest))?;
+            let blob = store
+                .open_blob(&layer.digest)
+                .with_context(|| format!("opening layer blob {}", layer.digest))?;
+            oci_layer::apply(blob, compression, &new_rootfs_dir)
+                .with_context(|| format!("applying layer {}", layer.digest))?;
+        }
+
+        // A byte-for-byte copy of the source's own current
+        // `config.json` otherwise — command, env, resource limits,
+        // labels, hostname, everything already baked into it, exactly
+        // matching real podman's own `ConfigToSpec`-based "derive the
+        // new spec directly from the existing container's own current
+        // config" approach rather than re-deriving it from CLI flags
+        // (which would be lossy: this project's own persisted state
+        // has no way to tell an image-provided env var apart from an
+        // explicit `--env` override after the fact).
+        let mut spec = source_bundle.spec.clone();
+        if let Some(root) = spec.root.as_mut() {
+            root.path = new_rootfs_dir.display().to_string();
+        }
+        let config_path = new_bundle_dir.join("config.json");
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&spec)?)
+            .with_context(|| format!("writing {}", config_path.display()))?;
+
+        let bundle = oci_runtime_core::Bundle::load(&new_bundle_dir)
+            .with_context(|| format!("loading bundle from {}", new_bundle_dir.display()))?;
+        oci_runtime_core::validate::validate(&bundle).context("config.json failed validation")?;
+        Ok(())
+    })();
+    if let Err(e) = prepared {
+        let _ = containers.remove(&new_id);
+        return Err(e);
+    }
+    // `create_container_record` leaves a fresh record in `Status::
+    // Creating` (its own placeholder default before the real create
+    // logic finishes) -- finalized here to `Status::Created`, the
+    // same real state `cmd_create` itself always leaves a brand new
+    // container in (see this command's own doc comment: no new
+    // runtime concept needed, the clone is never launched by this
+    // command itself unless `--run` says otherwise).
+    new_state.status = Status::Created;
+    containers.write(&new_state)?;
+
+    // Matches real podman's own identical ordering, checked directly
+    // (`ContainerClone`): destroy the source, then run the clone, all
+    // *before* the new id is ever printed.
+    if destroy {
+        remove_container(&containers, &source_id, force, None, true)
+            .with_context(|| format!("removing source container {container:?}"))?;
+    }
+    if run {
+        // `cmd_start`'s own reused path already prints the new id
+        // itself once it confirms the clone actually started
+        // (`launch_detached_and_confirm`'s own `print_id` parameter,
+        // `0186`) -- printing it again below too would be a real,
+        // previously-hit double-print bug (caught by this increment's
+        // own `clone_run_starts_the_clone_detached` test before
+        // landing), not a second, separate real output real podman
+        // itself ever produces either (`clone.go`'s own single
+        // `fmt.Println(rep.Id)`, unconditional on `--run`).
+        cmd_start(&new_id, false)?;
+    } else {
+        println!("{new_id}");
     }
     Ok(())
 }
