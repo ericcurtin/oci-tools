@@ -3879,6 +3879,152 @@ fn run_cpu_rt_flags_are_accepted_but_set_no_real_systemd_property_at_all() {
     );
 }
 
+/// `--cgroup-parent` (matching real `docker run`/`podman run
+/// --cgroup-parent` exactly) sets the real transient scope's own
+/// `Slice=` unit property -- previously unreachable from any `ociman`
+/// CLI flag at all. `app.slice` is a real, already-existing default
+/// slice on any `systemd --user` session (confirmed directly, `system
+/// ctl --user list-units '*.slice'`), safe to target without first
+/// needing to create a brand new one.
+#[test]
+fn run_cgroup_parent_sets_the_real_systemd_scopes_own_slice_property() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cgroup-parent:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "run",
+            "--rm",
+            "--cgroup-parent",
+            "app.slice",
+            "ociman-test/cgroup-parent:latest",
+        ])
+        .args(["/bin/sh", "-c", "sleep 10"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run");
+
+    let container_id = only_container_id(storage_dir.path(), Duration::from_secs(10));
+    assert!(!container_id.is_empty(), "container never appeared in `ps`");
+    let status = wait_for_running(storage_dir.path(), &container_id, Duration::from_secs(20));
+    assert_eq!(status, "running", "container never reached `running`");
+    let scope_name = real_scope_name(storage_dir.path(), &container_id);
+
+    let show = Command::new("systemctl")
+        .args(["--user", "show", &scope_name, "-p", "Slice", "--value"])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let slice = String::from_utf8_lossy(&show.stdout).trim().to_string();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(
+        slice, "app.slice",
+        "expected the real systemd scope's own Slice to reflect --cgroup-parent app.slice"
+    );
+}
+
+/// `--cgroup-parent` persists across a `create`-then-later-`start`,
+/// matching real podman's own "set once, persists for the container's
+/// whole lifetime" architecture exactly (checked directly,
+/// `~/git/podman/libpod/container_internal_linux.go`'s own
+/// `c.config.CgroupParent`, read fresh on every real (re)start rather
+/// than only the first) -- `ociman start` has no `--cgroup-parent`
+/// flag of its own at all, the same "only whatever the container was
+/// originally `run`/`create`d with matters" shape `--interactive`
+/// already established.
+#[test]
+fn create_cgroup_parent_persists_for_a_later_separate_start() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/create-cgroup-parent:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let create = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "create",
+            "--cgroup-parent",
+            "app.slice",
+            "ociman-test/create-cgroup-parent:latest",
+            "/bin/sh",
+            "-c",
+            "sleep 10",
+        ])
+        .output()
+        .expect("failed to spawn ociman create");
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let container_id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    assert!(!container_id.is_empty());
+
+    let mut start = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["start", &container_id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman start");
+
+    let status = wait_for_running(storage_dir.path(), &container_id, Duration::from_secs(20));
+    assert_eq!(status, "running", "container never reached `running`");
+    let scope_name = real_scope_name(storage_dir.path(), &container_id);
+
+    let show = Command::new("systemctl")
+        .args(["--user", "show", &scope_name, "-p", "Slice", "--value"])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let slice = String::from_utf8_lossy(&show.stdout).trim().to_string();
+
+    let _ = start.kill();
+    let _ = start.wait();
+
+    assert_eq!(
+        slice, "app.slice",
+        "expected --cgroup-parent app.slice, given at create time, to still apply at a later, \
+         separate start"
+    );
+}
+
 /// Same technique as the `--cpus` test above (query the real systemd
 /// scope's own resource property rather than trying to prove kernel
 /// enforcement directly), for `--memory-swap`: a *combined*

@@ -150,6 +150,12 @@ pub enum CgroupSetup {
         /// would make every `CgroupSetup::FromSpec` value pay for
         /// space it never uses (clippy's own `large_enum_variant`).
         resources: Option<Box<LinuxResources>>,
+        /// `--cgroup-parent` (`ociman run/create --cgroup-parent`,
+        /// matching real `docker run`/`podman run --cgroup-parent`
+        /// exactly) — see [`systemd_cgroup::create_scope`]'s own doc
+        /// comment for the exact real semantics and citation. `None`
+        /// leaves systemd's own default slice in place.
+        parent_slice: Option<String>,
     },
 }
 
@@ -338,6 +344,7 @@ pub unsafe fn run_reporting_pid(
         scope_name,
         description,
         resources,
+        parent_slice,
     } = &cgroup_setup
     {
         match systemd_cgroup::create_scope(
@@ -345,6 +352,7 @@ pub unsafe fn run_reporting_pid(
             scope_name,
             description,
             resources.as_deref(),
+            parent_slice.as_deref(),
         ) {
             Ok(dir) => {
                 // `resources.unified` (0398): the real systemd D-Bus

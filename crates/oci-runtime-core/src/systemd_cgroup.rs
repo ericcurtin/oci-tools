@@ -113,6 +113,21 @@ const JOB_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// `systemd --user`, the only mode this rootless-only project runs
 /// containers in so far) — not the system bus.
 ///
+/// `parent_slice` (`ociman run/create --cgroup-parent`, matching real
+/// `docker run`/`podman run --cgroup-parent` exactly): sets the real
+/// systemd `Slice=` unit property, placing the new scope under that
+/// slice instead of systemd's own default (checked directly, real
+/// crun's own `cgroup-systemd.c`'s own `get_systemd_scope_and_slice`
+/// sets the identical `"Slice"` D-Bus property from the exact same
+/// kind of caller-supplied string, with no transformation of its own
+/// either — the caller is expected to already supply a real,
+/// `.slice`-suffixed unit name, matching real docker's/podman's own
+/// identical "no CLI-side validation, pass straight through"
+/// philosophy this project already established for `--cpuset-cpus`/
+/// `--cpuset-mems`). `None` leaves systemd's own default in place
+/// (whatever slice the calling `--user` session's own default
+/// delegation already assigns new scopes to).
+///
 /// # A real hang, found by stress-testing concurrent invocations, not by inspection
 ///
 /// The entire D-Bus interaction below runs in a dedicated background
@@ -151,6 +166,7 @@ pub fn create_scope(
     scope_name: &str,
     description: &str,
     resources: Option<&LinuxResources>,
+    parent_slice: Option<&str>,
 ) -> io::Result<PathBuf> {
     if !scope_name.ends_with(".scope") {
         return Err(io::Error::new(
@@ -162,6 +178,7 @@ pub fn create_scope(
     let scope_name_owned = scope_name.to_string();
     let description_owned = description.to_string();
     let resources_owned = resources.cloned();
+    let parent_slice_owned = parent_slice.map(str::to_string);
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     // Deliberately not joined: if the timeout below fires, this thread
     // is simply abandoned (there is no way to cancel a blocked `zbus`
@@ -175,6 +192,7 @@ pub fn create_scope(
             &scope_name_owned,
             &description_owned,
             resources_owned.as_ref(),
+            parent_slice_owned.as_deref(),
         );
         let _ = result_tx.send(result);
     });
@@ -203,6 +221,7 @@ fn create_scope_dbus_roundtrip(
     scope_name: &str,
     description: &str,
     resources: Option<&LinuxResources>,
+    parent_slice: Option<&str>,
 ) -> io::Result<PathBuf> {
     let connection = Connection::session().map_err(to_io_error)?;
 
@@ -240,6 +259,14 @@ fn create_scope_dbus_roundtrip(
     ];
     if let Some(resources) = resources {
         properties.extend(resource_properties(resources));
+    }
+    // `--cgroup-parent` (see [`create_scope`]'s own doc comment for
+    // the exact real semantics and citation) — placed after
+    // `resources` so a caller-supplied slice always wins regardless
+    // of ordering (there is no actual conflict possible: `resource_
+    // properties` never emits a `"Slice"` entry of its own).
+    if let Some(slice) = parent_slice {
+        properties.push(("Slice", Value::from(slice)));
     }
     let auxiliary_units: Vec<(&str, Vec<(&str, Value)>)> = vec![];
 
@@ -850,7 +877,7 @@ mod tests {
 
     #[test]
     fn create_scope_rejects_a_name_not_ending_in_dot_scope() {
-        let err = create_scope(1, "not-a-scope", "test", None).unwrap_err();
+        let err = create_scope(1, "not-a-scope", "test", None, None).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
@@ -909,6 +936,7 @@ mod tests {
             &scope_name,
             "oci-runtime-core test scope",
             Some(&resources),
+            None,
         );
 
         // Ask systemd itself what it actually recorded for MemoryMax,

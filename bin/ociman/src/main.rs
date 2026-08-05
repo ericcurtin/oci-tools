@@ -177,6 +177,18 @@ const ANNOTATION_INTERACTIVE: &str = "io.oci-tools.interactive";
 /// whose own launch never got far enough to record it, in which case
 /// nothing was ever created under either name anyway).
 const ANNOTATION_SCOPE_NONCE: &str = "io.oci-tools.scope-nonce";
+/// `--cgroup-parent`'s own given value (`ociman run/create
+/// --cgroup-parent`, matching real `docker run`/`podman run
+/// --cgroup-parent` exactly) — persisted the same way `ANNOTATION_
+/// INTERACTIVE` already is: fixed once, at creation, the same real
+/// systemd `Slice=` unit property (`oci_runtime_core::systemd_cgroup::
+/// create_scope`'s own `parent_slice`) applies to *every* later launch
+/// of this same container (`ociman start`, not just the original
+/// `run`), matching real podman's own identical "set once, persists
+/// for the container's whole lifetime" architecture (`c.config.
+/// CgroupParent`, read fresh on every real (re)start rather than only
+/// the first).
+const ANNOTATION_CGROUP_PARENT: &str = "io.oci-tools.cgroup-parent";
 
 /// The real environment a container gets when its own image config
 /// declares *none at all* (`ContainerConfig.env` empty) — a real,
@@ -613,6 +625,22 @@ struct RunArgs {
     /// flag missing to reach it from `ociman run`/`create` at all.
     #[arg(long = "blkio-weight")]
     blkio_weight: Option<u16>,
+    /// Optional parent cgroup for the container, matching real
+    /// `docker run`/`podman run --cgroup-parent` exactly (checked
+    /// directly, `~/git/podman/cmd/podman/common/create.go`'s own
+    /// `cgroupParentFlagName`): sets the real systemd `Slice=` unit
+    /// property, placing this container's own transient scope under
+    /// that slice instead of systemd's own default — see
+    /// `oci_runtime_core::systemd_cgroup::create_scope`'s own doc
+    /// comment for the exact real semantics (a caller-supplied,
+    /// already-`.slice`-suffixed unit name, passed straight through
+    /// with no transformation of its own, matching real crun's own
+    /// identical `Slice` D-Bus property). Persisted (`ANNOTATION_
+    /// CGROUP_PARENT`) so a later `ociman start` still applies it,
+    /// matching real podman's own "set once, persists for the
+    /// container's whole lifetime" architecture.
+    #[arg(long = "cgroup-parent")]
+    cgroup_parent: Option<String>,
     /// Set a resource limit for the container's own process,
     /// repeatable — matching real `docker run --ulimit`/`podman run
     /// --ulimit` exactly: `NAME=soft[:hard]`, `-1` for either value
@@ -9105,6 +9133,18 @@ fn cmd_run(
             .insert(ANNOTATION_INTERACTIVE.to_string(), "true".to_string());
         containers.write(&state)?;
     }
+    if let Some(cgroup_parent) = &args.cgroup_parent {
+        // Same reasoning, same mechanism, as `interactive` just above
+        // (see `ANNOTATION_CGROUP_PARENT`'s own doc comment): a later
+        // `ociman start` needs this to still apply the real systemd
+        // `Slice=` unit property, matching real podman's own identical
+        // "set once, persists for the container's whole lifetime"
+        // behavior.
+        state
+            .annotations
+            .insert(ANNOTATION_CGROUP_PARENT.to_string(), cgroup_parent.clone());
+        containers.write(&state)?;
+    }
 
     if detach {
         // SAFETY: `ociman`'s own process has not spawned any additional
@@ -9127,6 +9167,7 @@ fn cmd_run(
                 // container's own stdin is always closed either way.
                 false,
                 preserve_fds,
+                args.cgroup_parent.clone(),
             )?;
         }
         // Only now, after the new detached keeper has already been
@@ -9151,6 +9192,7 @@ fn cmd_run(
         rm,
         interactive,
         preserve_fds,
+        args.cgroup_parent.as_deref(),
     )?;
 
     // Same deferred-reset reasoning as the `detach` branch above --
@@ -9209,6 +9251,11 @@ fn cmd_create(args: RunArgs, rm: bool, interactive: bool) -> anyhow::Result<()> 
         state
             .annotations
             .insert(ANNOTATION_INTERACTIVE.to_string(), "true".to_string());
+    }
+    if let Some(cgroup_parent) = &args.cgroup_parent {
+        state
+            .annotations
+            .insert(ANNOTATION_CGROUP_PARENT.to_string(), cgroup_parent.clone());
     }
     containers.write(&state)?;
     // Safe to perform immediately, unlike `cmd_run`'s own identical
@@ -9272,6 +9319,7 @@ unsafe fn launch_detached_and_confirm(
     print_id: bool,
     interactive: bool,
     preserve_fds: u32,
+    cgroup_parent: Option<String>,
 ) -> anyhow::Result<()> {
     let container_id_for_keeper = container_id.to_string();
 
@@ -9354,6 +9402,7 @@ unsafe fn launch_detached_and_confirm(
                 rm,
                 interactive,
                 preserve_fds,
+                cgroup_parent.as_deref(),
             ) {
                 Ok(_) => 0,
                 Err(_) => oci_runtime_core::launch::SETUP_FAILURE_EXIT_CODE,
@@ -9407,6 +9456,7 @@ fn run_and_finalize(
     rm: bool,
     interactive: bool,
     preserve_fds: u32,
+    cgroup_parent: Option<&str>,
 ) -> anyhow::Result<i32> {
     // A fresh scope-name nonce for *this* launch (0159) — set on
     // `state` in memory now, piggy-backed on `record_running`'s own
@@ -9460,6 +9510,7 @@ fn run_and_finalize(
             .as_ref()
             .and_then(|l| l.resources.clone())
             .map(Box::new),
+        parent_slice: cgroup_parent.map(str::to_string),
     };
 
     // SAFETY: forwarded from this function's own two call sites (see
@@ -12425,6 +12476,12 @@ fn cmd_start(id: &str, attach: bool) -> anyhow::Result<()> {
     // container was originally `run`/`create`d with does — see
     // `ANNOTATION_INTERACTIVE`'s own doc comment).
     let interactive = state.annotations.contains_key(ANNOTATION_INTERACTIVE);
+    // Same reasoning, same mechanism, for `--cgroup-parent` (see
+    // `ANNOTATION_CGROUP_PARENT`'s own doc comment): `ociman start`
+    // has no `--cgroup-parent` flag of its own either, matching real
+    // podman's own identical "only whatever the container was
+    // originally `run`/`create`d with matters" behavior.
+    let cgroup_parent = state.annotations.get(ANNOTATION_CGROUP_PARENT).cloned();
 
     // Matches `cmd_run`'s own initial `Creating` status: the shared
     // `wait_for_detached_container_to_start` this reuses waits for
@@ -12460,6 +12517,7 @@ fn cmd_start(id: &str, attach: bool) -> anyhow::Result<()> {
             // container is simply being resumed, not launched with a
             // brand new set of caller-provided fds.
             0,
+            cgroup_parent,
         )?;
     }
     if attach {

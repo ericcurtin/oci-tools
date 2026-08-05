@@ -288,6 +288,18 @@ fn run(args: &[String]) -> anyhow::Result<()> {
                     .as_ref()
                     .and_then(|l| l.resources.clone())
                     .map(Box::new),
+                // Real CRI *does* have an equivalent
+                // (`LinuxPodSandboxConfig.cgroup_parent`, `crates/
+                // oci-cri-types/proto/api.proto`'s own field 1, "the
+                // container runtime can convert it to systemd
+                // semantics if needed" -- exactly this project's own
+                // new `Slice=` translation), but reading it out of
+                // the sandbox config and threading it through here is
+                // a real, deliberately deferred gap, not fixed in the
+                // same increment that adds `--cgroup-parent` to
+                // `ociman run`/`create` (see `docs/design/0465`'s own
+                // "still out of scope" note).
+                parent_slice: None,
             },
             // No attach/interactive concept at this layer (real CRI
             // streaming attach is its own future RPC). Output goes to

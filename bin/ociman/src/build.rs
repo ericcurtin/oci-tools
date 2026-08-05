@@ -1970,6 +1970,15 @@ fn run_instruction(
             scope_name: format!("ociman-build-{}.scope", crate::short_id()),
             description: "oci-tools build RUN step".to_string(),
             resources: Some(Box::new(resources.clone())),
+            // Real `podman build --cgroup-parent` exists (checked
+            // directly, `~/git/podman/vendor/go.podman.io/buildah/
+            // pkg/cli/common.go`'s own `CommonBuildOptions`), unlike
+            // every other flag `0453`-`0464` found genuinely absent
+            // from `build` -- a real, deliberately deferred gap, not
+            // fixed in the same increment that adds `--cgroup-parent`
+            // to `ociman run`/`create` (see `docs/design/0465`'s own
+            // "still out of scope" note).
+            parent_slice: None,
         },
         None => oci_runtime_core::launch::CgroupSetup::FromSpec,
     };
