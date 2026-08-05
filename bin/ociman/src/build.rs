@@ -261,6 +261,7 @@ pub fn cmd_build(
     no_hosts: bool,
     no_hostname: bool,
     omit_history: bool,
+    cgroup_parent: Option<&str>,
     quiet: bool,
     json: bool,
     timestamp: Option<i64>,
@@ -573,6 +574,7 @@ pub fn cmd_build(
             resources: &resources,
             http_proxy,
             omit_history,
+            cgroup_parent,
         };
         let force_rootfs = copy_from_targets.contains(&stage_index);
         // `--squash`/`--squash-all` only ever apply to the target
@@ -949,6 +951,17 @@ struct StageContext<'a> {
     /// real buildah's own identical distinction. Build-wide, no
     /// per-stage/per-instruction override.
     omit_history: bool,
+    /// `--cgroup-parent`'s own given value, if any — carried here for
+    /// the same reason `resources`/`http_proxy`/`omit_history` are.
+    /// Sets the real systemd `Slice=` unit property for every `RUN`
+    /// step's own transient scope, matching real `podman build
+    /// --cgroup-parent` exactly (checked directly, `~/git/podman/
+    /// vendor/go.podman.io/buildah/pkg/cli/common.go`'s own
+    /// `CommonBuildOptions.CgroupParent`) — see `ociman run/create
+    /// --cgroup-parent`'s own doc comment (`0465`) for the exact real
+    /// `Slice=` semantics this reuses verbatim. Build-wide, no
+    /// per-stage/per-instruction override.
+    cgroup_parent: Option<&'a str>,
 }
 
 impl StageContext<'_> {
@@ -1628,6 +1641,7 @@ fn apply_instruction(
                 stage_ctx.resources,
                 stage_ctx.http_proxy,
                 stage_ctx.omit_history,
+                stage_ctx.cgroup_parent,
             )?;
         }
         Instruction::Copy {
@@ -1882,6 +1896,7 @@ fn run_instruction(
     resources: &Option<oci_spec_types::runtime::LinuxResources>,
     http_proxy: bool,
     omit_history: bool,
+    cgroup_parent: Option<&str>,
 ) -> anyhow::Result<()> {
     let args = args_for_run(shell_or_exec, current_shell);
     let command_text = args.join(" ");
@@ -1960,27 +1975,30 @@ fn run_instruction(
     // transient systemd scope instead" split). So this `RUN` step
     // gets the exact same treatment `ociman run`/`create` already do
     // (see `cmd_run`'s own identical `cgroup_setup` construction) —
-    // but *only* when `resources` is actually `Some(...)` at all
-    // (i.e. `--memory`/`--memory-swap` was actually given): the
-    // overwhelmingly common no-flag case keeps the original, lighter
-    // `FromSpec`/no-real-cgroup path completely unchanged, so this
-    // never costs anything for a build that doesn't use either flag.
-    let cgroup_setup = match resources {
-        Some(resources) => oci_runtime_core::launch::CgroupSetup::Systemd {
+    // but *only* when `resources` is actually `Some(...)` *or*
+    // `--cgroup-parent` was given (0465: a real scope still needs to
+    // exist for a `Slice=` property to mean anything at all, even
+    // with no other resource limit set): the overwhelmingly common
+    // no-flag case keeps the original, lighter `FromSpec`/no-real-
+    // cgroup path completely unchanged, so this never costs anything
+    // for a build that doesn't use any of these flags.
+    let cgroup_setup = if resources.is_some() || cgroup_parent.is_some() {
+        oci_runtime_core::launch::CgroupSetup::Systemd {
             scope_name: format!("ociman-build-{}.scope", crate::short_id()),
             description: "oci-tools build RUN step".to_string(),
-            resources: Some(Box::new(resources.clone())),
-            // Real `podman build --cgroup-parent` exists (checked
-            // directly, `~/git/podman/vendor/go.podman.io/buildah/
-            // pkg/cli/common.go`'s own `CommonBuildOptions`), unlike
-            // every other flag `0453`-`0464` found genuinely absent
-            // from `build` -- a real, deliberately deferred gap, not
-            // fixed in the same increment that adds `--cgroup-parent`
-            // to `ociman run`/`create` (see `docs/design/0465`'s own
-            // "still out of scope" note).
-            parent_slice: None,
-        },
-        None => oci_runtime_core::launch::CgroupSetup::FromSpec,
+            resources: resources.clone().map(Box::new),
+            // `--cgroup-parent` (0465's own "still out of scope" note
+            // for `build`, closed here): matching real `podman build
+            // --cgroup-parent` exactly (checked directly, `~/git/
+            // podman/vendor/go.podman.io/buildah/pkg/cli/common.go`'s
+            // own `CommonBuildOptions.CgroupParent`) — see `ociman
+            // run/create --cgroup-parent`'s own doc comment (`0465`)
+            // for the exact real `Slice=` semantics this reuses
+            // verbatim.
+            parent_slice: cgroup_parent.map(str::to_string),
+        }
+    } else {
+        oci_runtime_core::launch::CgroupSetup::FromSpec
     };
 
     // SAFETY: `ociman build`'s own process has not spawned any

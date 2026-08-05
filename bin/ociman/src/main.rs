@@ -1851,6 +1851,19 @@ enum Command {
         /// `--ulimit`/`--shm-size`/`--memory` already established.
         #[arg(long = "omit-history")]
         omit_history: bool,
+        /// Optional parent cgroup for every `RUN` step, matching real
+        /// `podman build --cgroup-parent` exactly (checked directly,
+        /// `~/git/podman/vendor/go.podman.io/buildah/pkg/cli/
+        /// common.go`'s own `CommonBuildOptions.CgroupParent`) — sets
+        /// the real systemd `Slice=` unit property for every `RUN`
+        /// step's own transient scope. See `Command::Run::cgroup_
+        /// parent`'s own doc comment (`0465`) for the exact real
+        /// `Slice=` semantics this reuses verbatim. Applies to every
+        /// `RUN` step in every stage alike, no per-stage/per-
+        /// instruction override, the same shape `--ulimit`/`--shm-
+        /// size`/`--memory` already established.
+        #[arg(long = "cgroup-parent")]
+        cgroup_parent: Option<String>,
         /// Refrain from announcing build progress — matching real
         /// `docker build -q`/`podman build --quiet` exactly (checked
         /// directly against a real installed `podman build -q`, three
@@ -4681,6 +4694,7 @@ fn main() -> std::process::ExitCode {
                 no_hosts,
                 no_hostname,
                 omit_history,
+                cgroup_parent,
                 quiet,
                 timestamp,
             }) => build::cmd_build(
@@ -4719,6 +4733,7 @@ fn main() -> std::process::ExitCode {
                 no_hosts,
                 no_hostname,
                 omit_history,
+                cgroup_parent.as_deref(),
                 quiet,
                 cli.global.json,
                 timestamp,

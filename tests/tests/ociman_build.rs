@@ -9541,3 +9541,77 @@ fn build_omit_history_skips_every_history_entry_but_still_applies_every_instruct
          --omit-history skipping only the descriptive history entry, not the layer itself"
     );
 }
+
+/// `ociman build --cgroup-parent` (matching real `podman build
+/// --cgroup-parent` exactly) sets the real transient scope's own
+/// `Slice=` unit property for every `RUN` step -- previously
+/// unreachable from `ociman build` at all (`0465`'s own "still out of
+/// scope" note, closed here). Given *alone*, with no other resource
+/// flag, proving the systemd-scope path activates purely from
+/// `--cgroup-parent` itself (the same real "no other resource flag
+/// needed" requirement `ociman run --cgroup-parent`'s own test
+/// already established) rather than only ever piggy-backing on an
+/// already-`Some(resources)` case. `app.slice` is a real, already-
+/// existing default slice on any `systemd --user` session, safe to
+/// target without first needing to create a brand new one.
+#[test]
+fn build_cgroup_parent_sets_the_real_systemd_scopes_own_slice_property() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let _lock = lock_build_scope_tests();
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/build-cgroup-parent-base:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/build-cgroup-parent-base:latest\n\
+         RUN sleep 5\n",
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "build",
+            "--cgroup-parent",
+            "app.slice",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/build-cgroup-parent-result:latest",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman build");
+
+    let scope_name = wait_for_build_scope(Duration::from_secs(10));
+
+    let show = Command::new("systemctl")
+        .args(["--user", "show", &scope_name, "-p", "Slice", "--value"])
+        .output()
+        .expect("failed to run systemctl --user show");
+    let slice = String::from_utf8_lossy(&show.stdout).trim().to_string();
+
+    let status = child.wait().expect("failed to wait on ociman build");
+
+    assert_eq!(
+        slice, "app.slice",
+        "expected the real systemd scope's own Slice to reflect --cgroup-parent app.slice"
+    );
+    assert!(status.success(), "ociman build itself should still succeed");
+}
