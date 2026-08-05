@@ -4,12 +4,13 @@
 //! `ociman ps` itself), `inspect` (`docs/design/0488`, a real alias
 //! for the top-level `ociman inspect` forced to container-only
 //! resolution), `rm` (`docs/design/0489`, a real, byte-identical
-//! alias for the top-level `ociman rm` itself), and `stop`
+//! alias for the top-level `ociman rm` itself), `stop`
 //! (`docs/design/0490`, the same byte-identical-alias shape for
-//! `ociman stop`) — see `ociman_ps.rs`/`ociman_stop.rs` for each
-//! top-level command's own much larger test suite; this file only
-//! proves each alias itself is byte-identical, not the aliased
-//! command's own full semantics again.
+//! `ociman stop`), and `start` (`docs/design/0491`, the same shape
+//! again for `ociman start`) — see `ociman_ps.rs`/`ociman_stop.rs`/
+//! `ociman_start.rs` for each top-level command's own much larger
+//! test suite; this file only proves each alias itself is byte-
+//! identical, not the aliased command's own full semantics again.
 //!
 //! `ociman container prune` removes every real, non-running container
 //! (this project's own `Created`/`Stopped`, never `Running`/`Paused`,
@@ -851,5 +852,75 @@ fn container_stop_time_flag_works_through_the_alias() {
     assert!(
         start.elapsed() < Duration::from_secs(5),
         "a real --time 0 should stop nearly immediately, not wait out any grace period"
+    );
+}
+
+/// `ociman container start` (0491) is a real, byte-identical alias
+/// for the top-level `ociman start`, matching real `podman container
+/// start`'s own checked-directly identical `Use`/`Short`/`Long`/
+/// `RunE`/`Args`/`ValidArgsFunction` (and identical `startFlags`-
+/// applied flag set) as top-level `podman start` exactly (`~/git/
+/// podman/cmd/podman/containers/start.go:20-39`). Full `start`
+/// semantics (attach, latest resolution, stdin forwarding) are
+/// already exhaustively tested against the top-level command in
+/// `ociman_start.rs`; this only proves the alias itself reaches the
+/// identical function with the identical fields.
+#[test]
+fn container_start_is_a_byte_identical_alias_for_top_level_start() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-start-alias:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/container-start-alias:latest", "true"],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    assert_eq!(inspect_json(storage_dir.path(), &id)["status"], "created");
+
+    let alias = ociman(storage_dir.path(), &["container", "start", &id]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&alias.stdout).trim(), id);
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "stopped", Duration::from_secs(20)),
+        "stopped"
+    );
+}
+
+/// The alias's own validation works too, not just the bare form —
+/// `--latest` and an explicit id together is a clear error, matching
+/// the top-level `ociman start`'s own already-established behavior
+/// exactly.
+#[test]
+fn container_start_latest_and_explicit_id_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let alias = ociman(
+        storage_dir.path(),
+        &["container", "start", "--latest", "some-container"],
+    );
+    assert!(!alias.status.success());
+    assert!(
+        String::from_utf8_lossy(&alias.stderr)
+            .contains("--latest and containers cannot be used together"),
+        "{alias:?}"
     );
 }

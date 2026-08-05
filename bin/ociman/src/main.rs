@@ -4916,6 +4916,33 @@ enum ContainerCommand {
         #[arg(short = 'l', long)]
         latest: bool,
     },
+    /// `podman container start`'s own real alias for the already-
+    /// existing flat [`Command::Start`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/start.go:20-39`: `containerStartCommand`
+    /// (`Parent: containerCmd`) and top-level `startCommand` share the
+    /// exact same `Use`/`Short`/`Long`/`RunE`/`Args`/
+    /// `ValidArgsFunction`, and both get the identical flag set
+    /// applied via the one shared `startFlags(cmd)` helper plus
+    /// `validate.AddLatestFlag` -- a byte-identical alias, the same
+    /// shape [`Self::Stop`] (`0490`) already established. Dispatches
+    /// into the same [`cmd_start`] `ociman start` itself already
+    /// calls, replaying the identical `--latest`/explicit-id
+    /// resolution the top-level [`Command::Start`] arm already has --
+    /// see [`Command::Start`]'s own doc comment for the exact
+    /// semantics (including this project's own honestly narrower
+    /// first-slice scope: no `--all`/`--filter`/`--interactive`/
+    /// multi-id yet, matching the top-level command's own identical
+    /// gap), not repeated here.
+    Start {
+        /// Same as [`Command::Start::id`].
+        id: Option<String>,
+        /// Same as [`Command::Start::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+        /// Same as [`Command::Start::attach`].
+        #[arg(short, long)]
+        attach: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -5768,6 +5795,26 @@ fn main() -> std::process::ExitCode {
                     &filter,
                     latest,
                 ),
+                ContainerCommand::Start { id, latest, attach } => {
+                    // Matches real podman's own exact wording, checked
+                    // directly (`~/git/podman/cmd/podman/containers/
+                    // start.go`'s own `validateStart`) -- the identical
+                    // check the top-level `Command::Start` arm already
+                    // has.
+                    anyhow::ensure!(
+                        !(latest && id.is_some()),
+                        "--latest and containers cannot be used together"
+                    );
+                    let resolved_id = match id {
+                        Some(id) => id,
+                        None => {
+                            anyhow::ensure!(latest, "start requires at least one argument");
+                            let containers = open_container_store()?;
+                            resolve_latest_container(&containers)?
+                        }
+                    };
+                    cmd_start(&resolved_id, attach)
+                }
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),
