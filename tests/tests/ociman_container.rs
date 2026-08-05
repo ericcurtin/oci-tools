@@ -1,9 +1,13 @@
 //! `ociman container` subcommand family integration tests
 //! (`docs/design/0357`): `exists` (see `ociman_exists.rs`), `prune`,
 //! `list`/`ls` (`docs/design/0431`, a real, genuine alias for
-//! `ociman ps` itself), and `inspect` (`docs/design/0488`, a real
-//! alias for the top-level `ociman inspect` forced to container-only
-//! resolution).
+//! `ociman ps` itself), `inspect` (`docs/design/0488`, a real alias
+//! for the top-level `ociman inspect` forced to container-only
+//! resolution), and `rm` (`docs/design/0489`, a real, byte-identical
+//! alias for the top-level `ociman rm` itself — see `ociman_ps.rs`
+//! for the top-level `rm`'s own much larger test suite; this file
+//! only proves the alias itself is byte-identical, not `rm`'s own
+//! full semantics again).
 //!
 //! `ociman container prune` removes every real, non-running container
 //! (this project's own `Created`/`Stopped`, never `Running`/`Paused`,
@@ -659,4 +663,94 @@ fn container_inspect_size_works() {
         json["size"]["root_fs_size"].is_number(),
         "expected a populated size field: {json:?}"
     );
+}
+
+/// `ociman container rm` (0489) is a real, byte-identical alias for
+/// the top-level `ociman rm`, matching real `podman container rm`'s
+/// own checked-directly identical `Use`/`Short`/`Long`/`RunE`/`Args`/
+/// `ValidArgsFunction` as top-level `podman rm` exactly (`~/git/
+/// podman/cmd/podman/containers/rm.go:39-49`). Full `rm` semantics
+/// (multi-id, `--all`, `--cidfile`, `--ignore`, `--time`, `--filter`,
+/// `--latest`) are already exhaustively tested against the top-level
+/// command in `ociman_ps.rs`; this only proves the alias itself
+/// reaches the identical function with the identical fields.
+#[test]
+fn container_rm_is_a_byte_identical_alias_for_top_level_rm() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-rm-alias:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/container-rm-alias:latest", "true"],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+
+    let alias = ociman(storage_dir.path(), &["container", "rm", &id]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&alias.stdout).trim(), id);
+    assert!(all_ids(storage_dir.path()).is_empty());
+}
+
+/// The alias's own flag set works too, not just the bare form —
+/// `--force` kills a still-running container first, matching the
+/// top-level `ociman rm --force`'s own already-established behavior
+/// exactly.
+#[test]
+fn container_rm_force_kills_a_still_running_container_first() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-rm-force:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/container-rm-force:latest",
+        &["sleep", "30"],
+    );
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let without_force = ociman(storage_dir.path(), &["container", "rm", &id]);
+    assert!(!without_force.status.success());
+    assert_eq!(all_ids(storage_dir.path()), vec![id.clone()]);
+
+    let with_force = ociman(storage_dir.path(), &["container", "rm", "--force", &id]);
+    assert!(
+        with_force.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_force.stderr)
+    );
+    assert!(all_ids(storage_dir.path()).is_empty());
 }

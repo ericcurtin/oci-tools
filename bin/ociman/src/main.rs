@@ -4843,6 +4843,42 @@ enum ContainerCommand {
         #[arg(short, long)]
         size: bool,
     },
+    /// `podman container rm`'s own real alias for the already-
+    /// existing flat [`Command::Rm`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/rm.go:39-49`: `containerRmCommand`
+    /// (nested, `Parent: containerCmd`) and top-level `rmCommand`
+    /// share the exact same `Use`/`Short`/`Long`/`RunE`/`Args`/
+    /// `ValidArgsFunction` verbatim -- a byte-identical alias, the
+    /// same shape [`ImageCommand::Rm`] (`0480`) already established
+    /// for the image side. Dispatches into the same [`cmd_rm`]
+    /// `ociman rm` itself already calls, with the identical field
+    /// set -- see [`Command::Rm`]'s own doc comment for the exact
+    /// semantics, not repeated here.
+    Rm {
+        /// Same as [`Command::Rm::ids`].
+        ids: Vec<String>,
+        /// Same as [`Command::Rm::force`].
+        #[arg(short, long)]
+        force: bool,
+        /// Same as [`Command::Rm::all`].
+        #[arg(short, long)]
+        all: bool,
+        /// Same as [`Command::Rm::cidfile`].
+        #[arg(long = "cidfile", value_name = "FILE")]
+        cidfile: Vec<PathBuf>,
+        /// Same as [`Command::Rm::ignore`].
+        #[arg(short, long)]
+        ignore: bool,
+        /// Same as [`Command::Rm::time`].
+        #[arg(short = 't', long = "time")]
+        time: Option<u64>,
+        /// Same as [`Command::Rm::filter`].
+        #[arg(long = "filter")]
+        filter: Vec<String>,
+        /// Same as [`Command::Rm::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -5666,6 +5702,16 @@ fn main() -> std::process::ExitCode {
                         InspectType::Container,
                     )
                 }
+                ContainerCommand::Rm {
+                    ids,
+                    force,
+                    all,
+                    cidfile,
+                    ignore,
+                    time,
+                    filter,
+                    latest,
+                } => cmd_rm(&ids, force, all, &cidfile, ignore, time, &filter, latest),
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),
