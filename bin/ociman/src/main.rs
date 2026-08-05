@@ -5083,6 +5083,39 @@ enum ContainerCommand {
         /// Same as [`Command::Rename::name`].
         name: String,
     },
+    /// `podman container wait`'s own real alias for the already-
+    /// existing flat [`Command::Wait`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/wait.go:20-73`: `containerWaitCommand`
+    /// (`Parent: containerCmd`) and top-level `waitCommand` share the
+    /// exact same `Use`/`Short`/`Long`/`RunE`/`ValidArgsFunction`, and
+    /// both get the identical flag set applied via the one shared
+    /// `waitFlags(cmd)` helper (`--interval`/`-i`, `--ignore`,
+    /// `--condition`, and the not-yet-ported `--exit-first-match` --
+    /// see [`Command::Wait`]'s own doc comment for exactly why this
+    /// project's own simpler lifecycle can't reach every real
+    /// condition value either) plus `validate.AddLatestFlag` -- a
+    /// byte-identical alias, the same shape [`Self::Kill`] (`0492`)
+    /// already established. Dispatches into the same [`cmd_wait`]
+    /// `ociman wait` itself already calls, replaying the identical
+    /// `--latest`/explicit-ids resolution the top-level
+    /// [`Command::Wait`] arm already has -- see [`Command::Wait`]'s
+    /// own doc comment for the exact semantics, not repeated here.
+    Wait {
+        /// Same as [`Command::Wait::ids`].
+        ids: Vec<String>,
+        /// Same as [`Command::Wait::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+        /// Same as [`Command::Wait::interval`].
+        #[arg(short, long, default_value_t = 250)]
+        interval: u64,
+        /// Same as [`Command::Wait::condition`].
+        #[arg(long = "condition")]
+        condition: Vec<String>,
+        /// Same as [`Command::Wait::ignore`].
+        #[arg(long)]
+        ignore: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -5985,6 +6018,33 @@ fn main() -> std::process::ExitCode {
                     latest,
                 } => cmd_restart(&ids, time, all, &cidfile, &filter, latest),
                 ContainerCommand::Rename { id, name } => cmd_rename(&id, &name),
+                ContainerCommand::Wait {
+                    ids,
+                    latest,
+                    interval,
+                    condition,
+                    ignore,
+                } => {
+                    // Matches real podman's own exact wording, checked
+                    // directly (`~/git/podman/cmd/podman/containers/
+                    // wait.go`) -- the identical check the top-level
+                    // `Command::Wait` arm already has.
+                    anyhow::ensure!(
+                        !(latest && !ids.is_empty()),
+                        "--latest and containers cannot be used together"
+                    );
+                    let ids: Vec<String> = if latest {
+                        let containers = open_container_store()?;
+                        vec![resolve_latest_container(&containers)?]
+                    } else {
+                        anyhow::ensure!(
+                            !ids.is_empty(),
+                            "wait requires a name, id, or the \"--latest\" flag"
+                        );
+                        ids
+                    };
+                    cmd_wait(&ids, interval, &condition, ignore)
+                }
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),

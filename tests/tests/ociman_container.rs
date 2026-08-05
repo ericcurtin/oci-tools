@@ -11,13 +11,14 @@
 //! again for `ociman kill`), `pause`/`unpause` (`docs/design/0493`,
 //! the same shape again for `ociman pause`/`ociman unpause`),
 //! `restart` (`docs/design/0494`, the same shape again for `ociman
-//! restart`), and `rename` (`docs/design/0495`, the same shape again
-//! for `ociman rename`, with no flags at all) — see `ociman_ps.rs`/
-//! `ociman_stop.rs`/`ociman_start.rs`/`ociman_kill.rs`/
-//! `ociman_pause.rs`/`ociman_rename.rs` for each top-level command's
-//! own much larger test suite; this file only proves each alias
-//! itself is byte-identical, not the aliased command's own full
-//! semantics again.
+//! restart`), `rename` (`docs/design/0495`, the same shape again for
+//! `ociman rename`, with no flags at all), and `wait` (`docs/design/
+//! 0496`, the same shape again for `ociman wait`) — see
+//! `ociman_ps.rs`/`ociman_stop.rs`/`ociman_start.rs`/
+//! `ociman_kill.rs`/`ociman_pause.rs`/`ociman_rename.rs`/
+//! `ociman_wait.rs` for each top-level command's own much larger test
+//! suite; this file only proves each alias itself is byte-identical,
+//! not the aliased command's own full semantics again.
 //!
 //! `ociman container prune` removes every real, non-running container
 //! (this project's own `Created`/`Stopped`, never `Running`/`Paused`,
@@ -1238,4 +1239,58 @@ fn container_rename_is_a_byte_identical_alias_for_top_level_rename() {
         "stderr: {}",
         String::from_utf8_lossy(&rm.stderr)
     );
+}
+
+/// `ociman container wait` (0496) is a real, byte-identical alias for
+/// the top-level `ociman wait`, matching real `podman container
+/// wait`'s own checked-directly identical `Use`/`Short`/`Long`/
+/// `RunE`/`ValidArgsFunction` (and identical `waitFlags`-applied flag
+/// set) as top-level `podman wait` exactly (`~/git/podman/cmd/podman/
+/// containers/wait.go:20-73`). Full `wait` semantics (multi-id,
+/// `--condition`, `--ignore`, `--latest`, `--interval`) are already
+/// exhaustively tested against the top-level command in
+/// `ociman_wait.rs`; this only proves the alias itself reaches the
+/// identical function with the identical fields.
+#[test]
+fn container_wait_is_a_byte_identical_alias_for_top_level_wait() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-wait-alias:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 42".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/container-wait-alias:latest"],
+    );
+    assert_eq!(run.status.code(), Some(42));
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+
+    // The container has already exited by the time `run` returns
+    // (foreground, not detached) -- the alias should return
+    // immediately with the real exit code.
+    let alias = ociman(storage_dir.path(), &["container", "wait", &id]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&alias.stdout).trim(), "42");
 }
