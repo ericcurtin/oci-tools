@@ -1737,6 +1737,26 @@ enum Command {
         /// the same shape `--no-hosts` just above already established.
         #[arg(long = "no-hostname")]
         no_hostname: bool,
+        /// Omit build history information from the built image
+        /// entirely, matching real `podman build --omit-history`
+        /// exactly (checked directly, `~/git/podman/vendor/
+        /// go.podman.io/buildah/pkg/cli/common.go`'s own
+        /// `fs.BoolVar(&flags.OmitHistory, "omit-history", false,
+        /// ...)`, and `~/git/podman/vendor/go.podman.io/buildah/
+        /// image.go`'s own `if !i.omitHistory { mb.buildHistory(...)
+        /// }`): every layer this build's own `RUN`/`COPY`/`ADD`
+        /// produces, and every config-only instruction (`ENV`/
+        /// `LABEL`/`WORKDIR`/...), is still fully applied and
+        /// recorded exactly as before — only the *descriptive*
+        /// `ociman history` entry for each is skipped, leaving the
+        /// image with exactly the base's own inherited history,
+        /// completely unchanged, no matter how many instructions this
+        /// build ran. Applies to every instruction in every stage
+        /// alike (including `--label`'s own trailing entry), no
+        /// per-stage/per-instruction override, the same shape
+        /// `--ulimit`/`--shm-size`/`--memory` already established.
+        #[arg(long = "omit-history")]
+        omit_history: bool,
         /// Refrain from announcing build progress — matching real
         /// `docker build -q`/`podman build --quiet` exactly (checked
         /// directly against a real installed `podman build -q`, three
@@ -4541,6 +4561,7 @@ fn main() -> std::process::ExitCode {
                 http_proxy,
                 no_hosts,
                 no_hostname,
+                omit_history,
                 quiet,
                 timestamp,
             }) => build::cmd_build(
@@ -4578,6 +4599,7 @@ fn main() -> std::process::ExitCode {
                 http_proxy,
                 no_hosts,
                 no_hostname,
+                omit_history,
                 quiet,
                 cli.global.json,
                 timestamp,
@@ -11440,7 +11462,17 @@ fn commit_inner(
             format!("commit {id}"),
         )
     };
-    oci_dockerfile::record_layer(&mut config, &mut layers, &committed, created_by, None);
+    // `ociman commit` has no `--omit-history` of its own at all
+    // (real `podman commit` doesn't either) -- always records a real
+    // history entry.
+    oci_dockerfile::record_layer(
+        &mut config,
+        &mut layers,
+        &committed,
+        created_by,
+        None,
+        false,
+    );
     if let Some(message) = message {
         // The OCI image spec's own `history[].comment` field, not a
         // top-level `Comment` -- see `Command::Commit`'s own doc

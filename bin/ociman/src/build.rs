@@ -260,6 +260,7 @@ pub fn cmd_build(
     http_proxy: bool,
     no_hosts: bool,
     no_hostname: bool,
+    omit_history: bool,
     quiet: bool,
     json: bool,
     timestamp: Option<i64>,
@@ -563,6 +564,7 @@ pub fn cmd_build(
             shm_size_bytes,
             resources: &resources,
             http_proxy,
+            omit_history,
         };
         let force_rootfs = copy_from_targets.contains(&stage_index);
         // `--squash`/`--squash-all` only ever apply to the target
@@ -627,6 +629,7 @@ pub fn cmd_build(
             &mut config,
             format!("LABEL {}", format_pairs(&labels)),
             timestamp,
+            omit_history,
         );
     }
 
@@ -922,6 +925,22 @@ struct StageContext<'a> {
     /// run_common.go`'s own `configureEnvironment`): build-wide, no
     /// per-stage/per-instruction override.
     http_proxy: bool,
+    /// `--omit-history`'s own already-resolved value (default
+    /// `false`) — carried here for the same reason `rlimits`/`shm_
+    /// size_bytes`/`resources`/`http_proxy` are. When `true`, skips
+    /// every [`oci_dockerfile::record_layer`]/[`oci_dockerfile::
+    /// record_empty_history`] call this stage makes, leaving `config.
+    /// history` exactly as inherited from the base image — matching
+    /// real `podman build --omit-history` exactly (checked directly,
+    /// `~/git/podman/vendor/go.podman.io/buildah/image.go`'s own `if
+    /// !i.omitHistory { mb.buildHistory(...) }`, which entirely skips
+    /// appending *any* new entries to the base's own already-seeded
+    /// history, rather than clearing it outright). The layers/`diff_
+    /// ids` themselves are still fully recorded either way -- only
+    /// the descriptive history metadata is ever omitted, matching
+    /// real buildah's own identical distinction. Build-wide, no
+    /// per-stage/per-instruction override.
+    omit_history: bool,
 }
 
 impl StageContext<'_> {
@@ -1600,6 +1619,7 @@ fn apply_instruction(
                 stage_ctx.shm_size_bytes,
                 stage_ctx.resources,
                 stage_ctx.http_proxy,
+                stage_ctx.omit_history,
             )?;
         }
         Instruction::Copy {
@@ -1645,6 +1665,7 @@ fn apply_instruction(
                 cache_candidates,
                 stage_ctx.dockerignore,
                 stage_ctx.forced_mtime,
+                stage_ctx.omit_history,
             )?;
         }
         Instruction::From { .. } => {
@@ -1665,6 +1686,7 @@ fn apply_instruction(
                 config,
                 format!("SHELL {}", words.join(" ")),
                 stage_ctx.forced_mtime,
+                stage_ctx.omit_history,
             );
         }
         // No config effect of its own -- `expand_stage` already fully
@@ -1693,6 +1715,7 @@ fn apply_instruction(
                 config,
                 format!("ENV {}", format_pairs(pairs)),
                 stage_ctx.forced_mtime,
+                stage_ctx.omit_history,
             );
         }
         Instruction::Label(pairs) => {
@@ -1704,6 +1727,7 @@ fn apply_instruction(
                 config,
                 format!("LABEL {}", format_pairs(pairs)),
                 stage_ctx.forced_mtime,
+                stage_ctx.omit_history,
             );
         }
         Instruction::Workdir(dir) => {
@@ -1714,6 +1738,7 @@ fn apply_instruction(
                 config,
                 format!("WORKDIR {resolved}"),
                 stage_ctx.forced_mtime,
+                stage_ctx.omit_history,
             );
         }
         Instruction::User(user) => {
@@ -1723,6 +1748,7 @@ fn apply_instruction(
                 config,
                 format!("USER {user}"),
                 stage_ctx.forced_mtime,
+                stage_ctx.omit_history,
             );
         }
         Instruction::Entrypoint(shell_or_exec) => {
@@ -1733,6 +1759,7 @@ fn apply_instruction(
                 config,
                 format!("ENTRYPOINT {}", args.join(" ")),
                 stage_ctx.forced_mtime,
+                stage_ctx.omit_history,
             );
         }
         Instruction::Cmd(shell_or_exec) => {
@@ -1743,6 +1770,7 @@ fn apply_instruction(
                 config,
                 format!("CMD {}", args.join(" ")),
                 stage_ctx.forced_mtime,
+                stage_ctx.omit_history,
             );
         }
         Instruction::Expose(ports) => {
@@ -1754,6 +1782,7 @@ fn apply_instruction(
                 config,
                 format!("EXPOSE {}", ports.join(" ")),
                 stage_ctx.forced_mtime,
+                stage_ctx.omit_history,
             );
         }
         Instruction::Volume(paths) => {
@@ -1765,6 +1794,7 @@ fn apply_instruction(
                 config,
                 format!("VOLUME {}", paths.join(" ")),
                 stage_ctx.forced_mtime,
+                stage_ctx.omit_history,
             );
         }
         Instruction::StopSignal(sig) => {
@@ -1774,6 +1804,7 @@ fn apply_instruction(
                 config,
                 format!("STOPSIGNAL {sig}"),
                 stage_ctx.forced_mtime,
+                stage_ctx.omit_history,
             );
         }
         Instruction::Maintainer(who) => {
@@ -1782,6 +1813,7 @@ fn apply_instruction(
                 config,
                 format!("MAINTAINER {who}"),
                 stage_ctx.forced_mtime,
+                stage_ctx.omit_history,
             );
         }
         Instruction::Healthcheck(cmd) => {
@@ -1798,6 +1830,7 @@ fn apply_instruction(
                 config,
                 format!("HEALTHCHECK {}", cmd.test.join(" ")),
                 stage_ctx.forced_mtime,
+                stage_ctx.omit_history,
             );
         }
         Instruction::Onbuild(trigger) => {
@@ -1807,6 +1840,7 @@ fn apply_instruction(
                 config,
                 format!("ONBUILD {trigger}"),
                 stage_ctx.forced_mtime,
+                stage_ctx.omit_history,
             );
         }
     }
@@ -1839,6 +1873,7 @@ fn run_instruction(
     shm_size_bytes: Option<i64>,
     resources: &Option<oci_spec_types::runtime::LinuxResources>,
     http_proxy: bool,
+    omit_history: bool,
 ) -> anyhow::Result<()> {
     let args = args_for_run(shell_or_exec, current_shell);
     let command_text = args.join(" ");
@@ -1984,7 +2019,14 @@ fn run_instruction(
         .with_context(|| format!("diffing rootfs after RUN {command_text}"))?;
     let committed = commit_layer(store, rootfs, &diff, forced_mtime)
         .with_context(|| format!("committing layer for RUN {command_text}"))?;
-    record_layer(config, layers, &committed, created_by, forced_mtime);
+    record_layer(
+        config,
+        layers,
+        &committed,
+        created_by,
+        forced_mtime,
+        omit_history,
+    );
     Ok(())
 }
 
@@ -2400,6 +2442,7 @@ fn copy_instruction(
         &committed,
         created_by,
         stage_ctx.forced_mtime,
+        stage_ctx.omit_history,
     );
     Ok(())
 }
@@ -2510,6 +2553,7 @@ fn add_instruction(
     cache_candidates: &[crate::build_cache::CacheCandidate],
     dockerignore: &oci_dockerfile::DockerIgnore,
     forced_mtime: Option<i64>,
+    omit_history: bool,
 ) -> anyhow::Result<()> {
     let chown = flags
         .chown
@@ -2771,7 +2815,14 @@ fn add_instruction(
         .with_context(|| format!("diffing rootfs after {command_text}"))?;
     let committed = commit_layer(store, rootfs, &diff, forced_mtime)
         .with_context(|| format!("committing layer for {command_text}"))?;
-    record_layer(config, layers, &committed, created_by, forced_mtime);
+    record_layer(
+        config,
+        layers,
+        &committed,
+        created_by,
+        forced_mtime,
+        omit_history,
+    );
     Ok(())
 }
 

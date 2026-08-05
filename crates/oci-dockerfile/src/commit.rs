@@ -196,22 +196,37 @@ fn created_timestamp(forced_created: Option<i64>) -> String {
 /// something shell-quoted like `RUN /bin/sh -c "..."`; this function
 /// doesn't prescribe a format, since it has no idea yet what a future
 /// build executor's own instruction text will look like).
+///
+/// `omit_history` (matching real `podman build --omit-history`
+/// exactly, checked directly: `~/git/podman/vendor/go.podman.io/
+/// buildah/image.go`'s own `if !i.omitHistory { mb.buildHistory(...)
+/// }`, which skips appending *any* new entries to the base image's
+/// own already-seeded history entirely, rather than clearing it):
+/// when `true`, the layer/`diff_ids` are still fully recorded either
+/// way — only the *descriptive* history entry itself is skipped,
+/// matching real buildah's own identical distinction (a built image
+/// under `--omit-history` still has every one of its real layers,
+/// just no human-readable record of which instruction produced
+/// which).
 pub fn record_layer(
     config: &mut ImageConfig,
     layers: &mut Vec<Descriptor>,
     committed: &CommittedLayer,
     created_by: impl Into<String>,
     forced_created: Option<i64>,
+    omit_history: bool,
 ) {
     layers.push(committed.descriptor.clone());
     config.rootfs.diff_ids.push(committed.diff_id.clone());
-    config.history.push(HistoryEntry {
-        created: Some(created_timestamp(forced_created)),
-        created_by: Some(created_by.into()),
-        author: None,
-        comment: None,
-        empty_layer: false,
-    });
+    if !omit_history {
+        config.history.push(HistoryEntry {
+            created: Some(created_timestamp(forced_created)),
+            created_by: Some(created_by.into()),
+            author: None,
+            comment: None,
+            empty_layer: false,
+        });
+    }
 }
 
 /// Record a build instruction that produced *no* new layer (e.g.
@@ -222,12 +237,19 @@ pub fn record_layer(
 /// on any real image shows these interleaved with real layer-producing
 /// entries, most with no corresponding layer size at all).
 ///
-/// `forced_created`: see [`created_timestamp`].
+/// `forced_created`: see [`created_timestamp`]. `omit_history`: see
+/// [`record_layer`]'s own doc comment — here, since there is no layer
+/// to still record either way, `true` makes this call a complete
+/// no-op.
 pub fn record_empty_history(
     config: &mut ImageConfig,
     created_by: impl Into<String>,
     forced_created: Option<i64>,
+    omit_history: bool,
 ) {
+    if omit_history {
+        return;
+    }
     config.history.push(HistoryEntry {
         created: Some(created_timestamp(forced_created)),
         created_by: Some(created_by.into()),
@@ -474,8 +496,22 @@ mod tests {
 
         let mut config = ImageConfig::default();
         let mut layers = Vec::new();
-        record_layer(&mut config, &mut layers, &committed_a, "RUN echo a", None);
-        record_layer(&mut config, &mut layers, &committed_b, "RUN echo b", None);
+        record_layer(
+            &mut config,
+            &mut layers,
+            &committed_a,
+            "RUN echo a",
+            None,
+            false,
+        );
+        record_layer(
+            &mut config,
+            &mut layers,
+            &committed_b,
+            "RUN echo b",
+            None,
+            false,
+        );
 
         assert_eq!(layers, vec![committed_a.descriptor, committed_b.descriptor]);
         assert_eq!(
@@ -503,13 +539,56 @@ mod tests {
         let mut config = ImageConfig::default();
         let layers: Vec<Descriptor> = Vec::new();
 
-        record_empty_history(&mut config, "ENV FOO=bar", None);
+        record_empty_history(&mut config, "ENV FOO=bar", None, false);
 
         assert!(layers.is_empty());
         assert!(config.rootfs.diff_ids.is_empty());
         assert_eq!(config.history.len(), 1);
         assert!(config.history[0].empty_layer);
         assert_eq!(config.history[0].created_by.as_deref(), Some("ENV FOO=bar"));
+    }
+
+    /// `omit_history: true` (`ociman build --omit-history`) skips the
+    /// history entry entirely, but the layer/`diff_ids` are still
+    /// fully recorded either way -- matching real buildah's own
+    /// identical distinction (checked directly, see `record_layer`'s
+    /// own doc comment).
+    #[test]
+    fn record_layer_with_omit_history_still_records_the_layer_but_skips_history() {
+        let (_store_dir, store) = temp_store();
+        let root = tempfile::tempdir().unwrap();
+        let before = Snapshot::capture(root.path()).unwrap();
+        write_file(&root.path().join("a.txt"), b"content");
+        let diff = changes(root.path(), &before).unwrap();
+        let committed = commit_layer(&store, root.path(), &diff, None).unwrap();
+
+        let mut config = ImageConfig::default();
+        let mut layers = Vec::new();
+        record_layer(
+            &mut config,
+            &mut layers,
+            &committed,
+            "RUN echo a",
+            None,
+            true,
+        );
+
+        assert_eq!(layers, vec![committed.descriptor]);
+        assert_eq!(config.rootfs.diff_ids, vec![committed.diff_id]);
+        assert!(
+            config.history.is_empty(),
+            "omit_history should have skipped the history entry entirely"
+        );
+    }
+
+    /// Same distinction, for [`record_empty_history`] -- since there
+    /// is no layer to record either way here, `omit_history: true`
+    /// makes this call a complete no-op.
+    #[test]
+    fn record_empty_history_with_omit_history_is_a_complete_no_op() {
+        let mut config = ImageConfig::default();
+        record_empty_history(&mut config, "ENV FOO=bar", None, true);
+        assert!(config.history.is_empty());
     }
 
     /// `record_layer`'s own `forced_created` overrides the real,
@@ -534,6 +613,7 @@ mod tests {
             &committed,
             "RUN echo a",
             Some(1_700_000_000),
+            false,
         );
 
         assert_eq!(
@@ -548,7 +628,7 @@ mod tests {
     fn record_empty_history_forced_created_overrides_the_real_current_time() {
         let mut config = ImageConfig::default();
 
-        record_empty_history(&mut config, "ENV FOO=bar", Some(1_700_000_000));
+        record_empty_history(&mut config, "ENV FOO=bar", Some(1_700_000_000), false);
 
         assert_eq!(
             config.history[0].created.as_deref(),

@@ -9429,3 +9429,115 @@ fn build_no_hostname_leaves_the_base_images_own_etc_hostname_completely_untouche
         "the RUN step should have seen the base image's own /etc/hostname verbatim"
     );
 }
+
+/// `ociman build --omit-history` (matching real `podman build
+/// --omit-history` exactly) skips every history entry this build's
+/// own instructions would otherwise add -- `RUN`/`COPY`/`ADD`/`ENV`/
+/// `LABEL` all still fully apply (a `RUN` step's own file write is
+/// still genuinely there in the built image, and `--label`'s own
+/// value is still genuinely set), but not one of them leaves a
+/// history entry behind: the built image's own history is left
+/// exactly as inherited from the base (empty here, since `seed_image`
+/// always seeds a base with none at all).
+#[test]
+fn build_omit_history_skips_every_history_entry_but_still_applies_every_instruction() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/omit-history-base:latest",
+        &busybox,
+        &["sh", "cat"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/omit-history-base:latest\n\
+         ENV FOO=bar\n\
+         RUN echo hello > /marker.txt\n\
+         LABEL owner=test\n",
+    );
+
+    let build = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            "--omit-history",
+            "--label",
+            "extra=from-cli",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/omit-history-result:latest",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let record = store
+        .resolve_image("docker.io/ociman-test/omit-history-result:latest")
+        .unwrap()
+        .unwrap();
+    let config = store.image_config(&record).unwrap();
+    assert!(
+        config.history.is_empty(),
+        "expected no history entries at all under --omit-history, got: {:?}",
+        config.history
+    );
+    // Every instruction still genuinely applied, despite no history
+    // entry existing for any of them.
+    assert_eq!(
+        config.config.as_ref().unwrap().labels.get("owner"),
+        Some(&"test".to_string())
+    );
+    assert_eq!(
+        config.config.as_ref().unwrap().labels.get("extra"),
+        Some(&"from-cli".to_string())
+    );
+    assert!(
+        config
+            .config
+            .as_ref()
+            .unwrap()
+            .env
+            .iter()
+            .any(|kv| kv == "FOO=bar")
+    );
+    // A real, present-day `created`, not left stuck at whatever the
+    // (history-less) base had (`None`) -- `created` mirrors the last
+    // history entry's own timestamp everywhere else in this project,
+    // but `--omit-history` leaves no history entry to mirror at all,
+    // so it should fall back to being unset, exactly matching the
+    // base's own untouched value.
+    assert!(config.created.is_none());
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "ociman-test/omit-history-result:latest",
+            "/bin/cat",
+            "/marker.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "hello\n",
+        "the RUN step's own real layer should still be genuinely present in spite of \
+         --omit-history skipping only the descriptive history entry, not the layer itself"
+    );
+}
