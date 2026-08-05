@@ -5271,6 +5271,26 @@ enum ContainerCommand {
         #[arg(long = "iidfile", value_name = "PATH")]
         iidfile: Option<PathBuf>,
     },
+    /// `podman container export`'s own real alias for the already-
+    /// existing flat [`Command::Export`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/export.go:22-68`:
+    /// `containerExportCommand` (`Parent: containerCmd`) and
+    /// top-level `exportCommand` share the exact same `Use`/`Short`/
+    /// `Long`/`Args`/`RunE`/`ValidArgsFunction`, and both get the
+    /// identical flag set applied via the one shared `exportFlags
+    /// (cmd)` helper (`--output`/`-o`) -- a byte-identical alias, the
+    /// same shape [`Self::Kill`] (`0492`) already established.
+    /// Dispatches into the same [`cmd_export`] `ociman export` itself
+    /// already calls, with the identical field set -- see
+    /// [`Command::Export`]'s own doc comment for the exact semantics,
+    /// not repeated here.
+    Export {
+        /// Same as [`Command::Export::id`].
+        id: String,
+        /// Same as [`Command::Export::output`].
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -6287,6 +6307,7 @@ fn main() -> std::process::ExitCode {
                     iidfile.as_deref(),
                     cli.global.json,
                 ),
+                ContainerCommand::Export { id, output } => cmd_export(&id, output.as_deref()),
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),

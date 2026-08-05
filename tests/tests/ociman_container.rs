@@ -22,15 +22,16 @@
 //! matching real `podman container diff`'s own narrower scope
 //! rather than real top-level `podman diff`'s broader auto-detect
 //! one), `cp` (`docs/design/0500`, the same byte-identical-alias
-//! shape again for `ociman cp`), and `commit` (`docs/design/0501`,
-//! the same shape again for `ociman commit`) — see `ociman_ps.rs`/
-//! `ociman_stop.rs`/`ociman_start.rs`/`ociman_kill.rs`/
-//! `ociman_pause.rs`/`ociman_rename.rs`/`ociman_wait.rs`/
-//! `ociman_top.rs`/`ociman_logs.rs`/`ociman_diff.rs`/`ociman_cp.rs`/
-//! `ociman_commit.rs` for each top-level command's own much larger
-//! test suite; this file only proves each alias itself is
-//! byte-identical, not the aliased command's own full semantics
-//! again.
+//! shape again for `ociman cp`), `commit` (`docs/design/0501`, the
+//! same shape again for `ociman commit`), and `export`
+//! (`docs/design/0502`, the same shape again for `ociman export`) —
+//! see `ociman_ps.rs`/`ociman_stop.rs`/`ociman_start.rs`/
+//! `ociman_kill.rs`/`ociman_pause.rs`/`ociman_rename.rs`/
+//! `ociman_wait.rs`/`ociman_top.rs`/`ociman_logs.rs`/`ociman_diff.rs`/
+//! `ociman_cp.rs`/`ociman_commit.rs`/`ociman_export.rs` for each
+//! top-level command's own much larger test suite; this file only
+//! proves each alias itself is byte-identical, not the aliased
+//! command's own full semantics again.
 //!
 //! `ociman container prune` removes every real, non-running container
 //! (this project's own `Created`/`Stopped`, never `Running`/`Paused`,
@@ -1659,5 +1660,80 @@ fn container_commit_is_a_byte_identical_alias_for_top_level_commit() {
         String::from_utf8_lossy(&run2.stdout),
         "hi\n",
         "the committed image's own new layer should contain the file the original container added"
+    );
+}
+
+/// `ociman container export` (0502) is a real, byte-identical alias
+/// for the top-level `ociman export`, matching real `podman
+/// container export`'s own checked-directly identical `Use`/`Short`/
+/// `Long`/`Args`/`RunE`/`ValidArgsFunction` (and identical
+/// `exportFlags`-applied flag set) as top-level `podman export`
+/// exactly (`~/git/podman/cmd/podman/containers/export.go:22-68`).
+/// Full `export` semantics (stdout-by-default, a still-running
+/// container's own live mounts excluded) are already exhaustively
+/// tested against the top-level command in `ociman_export.rs`; this
+/// only proves the alias itself reaches the identical function with
+/// the identical fields.
+#[test]
+fn container_export_is_a_byte_identical_alias_for_top_level_export() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    // `export` doesn't support this project's own rootless-overlay
+    // rootfs optimization yet (shares the same gap `cp`/`diff`/
+    // `commit` already have) -- force the real, full-extraction
+    // path instead.
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-export-alias:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/container-export-alias:latest", "true"],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+
+    let output_path = storage_dir.path().join("out.tar");
+    let alias = ociman(
+        storage_dir.path(),
+        &[
+            "container",
+            "export",
+            "-o",
+            output_path.to_str().unwrap(),
+            &id,
+        ],
+    );
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+
+    let archive_bytes = std::fs::read(&output_path).unwrap();
+    let mut archive = tar::Archive::new(&archive_bytes[..]);
+    let paths: Vec<String> = archive
+        .entries()
+        .unwrap()
+        .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        paths.iter().any(|p| p.contains("busybox")),
+        "expected a real archive of the container's own filesystem: {paths:?}"
     );
 }
