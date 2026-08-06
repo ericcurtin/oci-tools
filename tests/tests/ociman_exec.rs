@@ -1230,3 +1230,179 @@ fn exec_strips_a_leading_slash_from_the_container_reference() {
     ociman(storage_dir.path(), &["kill", "exec-leading-slash-ctr"]);
     run.wait().ok();
 }
+
+/// `ociman exec --detach`/`-d` (`docs/design/0534`), matching real
+/// `podman exec --detach`/`-d` exactly: the invocation itself returns
+/// immediately (exit `0`, printing the exec'd process's own real
+/// host-visible pid, this project's own closest honest equivalent to
+/// real podman's own opaque, persisted exec-session id -- see
+/// `Command::Exec::detach`'s own doc comment for why), well before
+/// the (deliberately much longer) command it started actually
+/// finishes -- proven by a real wall-clock bound on the `exec
+/// --detach` call itself, then a *second*, ordinary (non-detached)
+/// `exec` polling for the detached command's own real, delayed side
+/// effect (a marker file, written only after its own longer sleep) to
+/// prove it really did keep running in the background. The container
+/// itself stays completely unaffected throughout.
+#[test]
+fn exec_detach_returns_immediately_and_prints_the_exec_pid() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/exec-detach:latest",
+        &busybox,
+        &["sh", "sleep", "cat"],
+        ContainerConfig::default(),
+    );
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/exec-detach:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    // Neither `Stdio::piped()` nor the `ociman` helper above (which
+    // captures stdout/stderr via a real pipe through `Command::
+    // output()`) is safe here: the detached grandchild below inherits
+    // whatever stdio this invocation itself has, so a captured *pipe*
+    // -- for *any* of stdin/stdout/stderr, including just stdout,
+    // which this test genuinely needs to capture the printed pid --
+    // would never see `EOF` (hanging this call) until *that* process
+    // *also* exits, ~3s later, hiding the very thing this test is
+    // trying to prove. The exact same real hazard `ocirun_exec.rs`'s
+    // own identical `0533` test already found and documented for
+    // `ocirun exec --detach`; a real *file* (unlike a pipe) has no
+    // such "every writer must close it first" `EOF` semantics at all,
+    // so redirecting stdout there instead and reading it back only
+    // *after* this invocation's own `status()` returns sidesteps the
+    // hazard completely.
+    let stdout_file = tempfile::NamedTempFile::new().unwrap();
+    let started = Instant::now();
+    let exec = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "exec",
+            "--detach",
+            &id,
+            "/bin/sh",
+            "-c",
+            "sleep 3; echo done > /marker.txt",
+        ])
+        .stdin(Stdio::null())
+        .stdout(stdout_file.reopen().unwrap())
+        .stderr(Stdio::null())
+        .status()
+        .expect("failed to spawn ociman exec --detach");
+    let elapsed = started.elapsed();
+    assert!(exec.success(), "ociman exec --detach failed: {exec:?}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "--detach should return almost immediately, not block on the full 3s sleep: {elapsed:?}"
+    );
+    let printed = std::fs::read_to_string(stdout_file.path())
+        .unwrap()
+        .trim()
+        .to_string();
+    let exec_pid: i32 = printed
+        .parse()
+        .unwrap_or_else(|e| panic!("--detach should print a bare pid, got {printed:?}: {e}"));
+    assert!(exec_pid > 0);
+
+    // The container itself is unaffected: still running.
+    assert_eq!(
+        wait_for_container_status(
+            storage_dir.path(),
+            &id,
+            "running",
+            Duration::from_millis(200)
+        ),
+        "running"
+    );
+
+    // The detached command really did keep running in the background
+    // and eventually wrote its own marker -- checked via a second,
+    // ordinary (non-detached) `exec`, polled until it succeeds (the
+    // marker file may not exist quite yet the instant this loop
+    // starts).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let check = ociman(
+            storage_dir.path(),
+            &["exec", &id, "/bin/cat", "/marker.txt"],
+        );
+        if check.status.success() {
+            assert_eq!(String::from_utf8_lossy(&check.stdout), "done\n");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the detached command never wrote its own marker file"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    ociman(storage_dir.path(), &["kill", &id]);
+    run.wait().ok();
+}
+
+/// A real, checked-directly divergence from a non-detached `exec`:
+/// `--detach` always exits `0`, regardless of whatever the detached
+/// command will *eventually* exit with -- matching real `podman exec
+/// --detach`'s own identical `return nil` (never surfacing any later
+/// exit code back to this invocation's own exit status at all).
+#[test]
+fn exec_detach_exits_zero_even_though_the_detached_command_will_eventually_fail() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/exec-detach-fail:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/exec-detach-fail:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let exec = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["exec", "--detach", &id, "/bin/sh", "-c", "exit 7"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("failed to spawn ociman exec --detach");
+    assert!(
+        exec.success(),
+        "--detach should exit 0 regardless of the detached command's own eventual exit code: \
+         {exec:?}"
+    );
+
+    ociman(storage_dir.path(), &["kill", &id]);
+    run.wait().ok();
+}

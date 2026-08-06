@@ -4134,6 +4134,32 @@ enum Command {
         /// unlike real podman's own checked-directly default.
         #[arg(short, long)]
         interactive: bool,
+        /// Start the exec'd process and return immediately instead of
+        /// blocking until it exits — matching real `podman exec
+        /// --detach`/`-d` exactly (checked directly, `~/git/podman/
+        /// cmd/podman/containers/exec.go:64,208-219`: `!execDetach`
+        /// gates the ordinary, blocking `ContainerExec` path, while
+        /// `execDetach` instead calls `ContainerExecDetached` —
+        /// `~/git/podman/pkg/domain/infra/abi/containers.go:1003-
+        /// 1035`, which creates and starts a real, persistent *exec
+        /// session* and returns its own opaque session id — then
+        /// prints it, `fmt.Println(id)`). This project has no
+        /// persisted exec-session concept of any kind to hand back an
+        /// equivalent id for (`oci_runtime_core::exec` is a one-shot
+        /// fork-then-forget primitive, with nothing else recorded
+        /// anywhere once it returns) — the closest honest value to
+        /// print instead is the exec'd process's own real, host-
+        /// visible pid (0533's own `ocirun exec --detach` already
+        /// reports this same value via `--pid-file`; here it's simply
+        /// printed directly, with no file needed). Reuses [`oci_
+        /// runtime_core::exec::exec_reporting_pid`]'s own existing
+        /// `detach`-aware short-circuit (0533) rather than a second
+        /// implementation: no background "keeper" process is needed
+        /// here either, for the identical reason — the detached
+        /// process is simply left to be reparented to the nearest
+        /// subreaper/`PID 1` once this invocation itself exits.
+        #[arg(short, long)]
+        detach: bool,
         /// Pass `N` additional file descriptors, starting at fd 3
         /// (right after stdio), through to the exec'd process
         /// untouched — matching real `podman exec --preserve-fds`
@@ -5718,8 +5744,9 @@ enum ContainerCommand {
     /// top-level [`Command::Exec`] arm already has -- see
     /// [`Command::Exec`]'s own doc comment for the exact semantics
     /// (including this project's own honestly narrower first-slice
-    /// scope: no `--detach`/`--detach-keys`/`--tty`, matching the
-    /// top-level command's own identical gap), not repeated here.
+    /// scope: no `--detach-keys`/`--tty`, matching the top-level
+    /// command's own identical gap; `--detach` itself closed by
+    /// `0534`), not repeated here.
     Exec {
         /// Same as [`Command::Exec::positional`].
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -5745,6 +5772,9 @@ enum ContainerCommand {
         /// Same as [`Command::Exec::interactive`].
         #[arg(short, long)]
         interactive: bool,
+        /// Same as [`Command::Exec::detach`].
+        #[arg(short, long)]
+        detach: bool,
         /// Same as [`Command::Exec::preserve_fds`].
         #[arg(long = "preserve-fds", default_value_t = 0)]
         preserve_fds: u32,
@@ -7249,6 +7279,7 @@ fn main() -> std::process::ExitCode {
                     env,
                     env_file,
                     interactive,
+                    detach,
                     preserve_fds,
                     privileged,
                 } => {
@@ -7299,6 +7330,7 @@ fn main() -> std::process::ExitCode {
                         &combined_env,
                         preserve_fds,
                         interactive,
+                        detach,
                         privileged,
                         &args,
                     )
@@ -7587,6 +7619,7 @@ fn main() -> std::process::ExitCode {
                 env,
                 env_file,
                 interactive,
+                detach,
                 preserve_fds,
                 privileged,
             }) => {
@@ -7646,6 +7679,7 @@ fn main() -> std::process::ExitCode {
                     &combined_env,
                     preserve_fds,
                     interactive,
+                    detach,
                     privileged,
                     &args,
                 )
@@ -19519,6 +19553,7 @@ fn cmd_exec(
     extra_env: &[String],
     preserve_fds: u32,
     interactive: bool,
+    detach: bool,
     privileged: bool,
     args: &[String],
 ) -> anyhow::Result<()> {
@@ -19631,21 +19666,44 @@ fn cmd_exec(
         // checked-directly default (`-i` absent) of never connecting
         // the exec'd process's stdin at all.
         close_stdin: !interactive,
-        // `ociman exec` has no `--detach`/`-d` flag of its own yet
-        // (real `podman exec -d` does have one -- a real, separate,
-        // deliberately out-of-scope gap for a future increment, not
-        // closed by `ocirun exec --detach`, 0533). See `ExecRequest::
-        // detach`'s own doc comment.
-        detach: false,
+        // `--detach`/`-d` (0534) -- see `Command::Exec::detach`'s own
+        // doc comment.
+        detach,
     };
 
     // SAFETY: `ociman`'s own process has not spawned any additional
     // threads by this point, same as `run`'s own safety note.
     #[allow(unsafe_code)]
-    let exit_code = unsafe { oci_runtime_core::exec::exec(pid, request) }.context("exec")?;
+    let exit_code = unsafe {
+        oci_runtime_core::exec::exec_reporting_pid(pid, request, |exec_pid| {
+            // `--detach` (see `Command::Exec::detach`'s own doc
+            // comment): matching real `podman exec --detach`'s own
+            // `fmt.Println(id)` -- printed here, from inside this
+            // callback, rather than after the call returns below,
+            // since a non-detached exec never reaches this point at
+            // all in time to print anything meaningful (the callback
+            // still fires for it too, just discarded, the same "pay
+            // for one extra pipe and a 4-byte read, not a behavioral
+            // difference" cost every other non-detached caller of
+            // this same shared function already accepts).
+            if detach {
+                println!("{exec_pid}");
+            }
+        })
+    }
+    .context("exec")?;
 
-    // The exec'd process's own exit code becomes ours, same convention
-    // `run` already follows.
+    // A detached exec always exits `0` here (see `ExecRequest::
+    // detach`'s own doc comment: `exec_reporting_pid` itself already
+    // returns `Ok(0)` unconditionally in that case, without ever
+    // actually waiting on the exec'd process) -- `std::process::exit`
+    // below still applies uniformly either way, matching real
+    // podman's own identical "detached exec is `return nil`, i.e.
+    // whatever this process's own default success exit code already
+    // is" behavior.
+    //
+    // The exec'd process's own exit code becomes ours otherwise, same
+    // convention `run` already follows.
     std::process::exit(exit_code);
 }
 
