@@ -5353,6 +5353,54 @@ enum ContainerCommand {
         #[arg(short = 'l', long)]
         latest: bool,
     },
+    /// `podman container exec`'s own real alias for the already-
+    /// existing flat [`Command::Exec`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/exec.go:28-127`:
+    /// `containerExecCommand` (`Parent: containerCmd`) and top-level
+    /// `execCommand` share the exact same `Use`/`Short`/`Long`/
+    /// `RunE`/`ValidArgsFunction`, and both get the identical flag
+    /// set applied via the one shared `execFlags(cmd)` helper -- a
+    /// byte-identical alias, the same shape [`Self::Kill`] (`0492`)
+    /// already established. Dispatches into the same [`cmd_exec`]
+    /// `ociman exec` itself already calls, replaying the identical
+    /// manual container-reference-vs-command disambiguation the
+    /// top-level [`Command::Exec`] arm already has -- see
+    /// [`Command::Exec`]'s own doc comment for the exact semantics
+    /// (including this project's own honestly narrower first-slice
+    /// scope: no `--detach`/`--detach-keys`/`--tty`, matching the
+    /// top-level command's own identical gap), not repeated here.
+    Exec {
+        /// Same as [`Command::Exec::positional`].
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        positional: Vec<String>,
+        /// Same as [`Command::Exec::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+        /// Same as [`Command::Exec::cidfile`].
+        #[arg(long = "cidfile", value_name = "FILE")]
+        cidfile: Option<PathBuf>,
+        /// Same as [`Command::Exec::user`].
+        #[arg(short, long)]
+        user: Option<String>,
+        /// Same as [`Command::Exec::workdir`].
+        #[arg(short = 'w', long = "workdir")]
+        workdir: Option<String>,
+        /// Same as [`Command::Exec::env`].
+        #[arg(short, long = "env")]
+        env: Vec<String>,
+        /// Same as [`Command::Exec::env_file`].
+        #[arg(long = "env-file", value_name = "PATH")]
+        env_file: Vec<PathBuf>,
+        /// Same as [`Command::Exec::interactive`].
+        #[arg(short, long)]
+        interactive: bool,
+        /// Same as [`Command::Exec::preserve_fds`].
+        #[arg(long = "preserve-fds", default_value_t = 0)]
+        preserve_fds: u32,
+        /// Same as [`Command::Exec::privileged`].
+        #[arg(long)]
+        privileged: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -6426,6 +6474,69 @@ fn main() -> std::process::ExitCode {
                         }
                     };
                     cmd_attach(&resolved_id)
+                }
+                ContainerCommand::Exec {
+                    positional,
+                    latest,
+                    cidfile,
+                    user,
+                    workdir,
+                    env,
+                    env_file,
+                    interactive,
+                    preserve_fds,
+                    privileged,
+                } => {
+                    // Manual disambiguation, matching real podman's
+                    // own checked-directly `determineTargetCtrAndCmd`
+                    // exactly -- the identical logic the top-level
+                    // `Command::Exec` arm already has.
+                    anyhow::ensure!(
+                        !(latest && cidfile.is_some()),
+                        "--latest and --cidfile can not be used together"
+                    );
+                    let (id, args) = if latest || cidfile.is_some() {
+                        let id = if latest {
+                            let containers = open_container_store()?;
+                            resolve_latest_container(&containers)?
+                        } else {
+                            let path = cidfile.as_deref().expect("cidfile is Some in this branch");
+                            let content = std::fs::read_to_string(path)
+                                .with_context(|| format!("reading --cidfile {}", path.display()))?;
+                            content.split('\n').next().unwrap_or("").to_string()
+                        };
+                        (id, positional)
+                    } else {
+                        let mut iter = positional.into_iter();
+                        let first = iter.next().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "exec requires the name or ID of a container or the --latest \
+                                 or --cidfile flag"
+                            )
+                        })?;
+                        let id = first.strip_prefix('/').unwrap_or(&first).to_string();
+                        (id, iter.collect::<Vec<String>>())
+                    };
+                    anyhow::ensure!(
+                        !args.is_empty(),
+                        "must provide a non-empty command to start an exec session: invalid \
+                         argument"
+                    );
+                    let mut combined_env = Vec::new();
+                    for path in &env_file {
+                        combined_env.extend(build::read_env_file(path)?);
+                    }
+                    combined_env.extend(env);
+                    cmd_exec(
+                        &id,
+                        user.as_deref(),
+                        workdir.as_deref(),
+                        &combined_env,
+                        preserve_fds,
+                        interactive,
+                        privileged,
+                        &args,
+                    )
                 }
             },
             Some(Command::Image { command }) => match command {

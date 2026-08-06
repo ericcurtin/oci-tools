@@ -26,14 +26,16 @@
 //! same shape again for `ociman commit`), `export`
 //! (`docs/design/0502`, the same shape again for `ociman export`),
 //! `stats` (`docs/design/0503`, the same shape again for `ociman
-//! stats`), and `attach` (`docs/design/0504`, the same shape again
-//! for `ociman attach`) — see `ociman_ps.rs`/`ociman_stop.rs`/
+//! stats`), `attach` (`docs/design/0504`, the same shape again for
+//! `ociman attach`), and `exec` (`docs/design/0505`, the same shape
+//! again for `ociman exec`) — see `ociman_ps.rs`/`ociman_stop.rs`/
 //! `ociman_start.rs`/`ociman_kill.rs`/`ociman_pause.rs`/
 //! `ociman_rename.rs`/`ociman_wait.rs`/`ociman_top.rs`/
 //! `ociman_logs.rs`/`ociman_diff.rs`/`ociman_cp.rs`/
 //! `ociman_commit.rs`/`ociman_export.rs`/`ociman_stats.rs`/
-//! `ociman_attach.rs` for each top-level command's own much larger
-//! test suite; this file only proves each alias itself is byte-
+//! `ociman_attach.rs`/`ociman_exec.rs` for each top-level command's
+//! own much larger test suite; this file only proves each alias
+//! itself is byte-
 //! identical, not the aliased command's own full semantics again.
 //!
 //! `ociman container prune` removes every real, non-running container
@@ -1858,4 +1860,70 @@ fn container_attach_is_a_byte_identical_alias_for_top_level_attach() {
         "line1\nline2\n",
         "the alias should stream the container's own full output"
     );
+}
+
+/// `ociman container exec` (0505) is a real, byte-identical alias for
+/// the top-level `ociman exec`, matching real `podman container
+/// exec`'s own checked-directly identical `Use`/`Short`/`Long`/
+/// `RunE`/`ValidArgsFunction` (and identical `execFlags`-applied flag
+/// set) as top-level `podman exec` exactly (`~/git/podman/cmd/podman/
+/// containers/exec.go:28-127`). Full `exec` semantics (`--user`,
+/// `--workdir`, `--env`/`--env-file`, `--interactive`,
+/// `--preserve-fds`, `--privileged`, `--latest`/`--cidfile`) are
+/// already exhaustively tested against the top-level command in
+/// `ociman_exec.rs`; this only proves the alias itself reaches the
+/// identical function with the identical fields.
+#[test]
+fn container_exec_is_a_byte_identical_alias_for_top_level_exec() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-exec-alias:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/container-exec-alias:latest",
+        &["sleep", "30"],
+    );
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let alias = ociman(
+        storage_dir.path(),
+        &[
+            "container",
+            "exec",
+            &id,
+            "/bin/sh",
+            "-c",
+            "echo exec-worked-via-alias",
+        ],
+    );
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&alias.stdout),
+        "exec-worked-via-alias\n"
+    );
+
+    // Clean up the still-running container so the temp dir doesn't
+    // leak a live process past this test.
+    let _ = ociman(storage_dir.path(), &["kill", &id]);
 }
