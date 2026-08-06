@@ -1,10 +1,12 @@
 //! `ociman image mount`/`ociman image unmount` integration tests
-//! (`docs/design/0519`): a real, separate, non-alias pair of
+//! (`docs/design/0519`/`0520`): a real, separate, non-alias pair of
 //! subcommands from the already-existing container `mount`/`unmount`
 //! (`0361`/`0511`) — extracting (if not already cached) an image's
 //! own real rootfs and printing its cache path, and a real no-op
 //! respectively, correcting a mischaracterization of this pair as
 //! "cross-concept aliasing" repeated across `0481`/`0482`/`0499`.
+//! `--all` (`0520`) sweeps every image currently in local storage
+//! instead of naming one explicitly.
 
 use std::path::Path;
 use std::process::Command;
@@ -284,6 +286,173 @@ fn image_unmount_of_an_unknown_image_is_a_clear_error() {
     assert!(
         String::from_utf8_lossy(&unmount.stderr).contains("no such image"),
         "{}",
+        String::from_utf8_lossy(&unmount.stderr)
+    );
+}
+
+/// `image mount --all` (0520): mounts every image currently in local
+/// storage, one real cache path per line.
+#[test]
+fn image_mount_all_mounts_every_image_in_storage() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/image-mount-all-1:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/image-mount-all-2:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let mount = ociman(storage_dir.path(), &["image", "mount", "--all"]);
+    assert!(
+        mount.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&mount.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&mount.stdout).into_owned();
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    for line in lines {
+        assert!(Path::new(line).is_dir(), "{line:?}");
+    }
+}
+
+/// `image mount --all` on an empty store succeeds silently -- matching
+/// real `podman image mount --all`'s own identical behavior (nothing
+/// to iterate).
+#[test]
+fn image_mount_all_on_an_empty_store_succeeds_silently() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let mount = ociman(storage_dir.path(), &["image", "mount", "--all"]);
+    assert!(mount.status.success());
+    assert!(mount.stdout.is_empty());
+}
+
+/// `image mount --all` combined with an explicit image is a clear
+/// error, matching real podman's own exact wording.
+#[test]
+fn image_mount_all_with_an_explicit_image_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let mount = ociman(
+        storage_dir.path(),
+        &["image", "mount", "--all", "somereference"],
+    );
+    assert!(!mount.status.success());
+    assert!(
+        String::from_utf8_lossy(&mount.stderr).contains("you may not pass"),
+        "{}",
+        String::from_utf8_lossy(&mount.stderr)
+    );
+}
+
+/// `image unmount --all` (0520): a real no-op sweeping every image in
+/// local storage, printing each one's own short ID.
+#[test]
+fn image_unmount_all_prints_every_images_own_short_id() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/image-unmount-all-1:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    seed_image(
+        &store,
+        "ociman-test/image-unmount-all-2:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let unmount = ociman(storage_dir.path(), &["image", "unmount", "--all"]);
+    assert!(
+        unmount.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&unmount.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&unmount.stdout)
+            .trim()
+            .lines()
+            .count(),
+        2
+    );
+
+    // Both images must survive completely untouched.
+    let images = ociman(storage_dir.path(), &["images", "-q"]);
+    assert_eq!(
+        String::from_utf8_lossy(&images.stdout)
+            .trim()
+            .lines()
+            .count(),
+        2
+    );
+}
+
+/// `image unmount --all` on an empty store succeeds silently.
+#[test]
+fn image_unmount_all_on_an_empty_store_succeeds_silently() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let unmount = ociman(storage_dir.path(), &["image", "unmount", "--all"]);
+    assert!(unmount.status.success());
+    assert!(unmount.stdout.is_empty());
+}
+
+/// `image unmount --force` (0520): accepted for real CLI
+/// compatibility, but changes nothing -- the identical reasoning
+/// container `unmount --force` (0361) already establishes.
+#[test]
+fn image_unmount_force_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/image-unmount-force:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let unmount = ociman(
+        storage_dir.path(),
+        &[
+            "image",
+            "unmount",
+            "--force",
+            "ociman-test/image-unmount-force:latest",
+        ],
+    );
+    assert!(
+        unmount.status.success(),
+        "stderr: {}",
         String::from_utf8_lossy(&unmount.stderr)
     );
 }

@@ -6001,21 +6001,57 @@ enum ImageCommand {
     /// two-phase "resolve everything first" convention `container
     /// unmount`'s own multi-target case (`0471`) already established.
     ///
+    /// `--all`/`-a` (`0520`) mounts every image currently in local
+    /// storage instead, matching real `podman image mount --all`
+    /// exactly (checked directly, `~/git/podman/pkg/domain/infra/abi/
+    /// images.go:194-198`: `--all` sweeps every image via
+    /// `ListImages` with no filter at all beyond the same `readonly=
+    /// false` every one of this project's own images already
+    /// satisfies unconditionally — a real, honest match, not an
+    /// assumption). Mutually exclusive with an explicit image list —
+    /// matching real podman's own exact error wording for both
+    /// directions (checked directly, `mount.go`'s own `mount()`):
+    /// giving both together is `"when using the --all switch, you may
+    /// not pass any image names or IDs"`.
+    ///
+    /// **A real, checked-directly output-shape simplification versus
+    /// real podman's own default (non-`--format`) table for two or
+    /// more images**: this project always prints one bare path per
+    /// line (no id, no tab), the same plain output the single-image
+    /// case already had — real podman's own identical no-`--format`
+    /// case instead switches to a `{{.ID}}\t{{.Path}}` table the
+    /// moment more than one image (or `--all`) is involved (checked
+    /// directly: `mount.go`'s own bare-path branch is gated on
+    /// `len(args) == 1 && mountOpts.Format == "" && !mountOpts.All`
+    /// specifically, unlike the *container* `mount`'s own broader
+    /// bare-path condition covering `--all`/`--latest`/multiple
+    /// explicit containers alike, `~/git/podman/cmd/podman/
+    /// containers/mount.go`'s own `mount()`) -- a genuine difference
+    /// between the two real commands this project deliberately
+    /// doesn't replicate, since implementing a real templated table
+    /// just for this one flag combination would be disproportionate
+    /// to `--format`'s own still-deferred scope below.
+    ///
     /// **Deliberately narrower first slice** (matching this project's
     /// own established "narrow first slice, document the rest"
     /// pattern, e.g. `0361`'s own original container-mount scope
-    /// before `--all`/bare-mode/multi-id followed in `0470`-`0472`):
-    /// no `--all`, no bare-invocation "list every currently-cached
-    /// image" mode, no `--format`. Each is a real, separate, larger
-    /// gap of its own — bare-mode listing in particular needs a real
+    /// before bare-mode/multi-id followed in `0470`-`0472`): no bare-
+    /// invocation "list every currently-cached image" mode, no
+    /// `--format`. Bare-mode listing in particular needs a real
     /// cache-digest-to-image-reference reverse lookup this project has
     /// no existing primitive for at all, unlike the container version
     /// (whose bare-mode listing, `0470`, only ever needed the
     /// already-existing container store's own forward `id -> rootfs`
     /// mapping).
     Mount {
-        /// One or more image references or real/short IDs.
+        /// One or more image references or real/short IDs — omit
+        /// when using `--all`.
         images: Vec<String>,
+        /// Mount every image currently in local storage instead of
+        /// naming one explicitly — matching real `podman image mount
+        /// --all`/`-a` exactly (see this command's own doc comment).
+        #[arg(short, long)]
+        all: bool,
     },
     /// A real no-op — printing each given image's own real/short ID
     /// on success, matching the identical, already-established
@@ -6036,14 +6072,36 @@ enum ImageCommand {
     /// comment already gives for containers). Each given image is
     /// resolved *before* printing any id, the same two-phase
     /// convention [`Self::Mount`] above already establishes.
-    /// Deliberately narrower than real `podman image unmount`'s own
-    /// further `--all`/`--force` -- the identical, still-open gap
-    /// [`Self::Mount`]'s own doc comment already explains for its
-    /// sibling.
+    ///
+    /// `--all`/`-a` sweeps every image in local storage instead,
+    /// matching real `podman image unmount --all` exactly, the same
+    /// mutual-exclusivity/output-shape reasoning [`Self::Mount`]'s own
+    /// doc comment already gives (an unmount of zero images at all is
+    /// a real, silent success either way, matching real podman's own
+    /// identical behavior — there is nothing to iterate). `--force`/
+    /// `-f` is accepted for real CLI compatibility with real `podman
+    /// image unmount --force` but changes nothing, the identical
+    /// reasoning [`Command::Unmount::force`] (`0361`) already
+    /// establishes for containers. Deliberately narrower than real
+    /// `podman image unmount`'s own further `--format` -- the
+    /// identical, still-open gap [`Self::Mount`]'s own doc comment
+    /// already explains for its sibling.
     #[command(alias = "umount")]
     Unmount {
-        /// One or more image references or real/short IDs.
+        /// One or more image references or real/short IDs — omit
+        /// when using `--all`.
         images: Vec<String>,
+        /// Unmount every image currently in local storage instead of
+        /// naming one explicitly — matching real `podman image
+        /// unmount --all`/`-a` exactly (see this command's own doc
+        /// comment).
+        #[arg(short, long)]
+        all: bool,
+        /// Accepted for real CLI compatibility with real `podman
+        /// image unmount --force`/`-f`; has no effect (see this
+        /// command's own doc comment).
+        #[arg(short, long)]
+        force: bool,
     },
 }
 
@@ -7092,8 +7150,12 @@ fn main() -> std::process::ExitCode {
                     false,
                     InspectType::Image,
                 ),
-                ImageCommand::Mount { images } => cmd_image_mount(&images),
-                ImageCommand::Unmount { images } => cmd_image_unmount(&images),
+                ImageCommand::Mount { images, all } => cmd_image_mount(&images, all),
+                ImageCommand::Unmount {
+                    images,
+                    all,
+                    force: _,
+                } => cmd_image_unmount(&images, all),
             },
             Some(Command::Stats {
                 id,
@@ -8929,12 +8991,33 @@ fn resolve_images_or_bail(store: &Store, images: &[String]) -> anyhow::Result<Ve
         .collect()
 }
 
+/// Shared by [`cmd_image_mount`]/[`cmd_image_unmount`]: either every
+/// image currently in local storage (`--all`), or every explicitly
+/// given one, resolved via [`resolve_images_or_bail`] -- matching
+/// real `podman image mount`/`unmount --all`'s own exact mutual-
+/// exclusivity wording (see [`ImageCommand::Mount`]'s own doc
+/// comment for the full, checked-directly citation).
+fn resolve_images_or_all(
+    store: &Store,
+    images: &[String],
+    all: bool,
+) -> anyhow::Result<Vec<ImageRecord>> {
+    anyhow::ensure!(
+        !(all && !images.is_empty()),
+        "when using the --all switch, you may not pass any image names or IDs"
+    );
+    if all {
+        return store.list_images().context("listing images");
+    }
+    anyhow::ensure!(!images.is_empty(), "image name or ID must be specified");
+    resolve_images_or_bail(store, images)
+}
+
 /// `ociman image mount` — see [`ImageCommand::Mount`]'s own doc
 /// comment for the exact, checked-directly semantics and scope.
-fn cmd_image_mount(images: &[String]) -> anyhow::Result<()> {
-    anyhow::ensure!(!images.is_empty(), "image name or ID must be specified");
+fn cmd_image_mount(images: &[String], all: bool) -> anyhow::Result<()> {
     let store = open_store()?;
-    let records = resolve_images_or_bail(&store, images)?;
+    let records = resolve_images_or_all(&store, images, all)?;
     let cache_root = rootfs_setup::cache_root(&store);
     for record in &records {
         let manifest = store
@@ -8954,10 +9037,9 @@ fn cmd_image_mount(images: &[String]) -> anyhow::Result<()> {
 
 /// `ociman image unmount` — see [`ImageCommand::Unmount`]'s own doc
 /// comment for why this is a real no-op.
-fn cmd_image_unmount(images: &[String]) -> anyhow::Result<()> {
-    anyhow::ensure!(!images.is_empty(), "image name or ID must be specified");
+fn cmd_image_unmount(images: &[String], all: bool) -> anyhow::Result<()> {
     let store = open_store()?;
-    let records = resolve_images_or_bail(&store, images)?;
+    let records = resolve_images_or_all(&store, images, all)?;
     // The same 12-hex-char short ID this project's own `ociman
     // images`/`images -q` already print for "the id" everywhere else
     // -- not real podman's own literal full-length `r.Id`, kept
