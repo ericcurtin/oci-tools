@@ -2645,6 +2645,79 @@ enum Command {
         #[arg(long, value_enum)]
         sort: Option<PsSortKey>,
     },
+    /// "Initialize one or more containers, creating the OCI spec and
+    /// mounts for inspection" (real podman's own doc string, quoted
+    /// verbatim) — matching real `podman init`/`podman container
+    /// init` exactly (checked directly, `~/git/podman/cmd/podman/
+    /// containers/init.go`: a top-level `initCommand` *and* a nested
+    /// `containerInitCommand`, `Parent: containerCmd`, sharing one
+    /// `initFlags`/`RunE` — both registered here too, [`Self::Init`]
+    /// and [`ContainerCommand::Init`], dispatching into the same
+    /// [`cmd_init`]). Real docker has no equivalent at all (docker's
+    /// own `--init` is an unrelated `run`-time flag, already
+    /// implemented here).
+    ///
+    /// Resolves every given identifier first, exactly like [`Self::
+    /// Stop`]'s own multi-target convention: an unresolvable one
+    /// aborts the whole call before touching anything — a real,
+    /// checked-directly *different* policy than [`ContainerCommand::
+    /// Cleanup`]'s own deliberate whole-call *silent* success
+    /// inversion (`0529`): real `ContainerInit`
+    /// (`~/git/podman/pkg/domain/infra/abi/containers.go:1436-1454`)
+    /// propagates `getContainers`'s own resolution error directly
+    /// (`if err != nil { return nil, err }`), with no `ErrNoSuchCtr`-
+    /// swallowing special case at all, unlike `ContainerCleanup`'s
+    /// own.
+    ///
+    /// Per-container eligibility matches real podman's own exact
+    /// check, checked directly (`~/git/podman/libpod/
+    /// container_api.go`'s own `initUnlocked`: `ensureState
+    /// (Configured, Stopped, Exited)`, else a real `"container %s has
+    /// already been created in runtime"` error wrapping
+    /// `ErrCtrStateInvalid`). This project's own already-established
+    /// two-name state split (`Status::Created`/`Status::Stopped`, see
+    /// `ociman create`'s own doc comment) means every container that
+    /// has ever reached `Created` here has *already* had its own real
+    /// OCI-runtime `create` step run eagerly — exactly real podman's
+    /// own post-`Init` `Created` state, never its accepted, pre-
+    /// `Init` `Configured` one — so a `Created` container here always
+    /// hits the *rejected* branch, matching real podman's own
+    /// identical "already initialized" refusal. A `Stopped` one is
+    /// eligible, but a real, faithful no-op (not a hard error): this
+    /// project's own `start` always does a full, fresh launch from
+    /// the bundle regardless of whether the container was previously
+    /// `Created` or `Stopped` (see [`cmd_start`]'s own doc comment),
+    /// so there's no separate, in-advance "reinitialize the runtime
+    /// container" step for this command to actually perform. Under
+    /// `--all`, an ineligible container's own error is silently
+    /// tolerated (its id is still printed, as if successful) —
+    /// matching real `ContainerInit`'s own exact `if options.All &&
+    /// errors.Is(err, ErrCtrStateInvalid) { err = nil }`; outside
+    /// `--all`, it's a real, reported error, matching every other
+    /// container in the same call still being attempted regardless
+    /// (real podman's own per-container loop never aborts early on
+    /// one failure).
+    Init {
+        /// The container ID(s)/`--name`(s) to initialize — omit when
+        /// using `--all`/`--latest`.
+        containers: Vec<String>,
+        /// Initialize every container this project knows about, not
+        /// just the ones explicitly named — matching real `podman
+        /// init --all`/`-a` exactly. An ineligible container's own
+        /// error is silently tolerated under this flag (see this
+        /// command's own doc comment above).
+        #[arg(short, long)]
+        all: bool,
+        /// Initialize only the most recently created container —
+        /// matching real `podman init --latest`/`-l` exactly. Unlike
+        /// [`ContainerCommand::Cleanup::latest`]'s own real, checked-
+        /// directly divergence, an empty container store here is a
+        /// real, ordinary hard error, matching every *other*
+        /// `--latest` command in this project (real `init` has no
+        /// analogous "conmon lost the race" special case for this).
+        #[arg(short, long)]
+        latest: bool,
+    },
     /// Start an already-`Stopped` container again, reusing its own
     /// existing rootfs/config exactly as `run` originally left it —
     /// matching real `docker start`/`podman start` exactly, including
@@ -5134,6 +5207,25 @@ enum ContainerCommand {
         #[arg(short, long)]
         volumes: bool,
     },
+    /// `podman container init`'s own real, dual-registered twin of
+    /// the already-existing flat [`Command::Init`] -- checked
+    /// directly, `~/git/podman/cmd/podman/containers/init.go`: unlike
+    /// [`Self::Cleanup`]'s own nested-only registration, `init` shares
+    /// one `initCommand` definition with a genuinely separate, but
+    /// field-for-field identical, `containerInitCommand`. Dispatches
+    /// into the same [`cmd_init`] `ociman init` itself already calls,
+    /// with the identical field set -- see [`Command::Init`]'s own
+    /// doc comment for the exact semantics, not repeated here.
+    Init {
+        /// Same as [`Command::Init::containers`].
+        containers: Vec<String>,
+        /// Same as [`Command::Init::all`].
+        #[arg(short, long)]
+        all: bool,
+        /// Same as [`Command::Init::latest`].
+        #[arg(short, long)]
+        latest: bool,
+    },
     /// `podman container stop`'s own real alias for the already-
     /// existing flat [`Command::Stop`] -- checked directly, `~/git/
     /// podman/cmd/podman/containers/stop.go:36-101`: `containerStopCommand`
@@ -6556,6 +6648,11 @@ fn main() -> std::process::ExitCode {
                 size,
                 sort,
             ),
+            Some(Command::Init {
+                containers,
+                all,
+                latest,
+            }) => cmd_init(&containers, all, latest),
             Some(Command::Start { id, latest, attach }) => {
                 // Matches real podman's own exact wording, checked
                 // directly (`~/git/podman/cmd/podman/containers/
@@ -6896,6 +6993,11 @@ fn main() -> std::process::ExitCode {
                     depend: _,
                     volumes: _,
                 } => cmd_rm(&ids, force, all, &cidfile, ignore, time, &filter, latest),
+                ContainerCommand::Init {
+                    containers,
+                    all,
+                    latest,
+                } => cmd_init(&containers, all, latest),
                 ContainerCommand::Stop {
                     ids,
                     time,
@@ -15316,6 +15418,88 @@ fn stop_container(
     if reset_scope {
         reset_failed_systemd_scope(&resolved, &state);
     }
+    Ok(())
+}
+
+/// `ociman init`/`ociman container init` — see [`Command::Init`]'s
+/// own doc comment for the full real-vs-this-project reasoning
+/// (per-container eligibility, the `--all`-tolerant error swallowing,
+/// and why this deliberately does *not* replicate [`cmd_container_
+/// cleanup`]'s own whole-call silent-no-op inversion).
+fn cmd_init(ids: &[String], all: bool, latest: bool) -> anyhow::Result<()> {
+    // Matches real podman's own exact wording and check order, checked
+    // directly (`~/git/podman/cmd/podman/validate/args.go`'s own
+    // `CheckAllLatestAndIDFile`, called with `ignoreArgLen = false` —
+    // the same call `ociman container cleanup` (0529) already
+    // replicates verbatim).
+    anyhow::ensure!(
+        !(all && latest),
+        "--all and --latest cannot be used together"
+    );
+    anyhow::ensure!(
+        !(all && !ids.is_empty()),
+        "no arguments are needed with --all"
+    );
+    anyhow::ensure!(
+        !(latest && !ids.is_empty()),
+        "--latest and containers cannot be used together"
+    );
+    anyhow::ensure!(
+        all || latest || !ids.is_empty(),
+        "you must provide at least one name or id"
+    );
+
+    let containers = open_container_store()?;
+
+    // `(what to print on success, the container's own real id)` pairs.
+    // Unlike `cmd_container_cleanup`'s own deliberate whole-call
+    // *silent* no-op inversion (0529), real `ContainerInit` never
+    // swallows a resolution failure at all — an unresolvable explicit
+    // name is a real, immediate error, aborting before touching
+    // anything, the same "resolve everything first" convention
+    // `cmd_mount`'s own multi-target path already established.
+    let targets: Vec<(String, String)> = if all {
+        let mut states = containers.list().context("listing containers")?;
+        states.sort_by(|a, b| a.created.cmp(&b.created));
+        states.into_iter().map(|s| (s.id.clone(), s.id)).collect()
+    } else if latest {
+        let id = resolve_latest_container(&containers)?;
+        vec![(id.clone(), id)]
+    } else {
+        let mut resolved = Vec::with_capacity(ids.len());
+        for raw in ids {
+            resolved.push((raw.clone(), resolve_container_id(&containers, raw)?));
+        }
+        resolved
+    };
+
+    let mut had_error = false;
+    for (raw_input, id) in targets {
+        let state = containers.load(&id)?;
+        // Real podman's own exact eligibility, checked directly
+        // (`~/git/podman/libpod/container_api.go`'s own
+        // `initUnlocked`: `Configured`/`Stopped`/`Exited` succeed,
+        // everything else is a real, reported "already created in
+        // runtime" error) — see `Command::Init`'s own doc comment for
+        // exactly why this project's own `Status::Stopped` is the
+        // only status that maps onto real podman's *accepted* set
+        // here, and why it's still a real no-op even so.
+        if state.effective_status() == Status::Stopped {
+            println!("{raw_input}");
+            continue;
+        }
+        if all {
+            // Real `ContainerInit`'s own exact tolerance, checked
+            // directly: "If we're initializing all containers, ignore
+            // invalid state errors" — still printed as if successful.
+            println!("{raw_input}");
+            continue;
+        }
+        had_error = true;
+        eprintln!("error initializing {id}: container {id} has already been created in runtime");
+    }
+
+    anyhow::ensure!(!had_error, "init failed for one or more containers");
     Ok(())
 }
 

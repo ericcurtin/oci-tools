@@ -2590,3 +2590,48 @@ fn container_cleanup_all_and_latest_together_is_a_clear_error() {
             .contains("--all and --latest cannot be used together")
     );
 }
+
+/// `ociman container init` (`docs/design/0530`) is a real,
+/// dual-registered, byte-identical twin of the top-level `ociman
+/// init` -- matching real `podman container init`'s own checked-
+/// directly identical `Use`/`Short`/`Long`/`RunE`/`Args`/
+/// `ValidArgsFunction` as top-level `podman init` exactly (`~/git/
+/// podman/cmd/podman/containers/init.go`). Full `init` semantics
+/// (per-container eligibility, `--all`'s own error-tolerant sweep,
+/// `--latest`, the whole-call-abort-on-unresolvable-name behavior)
+/// are already exhaustively tested against the top-level command in
+/// `ociman_init.rs`; this only proves the alias itself reaches the
+/// identical function with the identical fields.
+#[test]
+fn container_init_is_a_byte_identical_alias_for_top_level_init() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-init-alias:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/container-init-alias:latest", "true"],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+
+    let alias = ociman(storage_dir.path(), &["container", "init", &id]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&alias.stdout).trim(), id);
+}
