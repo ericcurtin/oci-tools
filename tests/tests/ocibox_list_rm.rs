@@ -1,8 +1,14 @@
-//! `ocibox list`/`ocibox rm` integration tests: exercises the actual
-//! built `ocibox` binary — `ocibox create`'s own tests
-//! (`ocibox_create.rs`) already cover image resolution and rootfs
-//! extraction directly; this covers the rest of the family that makes
-//! `create` actually manageable.
+//! `ocibox list`/`ocibox rm`/`ocibox stop` integration tests:
+//! exercises the actual built `ocibox` binary — `ocibox create`'s own
+//! tests (`ocibox_create.rs`) already cover image resolution and
+//! rootfs extraction directly; this covers the rest of the family
+//! that makes `create` actually manageable. `stop` (`docs/design/
+//! 0518`) is a real, checked-directly no-op — a box has no persisted
+//! running state at all — but still requires every given name to
+//! genuinely resolve to a real box first, a real, deliberate
+//! divergence from `rm`'s own separate, tolerant handling of an
+//! unresolvable name (see `Command::Stop`'s own doc comment for the
+//! full, checked-directly reasoning).
 
 use std::path::Path;
 use std::process::Command;
@@ -578,4 +584,193 @@ fn rm_all_takes_priority_over_any_names_also_given() {
         !box_dir.exists(),
         "--all should have removed the real box despite the unrelated name also given"
     );
+}
+
+/// `ocibox stop` (0518): a real, checked-directly no-op once a given
+/// name actually resolves to a real box -- proven here by a real
+/// box's own storage directory surviving `stop` completely untouched.
+#[test]
+fn stop_on_a_real_box_is_a_real_no_op_and_never_removes_it() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/stop-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/stop-base:latest",
+            "--name",
+            "stopbox",
+        ],
+    );
+    assert!(create.status.success());
+    let box_dir = storage_dir.path().join("boxes").join("stopbox");
+    assert!(box_dir.is_dir());
+
+    let stop = ocibox(storage_dir.path(), &["stop", "stopbox"]);
+    assert!(
+        stop.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        stop.stdout.is_empty(),
+        "real distrobox prints nothing on a successful stop"
+    );
+    assert!(
+        box_dir.is_dir(),
+        "the box's own storage directory must survive stop completely untouched"
+    );
+
+    let list = ocibox(storage_dir.path(), &["list"]);
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("stopbox"),
+        "the box should still be fully present after stop"
+    );
+}
+
+/// `ocibox stop --yes`/`-Y` (0518): accepted for real CLI
+/// compatibility, but changes nothing -- the same reasoning `ocibox
+/// rm --yes` (0514) already established.
+#[test]
+fn stop_yes_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/stop-yes:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/stop-yes:latest",
+            "--name",
+            "stopyesbox",
+        ],
+    );
+    assert!(create.status.success());
+
+    let stop = ocibox(storage_dir.path(), &["stop", "stopyesbox", "--yes"]);
+    assert!(
+        stop.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        storage_dir.path().join("boxes").join("stopyesbox").is_dir(),
+        "the box's own storage directory must survive stop completely untouched"
+    );
+}
+
+/// `ocibox stop` on a name that doesn't resolve to any real box at
+/// all is a real, hard, immediate error -- a deliberate divergence
+/// from `ocibox rm`'s own separate, tolerant handling of the
+/// identical case, matching real distrobox's own genuine, hard
+/// failure there (see `Command::Stop`'s own doc comment for the
+/// full, checked-directly reasoning).
+#[test]
+fn stop_of_an_unknown_name_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let stop = ocibox(storage_dir.path(), &["stop", "does-not-exist"]);
+    assert!(!stop.status.success());
+    assert!(
+        String::from_utf8_lossy(&stop.stderr).contains("no such box"),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// `ocibox stop` with neither a name nor `--all` is a clear error --
+/// the same "at least one name, or --all, is required" restriction
+/// `ocibox rm` already establishes.
+#[test]
+fn stop_requires_a_name_or_all() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let stop = ocibox(storage_dir.path(), &["stop"]);
+    assert!(!stop.status.success());
+    assert!(
+        String::from_utf8_lossy(&stop.stderr).contains("no box name given"),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// `ocibox stop --all` with zero existing boxes at all is *not*
+/// itself an error -- matching real distrobox's own checked-directly
+/// non-fatal `"No containers found."` message.
+#[test]
+fn stop_all_on_an_empty_store_succeeds_with_a_message() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let stop = ocibox(storage_dir.path(), &["stop", "--all"]);
+    assert!(stop.status.success());
+    assert!(String::from_utf8_lossy(&stop.stderr).contains("No containers found."));
+}
+
+/// `ocibox stop --all` with one or more real boxes present is also a
+/// real, checked-directly no-op -- every box survives untouched.
+#[test]
+fn stop_all_on_existing_boxes_is_a_real_no_op() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/stop-all:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    for name in ["stopall1", "stopall2"] {
+        let create = ocibox(
+            storage_dir.path(),
+            &[
+                "create",
+                "--image",
+                "ocibox-test/stop-all:latest",
+                "--name",
+                name,
+            ],
+        );
+        assert!(create.status.success());
+    }
+
+    let stop = ocibox(storage_dir.path(), &["stop", "--all"]);
+    assert!(
+        stop.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(stop.stderr.is_empty());
+    for name in ["stopall1", "stopall2"] {
+        assert!(storage_dir.path().join("boxes").join(name).is_dir());
+    }
 }

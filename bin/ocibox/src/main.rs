@@ -33,8 +33,14 @@
 //! with one honest divergence (an explicit `--box` flag, since this
 //! project has no per-session `$CONTAINER_ID` a real `distrobox
 //! export` run from *inside* a box could detect instead — see
-//! `docs/design/0252`); `--app` desktop-entry export, `stop`, and
-//! `upgrade` are still ahead.
+//! `docs/design/0252`); `--app` desktop-entry export and `upgrade`
+//! are still ahead. `stop` (0518) landed as a real, checked-directly
+//! no-op: a box has no persisted running state at all, so real
+//! `distrobox stop`'s own only real effect (a real `podman stop`
+//! underneath) has no equivalent target here whatsoever — still
+//! requires every given name to actually resolve to a real box
+//! first, though, a real, deliberate divergence from `rm`'s own
+//! separate, tolerant handling of an unresolvable name.
 
 use std::path::{Path, PathBuf};
 
@@ -347,6 +353,57 @@ enum Command {
         /// this command's own doc comment above).
         #[arg(long, short = 'a')]
         all: bool,
+    },
+    /// A real, checked-directly no-op: a box has no persisted running
+    /// state at all (`docs/design/0207`/`0515` -- `ocibox enter` runs
+    /// a fresh, live command each time rather than starting/stopping
+    /// one long-lived process), so real `distrobox stop`'s own only
+    /// real effect (`~/git/distrobox/pkg/containermanager/providers/
+    /// podman.go:634-643`'s own `Stop`: shells out to a real `podman
+    /// stop <name>`) has no equivalent target here whatsoever.
+    ///
+    /// Still requires each given name (or every existing box, with
+    /// `--all`) to actually resolve to a real, already-existing box —
+    /// a real, deliberate divergence from `ocibox rm`'s own separate,
+    /// dedicated tolerance for an unresolvable name (`0321`): real
+    /// `distrobox rm` has its own distinct `warnUnknownContainers`
+    /// function specifically carving out that tolerance, but real
+    /// `distrobox stop` has no equivalent of it at all — an unknown
+    /// name there is a genuine, hard failure (the real, propagated
+    /// `podman stop somename` error `containerManager.Stop` never
+    /// catches or downgrades, checked directly, `~/git/distrobox/
+    /// pkg/commands/stop.go`'s own `Execute`), so this project matches
+    /// that same hard-failure shape instead of `rm`'s own tolerant
+    /// one. `--all` with zero existing boxes at all is *not* itself
+    /// an error, though — matching real distrobox's own checked-
+    /// directly non-fatal `"No containers found."` message printed to
+    /// stderr on an empty `--all` (`~/git/distrobox/internal/cli/
+    /// stop.go:84-87`, `ErrEmptyContainerList`; `stopAction` catches
+    /// it and still returns a clean exit). Prints nothing at all on
+    /// success either way, matching real distrobox's own identical
+    /// silence (checked directly: `~/git/distrobox/pkg/commands/
+    /// stop.go`'s own `Execute` has no success-path `Println` at
+    /// all).
+    Stop {
+        /// One or more box names — required unless `--all` is given.
+        /// This project's own narrower stance than real `distrobox
+        /// stop`'s own further fallback to a single configured
+        /// "default container name" with neither, a whole separate
+        /// concept this project doesn't have at all (the identical
+        /// restriction [`Command::Rm::names`]'s own doc comment
+        /// already establishes for `rm`).
+        names: Vec<String>,
+        /// Stop every existing box instead of naming one explicitly —
+        /// matching real `distrobox stop --all`/`-a` exactly.
+        #[arg(long, short = 'a')]
+        all: bool,
+        /// Accepted for real CLI compatibility with `distrobox stop
+        /// --yes`/`-Y`; has no effect, matching real distrobox's own
+        /// actual behavior under the one real mode this project can
+        /// ever run in (see [`Command::Rm::yes`]'s own doc comment,
+        /// `0514`, for the identical reasoning).
+        #[arg(long = "yes", short = 'Y')]
+        yes: bool,
     },
     /// Enter a box: runs a real, live, interactive command inside its
     /// own already-extracted rootfs — rootless namespaces (matching
@@ -748,6 +805,7 @@ fn main() -> std::process::ExitCode {
                 rm_home: _,
                 all,
             }) => cmd_rm(&names, all),
+            Some(Command::Stop { names, all, yes: _ }) => cmd_stop(&names, all),
             Some(Command::Enter {
                 name,
                 command,
@@ -1821,6 +1879,38 @@ fn cmd_rm(names: &[String], all: bool) -> anyhow::Result<()> {
         if let Err(e) = remove_one_box(name) {
             eprintln!("{e:#}");
         }
+    }
+    Ok(())
+}
+
+/// `ocibox stop` — see [`Command::Stop`]'s own doc comment for why
+/// this is a real, checked-directly no-op once every given name (or
+/// every existing box, with `--all`) is confirmed to actually
+/// resolve to a real box.
+fn cmd_stop(names: &[String], all: bool) -> anyhow::Result<()> {
+    if all {
+        if list_boxes()?.is_empty() {
+            // Matching real distrobox's own checked-directly non-
+            // fatal message exactly (`~/git/distrobox/internal/cli/
+            // stop.go:84-87`) -- not an error, just an honest report.
+            eprintln!("No containers found.");
+        }
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        !names.is_empty(),
+        "no box name given (try `ocibox stop <NAME>` or `--all`)"
+    );
+    // Every given name must actually resolve to a real, already-
+    // existing box -- checked up front, before "stopping" any of
+    // them, matching real distrobox's own genuine, hard failure for
+    // an unknown name (see this command's own doc comment for why
+    // this is a real, deliberate divergence from `ocibox rm`'s own
+    // separate, tolerant handling of the identical case).
+    for name in names {
+        validate_box_name(name)?;
+        anyhow::ensure!(boxes_root().join(name).is_dir(), "{name}: no such box");
     }
     Ok(())
 }
