@@ -246,6 +246,52 @@ fn rm_rm_home_flag_is_a_real_no_op_and_never_removes_the_custom_home() {
     );
 }
 
+/// `rm --yes`/`-Y` (0514): accepted for real CLI compatibility, but
+/// changes nothing at all -- real distrobox's own `--yes`/`-Y` only
+/// ever skips real interactive confirmation prompts this project has
+/// none of in the first place (see `Command::Rm`'s own doc comment
+/// for the full, checked-directly reasoning). Proven here against a
+/// real box, which is still genuinely removed exactly as a plain
+/// `rm` would.
+#[test]
+fn rm_yes_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/rm-yes:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/rm-yes:latest",
+            "--name",
+            "yesbox",
+        ],
+    );
+    assert!(create.status.success());
+    let box_dir = storage_dir.path().join("boxes").join("yesbox");
+    assert!(box_dir.is_dir());
+
+    let rm = ocibox(storage_dir.path(), &["rm", "yesbox", "--yes"]);
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&rm.stdout).trim(), "yesbox");
+    assert!(!box_dir.exists(), "the whole box directory should be gone");
+}
+
 /// `rm` of a name that simply doesn't resolve to any real box is a
 /// warning, not a hard error (0321 — a real correction: previously
 /// this hard-errored, before checking real `distrobox`'s own actual

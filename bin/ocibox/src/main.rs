@@ -226,6 +226,20 @@ enum Command {
     /// first place (the same "nothing to skip" reasoning `create
     /// --pull`'s own doc comment already gives for `--yes`).
     ///
+    /// `--yes`/`-Y` is accepted too (0514), for the identical real
+    /// reason `--force` already is: checked directly,
+    /// `~/git/distrobox/pkg/commands/rm.go:82,135,150`, real
+    /// distrobox's own `--yes`/`-Y` (`NoTTY`) only ever skips real
+    /// interactive confirmation prompts (the top-level "do you really
+    /// want to delete containers" one, a per-container "container is
+    /// running, force delete it" one, and `--rm-home`'s own prompt) —
+    /// this project has none of those prompts in the first place
+    /// (every invocation is already the real, checked-directly
+    /// equivalent of real distrobox's own always-`--yes`/`noTTY`
+    /// case, the same reasoning `--rm-home`'s own doc comment below
+    /// already gives), so there is nothing left for `--yes` to skip
+    /// here either.
+    ///
     /// `--rm-home` is accepted too (0405), for the identical real
     /// reason `--force` already is, but checked directly against
     /// real distrobox's own actual implementation first rather than
@@ -263,6 +277,12 @@ enum Command {
         /// comment).
         #[arg(long, short = 'f')]
         force: bool,
+        /// Accepted for real CLI compatibility with `distrobox rm
+        /// --yes`/`-Y`; has no effect, matching real distrobox's own
+        /// actual behavior under the one real mode this project can
+        /// ever run in (see this command's own doc comment).
+        #[arg(long = "yes", short = 'Y')]
+        yes: bool,
         /// Accepted for real CLI compatibility with `distrobox rm
         /// --rm-home`; has no effect, matching real distrobox's own
         /// actual behavior under the one real mode this project can
@@ -671,6 +691,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Rm {
                 names,
                 force: _,
+                yes: _,
                 rm_home: _,
                 all,
             }) => cmd_rm(&names, all),
