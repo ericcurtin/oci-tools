@@ -1322,6 +1322,29 @@ fn volume_prune_removes_only_unreferenced_volumes() {
     assert!(!stdout.contains("unused-vol"), "{stdout}");
 }
 
+/// `volume prune --force`/`-f` (0521): accepted for real CLI
+/// compatibility, but changes nothing -- the identical "nothing to
+/// skip" reasoning `container prune --force` already established.
+#[test]
+fn volume_prune_force_flag_is_accepted_and_behaves_identically() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let create = ociman(storage_dir.path(), &["volume", "create", "forceprunevol"]);
+    assert!(create.status.success(), "{create:?}");
+
+    let prune = ociman(storage_dir.path(), &["volume", "prune", "--force"]);
+    assert!(
+        prune.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&prune.stdout).trim(),
+        "forceprunevol"
+    );
+}
+
 /// `volume prune --filter label=` (matching real `podman volume
 /// prune --filter label=`'s own checked-directly narrower key set --
 /// `~/git/podman/pkg/domain/filters/volumes.go`'s own

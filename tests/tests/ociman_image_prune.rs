@@ -113,6 +113,44 @@ fn image_prune_all_removes_an_unused_tagged_image() {
     );
 }
 
+/// `image prune --force`/`-f` (0521): accepted for real CLI
+/// compatibility, but changes nothing -- the identical "nothing to
+/// skip" reasoning `container prune --force` already established.
+#[test]
+fn image_prune_force_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/image-prune-force:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let prune = ociman(
+        storage_dir.path(),
+        &["--json", "image", "prune", "--all", "--force"],
+    );
+    assert!(prune.status.success(), "{prune:?}");
+    let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(
+        view["images_removed"],
+        serde_json::json!(["docker.io/ociman-test/image-prune-force:latest"]),
+        "{view:?}"
+    );
+    assert!(
+        store
+            .resolve_image("docker.io/ociman-test/image-prune-force:latest")
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// Unlike `ociman prune`, `ociman image prune` never removes a real,
 /// stopped container -- even `--all` given -- matching a real
 /// installed `podman image prune`'s own identical, checked-directly

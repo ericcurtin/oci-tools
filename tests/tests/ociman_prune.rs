@@ -1375,3 +1375,57 @@ fn system_prune_is_a_byte_identical_alias_for_prune() {
         "{via_alias:?}"
     );
 }
+
+/// `prune --force`/`-f` (0521): accepted for real CLI compatibility,
+/// but changes nothing -- this project has no interactive
+/// confirmation prompt anywhere to skip in the first place, the
+/// identical "nothing to skip" reasoning `container prune --force`
+/// already established. Proven here (and through the `system prune`
+/// alias) by a real dangling image still being reclaimed exactly as
+/// a plain `prune` would.
+#[test]
+fn prune_force_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+
+    let run_scenario = |args: &[&str]| {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(storage_dir.path()).unwrap();
+        seed_image(
+            &store,
+            "ociman-test/prune-force:latest",
+            &busybox,
+            &["sh"],
+            ContainerConfig::default(),
+        );
+        let rmi = ociman(
+            storage_dir.path(),
+            &["rmi", "ociman-test/prune-force:latest"],
+        );
+        assert!(rmi.status.success(), "{rmi:?}");
+
+        let mut full_args = vec!["--json"];
+        full_args.extend_from_slice(args);
+        let prune = ociman(storage_dir.path(), &full_args);
+        assert!(
+            prune.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&prune.stderr)
+        );
+        let view: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+        view
+    };
+
+    let via_top_level = run_scenario(&["prune", "--force"]);
+    assert!(
+        via_top_level["blobs_removed"].as_u64().unwrap() > 0,
+        "{via_top_level:?}"
+    );
+    let via_alias = run_scenario(&["system", "prune", "-f"]);
+    assert!(
+        via_alias["blobs_removed"].as_u64().unwrap() > 0,
+        "{via_alias:?}"
+    );
+}

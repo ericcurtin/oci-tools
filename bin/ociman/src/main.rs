@@ -2168,6 +2168,14 @@ enum Command {
         /// own default exactly.
         #[arg(short, long)]
         all: bool,
+        /// Accepted for real CLI compatibility with `podman system
+        /// prune --force`/`-f`; has no effect (this project has no
+        /// interactive confirmation prompt anywhere to skip in the
+        /// first place, the same "nothing to skip" reasoning
+        /// `ContainerCommand::Prune::force`'s own doc comment already
+        /// gives).
+        #[arg(short, long)]
+        force: bool,
         /// Only reclaim an image whose own config also matches this —
         /// matching real `docker system prune --filter`/`podman
         /// system prune --filter` for the keys implemented so far:
@@ -4345,6 +4353,9 @@ enum SystemCommand {
         /// Same as [`Command::Prune::all`].
         #[arg(short, long)]
         all: bool,
+        /// Same as [`Command::Prune::force`].
+        #[arg(short, long)]
+        force: bool,
         /// Same as [`Command::Prune::filter`].
         #[arg(long = "filter")]
         filter: Vec<String>,
@@ -4576,6 +4587,14 @@ enum VolumeCommand {
     /// container (running or stopped) — matching real `docker volume
     /// prune`/`podman volume prune`.
     Prune {
+        /// Accepted for real CLI compatibility with `podman volume
+        /// prune --force`/`-f`; has no effect (this project has no
+        /// interactive confirmation prompt anywhere to skip in the
+        /// first place, the same "nothing to skip" reasoning
+        /// `ContainerCommand::Prune::force`'s own doc comment already
+        /// gives).
+        #[arg(short, long)]
+        force: bool,
         /// Only remove a volume also matching every given filter —
         /// `label=<key>[=<value>]`/`label!=<key>[=<value>]` (ANDed
         /// together, matching real `podman volume prune --filter
@@ -5751,6 +5770,14 @@ enum ImageCommand {
         /// tagged or not.
         #[arg(short, long)]
         all: bool,
+        /// Accepted for real CLI compatibility with `podman image
+        /// prune --force`/`-f`; has no effect (this project has no
+        /// interactive confirmation prompt anywhere to skip in the
+        /// first place, the same "nothing to skip" reasoning
+        /// `ContainerCommand::Prune::force`'s own doc comment already
+        /// gives).
+        #[arg(short, long)]
+        force: bool,
         /// Same real, checked-directly filter grammar and semantics
         /// as [`Command::Prune::filter`]'s own `--filter` — see its
         /// own doc comment for the full, exact rules
@@ -6260,11 +6287,19 @@ fn main() -> std::process::ExitCode {
                 format,
                 no_trunc,
             }) => cmd_history(&reference, cli.global.json, format.as_deref(), no_trunc),
-            Some(Command::Prune { all, filter }) => cmd_prune(cli.global.json, all, &filter),
+            Some(Command::Prune {
+                all,
+                force: _,
+                filter,
+            }) => cmd_prune(cli.global.json, all, &filter),
             Some(Command::System { command }) => match command {
                 SystemCommand::Df { verbose } => cmd_system_df(cli.global.json, verbose),
                 SystemCommand::Reset { force: _ } => cmd_system_reset(),
-                SystemCommand::Prune { all, filter } => cmd_prune(cli.global.json, all, &filter),
+                SystemCommand::Prune {
+                    all,
+                    force: _,
+                    filter,
+                } => cmd_prune(cli.global.json, all, &filter),
                 SystemCommand::Info { format } => cmd_info(cli.global.json, format.as_deref()),
             },
             Some(Command::Inspect {
@@ -6581,7 +6616,9 @@ fn main() -> std::process::ExitCode {
                 }
                 VolumeCommand::Rm { name, force } => cmd_volume_rm(&name, force),
                 VolumeCommand::Rename { name, new_name } => cmd_volume_rename(&name, &new_name),
-                VolumeCommand::Prune { filter } => cmd_volume_prune(cli.global.json, &filter),
+                VolumeCommand::Prune { force: _, filter } => {
+                    cmd_volume_prune(cli.global.json, &filter)
+                }
                 VolumeCommand::Exists { name } => cmd_volume_exists(&name),
                 VolumeCommand::Export { name, output } => {
                     cmd_volume_export(&name, output.as_deref())
@@ -7072,9 +7109,11 @@ fn main() -> std::process::ExitCode {
                     format,
                     sort,
                 } => cmd_images(quiet, cli.global.json, &filter, format.as_deref(), sort),
-                ImageCommand::Prune { all, filter } => {
-                    cmd_image_prune(cli.global.json, all, &filter)
-                }
+                ImageCommand::Prune {
+                    all,
+                    force: _,
+                    filter,
+                } => cmd_image_prune(cli.global.json, all, &filter),
                 ImageCommand::Tag { source, targets } => {
                     cmd_tag(&source, &targets, cli.global.json)
                 }
