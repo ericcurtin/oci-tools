@@ -495,6 +495,25 @@ enum Command {
         /// `--yes` to skip here regardless of whether it's given.
         #[arg(long = "yes", short = 'y')]
         yes: bool,
+        /// Accepted for real CLI compatibility with real `distrobox
+        /// enter --no-tty`/`-T` (real distrobox's own second alias,
+        /// `-H`, is also accepted here); has no effect. Checked
+        /// directly, `~/git/distrobox/internal/cli/enter.go:58-63`
+        /// plus `~/git/distrobox/pkg/containermanager/providers/
+        /// podman.go:849-853`/`docker.go`'s own identical shape: real
+        /// `--no-tty`'s *only* real effect is suppressing a real
+        /// `--tty` this project's `ocibox` never generates in the
+        /// first place -- this project's own `enter` never allocates
+        /// a PTY at all, a real, already-documented, project-wide
+        /// gap (`docs/design/0207`, the same one `ociman run`'s own
+        /// missing `-t`/`--tty` already has). Real `--no-tty`'s other,
+        /// smaller effect (dropping `su`'s own `--pty` under
+        /// `--unshare-groups`, `~/git/distrobox/pkg/containermanager/
+        /// containermanager.go`'s own `BuildCommandArgs`) doesn't
+        /// apply here either -- this project's `ocibox` has no
+        /// `--unshare-groups` concept of any kind.
+        #[arg(long = "no-tty", short = 'T', short_alias = 'H')]
+        no_tty: bool,
     },
     /// Create a temporary box, run one command (or a default shell)
     /// inside it, and always remove it again afterward — matching
@@ -882,6 +901,7 @@ fn main() -> std::process::ExitCode {
                 clean_path,
                 no_workdir,
                 yes: _,
+                no_tty: _,
             }) => cmd_enter(&name, &command, clean_path, no_workdir),
             Some(Command::Ephemeral {
                 image,

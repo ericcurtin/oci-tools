@@ -571,6 +571,45 @@ fn enter_yes_flag_is_accepted_and_behaves_identically() {
     );
 }
 
+/// `--no-tty`/`-T` (and real distrobox's own second alias, `-H`) is
+/// accepted for real CLI compatibility but changes nothing: this
+/// project's own `enter` never allocates a PTY at all regardless (see
+/// `Command::Enter::no_tty`'s own doc comment for the full,
+/// checked-directly reasoning).
+#[test]
+fn enter_no_tty_flag_and_both_real_aliases_are_accepted_and_behave_identically() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    make_box(&storage_dir, "notty-box");
+
+    let baseline = ocibox(
+        storage_dir.path(),
+        &["enter", "notty-box", "--", "/bin/sh", "-c", "echo baseline"],
+    );
+    assert!(baseline.status.success(), "{baseline:?}");
+
+    for flag in ["--no-tty", "-T", "-H"] {
+        let out = ocibox(
+            storage_dir.path(),
+            &["enter", flag, "notty-box", "--", "/bin/sh", "-c", "echo hi"],
+        );
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "hi",
+            "{flag} changed real output: {out:?}"
+        );
+    }
+}
+
 /// `ocibox enter`'s own default behavior (a real, previously-missing
 /// merge this project's `enter` has never performed before now):
 /// the box's own `PATH` gets the real *host*'s own `$PATH` merged in,
