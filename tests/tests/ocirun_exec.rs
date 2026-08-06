@@ -1151,3 +1151,238 @@ fn exec_with_neither_process_nor_a_command_is_a_clear_error() {
 
     ocirun(root_dir.path(), &["delete", "--force", "exec-no-args-test"]);
 }
+
+/// `ocirun exec --detach`/`-d` (`docs/design/0533`), matching real
+/// `runc exec --detach`/`-d`/`crun exec --detach`/`-d` exactly: the
+/// invocation itself returns success (exit `0`) as soon as the
+/// exec'd process is under way, well before the (deliberately much
+/// longer) command it started actually finishes — proven here by a
+/// real wall-clock bound on the `exec --detach` call itself, then
+/// polling for the detached command's own real, delayed side effect
+/// (a marker file, written only after its own longer sleep) to prove
+/// it really did keep running in the background rather than this
+/// project's own process having silently killed it early. The
+/// container itself stays completely unaffected throughout — no
+/// separate "keeper" process is needed for this (unlike `ocirun run
+/// --detach`, `0375`), since a detached `exec`'d process is simply
+/// left to be reparented to the nearest subreaper/`PID 1` once this
+/// invocation exits, the exact real mechanism both reference runtimes
+/// rely on too.
+#[test]
+fn exec_detach_returns_immediately_without_waiting_for_the_command_to_finish() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    let marker = bundle_dir.path().join("rootfs/marker.txt");
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let create = ocirun_create(root_dir.path(), bundle_dir.path(), "exec-detach-test");
+    assert!(create.status.success(), "{create:?}");
+    let start = ocirun(root_dir.path(), &["start", "exec-detach-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-detach-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    // Deliberately *not* the `ocirun` helper above (which captures
+    // stdout/stderr via a real pipe through `Command::output()`): the
+    // detached grandchild below inherits whatever stdio this
+    // invocation itself has, so a captured pipe would never see `EOF`
+    // -- and `output()` would never return -- until *that* process
+    // *also* exits, ~3s later, hiding the very thing this test is
+    // trying to prove. The exact same real hazard `ocirun_create`'s
+    // own doc comment above already documents for an analogous case;
+    // `Stdio::null()` (not a pipe at all) sidesteps it completely.
+    let started = std::time::Instant::now();
+    let exec = std::process::Command::new(bin_path("ocirun"))
+        .arg("--root")
+        .arg(root_dir.path())
+        .args([
+            "exec",
+            "--detach",
+            "exec-detach-test",
+            "/bin/sh",
+            "-c",
+            "sleep 3; echo done > /marker.txt",
+        ])
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to spawn ocirun exec --detach");
+    let elapsed = started.elapsed();
+    assert!(exec.success(), "ocirun exec --detach failed: {exec:?}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "--detach should return almost immediately, not block on the full 3s sleep: {elapsed:?}"
+    );
+    // The detached command hasn't had time to write its own marker
+    // yet -- proving this invocation really didn't wait for it.
+    assert!(
+        !marker.exists(),
+        "marker should not exist yet immediately after --detach returns"
+    );
+
+    // The container itself is unaffected: still running.
+    assert_eq!(
+        oci_tools_tests::state_status(root_dir.path(), "exec-detach-test"),
+        "running"
+    );
+
+    // The detached command really did keep running in the background
+    // and eventually wrote its own marker.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        marker.exists(),
+        "the detached command never wrote its own marker file"
+    );
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "done\n");
+
+    ocirun(root_dir.path(), &["delete", "--force", "exec-detach-test"]);
+}
+
+/// `--detach` composes with `--pid-file`, writing it *before*
+/// returning -- matching real runc's own exact order (`~/git/runc/
+/// utils_linux.go`'s own `runner.run`: `createPidFile` happens, then
+/// `if detach { return 0, nil }`), the same order [`exec_reporting_
+/// pid`]'s own pre-existing `on_pid`-then-return-on-detach sequence
+/// already gives for free, needing no special-casing at all.
+#[test]
+fn exec_detach_still_writes_the_pid_file_before_returning() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    let pid_file = bundle_dir.path().join("exec-detach.pid");
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let create = ocirun_create(
+        root_dir.path(),
+        bundle_dir.path(),
+        "exec-detach-pidfile-test",
+    );
+    assert!(create.status.success(), "{create:?}");
+    let start = ocirun(root_dir.path(), &["start", "exec-detach-pidfile-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-detach-pidfile-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    // `Stdio::null()` for the same real reason the timing test above
+    // documents: the detached grandchild otherwise inherits a real
+    // pipe that would never see `EOF` until it too exits.
+    let exec = std::process::Command::new(bin_path("ocirun"))
+        .args(["--root"])
+        .arg(root_dir.path())
+        .args(["exec", "--detach", "--pid-file"])
+        .arg(&pid_file)
+        .args(["exec-detach-pidfile-test", "/bin/sh", "-c", "sleep 2"])
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to spawn ocirun exec --detach");
+    assert!(exec.success(), "ocirun exec --detach failed: {exec:?}");
+
+    // Written already, by the time the (fast, detached) call above
+    // returned -- no poll-and-wait needed, unlike the non-detached
+    // `--pid-file` test above, which spawns `ocirun exec` itself in
+    // the background and polls because *that* call blocks for the
+    // full 30s sleep.
+    assert!(pid_file.exists(), "--pid-file was never written");
+    let file_content = std::fs::read_to_string(&pid_file).unwrap();
+    let exec_pid: i32 = file_content.trim().parse().unwrap_or_else(|e| {
+        panic!("--pid-file content {file_content:?} not a plain decimal pid: {e}")
+    });
+    assert!(exec_pid > 0);
+
+    ocirun(
+        root_dir.path(),
+        &["delete", "--force", "exec-detach-pidfile-test"],
+    );
+}
+
+/// A real, checked-directly divergence from a non-detached `exec`:
+/// `--detach` always exits `0`, regardless of whatever the detached
+/// command will *eventually* exit with -- matching real `runc exec
+/// --detach`/`crun exec --detach`'s own identical unconditional
+/// `return 0` exactly (this project's own success just means "the
+/// exec'd process started", not "and it later succeeded too").
+#[test]
+fn exec_detach_exits_zero_even_though_the_detached_command_will_eventually_fail() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let create = ocirun_create(root_dir.path(), bundle_dir.path(), "exec-detach-fail-test");
+    assert!(create.status.success(), "{create:?}");
+    let start = ocirun(root_dir.path(), &["start", "exec-detach-fail-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-detach-fail-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    // `Stdio::null()` for the same real reason the other two tests
+    // above document -- even though this particular detached command
+    // exits almost instantly either way, matching the same safe
+    // pattern consistently rather than relying on that coincidence.
+    let exec = std::process::Command::new(bin_path("ocirun"))
+        .arg("--root")
+        .arg(root_dir.path())
+        .args([
+            "exec",
+            "--detach",
+            "exec-detach-fail-test",
+            "/bin/sh",
+            "-c",
+            "exit 7",
+        ])
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to spawn ocirun exec --detach");
+    assert!(
+        exec.success(),
+        "--detach should exit 0 regardless of the detached command's own eventual exit code: \
+         {exec:?}"
+    );
+
+    ocirun(
+        root_dir.path(),
+        &["delete", "--force", "exec-detach-fail-test"],
+    );
+}

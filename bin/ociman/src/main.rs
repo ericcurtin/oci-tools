@@ -17191,6 +17191,10 @@ fn cmd_healthcheck_run(id: &str, ignore_result: bool) -> anyhow::Result<()> {
         // stdin of its own to begin with. See `ExecRequest::
         // close_stdin`'s own doc comment.
         close_stdin: true,
+        // A healthcheck genuinely needs its own real exit code back
+        // to decide healthy/unhealthy -- never detached. See
+        // `ExecRequest::detach`'s own doc comment.
+        detach: false,
     };
 
     // SAFETY: `ociman`'s own process has not spawned any additional
@@ -19627,6 +19631,12 @@ fn cmd_exec(
         // checked-directly default (`-i` absent) of never connecting
         // the exec'd process's stdin at all.
         close_stdin: !interactive,
+        // `ociman exec` has no `--detach`/`-d` flag of its own yet
+        // (real `podman exec -d` does have one -- a real, separate,
+        // deliberately out-of-scope gap for a future increment, not
+        // closed by `ocirun exec --detach`, 0533). See `ExecRequest::
+        // detach`'s own doc comment.
+        detach: false,
     };
 
     // SAFETY: `ociman`'s own process has not spawned any additional

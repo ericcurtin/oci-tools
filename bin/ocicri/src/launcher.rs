@@ -143,6 +143,10 @@ fn exec_run(args: &[String]) -> anyhow::Result<i32> {
         // meaningful to forward here either way. See `ExecRequest::
         // close_stdin`'s own doc comment.
         close_stdin: true,
+        // A probe genuinely needs its own real exit code/output back
+        // -- the entire point of `ExecSync` -- so this is never
+        // detached. See `ExecRequest::detach`'s own doc comment.
+        detach: false,
     };
 
     // SAFETY: this process is genuinely single-threaded here -- just

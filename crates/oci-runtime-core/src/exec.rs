@@ -89,6 +89,36 @@ pub struct ExecRequest {
     /// already set up verbatim" precedent for `ocirun run`/`create`
     /// (0187).
     pub close_stdin: bool,
+    /// `ocirun exec --detach`/`-d` (0533): return success as soon as
+    /// the exec'd process's own real pid is known (`on_pid` already
+    /// ran, including any `--pid-file` write), rather than blocking on
+    /// its exit — matching real `runc exec --detach`/`-d`/`crun exec
+    /// --detach`/`-d` exactly (checked directly, `~/git/runc/exec.go`:
+    /// `detach := r.detach || (r.action == CT_ACT_CREATE)`, then
+    /// `~/git/runc/utils_linux.go`'s own `runner.run`: `if detach {
+    /// return 0, nil }`, *after* starting the process and writing the
+    /// pid file — the exact same order [`exec_reporting_pid`] already
+    /// has via its own `on_pid`-then-wait sequence, needing no
+    /// reordering here at all; `~/git/crun/src/exec.c`/`~/git/crun/
+    /// src/libcrun/linux.c:6553-6554`'s own `libcrun_join_process`
+    /// confirms crun's own detach mode deliberately skips becoming the
+    /// exec'd process's subreaper too — it's simply left to whichever
+    /// ancestor already is one, or `PID 1`, exactly like this
+    /// project's own identical "just stop waiting and let the kernel
+    /// reparent it" implementation below). Unlike [`Command::Run::
+    /// detach`]'s own [`ocirun`-side equivalent], no background
+    /// "keeper" process is needed here at all: `exec` has no
+    /// persisted, queryable-afterward state of its own for one to
+    /// maintain (`ocirun run --detach`'s own keeper exists purely to
+    /// keep that state, e.g. `--keep`, current; a detached `exec` has
+    /// no analogous concept to keep at all) — simply not calling
+    /// [`process::wait`] and returning is both correct and sufficient,
+    /// the exact same reasoning real crun's own `detach_process` doc
+    /// comment gives. Every existing caller (`ocirun exec --pid-file`'s
+    /// own non-detached default, `ociman exec`/`healthcheck run`,
+    /// `ocicri`'s own `ExecSync` launcher) passes `false` here,
+    /// preserving today's exact blocking behavior unchanged.
+    pub detach: bool,
 }
 
 /// Like [`exec`], but calls `on_pid` with the exec'd process's own
@@ -151,6 +181,9 @@ pub unsafe fn exec_reporting_pid(
     // joined.
     let needs_pid_relay =
         request.namespaces.contains(&NamespaceType::Pid) || request.timeout.is_some();
+    // Captured before `request`'s own fields are moved into `setup`
+    // below — see [`ExecRequest::detach`]'s own doc comment.
+    let detach = request.detach;
 
     // Same real pid-reporting pipe `launch::create`'s own
     // `pid_pipe_write`/`read_container_pid` pair already establishes:
@@ -186,6 +219,19 @@ pub unsafe fn exec_reporting_pid(
 
     let exec_pid = read_exec_pid(read_fd)?;
     on_pid(exec_pid);
+
+    // `--detach` (see [`ExecRequest::detach`]'s own doc comment):
+    // return success immediately, exactly as if the exec'd process
+    // (or, when a pid namespace relay is involved, the outer relay
+    // still blocked on it) had already exited with code `0` — never
+    // actually waiting on `direct_child_pid` at all. It's simply
+    // reparented to the nearest subreaper (or `PID 1`) once this
+    // process itself later exits, the same real mechanism both
+    // reference runtimes' own detach modes rely on — nothing further
+    // for this project's own code to do.
+    if detach {
+        return Ok(0);
+    }
 
     let status = process::wait(direct_child_pid)?;
     Ok(process::exit_code_from_wait_status(status))

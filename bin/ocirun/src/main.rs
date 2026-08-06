@@ -414,6 +414,29 @@ enum Command {
         /// existed.
         #[arg(long = "no-new-privs")]
         no_new_privs: bool,
+        /// Detach: start the exec'd process and return immediately
+        /// (exit `0`) instead of blocking until it exits — matching
+        /// real `runc exec --detach`/`-d`/`crun exec --detach`/`-d`
+        /// exactly (checked directly, `~/git/runc/exec.go`: `detach :=
+        /// r.detach || (r.action == CT_ACT_CREATE)`, then `~/git/runc/
+        /// utils_linux.go`'s own `runner.run`: `if detach { return 0,
+        /// nil }`, *after* starting the process and writing the pid
+        /// file; `~/git/crun/src/exec.c:76,162-163,280`/`~/git/crun/
+        /// src/libcrun/linux.c:6553-6554`'s own `libcrun_join_process`
+        /// confirms crun's own detach mode also deliberately skips
+        /// becoming the exec'd process's own subreaper — it's simply
+        /// left to whichever ancestor already is one, or `PID 1`).
+        /// Unlike `run --detach` (0375), no background "keeper"
+        /// process is needed here at all: `exec` has no persisted,
+        /// queryable-afterward state of its own for one to maintain,
+        /// so simply not waiting and letting the kernel reparent the
+        /// detached process once this invocation exits is both
+        /// correct and sufficient — see [`oci_runtime_core::exec::
+        /// ExecRequest::detach`]'s own doc comment. Composes with
+        /// `--pid-file`, matching real runc/crun's own identical
+        /// "write the pid file, then return" order exactly.
+        #[arg(short = 'd', long)]
+        detach: bool,
         /// Write the exec'd process's own real pid to this file —
         /// matching real `runc exec --pid-file`/`crun exec --pid-file`
         /// exactly (checked directly, `~/git/runc/exec.go`'s own
@@ -824,6 +847,7 @@ fn main() -> std::process::ExitCode {
                 cap,
                 ignore_paused,
                 no_new_privs,
+                detach,
                 pid_file,
                 process,
                 args,
@@ -839,6 +863,7 @@ fn main() -> std::process::ExitCode {
                 &cap,
                 ignore_paused,
                 no_new_privs,
+                detach,
                 pid_file.as_deref(),
                 process.as_deref(),
             ),
@@ -2063,6 +2088,7 @@ fn cmd_exec(
     cap: &[String],
     ignore_paused: bool,
     no_new_privs: bool,
+    detach: bool,
     pid_file: Option<&Path>,
     process: Option<&Path>,
 ) -> anyhow::Result<()> {
@@ -2216,6 +2242,9 @@ fn cmd_exec(
         // established (0187). See `ExecRequest::close_stdin`'s own
         // doc comment.
         close_stdin: false,
+        // `--detach`/`-d` (0533) -- see `Command::Exec::detach`'s own
+        // doc comment.
+        detach,
     };
 
     // SAFETY: `ocirun`'s own process has not spawned any additional
