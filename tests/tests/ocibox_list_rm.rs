@@ -342,6 +342,59 @@ fn rm_yes_flag_is_accepted_and_behaves_identically() {
     assert!(!box_dir.exists(), "the whole box directory should be gone");
 }
 
+/// `rm --verbose`/`-v` (`docs/design/0536`): accepted for real CLI
+/// compatibility, but changes nothing at all -- real distrobox's own
+/// inherited root-level `--verbose`/`-v` global flag is genuinely
+/// dead, unused input by the time it reaches `rm`'s own real
+/// behavior (see `Command::Rm`'s own doc comment for the full,
+/// checked-directly reasoning). Proven here against a real box, with
+/// both spellings, each still genuinely removing it exactly as a
+/// plain `rm` would.
+#[test]
+fn rm_verbose_flag_and_its_short_alias_are_accepted_and_behave_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/rm-verbose:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    for (flag, name) in [("--verbose", "verbosebox1"), ("-v", "verbosebox2")] {
+        let create = ocibox(
+            storage_dir.path(),
+            &[
+                "create",
+                "--image",
+                "ocibox-test/rm-verbose:latest",
+                "--name",
+                name,
+            ],
+        );
+        assert!(create.status.success(), "{create:?}");
+        let box_dir = storage_dir.path().join("boxes").join(name);
+        assert!(box_dir.is_dir());
+
+        let rm = ocibox(storage_dir.path(), &["rm", name, flag]);
+        assert!(
+            rm.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&rm.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&rm.stdout).trim(), name);
+        assert!(
+            !box_dir.exists(),
+            "the whole box directory should be gone ({flag})"
+        );
+    }
+}
+
 /// `rm` of a name that simply doesn't resolve to any real box is a
 /// warning, not a hard error (0321 — a real correction: previously
 /// this hard-errored, before checking real `distrobox`'s own actual

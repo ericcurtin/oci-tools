@@ -353,6 +353,25 @@ enum Command {
         /// this command's own doc comment above).
         #[arg(long, short = 'a')]
         all: bool,
+        /// Accepted for real CLI compatibility with real distrobox's
+        /// own inherited root-level `--verbose`/`-v` global flag
+        /// (checked directly, `~/git/distrobox/internal/cli/
+        /// root.go:76-81`; `rm.go` itself declares no local `verbose`
+        /// flag of its own, reading the inherited global one instead,
+        /// `rm.go:68`); has no effect. Traced its own entire real
+        /// chain of custody directly rather than assumed: `rm.go`'s
+        /// own `removeContainer` never passes it into the actual
+        /// `containerManager.Remove` call at all (only `Force`/
+        /// `RemoveHome`/`ContainerHome`, `rm.go:158-162`) — its one
+        /// remaining use is `cleanup`'s own `GenerateEntryOptions.
+        /// Verbose` field (`rm.go:187-193`), which `generate_entry.go`'s
+        /// own `Execute` declares but never actually reads anywhere in
+        /// its own body (confirmed by exhaustive grep) — genuinely
+        /// dead, unused input in real distrobox itself at this exact
+        /// commit, not merely a flag this project has no equivalent
+        /// mechanism for.
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
     /// A real, checked-directly no-op: a box has no persisted running
     /// state at all (`docs/design/0207`/`0515` -- `ocibox enter` runs
@@ -893,6 +912,7 @@ fn main() -> std::process::ExitCode {
                 yes: _,
                 rm_home: _,
                 all,
+                verbose: _,
             }) => cmd_rm(&names, all),
             Some(Command::Stop { names, all, yes: _ }) => cmd_stop(&names, all),
             Some(Command::Enter {
