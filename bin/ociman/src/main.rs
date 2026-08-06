@@ -5328,6 +5328,31 @@ enum ContainerCommand {
         #[arg(long = "format", value_name = "TEMPLATE")]
         format: Option<String>,
     },
+    /// `podman container attach`'s own real alias for the already-
+    /// existing flat [`Command::Attach`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/attach.go:16-51`:
+    /// `containerAttachCommand` (`Parent: containerCmd`) and
+    /// top-level `attachCommand` share the exact same `Use`/`Short`/
+    /// `Long`/`Args`/`RunE`/`ValidArgsFunction`, and both get the
+    /// identical flag set applied via the one shared `attachFlags
+    /// (cmd)` helper (`--detach-keys`, `--no-stdin`, `--sig-proxy`)
+    /// plus `validate.AddLatestFlag` -- a byte-identical alias, the
+    /// same shape [`Self::Kill`] (`0492`) already established.
+    /// Dispatches into the same [`cmd_attach`] `ociman attach` itself
+    /// already calls, replaying the identical explicit-id-wins-over-
+    /// latest resolution the top-level [`Command::Attach`] arm
+    /// already has -- see [`Command::Attach`]'s own doc comment for
+    /// the exact semantics (including this project's own honestly
+    /// narrower first-slice scope: no `--no-stdin`/`--detach-keys`/
+    /// `--sig-proxy` at all, matching the top-level command's own
+    /// identical gap), not repeated here.
+    Attach {
+        /// Same as [`Command::Attach::id`].
+        id: Option<String>,
+        /// Same as [`Command::Attach::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -6381,6 +6406,26 @@ fn main() -> std::process::ExitCode {
                         cli.global.json,
                         format.as_deref(),
                     )
+                }
+                ContainerCommand::Attach { id, latest } => {
+                    // An explicit `id` always wins over `--latest`
+                    // outright, matching real podman's own checked-
+                    // directly behavior exactly -- the identical
+                    // logic the top-level `Command::Attach` arm
+                    // already has.
+                    let resolved_id = match id {
+                        Some(id) => id,
+                        None => {
+                            anyhow::ensure!(
+                                latest,
+                                "attach requires the name or id of one running container or \
+                                 the latest flag"
+                            );
+                            let containers = open_container_store()?;
+                            resolve_latest_container(&containers)?
+                        }
+                    };
+                    cmd_attach(&resolved_id)
                 }
             },
             Some(Command::Image { command }) => match command {
