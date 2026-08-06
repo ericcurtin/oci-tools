@@ -80,6 +80,50 @@ fn list_shows_every_created_box_sorted_by_name() {
     );
 }
 
+/// `list --no-color` (0515): accepted for real CLI compatibility, but
+/// changes nothing at all -- this project's own list output has no
+/// ANSI color codes anywhere in the first place (see `Command::List`'s
+/// own doc comment for the full, checked-directly reasoning). Proven
+/// here by comparing `list`'s own output with and without the flag,
+/// byte for byte.
+#[test]
+fn list_no_color_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/list-no-color:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/list-no-color:latest",
+            "--name",
+            "colorbox",
+        ],
+    );
+    assert!(create.status.success());
+
+    let plain = ocibox(storage_dir.path(), &["list"]);
+    assert!(plain.status.success());
+    let no_color = ocibox(storage_dir.path(), &["list", "--no-color"]);
+    assert!(no_color.status.success());
+    assert_eq!(plain.stdout, no_color.stdout);
+    assert!(
+        !String::from_utf8_lossy(&plain.stdout).contains('\u{1b}'),
+        "there should be no ANSI escape codes in this project's own list output at all"
+    );
+}
+
 #[test]
 fn list_json_reports_every_field_of_the_persisted_record() {
     let Some(busybox) = busybox_path() else {

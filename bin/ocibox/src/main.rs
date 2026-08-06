@@ -210,14 +210,37 @@ enum Command {
     /// List real, created boxes — matching real `distrobox list`
     /// (alias `ls`), narrowed to what this project's own boxes
     /// actually track so far (name, image, creation time): real
-    /// `distrobox list` shows real container status too, which
-    /// doesn't apply yet here since `ocibox create` doesn't launch
-    /// anything yet (`ocibox enter`, still ahead, is what will).
-    /// Sorted by name, matching real `distrobox list`'s own stable
-    /// sort order (checked directly against its own source,
-    /// `pkg/commands/list.go`).
+    /// `distrobox list` shows real container status too, which this
+    /// project's own boxes have no equivalent of at all -- unlike
+    /// `ociman`'s own containers, a box has no distinct running/
+    /// stopped state to report at all, `ocibox enter` runs a fresh,
+    /// live command each time rather than starting/stopping a single
+    /// persisted process (correcting this doc comment's own earlier,
+    /// now-stale claim that a still-pending `ocibox enter` would add
+    /// this once it landed -- it has, and doesn't, since a box's own
+    /// architecture genuinely has nothing to report here). Sorted by
+    /// name, matching real `distrobox list`'s own stable sort order
+    /// (checked directly against its own source, `pkg/commands/
+    /// list.go`).
+    ///
+    /// `--no-color` is accepted (0515), for real CLI compatibility,
+    /// but changes nothing: checked directly, `~/git/distrobox/
+    /// internal/cli/list.go:44-46,50-67`, real distrobox's own
+    /// `--no-color` only ever disables ANSI green/yellow highlighting
+    /// its own `printResult` applies per row based on each box's own
+    /// running state -- this project's own list output has no color
+    /// codes anywhere at all (confirmed by grep), a direct
+    /// consequence of the same "no running/stopped state to report"
+    /// gap just above, so there is nothing for `--no-color` to
+    /// disable here either.
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Accepted for real CLI compatibility with `distrobox list
+        /// --no-color`; has no effect (see this command's own doc
+        /// comment).
+        #[arg(long = "no-color")]
+        no_color: bool,
+    },
     /// Remove one or more boxes entirely (each one's own rootfs and
     /// persisted record) — matching real `distrobox rm NAME
     /// [NAME...]` (0321: previously a single name only). `--force` is
@@ -687,7 +710,7 @@ fn main() -> std::process::ExitCode {
                 &volume,
                 platform.as_deref(),
             ),
-            Some(Command::List) => cmd_list(cli.global.json),
+            Some(Command::List { no_color: _ }) => cmd_list(cli.global.json),
             Some(Command::Rm {
                 names,
                 force: _,
