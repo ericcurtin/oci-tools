@@ -1391,8 +1391,14 @@ enum Command {
         /// The registry host to log in to, e.g. `quay.io`,
         /// `ghcr.io`, `docker.io`.
         registry: String,
+        /// Required unless `--get-login` is given (this project has
+        /// no interactive terminal prompt to fall back to at all --
+        /// see this command's own doc comment for why real podman's
+        /// own equivalent gap, `getUserAndPass`'s "cannot prompt for
+        /// username without stdin", never actually matters here
+        /// either way).
         #[arg(short, long)]
-        username: String,
+        username: Option<String>,
         /// Mutually exclusive with `--password-stdin`.
         #[arg(short, long)]
         password: Option<String>,
@@ -1401,14 +1407,7 @@ enum Command {
         /// including its own real "concatenate every line with no
         /// separator at all" quirk -- `~/git/podman/vendor/
         /// go.podman.io/common/pkg/auth/auth.go`'s own
-        /// `opts.StdinPassword` branch, checked directly). Real
-        /// podman also requires `--username` to already be given
-        /// whenever this is set, but `username` is already
-        /// unconditionally mandatory in this command's own arg
-        /// struct, so that check can never trigger here -- a real,
-        /// deliberate divergence (this project simply has no
-        /// "username-less" login shape for it to matter for), not an
-        /// oversight.
+        /// `opts.StdinPassword` branch, checked directly).
         #[arg(long = "password-stdin")]
         password_stdin: bool,
         /// Accepted for real CLI compatibility with real `podman
@@ -1426,6 +1425,18 @@ enum Command {
         /// prompt.
         #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         tls_verify: bool,
+        /// Print the username already logged in to `registry` instead
+        /// of logging in -- matches real `podman login --get-login`
+        /// exactly (`~/git/container-libs/common/pkg/auth/
+        /// auth.go:161-167`, checked directly): real `auth.Login`
+        /// returns right after this check, before ever looking at
+        /// `--username`/`--password`/`--password-stdin` at all, so
+        /// this project matches that by doing the same (given
+        /// alongside any of them, they're simply ignored, not a CLI
+        /// error -- there is no real mutual-exclusivity check for
+        /// this anywhere in real podman's own source either).
+        #[arg(long = "get-login")]
+        get_login: bool,
     },
     /// Remove a registry's own stored credentials, matching real
     /// `docker logout`/`podman logout`. A no-op (not an error) if
@@ -6244,11 +6255,13 @@ fn main() -> std::process::ExitCode {
                 password,
                 password_stdin,
                 tls_verify: _,
+                get_login,
             }) => cmd_login(
                 &registry,
-                &username,
+                username.as_deref(),
                 password.as_deref(),
                 password_stdin,
+                get_login,
                 cli.global.json,
             ),
             Some(Command::Logout { registry, all }) => {
@@ -8022,13 +8035,50 @@ struct LoginResult {
     auth_file: String,
 }
 
+/// `ociman login --get-login`'s own `--json` output (`docs/design/
+/// 0528`).
+#[derive(Debug, Serialize)]
+struct GetLoginResult {
+    registry: String,
+    username: String,
+}
+
 fn cmd_login(
     registry: &str,
-    username: &str,
+    username: Option<&str>,
     password: Option<&str>,
     password_stdin: bool,
+    get_login: bool,
     json: bool,
 ) -> anyhow::Result<()> {
+    // `--get-login`, `~/git/container-libs/common/pkg/auth/
+    // auth.go:161-167` -- checked directly, real `auth.Login` returns
+    // right after this check, before ever looking at `--username`/
+    // `--password`/`--password-stdin` at all (see `Command::Login`'s
+    // own doc comment).
+    if get_login {
+        let username = oci_registry::Credentials::load()
+            .username_for(registry)
+            .with_context(|| format!("not logged into {registry}"))?;
+        if json {
+            oci_cli_common::output::print_json(&GetLoginResult {
+                registry: registry.to_string(),
+                username,
+            })?;
+        } else {
+            println!("{username}");
+        }
+        return Ok(());
+    }
+    // Real error message/condition for the case real podman's own
+    // `getUserAndPass` handles by attempting an interactive terminal
+    // prompt instead (`~/git/container-libs/common/pkg/auth/
+    // auth.go:287-312`) -- this project has no such prompt anywhere
+    // in its own architecture (see `Command::Login::username`'s own
+    // doc comment), so a missing `--username` is always a hard error
+    // here rather than ever blocking on one.
+    let username = username.context("--username is required unless --get-login is given")?;
+
     // Exact real error message/condition, `~/git/podman/vendor/
     // go.podman.io/common/pkg/auth/auth.go`'s own `opts.StdinPassword`
     // branch: `--password-stdin` and `--password` are mutually

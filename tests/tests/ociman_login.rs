@@ -384,3 +384,116 @@ fn login_with_neither_password_nor_password_stdin_is_a_real_error() {
         String::from_utf8_lossy(&login.stderr)
     );
 }
+
+/// `login --get-login` (0528): prints the username already logged in
+/// to a registry, matching real `podman login --get-login` exactly.
+#[test]
+fn login_get_login_prints_the_username_already_logged_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("auth.json");
+
+    assert!(
+        ociman(
+            &auth_file,
+            &["login", "quay.io", "-u", "myuser", "-p", "mypass"],
+        )
+        .status
+        .success()
+    );
+
+    let get_login = ociman(&auth_file, &["login", "--get-login", "quay.io"]);
+    assert!(
+        get_login.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&get_login.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&get_login.stdout).trim(), "myuser");
+}
+
+/// `--get-login` on a registry never logged into is a real error,
+/// matching real podman's own exact `"not logged into %s"` wording
+/// (`~/git/container-libs/common/pkg/auth/auth.go:163`).
+#[test]
+fn login_get_login_on_a_registry_never_logged_into_is_a_real_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("auth.json");
+
+    let get_login = ociman(&auth_file, &["login", "--get-login", "never-seen.example"]);
+    assert!(!get_login.status.success());
+    assert!(
+        String::from_utf8_lossy(&get_login.stderr).contains("not logged into never-seen.example"),
+        "stderr: {}",
+        String::from_utf8_lossy(&get_login.stderr)
+    );
+}
+
+/// `--get-login` ignores `--username`/`--password` entirely rather
+/// than erroring on them or the missing `--password-stdin` -- matches
+/// real `auth.Login`'s own early return before ever looking at any of
+/// them (see `Command::Login::get_login`'s own doc comment).
+#[test]
+fn login_get_login_ignores_username_and_password_when_given_alongside() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("auth.json");
+
+    assert!(
+        ociman(&auth_file, &["login", "quay.io", "-u", "real", "-p", "pw"])
+            .status
+            .success()
+    );
+
+    let get_login = ociman(
+        &auth_file,
+        &[
+            "login",
+            "--get-login",
+            "quay.io",
+            "--username",
+            "ignored",
+            "--password",
+            "ignored",
+        ],
+    );
+    assert!(
+        get_login.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&get_login.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&get_login.stdout).trim(), "real");
+}
+
+/// `login` without `--username` and without `--get-login` is a real
+/// error -- this project has no interactive prompt to fall back to at
+/// all (see `Command::Login::username`'s own doc comment).
+#[test]
+fn login_without_username_and_without_get_login_is_a_real_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("auth.json");
+
+    let login = ociman(&auth_file, &["login", "quay.io", "--password", "pw"]);
+    assert!(!login.status.success());
+    assert!(
+        String::from_utf8_lossy(&login.stderr)
+            .contains("--username is required unless --get-login is given"),
+        "stderr: {}",
+        String::from_utf8_lossy(&login.stderr)
+    );
+}
+
+#[test]
+fn login_get_login_json_reports_the_registry_and_username() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("auth.json");
+
+    assert!(
+        ociman(&auth_file, &["login", "ghcr.io", "-u", "u", "-p", "p"])
+            .status
+            .success()
+    );
+
+    let get_login = ociman(&auth_file, &["--json", "login", "--get-login", "ghcr.io"]);
+    assert!(get_login.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&get_login.stdout).unwrap();
+    assert_eq!(view["registry"], "ghcr.io");
+    assert_eq!(view["username"], "u");
+}

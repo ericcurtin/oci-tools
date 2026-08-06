@@ -76,15 +76,54 @@ impl Credentials {
         }
     }
 
+    /// The raw, still-base64-encoded `auth` value stored for
+    /// `registry_host` (falling back to the Docker Hub legacy key for
+    /// `registry_host == DOCKER_HUB_HOST`) -- the one lookup
+    /// [`basic_auth_header`] and [`username_for`] both share, so the
+    /// Hub-legacy-key fallback only has to live in one place.
+    ///
+    /// [`basic_auth_header`]: Credentials::basic_auth_header
+    /// [`username_for`]: Credentials::username_for
+    fn raw_auth_for(&self, registry_host: &str) -> Option<&str> {
+        self.entries
+            .get(registry_host)
+            .or_else(|| {
+                (registry_host == DOCKER_HUB_HOST)
+                    .then(|| self.entries.get(DOCKER_HUB_LEGACY_KEY))
+                    .flatten()
+            })
+            .map(String::as_str)
+    }
+
     /// The `Authorization: Basic ...` header value for `registry_host`, if
     /// credentials are configured for it.
     pub fn basic_auth_header(&self, registry_host: &str) -> Option<String> {
-        let auth = self.entries.get(registry_host).or_else(|| {
-            (registry_host == DOCKER_HUB_HOST)
-                .then(|| self.entries.get(DOCKER_HUB_LEGACY_KEY))
-                .flatten()
-        })?;
+        let auth = self.raw_auth_for(registry_host)?;
         Some(format!("Basic {auth}"))
+    }
+
+    /// The plaintext username half of `registry_host`'s own stored
+    /// `auth` entry (`base64(user:pass)`), decoded and split on the
+    /// first `:` — exactly real `decodeDockerAuth`'s own logic
+    /// (`~/git/container-libs/image/pkg/docker/config/config.go:877-
+    /// 902`, checked directly), `ociman login --get-login`'s own
+    /// backing (`docs/design/0528`).
+    ///
+    /// `None` for a missing entry, invalid base64, non-UTF-8 decoded
+    /// bytes, a decoded value with no `:` at all, or an empty
+    /// username — real `decodeDockerAuth` itself only rejects the
+    /// "no `:` at all" case (returning an empty `Username` for every
+    /// other one of these, an empty-string "no credentials" sentinel
+    /// this method folds into the same `None` its own caller already
+    /// treats identically: real `auth.Login`'s own very next check is
+    /// `if authConfig.Username == "" { return fmt.Errorf("not logged
+    /// into %s", key) }`).
+    pub fn username_for(&self, registry_host: &str) -> Option<String> {
+        let raw = self.raw_auth_for(registry_host)?;
+        let decoded = base64_decode(raw)?;
+        let decoded = String::from_utf8(decoded).ok()?;
+        let (username, _password) = decoded.split_once(':')?;
+        (!username.is_empty()).then(|| username.to_string())
     }
 }
 
@@ -263,6 +302,53 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+/// Decode a standard base64 string (with `=` padding) back into raw
+/// bytes — the exact inverse of [`base64_encode`] above, hand-rolled
+/// the same way and for the same reason (see this module's own doc
+/// comment for why this crate avoids a dependency here), used by
+/// [`Credentials::username_for`] to recover the username half of an
+/// already-stored `base64(user:pass)` `auth` field. `None` for
+/// anything [`base64_encode`] itself could never have produced (wrong
+/// length, a stray character outside the alphabet/`=`, a misplaced
+/// `=`) — this project has no other real use for a fully general,
+/// lenient decoder.
+fn base64_decode(data: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    fn sextet(byte: u8) -> Option<u8> {
+        ALPHABET.iter().position(|&b| b == byte).map(|i| i as u8)
+    }
+
+    let data = data.as_bytes();
+    if data.is_empty() {
+        return Some(Vec::new());
+    }
+    if !data.len().is_multiple_of(4) {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(data.len() / 4 * 3);
+    for chunk in data.chunks(4) {
+        let padding = chunk.iter().rev().take_while(|&&b| b == b'=').count();
+        if padding > 2 || chunk[..4 - padding].contains(&b'=') {
+            return None;
+        }
+        let mut sextets = [0u8; 4];
+        for (slot, &byte) in sextets.iter_mut().zip(chunk) {
+            if byte != b'=' {
+                *slot = sextet(byte)?;
+            }
+        }
+        out.push((sextets[0] << 2) | (sextets[1] >> 4));
+        if padding < 2 {
+            out.push((sextets[1] << 4) | (sextets[2] >> 2));
+        }
+        if padding < 1 {
+            out.push((sextets[2] << 6) | sextets[3]);
+        }
+    }
+    Some(out)
+}
+
 fn candidate_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(path) = std::env::var("REGISTRY_AUTH_FILE") {
@@ -350,6 +436,68 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_decode_is_the_exact_inverse_of_base64_encode_for_every_padding_case() {
+        for raw in [
+            &b""[..],
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            b"fooba",
+            b"foobar",
+            b"user:pass",
+        ] {
+            assert_eq!(base64_decode(&base64_encode(raw)).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn base64_decode_rejects_input_base64_encode_could_never_have_produced() {
+        assert_eq!(base64_decode("abc"), None); // wrong length
+        assert_eq!(base64_decode("ab#="), None); // stray character
+        assert_eq!(base64_decode("a=cd"), None); // misplaced padding
+    }
+
+    #[test]
+    fn username_for_decodes_the_username_half_of_a_real_stored_auth_entry() {
+        let mut entries = HashMap::new();
+        entries.insert("quay.io".to_string(), base64_encode(b"myuser:mypass"));
+        let creds = Credentials { entries };
+        assert_eq!(creds.username_for("quay.io"), Some("myuser".to_string()));
+    }
+
+    #[test]
+    fn username_for_is_none_for_a_registry_never_logged_into() {
+        assert_eq!(Credentials::empty().username_for("quay.io"), None);
+    }
+
+    #[test]
+    fn username_for_follows_the_same_docker_hub_legacy_key_fallback_as_basic_auth_header() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            DOCKER_HUB_LEGACY_KEY.to_string(),
+            base64_encode(b"hubuser:hubpass"),
+        );
+        let creds = Credentials { entries };
+        assert_eq!(
+            creds.username_for(DOCKER_HUB_HOST),
+            Some("hubuser".to_string())
+        );
+    }
+
+    #[test]
+    fn username_for_is_none_for_a_decoded_value_with_no_colon_at_all() {
+        let mut entries = HashMap::new();
+        // `base64("nocolonhere")`, checked directly -- real
+        // `decodeDockerAuth` treats a decoded value with no `:` at
+        // all as an invalid entry, yielding an empty (here: `None`)
+        // username, exactly like a missing entry.
+        entries.insert("quay.io".to_string(), base64_encode(b"nocolonhere"));
+        let creds = Credentials { entries };
+        assert_eq!(creds.username_for("quay.io"), None);
     }
 
     #[test]
