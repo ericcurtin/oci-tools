@@ -1140,3 +1140,74 @@ fn create_no_pivot_reaches_running_after_start() {
     );
     ocirun(root_dir.path(), &["delete", "create-no-pivot-test"]);
 }
+
+/// `ocirun create --no-subreaper` (matching real `crun create
+/// --no-subreaper` exactly, checked directly, `~/git/crun/src/
+/// create.c:47,80-81`: crun's own `OPTION_NO_SUBREAPER` case is a
+/// bare no-op even for `create` itself — a real, checked-directly
+/// *divergence* from real runc, which has no such flag on `create`
+/// at all): accepted for real crun-CLI compatibility, but changes
+/// nothing at all -- the lifecycle proceeds identically to a plain
+/// `create` with no flag given.
+#[test]
+fn create_no_subreaper_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let create = Command::new(bin_path("ocirun"))
+        .arg("--root")
+        .arg(root_dir.path())
+        .args(["create", "create-no-subreaper-test", "--bundle"])
+        .arg(bundle_dir.path())
+        .args(["--no-subreaper"])
+        .env_remove("OCI_TOOLS_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .expect("failed to spawn ocirun create --no-subreaper");
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert_eq!(
+        state_status(root_dir.path(), "create-no-subreaper-test"),
+        "created"
+    );
+
+    let start = ocirun(root_dir.path(), &["start", "create-no-subreaper-test"]);
+    assert!(
+        start.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "create-no-subreaper-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    // Cleanup.
+    let kill = ocirun(
+        root_dir.path(),
+        &["kill", "create-no-subreaper-test", "KILL"],
+    );
+    assert!(kill.status.success());
+    wait_for_status(
+        root_dir.path(),
+        "create-no-subreaper-test",
+        "stopped",
+        Duration::from_secs(5),
+    );
+    ocirun(root_dir.path(), &["delete", "create-no-subreaper-test"]);
+}

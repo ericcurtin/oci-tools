@@ -229,13 +229,13 @@ enum Command {
         /// real, matching upstream default behavior for both
         /// reference runtimes; `--no-subreaper` opts back out of it
         /// for the rare case a caller's own process tree already
-        /// relies on host-pid-1 reparenting instead. Deliberately not
-        /// offered on `ocirun create` at all — matching real runc's
-        /// own checked-directly absence there too (`create.go`'s own
-        /// flag list has no `--no-subreaper`): `create` returns
-        /// immediately without ever waiting on the container, so
-        /// setting this attribute in a process about to exit has no
-        /// real effect to opt out of in the first place.
+        /// relies on host-pid-1 reparenting instead. See
+        /// [`Command::Create::no_subreaper`]'s own doc comment for
+        /// why `ocirun create` also accepts (but ignores) this same
+        /// flag now, correcting an earlier version of this doc
+        /// comment's own claim that runc's checked-directly absence
+        /// on `create` meant this project shouldn't offer it there
+        /// either.
         #[arg(long = "no-subreaper")]
         no_subreaper: bool,
     },
@@ -262,6 +262,26 @@ enum Command {
         /// Same as `run --no-new-keyring` — see its own doc comment.
         #[arg(long = "no-new-keyring")]
         no_new_keyring: bool,
+        /// Accepted for real CLI compatibility with real `crun create
+        /// --no-subreaper` (checked directly, `~/git/crun/src/
+        /// create.c:47`: `{ "no-subreaper", ..., "do not create a
+        /// subreaper process (ignored)", ... }`), but changes
+        /// nothing at all — matching real crun's own identical,
+        /// checked-directly `OPTION_NO_SUBREAPER: break;` no-op
+        /// exactly (`~/git/crun/src/create.c:80-81`): even crun
+        /// itself never actually sets or clears the subreaper
+        /// attribute for `create`, only for `run`/`exec` (whichever
+        /// command actually blocks waiting on the container's own
+        /// exit) — a real, checked-directly *divergence* from real
+        /// runc, which has no `--no-subreaper` flag on `create` at
+        /// all (`~/git/runc/create.go`'s own flag list, confirmed
+        /// absent), so `ocirun create` accepting it at all is purely
+        /// for crun-compatibility, the same "accepted for real CLI
+        /// compatibility but changes nothing" convention `ocibox rm
+        /// --force`'s own doc comment already established for an
+        /// analogous case.
+        #[arg(long = "no-subreaper")]
+        no_subreaper: bool,
     },
     /// Start a previously `create`d container's process running.
     Start {
@@ -778,6 +798,10 @@ fn main() -> std::process::ExitCode {
                 preserve_fds,
                 no_pivot,
                 no_new_keyring,
+                // Accepted for real crun-compatibility, changes
+                // nothing at all -- see `Command::Create::
+                // no_subreaper`'s own doc comment.
+                no_subreaper: _,
             }) => cmd_create(
                 &root,
                 &id,
