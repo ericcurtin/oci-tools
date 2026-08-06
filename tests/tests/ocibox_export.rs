@@ -15,7 +15,7 @@ use std::process::Command;
 use oci_spec_types::image::ContainerConfig;
 use oci_store::Store;
 
-use oci_tools_tests::{bin_path, busybox_path, seed_image};
+use oci_tools_tests::{bin_path, busybox_path, seed_image, seed_image_with_files};
 
 fn ocibox(storage_root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin_path("ocibox"))
@@ -1601,4 +1601,125 @@ fn export_app_extra_flags_have_no_effect_without_a_field_code() {
         "no field code in Exec= means --extra-flags has no effect: {contents:?}"
     );
     assert!(!contents.contains("--no-remote"), "{contents:?}");
+}
+
+/// `export --bin --sudo`/`-S` (0525): prefixes the generated
+/// wrapper's own exec line with `sudo ` right before the exported
+/// binary's own path -- matching real `distrobox export --sudo`'s
+/// own core idea (see `Command::Export::sudo`'s own doc comment for
+/// the two real, deliberate simplifications this project's own
+/// entirely host-side export model needs).
+#[test]
+fn export_bin_sudo_flag_prefixes_the_wrapper_with_sudo() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image_with_files(
+        &store,
+        "ocibox-test/export-sudo:latest",
+        &busybox,
+        &["sh", "echo"],
+        &[("usr/bin/sudo", b"#!/bin/sh\nexec \"$@\"\n")],
+        ContainerConfig::default(),
+    );
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/export-sudo:latest",
+            "--name",
+            "sudobox",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "sudobox",
+            "--bin",
+            "/bin/echo",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+            "--sudo",
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let contents = std::fs::read_to_string(export_dir.path().join("echo")).unwrap();
+    assert!(
+        contents.contains("-- sudo '/bin/echo'"),
+        "sudo should be inserted right before the exported binary's own path: {contents:?}"
+    );
+}
+
+/// `export --bin --sudo` on a box with no `/usr/bin/sudo` at all is a
+/// real, immediate, clear error -- matching this project's own
+/// already-established "fail clearly and early" convention rather
+/// than silently producing a wrapper that would only fail confusingly
+/// later.
+#[test]
+fn export_bin_sudo_without_sudo_installed_is_a_clear_error() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "nosudobox");
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "nosudobox",
+            "--bin",
+            "/bin/echo",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+            "--sudo",
+        ],
+    );
+    assert!(!export.status.success());
+    assert!(
+        String::from_utf8_lossy(&export.stderr).contains("sudo"),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert!(
+        !export_dir.path().join("echo").exists(),
+        "no wrapper should have been written at all"
+    );
+}
+
+/// `--sudo` combined with `--app` is a clear error -- this project's
+/// own generated desktop entry doesn't wire `--sudo` in at all yet
+/// (see `Command::Export::sudo`'s own doc comment for why).
+#[test]
+fn export_app_and_sudo_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &["export", "--box", "anybox", "--app", "anyapp", "--sudo"],
+    );
+    assert!(!export.status.success());
+    assert!(
+        String::from_utf8_lossy(&export.stderr).contains("--sudo"),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
 }

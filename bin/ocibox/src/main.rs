@@ -710,6 +710,48 @@ enum Command {
         /// gave it one).
         #[arg(long = "enter-flags", value_name = "FLAGS", allow_hyphen_values = true)]
         enter_flags: Option<String>,
+        /// Run the exported `--bin` as `sudo` inside the box —
+        /// matching real `distrobox export --sudo`/`-S`'s own core
+        /// idea exactly (checked directly, `~/git/distrobox/internal/
+        /// inside-distrobox/assets/distrobox-export:270-296`), with
+        /// two real, deliberate, honestly-documented simplifications
+        /// this project's own entirely host-side, static-wrapper
+        /// export model can't faithfully replicate:
+        ///
+        /// 1. Real distrobox additionally detects `doas`/`su-exec`
+        ///    inside the box (each taking priority over plain `sudo`
+        ///    if present) and probes whether `sudo` itself can run
+        ///    passwordless (`sudo -S test`) before falling back to
+        ///    plain `sudo`. Both checks need a real, *live* command
+        ///    run inside the box at export time; this project's own
+        ///    `--bin` export never launches anything live at all
+        ///    (checked directly, `rootfs_bin.is_file()` — a plain,
+        ///    static rootfs path check, the same convention this flag
+        ///    reuses below for `sudo` itself). This first slice only
+        ///    ever looks for plain `/usr/bin/sudo` in the box's own
+        ///    rootfs statically — `doas`/`su-exec` detection is a
+        ///    real, separate, deliberately deferred gap, not silently
+        ///    dropped.
+        /// 2. `--app`'s own generated desktop entry doesn't wire this
+        ///    flag in at all yet (a clear, immediate error if given
+        ///    together) -- real distrobox's own identical `sudo_
+        ///    prefix` mechanism applies to both `--bin` and `--app`
+        ///    alike, but closing the `--app` half needs its own,
+        ///    separate verification of exactly how a desktop entry's
+        ///    `Exec=` line embeds it, not assumed from the `--bin`
+        ///    case alone.
+        ///
+        /// A box with no `/usr/bin/sudo` at all is a real, immediate,
+        /// clear error at export time -- matching this project's own
+        /// already-established "fail clearly and early rather than
+        /// produce a wrapper that would only fail confusingly later"
+        /// convention (the same reasoning `rootfs_bin.is_file()`'s own
+        /// doc comment already gives), a real, deliberate improvement
+        /// over real distrobox's own less defensive behavior there
+        /// (which would still generate a wrapper invoking a `sudo`
+        /// that may not actually exist).
+        #[arg(long, short = 'S')]
+        sudo: bool,
     },
     /// Generate (or `--delete`) a real, standalone desktop launcher
     /// for entering a whole box — matching real `distrobox generate-
@@ -872,6 +914,7 @@ fn main() -> std::process::ExitCode {
                 list_binaries,
                 extra_flags,
                 enter_flags,
+                sudo,
             }) => cmd_export(
                 &box_name,
                 ExportArgs {
@@ -884,6 +927,7 @@ fn main() -> std::process::ExitCode {
                     list_binaries,
                     extra_flags: extra_flags.as_deref(),
                     enter_flags: enter_flags.as_deref(),
+                    sudo,
                 },
             ),
             Some(Command::GenerateEntry {
@@ -2095,6 +2139,7 @@ struct ExportArgs<'a> {
     list_binaries: bool,
     extra_flags: Option<&'a str>,
     enter_flags: Option<&'a str>,
+    sudo: bool,
 }
 
 fn cmd_export(box_name: &str, args: ExportArgs) -> anyhow::Result<()> {
@@ -2108,6 +2153,7 @@ fn cmd_export(box_name: &str, args: ExportArgs) -> anyhow::Result<()> {
         list_binaries,
         extra_flags,
         enter_flags,
+        sudo,
     } = args;
     if list_apps || list_binaries {
         anyhow::ensure!(
@@ -2127,6 +2173,9 @@ fn cmd_export(box_name: &str, args: ExportArgs) -> anyhow::Result<()> {
     match (app, bin) {
         (Some(_), Some(_)) => anyhow::bail!("choose only one of --app or --bin"),
         (None, None) => anyhow::bail!("either --app or --bin is required"),
+        (Some(_), None) if sudo => {
+            anyhow::bail!("--sudo is only supported with --bin (not yet with --app)")
+        }
         (Some(app), None) => cmd_export_app(
             box_name,
             app,
@@ -2136,9 +2185,15 @@ fn cmd_export(box_name: &str, args: ExportArgs) -> anyhow::Result<()> {
             extra_flags,
             enter_flags,
         ),
-        (None, Some(bin)) => {
-            cmd_export_bin(box_name, bin, export_path, delete, extra_flags, enter_flags)
-        }
+        (None, Some(bin)) => cmd_export_bin(
+            box_name,
+            bin,
+            export_path,
+            delete,
+            extra_flags,
+            enter_flags,
+            sudo,
+        ),
     }
 }
 
@@ -2157,6 +2212,7 @@ fn cmd_export_bin(
     delete: bool,
     extra_flags: Option<&str>,
     enter_flags: Option<&str>,
+    sudo: bool,
 ) -> anyhow::Result<()> {
     validate_box_name(box_name)?;
     let box_dir = boxes_root().join(box_name);
@@ -2206,6 +2262,25 @@ fn cmd_export_bin(
         "cannot find {bin} inside box {box_name:?}"
     );
 
+    // `--sudo`'s own real target -- see [`Command::Export::sudo`]'s
+    // own doc comment for exactly why this checks only for plain
+    // `/usr/bin/sudo`, statically, rather than replicating real
+    // distrobox's own live `doas`/`su-exec`/passwordless-`sudo -S`
+    // detection. A box with none of that installed is a real,
+    // immediate, clear error here -- the same "fail clearly and
+    // early" reasoning `rootfs_bin.is_file()`'s own check just above
+    // already applies.
+    let sudo_prefix = if sudo {
+        anyhow::ensure!(
+            box_dir.join("rootfs/usr/bin/sudo").is_file(),
+            "cannot find /usr/bin/sudo inside box {box_name:?} (--sudo needs sudo already \
+             installed there)"
+        );
+        "sudo "
+    } else {
+        ""
+    };
+
     std::fs::create_dir_all(&export_dir)
         .with_context(|| format!("creating {}", export_dir.display()))?;
 
@@ -2226,7 +2301,8 @@ fn cmd_export_bin(
     // `Command::Export::enter_flags`'s own doc comment).
     let enter = enter_flags.map(|f| format!(" {f}")).unwrap_or_default();
     let script = format!(
-        "#!/bin/sh\n# {EXPORT_MARKER}\n# box: {box_name}\nexec ocibox enter {box_name}{enter} -- '{bin}'{extra} \"$@\"\n"
+        "#!/bin/sh\n# {EXPORT_MARKER}\n# box: {box_name}\nexec ocibox enter {box_name}{enter} -- \
+         {sudo_prefix}'{bin}'{extra} \"$@\"\n"
     );
     std::fs::write(&dest_file, script)
         .with_context(|| format!("writing {}", dest_file.display()))?;
