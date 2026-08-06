@@ -27,15 +27,16 @@
 //! (`docs/design/0502`, the same shape again for `ociman export`),
 //! `stats` (`docs/design/0503`, the same shape again for `ociman
 //! stats`), `attach` (`docs/design/0504`, the same shape again for
-//! `ociman attach`), and `exec` (`docs/design/0505`, the same shape
-//! again for `ociman exec`) — see `ociman_ps.rs`/`ociman_stop.rs`/
-//! `ociman_start.rs`/`ociman_kill.rs`/`ociman_pause.rs`/
-//! `ociman_rename.rs`/`ociman_wait.rs`/`ociman_top.rs`/
-//! `ociman_logs.rs`/`ociman_diff.rs`/`ociman_cp.rs`/
+//! `ociman attach`), `exec` (`docs/design/0505`, the same shape
+//! again for `ociman exec`), and `run` (`docs/design/0506`, the same
+//! shape again for `ociman run`) — see `ociman_ps.rs`/
+//! `ociman_stop.rs`/`ociman_start.rs`/`ociman_kill.rs`/
+//! `ociman_pause.rs`/`ociman_rename.rs`/`ociman_wait.rs`/
+//! `ociman_top.rs`/`ociman_logs.rs`/`ociman_diff.rs`/`ociman_cp.rs`/
 //! `ociman_commit.rs`/`ociman_export.rs`/`ociman_stats.rs`/
-//! `ociman_attach.rs`/`ociman_exec.rs` for each top-level command's
-//! own much larger test suite; this file only proves each alias
-//! itself is byte-
+//! `ociman_attach.rs`/`ociman_exec.rs`/`ociman_run.rs` for each
+//! top-level command's own much larger test suite; this file only
+//! proves each alias itself is byte-
 //! identical, not the aliased command's own full semantics again.
 //!
 //! `ociman container prune` removes every real, non-running container
@@ -1926,4 +1927,63 @@ fn container_exec_is_a_byte_identical_alias_for_top_level_exec() {
     // Clean up the still-running container so the temp dir doesn't
     // leak a live process past this test.
     let _ = ociman(storage_dir.path(), &["kill", &id]);
+}
+
+/// `ociman container run` (0506) is a real, byte-identical alias for
+/// the top-level `ociman run`, matching real `podman container run`'s
+/// own checked-directly identical `Args`/`Use`/`Short`/`Long`/`RunE`/
+/// `ValidArgsFunction` (and identical `runFlags`-applied flag set,
+/// shared with `ociman create`'s own already-flattened [`RunArgs`])
+/// as top-level `podman run` exactly (`~/git/podman/cmd/podman/
+/// containers/run.go:24-105`). Full `run` semantics (the entire,
+/// enormous [`RunArgs`] flag surface, `--rm`, `--detach`,
+/// `--interactive`, `--preserve-fds`) are already exhaustively tested
+/// against the top-level command in `ociman_run.rs`; this only
+/// proves the alias itself reaches the identical function with the
+/// identical fields.
+#[test]
+fn container_run_is_a_byte_identical_alias_for_top_level_run() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-run-alias:latest",
+        &busybox,
+        &["sh", "echo"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/echo".to_string(),
+                "default-cmd-unused".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+
+    let alias = ociman(
+        storage_dir.path(),
+        &[
+            "container",
+            "run",
+            "--rm",
+            "ociman-test/container-run-alias:latest",
+            "/bin/echo",
+            "overridden-args-used",
+        ],
+    );
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&alias.stdout);
+    assert!(stdout.contains("overridden-args-used"), "{stdout:?}");
+    assert!(!stdout.contains("default-cmd-unused"), "{stdout:?}");
+
+    // `--rm` should have already reclaimed the container's own
+    // storage.
+    assert!(all_ids(storage_dir.path()).is_empty());
 }

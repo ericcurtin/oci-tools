@@ -5401,6 +5401,43 @@ enum ContainerCommand {
         #[arg(long)]
         privileged: bool,
     },
+    /// `podman container run`'s own real alias for the already-
+    /// existing flat [`Command::Run`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/run.go:24-105`:
+    /// `containerRunCommand` (`Parent: containerCmd`) and top-level
+    /// `runCommand` share the exact same `Args`/`Use`/`Short`/`Long`/
+    /// `RunE`/`ValidArgsFunction`, and both get the identical flag
+    /// set applied via the one shared `runFlags(cmd)` helper -- a
+    /// byte-identical alias, the same shape [`Self::Kill`] (`0492`)
+    /// already established. Dispatches into the same [`cmd_run`]
+    /// `ociman run` itself already calls, with the identical field
+    /// set -- see [`Command::Run`]'s own doc comment for the exact
+    /// semantics, not repeated here.
+    Run {
+        /// Same as [`Command::Run::args`]. Boxed (unlike the
+        /// top-level [`Command::Run::args`] field) purely to keep
+        /// this smaller, otherwise-lightweight [`ContainerCommand`]
+        /// enum's own overall size down -- `clippy::large_enum_variant`
+        /// (checked directly: every other [`ContainerCommand`]
+        /// variant is tiny, so this one 1100+-byte [`RunArgs`]
+        /// embedded directly would dominate the whole enum's size);
+        /// no behavior difference at all, `clap` flattens through a
+        /// `Box` exactly the same way.
+        #[command(flatten)]
+        args: Box<RunArgs>,
+        /// Same as [`Command::Run::rm`].
+        #[arg(long)]
+        rm: bool,
+        /// Same as [`Command::Run::detach`].
+        #[arg(short, long)]
+        detach: bool,
+        /// Same as [`Command::Run::interactive`].
+        #[arg(short, long)]
+        interactive: bool,
+        /// Same as [`Command::Run::preserve_fds`].
+        #[arg(long = "preserve-fds", default_value_t = 0)]
+        preserve_fds: u32,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -6538,6 +6575,13 @@ fn main() -> std::process::ExitCode {
                         &args,
                     )
                 }
+                ContainerCommand::Run {
+                    args,
+                    rm,
+                    detach,
+                    interactive,
+                    preserve_fds,
+                } => cmd_run(*args, rm, detach, interactive, preserve_fds),
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),
