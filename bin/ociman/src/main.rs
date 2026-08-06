@@ -1411,6 +1411,21 @@ enum Command {
         /// oversight.
         #[arg(long = "password-stdin")]
         password_stdin: bool,
+        /// Accepted for real CLI compatibility with real `podman
+        /// login --tls-verify`; has no effect: checked directly,
+        /// `~/git/podman/cmd/podman/login.go:56,67-70,102-104` --
+        /// real `--tls-verify` only ever controls whether the *real
+        /// registry connection* `auth.Login` makes to verify the
+        /// given credentials skips TLS certificate verification. This
+        /// project's own `cmd_login` never makes any such connection
+        /// at all (see this command's own doc comment) -- a genuine,
+        /// faithful no-op, the same "nothing to skip" reasoning class
+        /// the `--force` sweep (`0521`) already established, applied
+        /// here to a flag whose real target is a network call this
+        /// project deliberately skips rather than a confirmation
+        /// prompt.
+        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        tls_verify: bool,
     },
     /// Remove a registry's own stored credentials, matching real
     /// `docker logout`/`podman logout`. A no-op (not an error) if
@@ -6228,6 +6243,7 @@ fn main() -> std::process::ExitCode {
                 username,
                 password,
                 password_stdin,
+                tls_verify: _,
             }) => cmd_login(
                 &registry,
                 &username,

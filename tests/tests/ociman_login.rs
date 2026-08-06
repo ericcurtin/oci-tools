@@ -74,6 +74,65 @@ fn login_writes_real_credentials_ociman_pull_could_actually_use() {
     assert_eq!(mode, 0o600);
 }
 
+/// `login --tls-verify` (0527): accepted for real CLI compatibility,
+/// but changes nothing at all -- this project's own `cmd_login` never
+/// makes a real registry connection in the first place, so there is
+/// nothing for `--tls-verify` to affect either way (see
+/// `Command::Login`'s own doc comment for the full, checked-directly
+/// reasoning). Proven here both ways (`=true`/`=false`) writing the
+/// identical real credentials.
+#[test]
+fn login_tls_verify_flag_is_accepted_and_behaves_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("auth.json");
+
+    let login_true = ociman(
+        &auth_file,
+        &[
+            "login",
+            "quay.io",
+            "--username",
+            "myuser",
+            "--password",
+            "mypass",
+            "--tls-verify=true",
+        ],
+    );
+    assert!(
+        login_true.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&login_true.stderr)
+    );
+    let root: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&auth_file).unwrap()).unwrap();
+    assert_eq!(root["auths"]["quay.io"]["auth"], "bXl1c2VyOm15cGFzcw==");
+
+    let login_false = ociman(
+        &auth_file,
+        &[
+            "login",
+            "ghcr.io",
+            "--username",
+            "otheruser",
+            "--password",
+            "otherpass",
+            "--tls-verify=false",
+        ],
+    );
+    assert!(
+        login_false.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&login_false.stderr)
+    );
+    let root: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&auth_file).unwrap()).unwrap();
+    // `base64("otheruser:otherpass")`, checked directly.
+    assert_eq!(
+        root["auths"]["ghcr.io"]["auth"],
+        "b3RoZXJ1c2VyOm90aGVycGFzcw=="
+    );
+}
+
 #[test]
 fn login_json_reports_the_registry_and_auth_file_path() {
     let dir = tempfile::tempdir().unwrap();
