@@ -1035,3 +1035,119 @@ fn exec_pid_file_writes_the_real_pid_of_the_exec_process() {
         &["delete", "--force", "exec-pid-file-test"],
     );
 }
+
+/// `ocirun exec --process`/`-p` (matching real `runc exec --process`/
+/// `crun exec --process` exactly, checked directly, `~/git/runc/
+/// exec.go`'s own `getProcess`): the entire process specification
+/// comes from the given JSON file instead of `COMMAND`/`--user`/
+/// `--cwd`/`--env`/`--no-new-privs`, all of which are given here too
+/// (deliberately mismatched from the file's own values) to prove they
+/// are genuinely ignored, not merged.
+#[test]
+fn exec_process_flag_reads_the_entire_spec_from_a_json_file_ignoring_other_flags() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let create = ocirun_create(root_dir.path(), bundle_dir.path(), "exec-process-test");
+    assert!(create.status.success(), "{create:?}");
+    let start = ocirun(root_dir.path(), &["start", "exec-process-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-process-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    // `cwd` deliberately set to `/bin` rather than `/` (the default
+    // every bundle's own process already declares, `Spec::example`)
+    // -- `/bin` genuinely exists in this test's own minimal busybox
+    // rootfs (`write_bundle` creates it), and differs from the
+    // default, so a correct `pwd` here can only mean the JSON file's
+    // own `cwd` genuinely took effect.
+    let process_json = serde_json::json!({
+        "user": {"uid": 0, "gid": 0},
+        "args": ["/bin/sh", "-c", "pwd; env | grep ^MARKER=; grep -E \"^NoNewPrivs:\" /proc/self/status"],
+        "env": ["MARKER=from-process-json"],
+        "cwd": "/bin",
+        "noNewPrivileges": true
+    });
+    let process_path = bundle_dir.path().join("process.json");
+    std::fs::write(
+        &process_path,
+        serde_json::to_vec_pretty(&process_json).unwrap(),
+    )
+    .unwrap();
+
+    let exec = ocirun(
+        root_dir.path(),
+        &[
+            "exec",
+            "--process",
+            process_path.to_str().unwrap(),
+            // Deliberately mismatched, must be ignored entirely.
+            "--cwd",
+            "/",
+            "--env",
+            "SHOULD_NOT_APPEAR=1",
+            "exec-process-test",
+        ],
+    );
+    assert!(
+        exec.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&exec.stdout),
+        "/bin\nMARKER=from-process-json\nNoNewPrivs:\t1\n"
+    );
+
+    ocirun(root_dir.path(), &["delete", "--force", "exec-process-test"]);
+}
+
+/// Real `runc exec`/`crun exec` both require a `COMMAND` when
+/// `--process` isn't given — matching that exactly, now that `exec`'s
+/// own `args` positional is no longer unconditionally `required` at
+/// the clap level (needed to make `--process` alone valid).
+#[test]
+fn exec_with_neither_process_nor_a_command_is_a_clear_error() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let create = ocirun_create(root_dir.path(), bundle_dir.path(), "exec-no-args-test");
+    assert!(create.status.success(), "{create:?}");
+    let start = ocirun(root_dir.path(), &["start", "exec-no-args-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-no-args-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let exec = ocirun(root_dir.path(), &["exec", "exec-no-args-test"]);
+    assert!(!exec.status.success());
+    assert!(
+        String::from_utf8_lossy(&exec.stderr).contains("exec args cannot be empty"),
+        "{exec:?}"
+    );
+
+    ocirun(root_dir.path(), &["delete", "--force", "exec-no-args-test"]);
+}

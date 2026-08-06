@@ -409,8 +409,31 @@ enum Command {
         /// ever meaningful from inside the joined namespace).
         #[arg(long = "pid-file")]
         pid_file: Option<PathBuf>,
-        /// Command and arguments to run inside the container.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        /// Read the entire process specification (`user`/`args`/`env`/
+        /// `cwd`/`capabilities`/`noNewPrivileges`) from this JSON
+        /// file instead of building one from `COMMAND`/`--user`/
+        /// `--cwd`/`--env`/`--cap`/`--no-new-privs` — matching real
+        /// `runc exec --process`/`-p`/`crun exec --process`/`-p`
+        /// exactly (checked directly, `~/git/runc/exec.go`'s own
+        /// `getProcess`: given this flag, every other CLI-flag-based
+        /// override is bypassed entirely, not merged with the JSON —
+        /// the same real, checked-directly behavior `~/git/crun/src/
+        /// exec.c`'s own identical `if (exec_options.process) ...
+        /// else { ... }` branch has, never touching `--cwd`/`--user`/
+        /// `--cap`/etc. once given). Reuses the exact same
+        /// [`oci_spec_types::runtime::Process`] struct (and its
+        /// already-`camelCase`-renamed `Deserialize`) real container
+        /// bundles themselves already use, needing no new type at
+        /// all. `COMMAND` becomes optional when this is given
+        /// (matching real runc's own `crun_assert_n_args`/`cli.Args
+        /// == 1` requiring only the container ID, no trailing command
+        /// at all, when `--process` is set); without it, `COMMAND` is
+        /// still required, exactly as before this flag existed.
+        #[arg(short = 'p', long = "process", value_name = "FILE")]
+        process: Option<PathBuf>,
+        /// Command and arguments to run inside the container — omit
+        /// when using `--process`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Show this runtime's own real, checked support surface (hooks,
@@ -778,6 +801,7 @@ fn main() -> std::process::ExitCode {
                 ignore_paused,
                 no_new_privs,
                 pid_file,
+                process,
                 args,
             }) => cmd_exec(
                 &root,
@@ -792,6 +816,7 @@ fn main() -> std::process::ExitCode {
                 ignore_paused,
                 no_new_privs,
                 pid_file.as_deref(),
+                process.as_deref(),
             ),
             Some(Command::Features) => oci_cli_common::output::print_json(&features::features()),
             Some(Command::Ps {
@@ -2015,6 +2040,7 @@ fn cmd_exec(
     ignore_paused: bool,
     no_new_privs: bool,
     pid_file: Option<&Path>,
+    process: Option<&Path>,
 ) -> anyhow::Result<()> {
     verify_preserve_fds(preserve_fds)?;
     let store = StateStore::open(root)
@@ -2062,45 +2088,97 @@ fn cmd_exec(
         .map(|ns| ns.kind)
         .collect();
 
-    let mut effective_user = process_spec.user.clone();
-    if let Some(user) = user {
-        let (uid, gid) = parse_numeric_user(user)?;
-        effective_user.uid = uid;
-        // Matches real `runc exec`: `--user 1000` alone only overrides
-        // the uid, leaving the container's own default gid in place;
-        // `--user 1000:1000` overrides both.
-        if let Some(gid) = gid {
-            effective_user.gid = gid;
+    // `--process`/`-p` (matching real `runc exec --process`/`crun
+    // exec --process` exactly, checked directly, `~/git/runc/
+    // exec.go`'s own `getProcess`): given at all, the entire process
+    // specification comes from this JSON file instead, bypassing
+    // every other CLI-flag-based override below entirely (`--user`/
+    // `--cwd`/`--env`/`--cap`/`--no-new-privs`/`COMMAND` are all
+    // silently unused in that case, exactly matching both reference
+    // runtimes' own identical early-return shape -- neither ever
+    // merges the two).
+    let (
+        effective_user,
+        effective_capabilities,
+        no_new_privileges,
+        effective_cwd,
+        effective_env,
+        effective_args,
+    ) = if let Some(process_path) = process {
+        let bytes = std::fs::read(process_path)
+            .with_context(|| format!("reading {}", process_path.display()))?;
+        let spec: oci_spec_types::runtime::Process = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {}", process_path.display()))?;
+        // Matches real runc's own `validateProcessSpec` exactly
+        // (`~/git/runc/utils_linux.go`): a non-empty, absolute
+        // `cwd`, and at least one arg (the executable itself).
+        anyhow::ensure!(!spec.cwd.is_empty(), "Cwd property must not be empty");
+        anyhow::ensure!(
+            Path::new(&spec.cwd).is_absolute(),
+            "Cwd must be an absolute path"
+        );
+        anyhow::ensure!(!spec.args.is_empty(), "args must not be empty");
+        (
+            spec.user,
+            spec.capabilities,
+            spec.no_new_privileges,
+            spec.cwd,
+            spec.env,
+            spec.args,
+        )
+    } else {
+        anyhow::ensure!(!args.is_empty(), "exec args cannot be empty");
+        let mut effective_user = process_spec.user.clone();
+        if let Some(user) = user {
+            let (uid, gid) = parse_numeric_user(user)?;
+            effective_user.uid = uid;
+            // Matches real `runc exec`: `--user 1000` alone only
+            // overrides the uid, leaving the container's own
+            // default gid in place; `--user 1000:1000` overrides
+            // both.
+            if let Some(gid) = gid {
+                effective_user.gid = gid;
+            }
         }
-    }
-    // Matches real `runc exec -g`/`--additional-gids` exactly: each
-    // given GID is *appended* to the container's own already-declared
-    // supplementary groups, never replacing them (checked directly
-    // against `~/git/runc/exec.go`'s own identical `append`).
-    effective_user
-        .additional_gids
-        .extend(additional_gids.iter().copied());
-    let mut effective_env = process_spec.env.clone();
-    effective_env.extend(extra_env.iter().cloned());
+        // Matches real `runc exec -g`/`--additional-gids` exactly:
+        // each given GID is *appended* to the container's own
+        // already-declared supplementary groups, never replacing
+        // them (checked directly against `~/git/runc/exec.go`'s
+        // own identical `append`).
+        effective_user
+            .additional_gids
+            .extend(additional_gids.iter().copied());
+        let mut effective_env = process_spec.env.clone();
+        effective_env.extend(extra_env.iter().cloned());
 
-    let mut effective_capabilities = process_spec.capabilities.clone();
-    apply_exec_cap_flags(&mut effective_capabilities, cap);
+        let mut effective_capabilities = process_spec.capabilities.clone();
+        apply_exec_cap_flags(&mut effective_capabilities, cap);
+
+        (
+            effective_user,
+            effective_capabilities,
+            // `--no-new-privs` (matching real `runc exec`/`crun
+            // exec --no-new-privs` exactly, checked directly):
+            // given at all forces `true`; not given leaves the
+            // exec'd process inheriting the container's own
+            // already-declared value unchanged, exactly as before
+            // this flag existed.
+            no_new_privs || process_spec.no_new_privileges,
+            cwd.map(str::to_string)
+                .unwrap_or_else(|| process_spec.cwd.clone()),
+            effective_env,
+            args.to_vec(),
+        )
+    };
 
     let request = oci_runtime_core::exec::ExecRequest {
         namespaces,
         user: effective_user,
         capabilities: effective_capabilities,
-        // `--no-new-privs` (matching real `runc exec`/`crun exec
-        // --no-new-privs` exactly, checked directly): given at all
-        // forces `true`; not given leaves the exec'd process
-        // inheriting the container's own already-declared value
-        // unchanged, exactly as before this flag existed.
-        no_new_privileges: no_new_privs || process_spec.no_new_privileges,
-        cwd: cwd
-            .map(str::to_string)
-            .unwrap_or_else(|| process_spec.cwd.clone()),
+        no_new_privileges,
+        cwd: effective_cwd,
         env: effective_env,
-        args: args.to_vec(),
+        args: effective_args,
         preserve_fds,
         // `ocirun exec` has no `--timeout` flag of its own, matching
         // real `crun exec`/`runc exec`'s own identical lack of one
