@@ -5291,6 +5291,43 @@ enum ContainerCommand {
         #[arg(short, long, value_name = "PATH")]
         output: Option<PathBuf>,
     },
+    /// `podman container stats`'s own real alias for the already-
+    /// existing flat [`Command::Stats`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/stats.go:22-93`:
+    /// `containerStatsCommand` (`Parent: containerCmd`) and
+    /// top-level `statsCommand` share the exact same `Use`/`Short`/
+    /// `Long`/`Args`/`RunE`/`ValidArgsFunction`, and both get the
+    /// identical flag set applied via the one shared `statFlags(cmd)`
+    /// helper (`--all`/`-a`, `--format`, `--no-reset`, `--no-stream`,
+    /// `--interval`) plus `validate.AddLatestFlag` -- a byte-identical
+    /// alias, the same shape [`Self::Kill`] (`0492`) already
+    /// established. Dispatches into the same [`cmd_stats`] `ociman
+    /// stats` itself already calls, replaying the identical
+    /// `--latest`/explicit-id resolution the top-level
+    /// [`Command::Stats`] arm already has -- see [`Command::Stats`]'s
+    /// own doc comment for the exact semantics (including this
+    /// project's own honestly narrower first-slice scope: no
+    /// `--all`, single container only, matching the top-level
+    /// command's own identical gap), not repeated here.
+    Stats {
+        /// Same as [`Command::Stats::id`].
+        id: Option<String>,
+        /// Same as [`Command::Stats::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+        /// Same as [`Command::Stats::no_stream`].
+        #[arg(long)]
+        no_stream: bool,
+        /// Same as [`Command::Stats::interval`].
+        #[arg(short, long, default_value_t = 5)]
+        interval: u64,
+        /// Same as [`Command::Stats::no_reset`].
+        #[arg(long)]
+        no_reset: bool,
+        /// Same as [`Command::Stats::format`].
+        #[arg(long = "format", value_name = "TEMPLATE")]
+        format: Option<String>,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -6308,6 +6345,43 @@ fn main() -> std::process::ExitCode {
                     cli.global.json,
                 ),
                 ContainerCommand::Export { id, output } => cmd_export(&id, output.as_deref()),
+                ContainerCommand::Stats {
+                    id,
+                    latest,
+                    no_stream,
+                    interval,
+                    no_reset,
+                    format,
+                } => {
+                    // Matches real podman's own exact wording, checked
+                    // directly (`~/git/podman/cmd/podman/containers/
+                    // stats.go`'s own `checkStatOptions`) -- the
+                    // identical check the top-level `Command::Stats`
+                    // arm already has.
+                    anyhow::ensure!(
+                        !(latest && id.is_some()),
+                        "--all, --latest and containers cannot be used together"
+                    );
+                    let resolved_id = match id {
+                        Some(id) => id,
+                        None => {
+                            anyhow::ensure!(
+                                latest,
+                                "no container ID/name given (try `ociman stats <ID>` or --latest)"
+                            );
+                            let containers = open_container_store()?;
+                            resolve_latest_container(&containers)?
+                        }
+                    };
+                    cmd_stats(
+                        &resolved_id,
+                        no_stream,
+                        interval,
+                        no_reset,
+                        cli.global.json,
+                        format.as_deref(),
+                    )
+                }
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),
