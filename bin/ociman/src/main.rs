@@ -5438,6 +5438,31 @@ enum ContainerCommand {
         #[arg(long = "preserve-fds", default_value_t = 0)]
         preserve_fds: u32,
     },
+    /// `podman container create`'s own real alias for the already-
+    /// existing flat [`Command::Create`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/create.go:32-101`:
+    /// `containerCreateCommand` (`Parent: containerCmd`) and
+    /// top-level `createCommand` share the exact same `Args`/`Use`/
+    /// `Short`/`Long`/`RunE`/`ValidArgsFunction`, and both get the
+    /// identical flag set applied via the one shared `createFlags
+    /// (cmd)` helper -- a byte-identical alias, the same shape
+    /// [`Self::Kill`] (`0492`) already established. Dispatches into
+    /// the same [`cmd_create`] `ociman create` itself already calls,
+    /// with the identical field set -- see [`Command::Create`]'s own
+    /// doc comment for the exact semantics, not repeated here.
+    Create {
+        /// Same as [`Command::Create::args`]. Boxed for the exact
+        /// same `clippy::large_enum_variant` reason [`Self::Run::
+        /// args`]'s own doc comment already explains.
+        #[command(flatten)]
+        args: Box<RunArgs>,
+        /// Same as [`Command::Create::rm`].
+        #[arg(long)]
+        rm: bool,
+        /// Same as [`Command::Create::interactive`].
+        #[arg(short, long)]
+        interactive: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -6582,6 +6607,11 @@ fn main() -> std::process::ExitCode {
                     interactive,
                     preserve_fds,
                 } => cmd_run(*args, rm, detach, interactive, preserve_fds),
+                ContainerCommand::Create {
+                    args,
+                    rm,
+                    interactive,
+                } => cmd_create(*args, rm, interactive),
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),

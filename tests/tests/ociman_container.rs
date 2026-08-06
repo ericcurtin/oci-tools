@@ -28,15 +28,16 @@
 //! `stats` (`docs/design/0503`, the same shape again for `ociman
 //! stats`), `attach` (`docs/design/0504`, the same shape again for
 //! `ociman attach`), `exec` (`docs/design/0505`, the same shape
-//! again for `ociman exec`), and `run` (`docs/design/0506`, the same
-//! shape again for `ociman run`) — see `ociman_ps.rs`/
+//! again for `ociman exec`), `run` (`docs/design/0506`, the same
+//! shape again for `ociman run`), and `create` (`docs/design/0507`,
+//! the same shape again for `ociman create`) — see `ociman_ps.rs`/
 //! `ociman_stop.rs`/`ociman_start.rs`/`ociman_kill.rs`/
 //! `ociman_pause.rs`/`ociman_rename.rs`/`ociman_wait.rs`/
 //! `ociman_top.rs`/`ociman_logs.rs`/`ociman_diff.rs`/`ociman_cp.rs`/
 //! `ociman_commit.rs`/`ociman_export.rs`/`ociman_stats.rs`/
-//! `ociman_attach.rs`/`ociman_exec.rs`/`ociman_run.rs` for each
-//! top-level command's own much larger test suite; this file only
-//! proves each alias itself is byte-
+//! `ociman_attach.rs`/`ociman_exec.rs`/`ociman_run.rs`/
+//! `ociman_create.rs` for each top-level command's own much larger
+//! test suite; this file only proves each alias itself is byte-
 //! identical, not the aliased command's own full semantics again.
 //!
 //! `ociman container prune` removes every real, non-running container
@@ -1986,4 +1987,57 @@ fn container_run_is_a_byte_identical_alias_for_top_level_run() {
     // `--rm` should have already reclaimed the container's own
     // storage.
     assert!(all_ids(storage_dir.path()).is_empty());
+}
+
+/// `ociman container create` (0507) is a real, byte-identical alias
+/// for the top-level `ociman create`, matching real `podman
+/// container create`'s own checked-directly identical `Args`/`Use`/
+/// `Short`/`Long`/`RunE`/`ValidArgsFunction` (and identical
+/// `createFlags`-applied flag set, shared with `ociman run`'s own
+/// already-flattened [`RunArgs`]) as top-level `podman create`
+/// exactly (`~/git/podman/cmd/podman/containers/create.go:32-101`).
+/// Full `create` semantics (the entire, enormous [`RunArgs`] flag
+/// surface, `--rm`, `--interactive`, hidden-from-plain-`ps`) are
+/// already exhaustively tested against the top-level command in
+/// `ociman_create.rs`; this only proves the alias itself reaches the
+/// identical function with the identical fields.
+#[test]
+fn container_create_is_a_byte_identical_alias_for_top_level_create() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-create-alias:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let alias = ociman(
+        storage_dir.path(),
+        &[
+            "container",
+            "create",
+            "ociman-test/container-create-alias:latest",
+            "true",
+        ],
+    );
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    let id = String::from_utf8_lossy(&alias.stdout).trim().to_string();
+    assert!(!id.is_empty());
+    assert_eq!(inspect_json(storage_dir.path(), &id)["status"], "created");
+
+    // Hidden from a plain `ps`, visible with `ps -a` -- matching the
+    // top-level command's own already-established behavior.
+    let ps = ociman(storage_dir.path(), &["ps", "-q"]);
+    assert!(String::from_utf8_lossy(&ps.stdout).trim().is_empty());
+    assert_eq!(all_ids(storage_dir.path()), vec![id]);
 }
