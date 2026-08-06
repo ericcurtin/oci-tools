@@ -5965,6 +5965,86 @@ enum ImageCommand {
         #[arg(long = "format", short = 'f', value_name = "TEMPLATE")]
         format: Option<String>,
     },
+    /// Mount (extracting if not already cached) one or more images'
+    /// own real root filesystems, printing each one's own real cache
+    /// path — matching real `podman image mount IMAGE [IMAGE...]`'s
+    /// own single/multi-explicit-image case exactly (checked
+    /// directly, `~/git/podman/cmd/podman/images/mount.go`: with
+    /// exactly one image given, no `--format`, no `--all`, prints
+    /// just `reports[0].Path`; the identical shape this project's own
+    /// `cmd_image_mount` mirrors below). A real, separate, non-alias
+    /// command from the already-existing container [`Command::
+    /// Mount`]/[`ContainerCommand::Mount`] (`0361`/`0511`) -- checked
+    /// directly, real podman's own `image mount` calls a genuinely
+    /// different `registry.ImageEngine().Mount` ABI method than
+    /// `container mount`'s own `ContainerEngine().ContainerMount`,
+    /// with its own distinct `ImageMountOptions` type; three earlier
+    /// design notes (`0481`/`0482`/`0499`) had each mischaracterized
+    /// this pair as "cross-concept aliasing" of the container
+    /// commands without actually checking this source — corrected
+    /// here, not silently.
+    ///
+    /// Reuses the exact same `oci_store::ensure_cached` cache
+    /// `ociman run`/`ociboot`/`ocibox create` already share (`0109`/
+    /// `0200`) -- an image already cached returns its own existing
+    /// path immediately (matching real podman's own "already mounted,
+    /// just increments a refcount and returns the same path" case in
+    /// spirit); one never previously extracted is built fresh, the
+    /// identical real, measurable extraction work `ociman run`'s own
+    /// first use of any given image always pays regardless. Each
+    /// given image is resolved via the same `resolve_by_reference_or_
+    /// id` (a tag reference, or a real/short image ID fallback,
+    /// `0122`) `ociman rmi`/`inspect` already share -- matching real
+    /// podman's own `IMAGE-NAME-OR-ID` accepted input shape exactly
+    /// -- *before* mounting any of them: a resolution failure for any
+    /// one aborts the whole call with nothing mounted, the same
+    /// two-phase "resolve everything first" convention `container
+    /// unmount`'s own multi-target case (`0471`) already established.
+    ///
+    /// **Deliberately narrower first slice** (matching this project's
+    /// own established "narrow first slice, document the rest"
+    /// pattern, e.g. `0361`'s own original container-mount scope
+    /// before `--all`/bare-mode/multi-id followed in `0470`-`0472`):
+    /// no `--all`, no bare-invocation "list every currently-cached
+    /// image" mode, no `--format`. Each is a real, separate, larger
+    /// gap of its own — bare-mode listing in particular needs a real
+    /// cache-digest-to-image-reference reverse lookup this project has
+    /// no existing primitive for at all, unlike the container version
+    /// (whose bare-mode listing, `0470`, only ever needed the
+    /// already-existing container store's own forward `id -> rootfs`
+    /// mapping).
+    Mount {
+        /// One or more image references or real/short IDs.
+        images: Vec<String>,
+    },
+    /// A real no-op — printing each given image's own real/short ID
+    /// on success, matching the identical, already-established
+    /// reasoning [`ContainerCommand::Unmount`] (`0511`, reusing
+    /// [`Command::Unmount`]'s own `0361` no-op rationale) gives for
+    /// containers, applied here to images instead: this project's own
+    /// rootfs cache is permanent and content-addressed, never torn
+    /// down by any real reference count at all (only `ociman prune`'s
+    /// own separate GC pass, `0106`, ever actually removes a cache
+    /// entry, and only once nothing references it anymore) -- there
+    /// is no real "unmount" step to perform here, matching real
+    /// rootful `podman image unmount`'s own checked-directly behavior
+    /// for the one storage-driver case this project's images actually
+    /// are (a real rootful `sudo podman image unmount imgID` succeeds
+    /// and prints its own id either way, real podman's own storage
+    /// layer deciding internally whether an actual unmount was even
+    /// needed, the identical reasoning [`Command::Unmount`]'s own doc
+    /// comment already gives for containers). Each given image is
+    /// resolved *before* printing any id, the same two-phase
+    /// convention [`Self::Mount`] above already establishes.
+    /// Deliberately narrower than real `podman image unmount`'s own
+    /// further `--all`/`--force` -- the identical, still-open gap
+    /// [`Self::Mount`]'s own doc comment already explains for its
+    /// sibling.
+    #[command(alias = "umount")]
+    Unmount {
+        /// One or more image references or real/short IDs.
+        images: Vec<String>,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -7012,6 +7092,8 @@ fn main() -> std::process::ExitCode {
                     false,
                     InspectType::Image,
                 ),
+                ImageCommand::Mount { images } => cmd_image_mount(&images),
+                ImageCommand::Unmount { images } => cmd_image_unmount(&images),
             },
             Some(Command::Stats {
                 id,
@@ -8826,6 +8908,64 @@ fn cmd_history(
             truncated
         };
         println!("{:<24} {:<60} {:>12}", view.created, created_by, view.size);
+    }
+    Ok(())
+}
+
+/// Resolves every one of `images` (tag reference or real/short ID)
+/// against `store`, aborting on the very first one that doesn't
+/// resolve to anything at all -- shared by [`cmd_image_mount`]/
+/// [`cmd_image_unmount`]'s own identical two-phase "resolve
+/// everything first" convention.
+fn resolve_images_or_bail(store: &Store, images: &[String]) -> anyhow::Result<Vec<ImageRecord>> {
+    images
+        .iter()
+        .map(|image| {
+            resolve_image_by_reference_or_id(store, image)
+                .with_context(|| format!("looking up {image} in local storage"))?
+                .ok_or_else(|| anyhow::anyhow!("{image}: no such image in local storage"))
+                .map(|resolved| resolved.record().clone())
+        })
+        .collect()
+}
+
+/// `ociman image mount` — see [`ImageCommand::Mount`]'s own doc
+/// comment for the exact, checked-directly semantics and scope.
+fn cmd_image_mount(images: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(!images.is_empty(), "image name or ID must be specified");
+    let store = open_store()?;
+    let records = resolve_images_or_bail(&store, images)?;
+    let cache_root = rootfs_setup::cache_root(&store);
+    for record in &records {
+        let manifest = store
+            .image_manifest(record)
+            .with_context(|| format!("reading manifest for {}", record.reference))?;
+        let cache_dir = oci_store::ensure_cached(
+            &store,
+            &cache_root,
+            &record.manifest_digest,
+            &manifest.layers,
+        )
+        .context("building/reusing the rootfs cache")?;
+        println!("{}", cache_dir.display());
+    }
+    Ok(())
+}
+
+/// `ociman image unmount` — see [`ImageCommand::Unmount`]'s own doc
+/// comment for why this is a real no-op.
+fn cmd_image_unmount(images: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(!images.is_empty(), "image name or ID must be specified");
+    let store = open_store()?;
+    let records = resolve_images_or_bail(&store, images)?;
+    // The same 12-hex-char short ID this project's own `ociman
+    // images`/`images -q` already print for "the id" everywhere else
+    // -- not real podman's own literal full-length `r.Id`, kept
+    // consistent with this project's own single, already-established
+    // convention rather than introducing a second, inconsistent
+    // full-length id format nowhere else used.
+    for record in &records {
+        println!("{}", &record.manifest_digest.hex()[..12]);
     }
     Ok(())
 }
