@@ -611,3 +611,82 @@ fn enter_clean_path_resets_to_the_bare_fhs_standard_ignoring_the_real_host_path(
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n",
     );
 }
+
+/// `ocibox enter`'s own default (no `--no-workdir`) real host-cwd-
+/// forwarding, matching real `distrobox enter`'s own identical
+/// `GetWorkDir` behavior exactly (`~/git/distrobox/pkg/
+/// containermanager/containermanager.go`) for the case where the
+/// real host's own current directory is inside the box's own bind-
+/// mounted `$HOME`: the box starts there too (not at bare `$HOME`),
+/// and `$PWD` is set to match.
+#[test]
+fn enter_forwards_the_real_hosts_own_current_working_directory_when_inside_home() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    let home_dir = tempfile::tempdir().unwrap();
+    let subdir = home_dir.path().join("project");
+    std::fs::create_dir(&subdir).unwrap();
+
+    let out = Command::new(bin_path("ocibox"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .env("HOME", home_dir.path())
+        .current_dir(&subdir)
+        .args(["enter", "testbox", "--", "/bin/sh", "-c", "pwd; echo $PWD"])
+        .output()
+        .expect("failed to spawn ocibox enter");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let expected = format!("{}\n{}\n", subdir.display(), subdir.display());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
+/// `ocibox enter --no-workdir` restores the pre-existing (home-only)
+/// behavior exactly, ignoring the real host's own current working
+/// directory entirely — matching real `distrobox enter --no-workdir`/
+/// `-nw` exactly (`~/git/distrobox/internal/cli/enter.go`).
+#[test]
+fn enter_no_workdir_flag_starts_from_home_instead_of_the_real_cwd() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    let home_dir = tempfile::tempdir().unwrap();
+    let subdir = home_dir.path().join("project");
+    std::fs::create_dir(&subdir).unwrap();
+
+    let out = Command::new(bin_path("ocibox"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .env("HOME", home_dir.path())
+        .current_dir(&subdir)
+        .args([
+            "enter",
+            "--no-workdir",
+            "testbox",
+            "--",
+            "/bin/sh",
+            "-c",
+            "pwd",
+        ])
+        .output()
+        .expect("failed to spawn ocibox enter");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", home_dir.path().display())
+    );
+}

@@ -318,6 +318,26 @@ enum Command {
         /// bare image-declared one.
         #[arg(long = "clean-path", short = 'c')]
         clean_path: bool,
+        /// Always start the box from its own home directory instead
+        /// of forwarding the real host's own current working
+        /// directory — matching real `distrobox enter --no-workdir`/
+        /// `-nw` exactly (checked directly, `~/git/distrobox/
+        /// internal/cli/enter.go`'s own `no-workdir`/`"nw"` flag,
+        /// default `false`). Without it (the default, and a real,
+        /// previously-missing behavior this closes at the same time
+        /// — see [`resolve_workdir`]'s own doc comment): if the real
+        /// host's own current directory is inside (or is) the box's
+        /// own already-bind-mounted `$HOME`, the box starts there
+        /// too, matching real distrobox's own `GetWorkDir`
+        /// (`~/git/distrobox/pkg/containermanager/containermanager.go`)
+        /// for that one case exactly — the other, host-cwd-outside-
+        /// `$HOME` case real distrobox handles by bind-mounting the
+        /// *entire* host filesystem under `/run/host` first is
+        /// deliberately not replicated here (this project's own
+        /// `ocibox` has no such whole-host mount at all), an honestly
+        /// narrower first slice.
+        #[arg(long = "no-workdir")]
+        no_workdir: bool,
     },
     /// Create a temporary box, run one command (or a default shell)
     /// inside it, and always remove it again afterward — matching
@@ -658,7 +678,8 @@ fn main() -> std::process::ExitCode {
                 name,
                 command,
                 clean_path,
-            }) => cmd_enter(&name, &command, clean_path),
+                no_workdir,
+            }) => cmd_enter(&name, &command, clean_path, no_workdir),
             Some(Command::Ephemeral {
                 image,
                 clone,
@@ -1301,6 +1322,47 @@ fn reorder_fhs_path(path: &str) -> String {
     result
 }
 
+/// `--no-workdir` (`no_workdir: true`) always wins outright: the
+/// box's own `fallback` (whichever of `$HOME`/the box's own declared
+/// `working_dir`/`"/"` [`enter_spec`]'s own caller already resolved)
+/// is returned unconditionally, matching real distrobox's own
+/// `GetWorkDir`'s identical `if noWorkDir { return containerHome }`
+/// early return exactly (`~/git/distrobox/pkg/containermanager/
+/// containermanager.go`). Otherwise: if `cwd` (the real host's own
+/// current working directory, or `None` when reading it failed
+/// entirely — [`enter_spec`]'s own caller passes `std::env::
+/// current_dir().ok()`, kept as a separate parameter here purely so
+/// this function's own real branching logic can be unit-tested
+/// without mutating this whole process's own actual working
+/// directory) resolves to (or is genuinely inside) the box's own
+/// `home`, that real host path is used verbatim — already visible
+/// inside the rootfs via the exact same bind mount [`enter_spec`]
+/// already sets up for `home` itself, needing no new mount of its
+/// own — matching real distrobox's own identical `workDir` case
+/// exactly. Any other case (no real `home` resolved at all, no `cwd`
+/// at all, or a host cwd genuinely outside `home`) falls back to
+/// `fallback` instead — an honestly narrower first slice than real
+/// distrobox's own further `/run/host`-prefixed case, which needs a
+/// whole *separate*, unconditional bind mount of the entire host
+/// filesystem this project's own `ocibox` has no equivalent of at
+/// all.
+fn resolve_workdir(
+    no_workdir: bool,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+    fallback: &str,
+) -> String {
+    if no_workdir {
+        return fallback.to_string();
+    }
+    match (cwd, home) {
+        (Some(cwd), Some(home)) if cwd == home || cwd.starts_with(home) => {
+            cwd.to_string_lossy().into_owned()
+        }
+        _ => fallback.to_string(),
+    }
+}
+
 /// Picks a default command to run when `ocibox enter` is given no
 /// explicit `COMMAND`: `/bin/bash` if the box's own rootfs has one,
 /// else `/bin/sh`, else a clear, real error naming neither — rather
@@ -1334,6 +1396,7 @@ fn enter_spec(
     record: &BoxRecord,
     args: Vec<String>,
     clean_path: bool,
+    no_workdir: bool,
 ) -> anyhow::Result<oci_spec_types::runtime::Spec> {
     let (euid, egid) = oci_cli_common::identity::effective_uid_gid();
     let mut spec = oci_spec_types::runtime::Spec::example().into_rootless(euid, egid);
@@ -1440,11 +1503,27 @@ fn enter_spec(
         Some(entry) => *entry = format!("PATH={new_path}"),
         None => process.env.push(format!("PATH={new_path}")),
     }
-    process.cwd = home
+    let fallback_cwd = home
         .as_ref()
         .map(|h| h.to_string_lossy().into_owned())
         .or_else(|| record.working_dir.clone().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "/".to_string());
+    process.cwd = resolve_workdir(
+        no_workdir,
+        std::env::current_dir().ok().as_deref(),
+        home.as_deref(),
+        &fallback_cwd,
+    );
+    // Matches real `distrobox enter`'s own unconditional `--env=
+    // PWD=<workdir>` exactly (`~/git/distrobox/pkg/containermanager/
+    // providers/podman.go`'s own `generateEnterCommand`) — a real,
+    // previously-missing environment variable this project's own
+    // `ocibox enter` never set at all before now, regardless of
+    // `--no-workdir`.
+    match process.env.iter_mut().find(|kv| kv.starts_with("PWD=")) {
+        Some(entry) => *entry = format!("PWD={}", process.cwd),
+        None => process.env.push(format!("PWD={}", process.cwd)),
+    }
 
     if let Some(capabilities) = process.capabilities.as_mut() {
         let podman_caps = oci_spec_types::runtime::podman_default_capabilities();
@@ -1497,8 +1576,13 @@ fn enter_spec(
 /// other real container this project launches uses — see this
 /// module's own doc comment and [`Command::Enter`]'s own doc comment
 /// for exactly what this first slice does and doesn't do yet.
-fn cmd_enter(name: &str, command: &[String], clean_path: bool) -> anyhow::Result<()> {
-    let exit_code = enter_and_get_exit_code(name, command, clean_path)?;
+fn cmd_enter(
+    name: &str,
+    command: &[String],
+    clean_path: bool,
+    no_workdir: bool,
+) -> anyhow::Result<()> {
+    let exit_code = enter_and_get_exit_code(name, command, clean_path, no_workdir)?;
     // The container's own exit code becomes ours, matching `ocirun
     // run`'s own identical real bypass of `oci_cli_common::run_main`'s
     // usual `Ok(())`-means-success mapping: exit code 0 must mean "the
@@ -1519,6 +1603,7 @@ fn enter_and_get_exit_code(
     name: &str,
     command: &[String],
     clean_path: bool,
+    no_workdir: bool,
 ) -> anyhow::Result<i32> {
     validate_box_name(name)?;
     let box_dir = boxes_root().join(name);
@@ -1537,7 +1622,7 @@ fn enter_and_get_exit_code(
         command.to_vec()
     };
 
-    let spec = enter_spec(&record, args, clean_path)
+    let spec = enter_spec(&record, args, clean_path, no_workdir)
         .with_context(|| format!("preparing spec for {name}"))?;
     let config_path = box_dir.join(oci_runtime_core::bundle::CONFIG_FILENAME);
     std::fs::write(&config_path, serde_json::to_vec_pretty(&spec)?)
@@ -1729,10 +1814,13 @@ fn cmd_ephemeral(
     create_box(image, clone, &name, pull, hostname, home, volumes, platform)
         .with_context(|| format!("creating ephemeral box {name}"))?;
 
-    // Real `distrobox ephemeral` has no `--clean-path` flag of its
-    // own at all (checked directly, `~/git/distrobox/internal/cli/
-    // ephemeral.go`) -- unlike `enter`, always the default merge.
-    let result = enter_and_get_exit_code(&name, command, false);
+    // Real `distrobox ephemeral` has no `--clean-path`/`--no-workdir`
+    // flag of its own at all (checked directly, `~/git/distrobox/
+    // internal/cli/ephemeral.go`/`~/git/distrobox/pkg/commands/
+    // ephemeral.go:91`'s own `EnterOptions{...}` construction, which
+    // never sets `NoWorkDir`) -- unlike `enter`, always the default
+    // merge/forward for both.
+    let result = enter_and_get_exit_code(&name, command, false, false);
 
     // Always attempted, regardless of whether the command inside the
     // box succeeded, failed, or `enter` itself errored outright (e.g.
@@ -2770,6 +2858,74 @@ mod tests {
         assert_eq!(
             reorder_fhs_path("/some/other/dir"),
             "/usr/local/sbin:/usr/local/bin:/some/other/dir"
+        );
+    }
+
+    #[test]
+    fn resolve_workdir_no_workdir_always_wins_ignoring_cwd_and_home() {
+        assert_eq!(
+            resolve_workdir(
+                true,
+                Some(Path::new("/home/user/project")),
+                Some(Path::new("/home/user")),
+                "/home/user"
+            ),
+            "/home/user"
+        );
+    }
+
+    #[test]
+    fn resolve_workdir_forwards_a_real_host_cwd_inside_home() {
+        assert_eq!(
+            resolve_workdir(
+                false,
+                Some(Path::new("/home/user/project")),
+                Some(Path::new("/home/user")),
+                "/home/user"
+            ),
+            "/home/user/project"
+        );
+    }
+
+    #[test]
+    fn resolve_workdir_forwards_a_host_cwd_that_is_exactly_home() {
+        assert_eq!(
+            resolve_workdir(
+                false,
+                Some(Path::new("/home/user")),
+                Some(Path::new("/home/user")),
+                "/home/user"
+            ),
+            "/home/user"
+        );
+    }
+
+    #[test]
+    fn resolve_workdir_falls_back_when_cwd_is_outside_home() {
+        assert_eq!(
+            resolve_workdir(
+                false,
+                Some(Path::new("/tmp/somewhere/else")),
+                Some(Path::new("/home/user")),
+                "/home/user"
+            ),
+            "/home/user"
+        );
+    }
+
+    #[test]
+    fn resolve_workdir_falls_back_with_no_home_at_all() {
+        assert_eq!(
+            resolve_workdir(false, Some(Path::new("/tmp/somewhere")), None, "/"),
+            "/"
+        );
+    }
+
+    #[test]
+    fn resolve_workdir_falls_back_when_cwd_is_unreadable() {
+        assert_eq!(
+            resolve_workdir(false, None, Some(Path::new("/home/user")), "/home/user"),
+            "/home/user"
         );
     }
 
