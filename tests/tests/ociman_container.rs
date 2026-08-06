@@ -2258,3 +2258,335 @@ fn container_update_is_a_byte_identical_alias_for_top_level_update() {
 
     ociman(storage_dir.path(), &["kill", &id]);
 }
+
+/// `ociman container cleanup` (`docs/design/0529`): the teardown
+/// itself is a real no-op here (see `ContainerCommand::Cleanup`'s own
+/// doc comment), so a bare, explicit-id call just prints the given
+/// identifier back and leaves the container completely untouched.
+#[test]
+fn container_cleanup_bare_prints_the_id_and_leaves_the_container_untouched() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cleanup-bare:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/cleanup-bare:latest", "true"],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+    let cleanup = ociman(storage_dir.path(), &["container", "cleanup", &id]);
+    assert!(
+        cleanup.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&cleanup.stdout).trim(), id);
+
+    // Still exists, still `Created` -- cleanup alone never removes or
+    // otherwise changes a container.
+    assert_eq!(inspect_json(storage_dir.path(), &id)["status"], "created");
+}
+
+/// `--all`/`-a` sweeps every real container, oldest first -- matching
+/// real `podman container cleanup --all` exactly.
+#[test]
+fn container_cleanup_all_sweeps_every_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cleanup-all:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let create1 = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/cleanup-all:latest", "true"],
+    );
+    assert!(create1.status.success());
+    let id1 = String::from_utf8_lossy(&create1.stdout).trim().to_string();
+    let create2 = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/cleanup-all:latest", "true"],
+    );
+    assert!(create2.status.success());
+    let id2 = String::from_utf8_lossy(&create2.stdout).trim().to_string();
+
+    let cleanup = ociman(storage_dir.path(), &["container", "cleanup", "--all"]);
+    assert!(
+        cleanup.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    let mut printed: Vec<String> = String::from_utf8_lossy(&cleanup.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    printed.sort();
+    let mut expected = vec![id1, id2];
+    expected.sort();
+    assert_eq!(printed, expected);
+}
+
+/// `--latest`/`-l` on a genuinely empty container store is a real,
+/// checked-directly silent success (exit `0`, nothing printed) --
+/// unlike every *other* `--latest`-accepting command in this project,
+/// which hard-errors instead. See `ContainerCommand::Cleanup`'s own
+/// doc comment for exactly why this particular command's real
+/// upstream behavior is inverted here.
+#[test]
+fn container_cleanup_latest_on_an_empty_store_is_a_silent_success() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let cleanup = ociman(storage_dir.path(), &["container", "cleanup", "--latest"]);
+    assert!(
+        cleanup.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    assert!(String::from_utf8_lossy(&cleanup.stdout).trim().is_empty());
+}
+
+/// A genuine, checked-directly semantic inversion: giving even one
+/// unresolvable explicit name makes the *entire* call a silent, zero-
+/// output success, not a partial sweep over the names that *do*
+/// resolve and not a hard error either -- see `ContainerCommand::
+/// Cleanup`'s own doc comment for the exact real upstream mechanism
+/// this replicates (`getContainers`'s own plain-lookup loop returning
+/// on the very first `ErrNoSuchCtr`, converted by `ContainerCleanup`
+/// itself into `(nil, nil)`).
+#[test]
+fn container_cleanup_any_unresolvable_name_silently_no_ops_the_whole_call() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cleanup-unresolvable:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/cleanup-unresolvable:latest", "true"],
+    );
+    assert!(create.status.success());
+    let real_id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+    let cleanup = ociman(
+        storage_dir.path(),
+        &["container", "cleanup", &real_id, "does-not-exist"],
+    );
+    assert!(
+        cleanup.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    // Nothing printed at all -- not even the real container's own id,
+    // even though it *would* have resolved on its own.
+    assert!(String::from_utf8_lossy(&cleanup.stdout).trim().is_empty());
+    // And it was never touched either.
+    assert_eq!(
+        inspect_json(storage_dir.path(), &real_id)["status"],
+        "created"
+    );
+}
+
+/// `--rm` actually removes the container entirely -- reusing the same
+/// [`remove_container`] primitive `ociman rm` itself already uses.
+/// Uses `ociman run` (not `create`) so the container is genuinely
+/// `Stopped`, not merely `Created`: this project's own
+/// `remove_container` (unlike real podman) requires `--force` for
+/// anything short of `Stopped`, and real `podman container cleanup
+/// --rm`'s own hardcoded `force: false` (checked directly) means this
+/// command never overrides that -- matching the realistic case
+/// `cleanup` actually targets (conmon invoking it right after a
+/// container has just exited on its own).
+#[test]
+fn container_cleanup_rm_removes_the_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cleanup-rm:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/cleanup-rm:latest", "true"],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+    assert_eq!(inspect_json(storage_dir.path(), &id)["status"], "stopped");
+
+    let cleanup = ociman(storage_dir.path(), &["container", "cleanup", "--rm", &id]);
+    assert!(
+        cleanup.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&cleanup.stdout).trim(), id);
+    assert!(all_ids(storage_dir.path()).is_empty());
+}
+
+/// `--rmi` (with `--rm`) also removes the container's own backing
+/// image -- matching real `podman container cleanup --rmi` exactly.
+#[test]
+fn container_cleanup_rm_rmi_also_removes_the_backing_image() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cleanup-rmi:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    assert_eq!(store.list_images().unwrap().len(), 1);
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/cleanup-rmi:latest", "true"],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+    assert_eq!(inspect_json(storage_dir.path(), &id)["status"], "stopped");
+
+    let cleanup = ociman(
+        storage_dir.path(),
+        &["container", "cleanup", "--rm", "--rmi", &id],
+    );
+    assert!(
+        cleanup.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&cleanup.stdout).trim(), id);
+    assert!(all_ids(storage_dir.path()).is_empty());
+    assert!(store.list_images().unwrap().is_empty());
+}
+
+/// `--rmi` is a real, silent success (matching real `podman`'s own
+/// `ImageRemoveOptions{Ignore: true}`, checked directly) once the
+/// image has *already* been removed by something else -- e.g. a
+/// concurrent `cleanup --rm --rmi` racing against this one for a
+/// second container that used the exact same image. Simulates that
+/// race directly (`store.remove_image`) rather than trying to
+/// actually win a real race, for a fast, deterministic test.
+#[test]
+fn container_cleanup_rmi_is_a_silent_success_once_the_image_is_already_gone() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/cleanup-rmi-race:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let create = ociman(
+        storage_dir.path(),
+        &["create", "ociman-test/cleanup-rmi-race:latest", "true"],
+    );
+    assert!(create.status.success());
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+    // Simulate another process having already removed the image.
+    assert!(
+        store
+            .remove_image("docker.io/ociman-test/cleanup-rmi-race:latest")
+            .unwrap()
+    );
+    assert!(store.list_images().unwrap().is_empty());
+
+    let cleanup = ociman(storage_dir.path(), &["container", "cleanup", "--rmi", &id]);
+    assert!(
+        cleanup.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&cleanup.stdout).trim(), id);
+    // The container itself is untouched (`--rm` wasn't given).
+    assert_eq!(inspect_json(storage_dir.path(), &id)["status"], "created");
+}
+
+/// Matches real podman's own exact validation, checked directly
+/// (`~/git/podman/cmd/podman/validate/args.go`'s own
+/// `CheckAllLatestAndIDFile`, called with `ignoreArgLen = false`): a
+/// bare invocation with no explicit containers and neither `--all`
+/// nor `--latest` is a real, immediate error -- unlike e.g. `ociman
+/// mount`'s own deliberately different bare-invocation behavior.
+#[test]
+fn container_cleanup_with_no_target_at_all_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let cleanup = ociman(storage_dir.path(), &["container", "cleanup"]);
+    assert!(!cleanup.status.success());
+    assert!(
+        String::from_utf8_lossy(&cleanup.stderr)
+            .contains("you must provide at least one name or id")
+    );
+}
+
+/// `--all` and `--latest` together is a real, immediate error --
+/// matching real podman's own identical validation exactly.
+#[test]
+fn container_cleanup_all_and_latest_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let cleanup = ociman(
+        storage_dir.path(),
+        &["container", "cleanup", "--all", "--latest"],
+    );
+    assert!(!cleanup.status.success());
+    assert!(
+        String::from_utf8_lossy(&cleanup.stderr)
+            .contains("--all and --latest cannot be used together")
+    );
+}

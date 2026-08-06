@@ -4962,6 +4962,106 @@ enum ContainerCommand {
         #[arg(long)]
         run: bool,
     },
+    /// `podman container cleanup`'s own real, nested-only subcommand
+    /// -- no top-level twin exists in real podman either (checked
+    /// directly, `~/git/podman/cmd/podman/containers/cleanup.go`:
+    /// `cleanupCommand` is registered with `Parent: containerCmd`
+    /// only), matching [`ContainerCommand::Clone`]'s own identical
+    /// shape. Tears down a container's own mount/network stack after
+    /// it exits -- normally run automatically by conmon, but also
+    /// usable by hand "if container cleanup has failed" (real
+    /// podman's own doc string, quoted verbatim). Since this
+    /// project's own containers have no separate, persistent
+    /// mount/network state beyond what `create`/`run` already manage
+    /// moment-to-moment (the exact same reasoning [`Command::
+    /// Unmount`]'s own doc comment already established), the
+    /// teardown itself is a real no-op here too -- this command's
+    /// only real effect (beyond validation) is `--rm`/`--rmi`.
+    ///
+    /// A genuine, checked-directly semantic *inversion* from every
+    /// other sibling verb in this family: resolving an explicit
+    /// name/id that doesn't exist makes the *entire* call a silent,
+    /// zero-output success (exit `0`, nothing printed) -- never a
+    /// partial sweep over just the names that *do* resolve, and never
+    /// a hard error either. This isn't a simplification on this
+    /// project's own part; it's real, checked-directly upstream
+    /// behavior (`~/git/podman/pkg/domain/infra/abi/containers.go`'s
+    /// own `getContainers`, whose `default` case -- the plain, no-
+    /// `--all`/`--latest`, explicit-names-only path -- returns on the
+    /// very first unresolvable name with no per-name tolerance at
+    /// all, and `ContainerCleanup` itself then converts that specific
+    /// `ErrNoSuchCtr` into `(nil, nil)`, quoting its own comment:
+    /// "cleanup command spawned by conmon lost race as another
+    /// process already removed the ctr"). `--latest` on an empty
+    /// container store hits the exact same conversion
+    /// (`GetLatestContainer`'s own `ErrNoSuchCtr`) and is therefore
+    /// *also* a silent success here -- unlike every other `--latest`-
+    /// accepting command in this project, which hard-errors on an
+    /// empty store instead.
+    ///
+    /// `--exec <SESSION>` (clean up a single named exec session
+    /// instead of the container) and the hidden `--stopped-only` flag
+    /// are both deliberately omitted entirely, not accepted-then-
+    /// rejected: the former's real target is a conmon-tracked
+    /// background exec session, a concept this project has no
+    /// equivalent of at all (matching `ocirun exec`'s own already-
+    /// established "runs and waits inline, nothing left running in
+    /// the background to later clean up" design); the latter is
+    /// hidden in real podman too, so omitting it changes nothing
+    /// anyone would notice.
+    Cleanup {
+        /// Explicit container id(s)/name(s) to clean up. Mutually
+        /// exclusive with `--all`/`--latest`; at least one of the
+        /// three is required (matching real podman's own exact "you
+        /// must provide at least one name or id" wording, checked
+        /// directly -- unlike e.g. `ociman mount`'s own deliberately
+        /// different bare-invocation behavior).
+        containers: Vec<String>,
+        /// Clean up every container this project knows about, not
+        /// just the ones explicitly named -- matching real `podman
+        /// container cleanup --all`/`-a` exactly.
+        #[arg(short, long)]
+        all: bool,
+        /// Clean up only the most recently created container --
+        /// matching real `podman container cleanup --latest`/`-l`
+        /// exactly. A real, checked-directly divergence from every
+        /// *other* `--latest` command here: an empty container store
+        /// is a silent success, not an error (see this command's own
+        /// doc comment above).
+        #[arg(short, long)]
+        latest: bool,
+        /// After cleanup, remove the container entirely too --
+        /// matching real `podman container cleanup --rm` exactly.
+        /// Reuses the exact same [`remove_container`] primitive
+        /// `ociman rm` itself already uses, always with `--force`-
+        /// less semantics (a still-running container is a real,
+        /// reported error, never silently force-killed) -- matching
+        /// real podman's own hardcoded `force: false` at this exact
+        /// call site (`RemoveContainer(ctx, ctr.Container, false,
+        /// true, timeout)`, checked directly), a genuine, deliberate
+        /// divergence from this project's *other* removal-cascade
+        /// call sites (e.g. `ociman rmi --force`'s own dependent-
+        /// container cascade, [`rmi_one`]), which always force-kill
+        /// instead.
+        #[arg(long)]
+        rm: bool,
+        /// After cleanup (and, if `--rm` was also given, after
+        /// removing the container itself), also remove its own
+        /// backing image -- matching real `podman container cleanup
+        /// --rmi` exactly. A missing/already-removed image is a
+        /// silent success (matching real `ImageRemoveOptions{Ignore:
+        /// true}`, checked directly), but every *other* removal
+        /// failure (e.g. the image still has another real dependent
+        /// container) is still a real, reported error -- exactly
+        /// [`cmd_rmi`]'s own already-established `--ignore` semantics,
+        /// reused verbatim here rather than reimplemented. Only at
+        /// most one of `--rm`'s own error or this one ever surfaces
+        /// per container (real podman's own exact `switch`-based
+        /// precedence, checked directly, `cleanup.go`'s own `cleanup`
+        /// function): both are still attempted regardless.
+        #[arg(long)]
+        rmi: bool,
+    },
     /// `podman container inspect`'s own real alias for the already-
     /// existing flat [`Command::Inspect`], forced to container-only
     /// resolution -- checked directly, `~/git/podman/cmd/podman/
@@ -6745,6 +6845,13 @@ fn main() -> std::process::ExitCode {
                     force,
                     run,
                 } => cmd_clone(&container, name.as_deref(), destroy, force, run),
+                ContainerCommand::Cleanup {
+                    containers,
+                    all,
+                    latest,
+                    rm,
+                    rmi,
+                } => cmd_container_cleanup(&containers, all, latest, rm, rmi),
                 ContainerCommand::Inspect {
                     reference,
                     latest,
@@ -12365,6 +12472,135 @@ fn cmd_clone(
     } else {
         println!("{new_id}");
     }
+    Ok(())
+}
+
+/// `ociman container cleanup` — see [`ContainerCommand::Cleanup`]'s
+/// own doc comment for the full real-vs-this-project reasoning
+/// (silent no-op teardown, the "unresolvable name means the whole
+/// call is a silent success" inversion, and `--rm`/`--rmi`'s own
+/// exact error precedence).
+fn cmd_container_cleanup(
+    ids: &[String],
+    all: bool,
+    latest: bool,
+    rm: bool,
+    rmi: bool,
+) -> anyhow::Result<()> {
+    // Matches real podman's own exact wording and check order, checked
+    // directly (`~/git/podman/cmd/podman/validate/args.go`'s own
+    // `CheckAllLatestAndIDFile`, called with `ignoreArgLen = false` --
+    // unlike e.g. `ociman mount`'s own `true`, see that command's own
+    // doc comment for why bare invocations behave differently there).
+    anyhow::ensure!(
+        !(all && latest),
+        "--all and --latest cannot be used together"
+    );
+    anyhow::ensure!(
+        !(all && !ids.is_empty()),
+        "no arguments are needed with --all"
+    );
+    anyhow::ensure!(
+        !(latest && !ids.is_empty()),
+        "--latest and containers cannot be used together"
+    );
+    anyhow::ensure!(
+        all || latest || !ids.is_empty(),
+        "you must provide at least one name or id"
+    );
+
+    let containers = open_container_store()?;
+
+    // `(what to print on success, the container's own real id)` pairs,
+    // in the exact order to process. See this command's own doc
+    // comment for why an unresolvable explicit name aborts the whole
+    // call *silently* (`return Ok(())`), never with an error, and why
+    // an empty store under `--latest` does too.
+    let targets: Vec<(String, String)> = if all {
+        let mut states = containers.list().context("listing containers")?;
+        states.sort_by(|a, b| a.created.cmp(&b.created));
+        states.into_iter().map(|s| (s.id.clone(), s.id)).collect()
+    } else if latest {
+        match resolve_latest_container(&containers) {
+            Ok(id) => vec![(id.clone(), id)],
+            Err(_) => return Ok(()),
+        }
+    } else {
+        let mut resolved = Vec::with_capacity(ids.len());
+        for raw in ids {
+            match resolve_container_id(&containers, raw) {
+                Ok(id) => resolved.push((raw.clone(), id)),
+                Err(_) => return Ok(()),
+            }
+        }
+        resolved
+    };
+
+    let store = if rmi { Some(open_store()?) } else { None };
+    let mut had_error = false;
+
+    for (raw_input, id) in targets {
+        // Captured *before* any `--rm` removal below, since that
+        // deletes the container's own recorded state entirely.
+        let image_ref = if rmi {
+            containers
+                .load(&id)
+                .ok()
+                .and_then(|state| state.annotations.get(ANNOTATION_IMAGE).cloned())
+        } else {
+            None
+        };
+
+        // The teardown itself is a real no-op here — see this
+        // command's own doc comment. `--rm` always takes the "real
+        // remove" branch unconditionally: real podman's own identical
+        // branch is additionally gated on `!ctr.ShouldRestart(ctx)`, a
+        // restart-policy concept this project has no equivalent of at
+        // all, so that condition is always true here.
+        let rm_err = if rm {
+            remove_container(&containers, &id, false, None, true).err()
+        } else {
+            None
+        };
+
+        // Attempted regardless of whether `--rm` just failed above —
+        // matching real podman's own identical unconditional-attempt
+        // shape (`~/git/podman/pkg/domain/infra/abi/containers.go`'s
+        // own `ContainerCleanup`) — but only one error ever surfaces
+        // per container, `--rm`'s own taking priority (see below).
+        let rmi_err = if let (true, Some(image_ref)) = (rmi, &image_ref) {
+            let store = store.as_ref().expect("store opened above when rmi is set");
+            match resolve_image_by_reference_or_id(store, image_ref) {
+                // Already gone (e.g. removed by a concurrent cleanup
+                // race) — a silent success, matching real
+                // `ImageRemoveOptions{Ignore: true}` exactly.
+                Ok(None) => None,
+                Ok(Some(resolved)) => rmi_one(store, &containers, image_ref, resolved, false).err(),
+                Err(e) => Some(e.into()),
+            }
+        } else {
+            None
+        };
+
+        // Real podman's own exact precedence, checked directly
+        // (`cleanup.go`'s own `cleanup` function's `switch`): at most
+        // one error surfaces per container, `--rm`'s own always
+        // winning over `--rmi`'s.
+        if let Some(e) = rm_err {
+            had_error = true;
+            eprintln!("error removing container {id}: {e:#}");
+            continue;
+        }
+        if let Some(e) = rmi_err {
+            had_error = true;
+            eprintln!("error removing image: {e:#}");
+            continue;
+        }
+
+        println!("{raw_input}");
+    }
+
+    anyhow::ensure!(!had_error, "cleanup failed for one or more containers");
     Ok(())
 }
 
