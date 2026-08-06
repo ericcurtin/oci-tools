@@ -3027,6 +3027,54 @@ fn rm_ignore_tolerates_an_unreadable_cidfile() {
     assert!(out.stdout.is_empty());
 }
 
+/// `ociman rm --depend`/`--volumes` (`docs/design/0513`) are both
+/// accepted for real CLI compatibility with real `podman rm
+/// --depend`/`--volumes`, but change nothing at all: this project
+/// has neither an inter-container namespace-sharing/pod concept
+/// (`--depend`'s own real target) nor an anonymous-volume concept
+/// (`--volumes`'s own real target) anywhere, so a plain `rm` with
+/// either or both flags given behaves identically to one without
+/// them.
+#[test]
+fn rm_depend_and_volumes_are_accepted_and_behave_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/rm-depend-volumes:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/rm-depend-volumes:latest", "true"],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let ps = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    let id = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+    assert!(!id.is_empty(), "{ps:?}");
+
+    let rm = ociman(storage_dir.path(), &["rm", "--depend", "--volumes", &id]);
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&rm.stdout).trim(), id);
+
+    let ps_after = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    assert!(
+        String::from_utf8_lossy(&ps_after.stdout).trim().is_empty(),
+        "the container should still be genuinely removed"
+    );
+}
+
 /// `ociman ps --format` (0333) renders one line per listed container,
 /// reusing the exact same Go-template-*lite* engine `ociman inspect
 /// --format` (`0332`) already established.

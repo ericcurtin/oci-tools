@@ -2872,6 +2872,41 @@ enum Command {
         /// `validate.CheckAllLatestAndIDFile` already enforces.
         #[arg(short = 'l', long)]
         latest: bool,
+        /// Accepted for real CLI compatibility with real `podman rm
+        /// --depend` ("Remove container and all containers that
+        /// depend on the selected container"), but changes nothing:
+        /// checked directly, `~/git/podman/pkg/domain/infra/abi/
+        /// containers.go:467-469`, `--depend` only ever widens
+        /// removal to a container's own dependency graph — other
+        /// containers sharing its namespaces (`--net=container:`/
+        /// `--ipc=container:`/etc.) or its own pod's infra/service
+        /// containers. This project has neither concept anywhere at
+        /// all (no inter-container namespace-sharing, no pods), so a
+        /// container's own dependency graph here is always just
+        /// itself alone — `~/git/podman/libpod/runtime_ctr.go:645-
+        /// 653`'s own doc comment confirms `RemoveContainerAndDep
+        /// endencies` "functions identically to RemoveContainer"
+        /// whenever there's nothing to depend on, the one state this
+        /// project can ever reach, the same "accepted for real CLI
+        /// compatibility but changes nothing" convention `ocibox rm
+        /// --force`'s own doc comment already established.
+        #[arg(long)]
+        depend: bool,
+        /// Accepted for real CLI compatibility with real `podman rm
+        /// --volumes`/`-v` ("Remove anonymous volumes associated
+        /// with the container"), but changes nothing: checked
+        /// directly, `~/git/podman/libpod/runtime_ctr.go:1035-1041`
+        /// only ever removes a container's own attached volume when
+        /// `!volume.Anonymous()` is false — this project's own
+        /// volume schema has no anonymous-vs-named distinction
+        /// anywhere at all (every volume here is always explicitly
+        /// named, see [`VolumeCommand::Prune`]'s own doc comment for
+        /// this same already-established reasoning), so that
+        /// condition is never true here, the identical "accepted for
+        /// real CLI compatibility but changes nothing" convention
+        /// `--depend` just above already uses.
+        #[arg(short, long)]
+        volumes: bool,
     },
     /// Copy files/directories between the local filesystem and a
     /// container (running or stopped), or between two containers —
@@ -4901,6 +4936,12 @@ enum ContainerCommand {
         /// Same as [`Command::Rm::latest`].
         #[arg(short = 'l', long)]
         latest: bool,
+        /// Same as [`Command::Rm::depend`].
+        #[arg(long)]
+        depend: bool,
+        /// Same as [`Command::Rm::volumes`].
+        #[arg(short, long)]
+        volumes: bool,
     },
     /// `podman container stop`'s own real alias for the already-
     /// existing flat [`Command::Stop`] -- checked directly, `~/git/
@@ -6111,6 +6152,11 @@ fn main() -> std::process::ExitCode {
                 time,
                 filter,
                 latest,
+                // Accepted for real CLI compatibility, changes
+                // nothing at all -- see `Command::Rm::depend`/
+                // `Command::Rm::volumes`'s own doc comments.
+                depend: _,
+                volumes: _,
             }) => cmd_rm(&ids, force, all, &cidfile, ignore, time, &filter, latest),
             Some(Command::Cp {
                 src,
@@ -6379,6 +6425,8 @@ fn main() -> std::process::ExitCode {
                     time,
                     filter,
                     latest,
+                    depend: _,
+                    volumes: _,
                 } => cmd_rm(&ids, force, all, &cidfile, ignore, time, &filter, latest),
                 ContainerCommand::Stop {
                     ids,
