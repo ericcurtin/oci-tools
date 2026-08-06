@@ -206,6 +206,35 @@ enum Command {
         /// identical real parsing.
         #[arg(long, value_name = "OS/ARCH[/VARIANT]")]
         platform: Option<String>,
+        /// Accepted for real CLI compatibility with `distrobox create
+        /// --no-entry`; has no effect: checked directly,
+        /// `~/git/distrobox/internal/cli/create.go:156-161,200`
+        /// (`generateEntry := cfg.GenerateEntry && !cmd.Bool
+        /// ("no-entry")`) and `~/git/distrobox/pkg/commands/
+        /// create.go:163` (`if opts.GenerateEntry && !opts.DryRun &&
+        /// !opts.Rootful { ...generateEntryCmd.Execute... }`) --
+        /// real distrobox's own `--no-entry` only ever suppresses an
+        /// automatic desktop-entry generation `create` would
+        /// otherwise perform right after a successful create.
+        /// `ocibox create` never performs that automatic step at all
+        /// (entry generation here is still its own separate, always-
+        /// manually-invoked `ocibox generate-entry`, `0364`) --
+        /// deliberately still out of scope, see this project's own
+        /// `docs/design/0515` for exactly why (a real default-
+        /// behavior change needing existing `create` tests' `$HOME`
+        /// environment audited first, not just a flag). Since the
+        /// suppressed behavior already never happens either way,
+        /// `--no-entry` is a genuine, faithful no-op today, the same
+        /// "accepted for real CLI compatibility but changes nothing"
+        /// convention `--yes` on this same command already
+        /// establishes. Real `distrobox ephemeral` explicitly strips
+        /// this exact flag back out of its own inherited flag set
+        /// (`~/git/distrobox/internal/cli/ephemeral.go:22-24`,
+        /// `ignoredFlags`) rather than accepting-and-ignoring it --
+        /// matched here identically: `ocibox ephemeral` deliberately
+        /// has no `--no-entry` of its own either.
+        #[arg(long = "no-entry")]
+        no_entry: bool,
     },
     /// List real, created boxes — matching real `distrobox list`
     /// (alias `ls`), narrowed to what this project's own boxes
@@ -700,6 +729,7 @@ fn main() -> std::process::ExitCode {
                 home,
                 volume,
                 platform,
+                no_entry: _,
             }) => cmd_create(
                 image.as_deref(),
                 clone.as_deref(),

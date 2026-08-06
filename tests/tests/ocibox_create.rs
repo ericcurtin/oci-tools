@@ -132,6 +132,64 @@ fn create_yes_flag_is_accepted_and_behaves_identically() {
     assert!(create_short.status.success(), "{create_short:?}");
 }
 
+/// `create --no-entry` (0517): accepted for real CLI compatibility,
+/// but changes nothing at all -- real distrobox's own `--no-entry`
+/// only ever suppresses an automatic desktop-entry generation
+/// `create` would otherwise perform right after a successful create
+/// (see `Command::Create`'s own doc comment for the full, checked-
+/// directly reasoning); `ocibox create` never performs that
+/// automatic step at all regardless, so there is nothing for
+/// `--no-entry` to suppress here either. Proven here against a real,
+/// dedicated `$HOME` (never the real ambient one running this test
+/// suite): the box is still genuinely created, and no `.desktop`
+/// entry appears either way.
+#[test]
+fn create_no_entry_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let fake_home = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/create-no-entry:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = Command::new(bin_path("ocibox"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env("HOME", fake_home.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args([
+            "create",
+            "--image",
+            "ocibox-test/create-no-entry:latest",
+            "--name",
+            "noentrybox",
+            "--no-entry",
+        ])
+        .output()
+        .expect("failed to spawn ocibox create --no-entry");
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&create.stdout).trim(), "noentrybox");
+    assert!(storage_dir.path().join("boxes").join("noentrybox").is_dir());
+    assert!(
+        !fake_home
+            .path()
+            .join(".local/share/applications/noentrybox.desktop")
+            .exists(),
+        "no desktop entry should ever appear -- create never generates one at all, --no-entry or not"
+    );
+}
+
 #[test]
 fn create_refuses_a_name_already_in_use() {
     let Some(busybox) = busybox_path() else {
