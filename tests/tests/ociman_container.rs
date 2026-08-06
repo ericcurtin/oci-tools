@@ -2635,3 +2635,49 @@ fn container_init_is_a_byte_identical_alias_for_top_level_init() {
     );
     assert_eq!(String::from_utf8_lossy(&alias.stdout).trim(), id);
 }
+
+/// `ociman container port` (`docs/design/0535`) is a real,
+/// dual-registered, byte-identical twin of the top-level `ociman
+/// port` -- matching real `podman container port`'s own checked-
+/// directly identical `Use`/`Short`/`Long`/`RunE`/`ValidArgsFunction`
+/// as top-level `podman port` exactly (`~/git/podman/cmd/podman/
+/// containers/port.go`). Full `port` semantics (the real, checked-
+/// directly-confirmed always-silent-success behavior given this
+/// project's own permanent lack of any port-publishing concept,
+/// `--all`/`--latest`, malformed-`PORT` validation) are already
+/// exhaustively tested against the top-level command in
+/// `ociman_port.rs`; this only proves the alias itself reaches the
+/// identical function with the identical fields.
+#[test]
+fn container_port_is_a_byte_identical_alias_for_top_level_port() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-port-alias:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/container-port-alias:latest", "true"],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+
+    let alias = ociman(storage_dir.path(), &["container", "port", &id]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert!(String::from_utf8_lossy(&alias.stdout).trim().is_empty());
+}

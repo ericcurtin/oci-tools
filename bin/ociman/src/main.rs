@@ -4032,6 +4032,80 @@ enum Command {
         #[arg(short = 'l', long)]
         latest: bool,
     },
+    /// "List port mappings for the CONTAINER, or look up the public-
+    /// facing port that is NAT-ed to the PRIVATE_PORT" (real podman's
+    /// own doc string, quoted verbatim) — matching real `podman
+    /// port`/`podman container port` exactly (checked directly,
+    /// `~/git/podman/cmd/podman/containers/port.go`: a dual-
+    /// registered top-level `portCommand` *and* nested
+    /// `containerPortCommand`, both sharing one `RunE`).
+    ///
+    /// This project has never implemented any port-publishing concept
+    /// at all (no `-p`/`--publish` on `run`/`create`, confirmed absent
+    /// back to `docs/design/0020`'s own original scope list, and named
+    /// as a real, deferred gap in `0452`'s own doc comment too) — a
+    /// container here can genuinely never have a real port mapping to
+    /// report, matching real `podman container.PortMappings()`'s own
+    /// always-empty return in that exact case. Checked directly
+    /// against a real installed `podman 4.9.3` with a real container
+    /// that has none either (never assumed): this makes the entire
+    /// command a real, honest no-op — always a silent success, never
+    /// an error, for *any* explicit `PORT` given, no matter how
+    /// implausible, since real `ContainerPort`'s own "failed to find
+    /// published port" check (`port.go:150-152`) lives *inside* a
+    /// `for range reports` loop that a permanently-empty `reports`
+    /// slice makes unreachable — not a simplification on this
+    /// project's own part, a real, checked-directly upstream quirk
+    /// this given-zero-mappings case always hits, faithfully ported
+    /// rather than "fixed" into something that reports differently.
+    ///
+    /// `[CONTAINER] [PORT]` — real podman's own checked-directly
+    /// manual disambiguation depending on `--latest`, the identical
+    /// shape [`Command::Top::positional`]/[`Command::Exec::
+    /// positional`] already established (`port.go`'s own action
+    /// function): with `--latest` absent, the first element is the
+    /// container reference (a leading `/` stripped, the same real
+    /// docker-compatibility quirk `exec`/`top` already port) and a
+    /// second is `PORT`; with `--latest`, the container comes from
+    /// that flag alone and a *single* remaining element is `PORT` —
+    /// giving `--latest` together with *two* positional elements
+    /// (real podman's own genuinely obscure corner case) leaves both
+    /// silently unused by neither slot at all, a real, checked-
+    /// directly upstream oddity faithfully ported here too (utterly
+    /// inconsequential either way, since the real output never
+    /// depends on `PORT` in the first place — see above). More than
+    /// two positional elements at all is a real, immediate error,
+    /// matching real podman's own exact `` "`port` accepts at most 2
+    /// arguments" `` wording. A given `PORT` is still validated for a
+    /// real, immediate error on a genuinely malformed one (more than
+    /// one `/`, or a non-numeric/out-of-`u16`-range number) — matching
+    /// real podman's own identical `strconv.ParseUint`/slash-count
+    /// checks, which run *before* ever reaching the always-empty
+    /// search above.
+    Port {
+        /// See this command's own doc comment for the exact real
+        /// disambiguation.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        positional: Vec<String>,
+        /// Sweep every container this project knows about instead of
+        /// naming one explicitly — matching real `podman port --all`/
+        /// `-a` exactly. Mutually exclusive with any positional
+        /// argument at all (checked directly, real podman's own
+        /// `"no arguments are needed with --all"`).
+        #[arg(short, long)]
+        all: bool,
+        /// Target the single, real most-recently-*created* container
+        /// instead of naming one explicitly — matching real `podman
+        /// port --latest`/`-l` exactly (see [`Command::Rm::latest`]'s
+        /// own doc comment for the exact, checked-directly
+        /// `GetLatestContainer` semantics this shares verbatim,
+        /// including a real, propagated hard error on an empty store
+        /// — unlike [`ContainerCommand::Cleanup::latest`]'s own
+        /// separate, checked-directly *different* silent-success
+        /// convention, `0529`).
+        #[arg(short = 'l', long)]
+        latest: bool,
+    },
     /// Run an additional process inside an already-running container,
     /// joining its existing namespaces.
     Exec {
@@ -5511,6 +5585,29 @@ enum ContainerCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         positional: Vec<String>,
         /// Same as [`Command::Top::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+    },
+    /// `podman container port`'s own real, dual-registered twin of
+    /// the already-existing flat [`Command::Port`] -- checked
+    /// directly, `~/git/podman/cmd/podman/containers/port.go`: unlike
+    /// [`Self::Cleanup`]'s own nested-only registration, `port` shares
+    /// one flag-setup helper (`portFlags`) between a genuinely
+    /// separate top-level `portCommand` and nested
+    /// `containerPortCommand`, the same shape [`Command::Init`]
+    /// (`0530`) already established for an identical dual-
+    /// registration. Dispatches into the same [`cmd_port`] `ociman
+    /// port` itself already calls, with the identical field set --
+    /// see [`Command::Port`]'s own doc comment for the exact
+    /// semantics, not repeated here.
+    Port {
+        /// Same as [`Command::Port::positional`].
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        positional: Vec<String>,
+        /// Same as [`Command::Port::all`].
+        #[arg(short, long)]
+        all: bool,
+        /// Same as [`Command::Port::latest`].
         #[arg(short = 'l', long)]
         latest: bool,
     },
@@ -7144,6 +7241,11 @@ fn main() -> std::process::ExitCode {
                     };
                     cmd_top(&id, &ps_args)
                 }
+                ContainerCommand::Port {
+                    positional,
+                    all,
+                    latest,
+                } => cmd_port(&positional, all, latest),
                 ContainerCommand::Logs {
                     id,
                     latest,
@@ -7610,6 +7712,11 @@ fn main() -> std::process::ExitCode {
                 };
                 cmd_top(&id, &ps_args)
             }
+            Some(Command::Port {
+                positional,
+                all,
+                latest,
+            }) => cmd_port(&positional, all, latest),
             Some(Command::Exec {
                 positional,
                 latest,
@@ -16450,6 +16557,112 @@ fn cmd_top(id: &str, ps_args: &[String]) -> anyhow::Result<()> {
     oci_runtime_core::cgroups::print_ps_table(&pids, ps_args).context("printing ps table")
 }
 
+/// Validates a real `podman port PORT` argument's own format --
+/// `<port>[/<protocol>]` -- checked directly against `~/git/podman/
+/// cmd/podman/containers/port.go`'s own `strings.Split(port, "/")`/
+/// `strconv.ParseUint(fields[0], 10, 16)`. The parsed value is never
+/// actually used afterward at all (see [`Command::Port`]'s own doc
+/// comment for exactly why this project's own version never has
+/// anything real to search for) -- this exists purely to give the
+/// same real, immediate error a genuinely malformed value gets from
+/// real podman, before ever reaching that always-empty search.
+fn validate_port_spec(port: &str) -> anyhow::Result<()> {
+    let fields: Vec<&str> = port.split('/').collect();
+    anyhow::ensure!(
+        fields.len() <= 2,
+        "port formats are port/protocol. '{port}' is invalid"
+    );
+    fields[0]
+        .parse::<u16>()
+        .with_context(|| format!("parsing port number {:?}", fields[0]))?;
+    Ok(())
+}
+
+/// `ociman port`/`ociman container port` — see [`Command::Port`]'s
+/// own doc comment for the full real-vs-this-project reasoning: a
+/// real, honest no-op given this project's own permanent lack of any
+/// port-publishing concept, faithfully porting real podman's own
+/// checked-directly-confirmed "not-found error is unreachable"
+/// consequence that this exact case always hits.
+fn cmd_port(positional: &[String], all: bool, latest: bool) -> anyhow::Result<()> {
+    // Matches real podman's own exact wording, checked directly
+    // (`~/git/podman/cmd/podman/validate/args.go`'s own
+    // `CheckAllLatestAndIDFile`): these two checks run unconditionally
+    // even with `ignoreArgLen = true` (real `port`'s own case) --
+    // only the bare "at least one name or id" and "--latest and
+    // containers" checks are skipped by that flag, replaced by
+    // `port.go`'s own manual checks below instead.
+    anyhow::ensure!(
+        !(all && latest),
+        "--all and --latest cannot be used together"
+    );
+    anyhow::ensure!(
+        !(all && !positional.is_empty()),
+        "no arguments are needed with --all"
+    );
+
+    // `port.go`'s own action-body logic from here on, replicated in
+    // the identical order (checked directly) -- including a real,
+    // genuinely obscure upstream quirk faithfully ported rather than
+    // "fixed": giving `--latest` together with *two* positional
+    // elements leaves both silently unused by either slot at all (see
+    // this command's own doc comment for why that's utterly
+    // inconsequential either way).
+    anyhow::ensure!(
+        !(positional.is_empty() && !latest && !all),
+        "you must supply a running container name or id"
+    );
+    let container = if !latest && !positional.is_empty() {
+        positional[0]
+            .strip_prefix('/')
+            .unwrap_or(&positional[0])
+            .to_string()
+    } else {
+        String::new()
+    };
+    anyhow::ensure!(positional.len() <= 2, "`port` accepts at most 2 arguments");
+    let port = if positional.len() > 1 && !latest {
+        positional[1].as_str()
+    } else if positional.len() == 1 && latest {
+        positional[0].as_str()
+    } else {
+        ""
+    };
+    if !port.is_empty() {
+        validate_port_spec(port)?;
+    }
+
+    let containers = open_container_store()?;
+    let targets: Vec<String> = if all {
+        let mut states = containers.list().context("listing containers")?;
+        states.sort_by(|a, b| a.created.cmp(&b.created));
+        states.into_iter().map(|s| s.id).collect()
+    } else if latest {
+        vec![resolve_latest_container(&containers)?]
+    } else {
+        vec![resolve_container_id(&containers, &container)?]
+    };
+
+    // Every real container here would need a genuine port mapping to
+    // ever print anything at all -- something this project has never
+    // had any way to record in the first place (see this command's
+    // own doc comment). A non-`Running` one is silently skipped here
+    // too, matching real `ContainerPort`'s own identical `state !=
+    // ContainerStateRunning { continue }` -- but since there is never
+    // anything to print regardless, this loop only ever confirms each
+    // target genuinely resolved (already done above); it produces no
+    // real output either way, exactly matching a real installed
+    // `podman port` against a container with no port mappings of its
+    // own (checked directly, not assumed).
+    for id in &targets {
+        let state = containers.load(id)?;
+        if state.effective_status() != Status::Running {
+            continue;
+        }
+    }
+    Ok(())
+}
+
 /// `ociman pause` — see [`Command::Pause`]'s own doc comment for the
 /// full `--all`/`--cidfile`/multi-target shape (0320). Delegates the
 /// actual per-container logic to [`pause_or_unpause_one`].
@@ -21395,5 +21608,39 @@ mod tests {
         let result = resolve_exec_capabilities(None, false, 0).unwrap();
         assert!(result.bounding.is_empty());
         assert!(result.effective.is_empty());
+    }
+
+    // `validate_port_spec` (`Command::Port`, 0535) is pure, process-
+    // free parsing logic worth its own direct unit tests, matching
+    // the identical reasoning `parse_memory_limit`'s own tests above
+    // already established.
+
+    #[test]
+    fn validate_port_spec_accepts_a_bare_port_number() {
+        assert!(validate_port_spec("80").is_ok());
+        assert!(validate_port_spec("65535").is_ok());
+        assert!(validate_port_spec("0").is_ok());
+    }
+
+    #[test]
+    fn validate_port_spec_accepts_a_port_with_an_explicit_protocol() {
+        assert!(validate_port_spec("80/tcp").is_ok());
+        assert!(validate_port_spec("53/udp").is_ok());
+    }
+
+    #[test]
+    fn validate_port_spec_rejects_more_than_one_slash() {
+        let err = validate_port_spec("80/tcp/udp").unwrap_err();
+        assert!(err.to_string().contains("is invalid"), "{err}");
+    }
+
+    #[test]
+    fn validate_port_spec_rejects_a_non_numeric_port() {
+        assert!(validate_port_spec("not-a-number").is_err());
+    }
+
+    #[test]
+    fn validate_port_spec_rejects_a_port_number_above_u16_max() {
+        assert!(validate_port_spec("65536").is_err());
     }
 }
