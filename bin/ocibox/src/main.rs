@@ -427,6 +427,23 @@ enum Command {
     /// papered over — true cross-session persistence needs `create`
     /// to also launch a genuinely long-lived keeper process the box
     /// stays subordinate to, deferred to its own future increment.
+    ///
+    /// A separate, pre-existing, honestly-documented limitation this
+    /// note found while wiring `--yes` below rather than papering
+    /// over: real `distrobox enter somename` on a box that doesn't
+    /// exist yet doesn't just error -- it *offers to auto-create one*
+    /// (checked directly, `~/git/distrobox/internal/cli/enter.go:107-
+    /// 115,141-176`, `offerCreateMissing`: a real interactive
+    /// confirmation prompt, `"Create it now, out of image %s?"`,
+    /// defaulting to "yes" even on a bare Enter, from
+    /// `cfg.DefaultContainerImage`), rather than a hard error. This
+    /// project's own `enter` has never had any equivalent of that
+    /// auto-create flow at all -- a missing box is always this exact
+    /// same immediate `"{name}: no such box"` error, matching real
+    /// distrobox's own *declined*-the-prompt outcome unconditionally,
+    /// never its own true default (auto-create) one. A real,
+    /// separate, bigger gap than a single flag, deliberately not
+    /// closed here.
     Enter {
         /// The box's own name, exactly as given to `ocibox create
         /// --name`.
@@ -467,6 +484,17 @@ enum Command {
         /// narrower first slice.
         #[arg(long = "no-workdir")]
         no_workdir: bool,
+        /// Accepted for real CLI compatibility with `distrobox enter
+        /// --yes`/`-y`; has no effect (see this command's own doc
+        /// comment for the full, checked-directly reasoning): real
+        /// distrobox's own `--yes` only ever skips the interactive
+        /// confirmation prompt gating its own auto-create-a-missing-
+        /// box flow, which this project's `enter` has no equivalent
+        /// of at all -- a missing box is always the identical
+        /// immediate error either way, so there is nothing for
+        /// `--yes` to skip here regardless of whether it's given.
+        #[arg(long = "yes", short = 'y')]
+        yes: bool,
     },
     /// Create a temporary box, run one command (or a default shell)
     /// inside it, and always remove it again afterward — matching
@@ -811,6 +839,7 @@ fn main() -> std::process::ExitCode {
                 command,
                 clean_path,
                 no_workdir,
+                yes: _,
             }) => cmd_enter(&name, &command, clean_path, no_workdir),
             Some(Command::Ephemeral {
                 image,

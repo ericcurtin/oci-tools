@@ -535,6 +535,42 @@ fn enter_of_an_unknown_box_is_a_clear_error() {
     );
 }
 
+/// `enter --yes`/`-y` (0522): accepted for real CLI compatibility,
+/// but changes nothing -- this project's own `enter` has no auto-
+/// create-a-missing-box flow at all for real distrobox's own
+/// `--yes` to skip a prompt in front of (see `Command::Enter`'s own
+/// doc comment for the full, checked-directly reasoning). Proven
+/// here both ways: still a clear error on an unknown box, and still
+/// a real, successful enter on a real one.
+#[test]
+fn enter_yes_flag_is_accepted_and_behaves_identically() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let unknown = ocibox(storage_dir.path(), &["enter", "--yes", "no-such-box"]);
+    assert!(!unknown.status.success());
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("no such box"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    make_box(&storage_dir, "yesbox");
+    let known = ocibox(
+        storage_dir.path(),
+        &["enter", "--yes", "yesbox", "--", "/bin/sh", "-c", "exit 0"],
+    );
+    assert!(
+        known.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&known.stderr)
+    );
+}
+
 /// `ocibox enter`'s own default behavior (a real, previously-missing
 /// merge this project's `enter` has never performed before now):
 /// the box's own `PATH` gets the real *host*'s own `$PATH` merged in,
