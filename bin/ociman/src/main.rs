@@ -1666,6 +1666,36 @@ enum Command {
         /// Repeatable.
         #[arg(long = "unsetlabel", value_name = "KEY")]
         unsetlabel: Vec<String>,
+        /// Accepted for real CLI compatibility with real `docker
+        /// build --unsetannotation`/`podman build --unsetannotation`;
+        /// has no effect (this project's own build path never
+        /// inherits a base image's own manifest-level annotations
+        /// into the image being built at all -- unlike real buildah's
+        /// own `Builder.initConfig`, checked directly, `~/git/podman/
+        /// vendor/go.podman.io/buildah/config.go:88-99`, which
+        /// unconditionally copies a real OCI base manifest's own
+        /// `annotations` into `b.ImageAnnotations` the moment any
+        /// base image is set -- `--unsetannotation`'s only real job,
+        /// removing one of *those* inherited entries before commit,
+        /// `~/git/podman/vendor/go.podman.io/buildah/image.go:645-
+        /// 646`, therefore has nothing to act on here regardless).
+        /// This project's own `--annotation` is the only way any
+        /// annotation ever reaches the built image
+        /// (`manifest_annotations`, built solely from that one CLI
+        /// flag) -- a real, separate, bigger gap than a single flag,
+        /// deliberately not closed here, honestly named rather than
+        /// papered over (the same "document the real, separate,
+        /// pre-existing gap" convention `0522` already established
+        /// for `ocibox enter --yes`). Even combined with `--annotation
+        /// KEY=value` for the exact same key in one call, real
+        /// buildah's own checked-directly apply order (`unset` before
+        /// `set`) always lets the explicit `--annotation` win anyway
+        /// -- the identical outcome accepting-and-discarding this
+        /// flag entirely already produces, so there is no reachable
+        /// case here where a genuine no-op diverges from real
+        /// buildah's own actual result. Repeatable.
+        #[arg(long = "unsetannotation", value_name = "KEY")]
+        unsetannotation: Vec<String>,
         /// Set a `RUN` step's own `RLIMIT_*` resource limit,
         /// `NAME=soft[:hard]` (repeatable) — matching real `podman
         /// build --ulimit` exactly (checked directly, `~/git/podman/
@@ -6231,6 +6261,7 @@ fn main() -> std::process::ExitCode {
                 platform,
                 unsetenv,
                 unsetlabel,
+                unsetannotation: _,
                 ulimit,
                 shm_size,
                 memory,

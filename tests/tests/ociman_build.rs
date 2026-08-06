@@ -1259,6 +1259,91 @@ fn no_annotation_flag_at_all_leaves_manifest_annotations_empty() {
     assert!(manifest.annotations.is_empty());
 }
 
+/// `--unsetannotation` (0524): accepted for real CLI compatibility,
+/// but changes nothing at all -- this project's own build path never
+/// inherits a base image's own manifest-level annotations in the
+/// first place, so there is nothing for it to ever remove here (see
+/// `Command::Build`'s own doc comment for the full, checked-directly
+/// reasoning). Proven here two ways: alone, with no `--annotation` at
+/// all (manifest annotations stay empty, same as before this flag
+/// existed), and combined with `--annotation` for the exact same key
+/// in the same call (the explicit `--annotation` still wins, matching
+/// real buildah's own checked-directly apply order).
+#[test]
+fn build_unsetannotation_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/unsetannotation-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let context_dir = tempfile::tempdir().unwrap();
+    write_containerfile(
+        context_dir.path(),
+        "FROM ociman-test/unsetannotation-base:latest\n",
+    );
+
+    let alone = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/unsetannotation-alone:latest",
+            "--unsetannotation",
+            "foo",
+        ],
+    );
+    assert!(
+        alone.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alone.stderr)
+    );
+    let alone_record = store
+        .resolve_image("docker.io/ociman-test/unsetannotation-alone:latest")
+        .unwrap()
+        .unwrap();
+    let alone_manifest = store.image_manifest(&alone_record).unwrap();
+    assert!(alone_manifest.annotations.is_empty());
+
+    let combined = ociman(
+        storage_dir.path(),
+        &[
+            "build",
+            context_dir.path().to_str().unwrap(),
+            "-t",
+            "ociman-test/unsetannotation-combined:latest",
+            "--annotation",
+            "foo=bar",
+            "--unsetannotation",
+            "foo",
+        ],
+    );
+    assert!(
+        combined.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&combined.stderr)
+    );
+    let combined_record = store
+        .resolve_image("docker.io/ociman-test/unsetannotation-combined:latest")
+        .unwrap()
+        .unwrap();
+    let combined_manifest = store.image_manifest(&combined_record).unwrap();
+    assert_eq!(
+        combined_manifest.annotations.get("foo").map(String::as_str),
+        Some("bar"),
+        "the explicit --annotation should still win"
+    );
+}
+
 /// `--target <name>` builds only that named stage (and whatever it
 /// depends on), never the stages after it in the file -- proven the
 /// same way `an_unreferenced_stage_is_pruned_and_never_built` proves
