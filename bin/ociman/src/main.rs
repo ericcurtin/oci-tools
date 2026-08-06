@@ -4333,9 +4333,11 @@ enum SystemCommand {
 
 /// `ociman volume`'s own subcommands — matching real `docker volume`/
 /// `podman volume`'s own real subset this project implements (`ls`/
-/// `create`/`inspect`/`rm`/`prune`/`export`/`import`; real podman's
-/// own further subcommands, `mount`/`unmount`/`reload`, are out of
-/// scope for now, see `docs/design/0173`/`docs/design/0302`).
+/// `create`/`inspect`/`rm`/`rename`/`prune`/`exists`/`export`/
+/// `import`/`mount`/`unmount`/`reload`; this doc comment previously
+/// (incorrectly, stale since `0361` actually added `mount`/`unmount`)
+/// claimed those two plus `reload` were still out of scope, see
+/// `docs/design/0173`/`docs/design/0302`/`0361`/`0512`).
 #[derive(Debug, clap::Subcommand)]
 enum VolumeCommand {
     /// Create a new named volume — matching real `docker volume
@@ -4646,6 +4648,27 @@ enum VolumeCommand {
         /// The volume's own name.
         name: String,
     },
+    /// A real, checked-directly no-op — matching real `podman volume
+    /// reload`'s own identical behavior in the one state this
+    /// project can ever be in: no volume-plugin drivers configured
+    /// at all (checked directly, `~/git/podman/libpod/
+    /// runtime_volume_common.go:261-266`'s own `UpdateVolumePlugins`:
+    /// iterates `r.config.Engine.VolumePlugins`, a real, empty map
+    /// here since this project has no pluggable volume-driver
+    /// concept whatsoever, `0361`'s own already-established
+    /// reasoning — with zero configured plugins the loop body never
+    /// runs, `added`/`removed` both stay empty, and `~/git/podman/
+    /// cmd/podman/volumes/reload.go:34-40`'s own `printReload` only
+    /// prints when non-empty). `0361` had deferred this command
+    /// outright as "plugin-driver-only... out of scope" without
+    /// separately checking whether it's actually a real, faithful
+    /// no-op in the only state this project can ever reach — the
+    /// same class of re-examination `mount`/`unmount`'s own
+    /// (`0511`) mis-deferral just corrected, though this one turns
+    /// out to be a genuine no-op rather than a mis-scoping. Prints
+    /// nothing at all and always succeeds, matching real podman's
+    /// own checked-directly output exactly.
+    Reload,
 }
 
 /// `ociman container`'s own subcommand family (see
@@ -6277,6 +6300,7 @@ fn main() -> std::process::ExitCode {
                 VolumeCommand::Import { name, source } => cmd_volume_import(&name, &source),
                 VolumeCommand::Mount { name } => cmd_volume_mount(&name),
                 VolumeCommand::Unmount { name } => cmd_volume_unmount(&name),
+                VolumeCommand::Reload => cmd_volume_reload(),
             },
             Some(Command::Container { command }) => match command {
                 ContainerCommand::Exists { name, external: _ } => cmd_container_exists(&name),
@@ -16730,6 +16754,13 @@ fn cmd_volume_unmount(name: &str) -> anyhow::Result<()> {
         "no volume with name {name:?} found: no such volume"
     );
     println!("{name}");
+    Ok(())
+}
+
+/// `ociman volume reload` — see [`VolumeCommand::Reload`]'s own doc
+/// comment for why this is a real, checked-directly no-op (no
+/// volume-plugin drivers configured anywhere in this project).
+fn cmd_volume_reload() -> anyhow::Result<()> {
     Ok(())
 }
 

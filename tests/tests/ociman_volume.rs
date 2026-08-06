@@ -1751,3 +1751,51 @@ fn volume_mount_and_unmount_of_an_unknown_volume_are_clear_errors() {
         String::from_utf8_lossy(&unmount.stderr)
     );
 }
+
+/// `ociman volume reload` (`docs/design/0512`) is a real,
+/// checked-directly no-op -- matching real `podman volume reload`'s
+/// own identical behavior in the one state this project can ever be
+/// in (no volume-plugin drivers configured at all, checked directly,
+/// `~/git/podman/libpod/runtime_volume_common.go:261-266`'s own
+/// `UpdateVolumePlugins`). Always succeeds, prints nothing at all,
+/// and leaves every existing volume fully untouched -- whether or
+/// not any volumes exist at all.
+#[test]
+fn volume_reload_is_a_real_no_op_that_prints_nothing() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    // With no volumes at all.
+    let reload_empty = ociman(storage_dir.path(), &["volume", "reload"]);
+    assert!(reload_empty.status.success(), "{reload_empty:?}");
+    assert!(reload_empty.stdout.is_empty(), "{reload_empty:?}");
+    assert!(reload_empty.stderr.is_empty(), "{reload_empty:?}");
+
+    // With an existing volume, which must survive fully untouched.
+    let create = ociman(storage_dir.path(), &["volume", "create", "reloadvol"]);
+    assert!(create.status.success(), "{create:?}");
+    let mountpoint = volume_mountpoint(storage_dir.path(), "reloadvol");
+
+    let reload = ociman(storage_dir.path(), &["volume", "reload"]);
+    assert!(reload.status.success(), "{reload:?}");
+    assert!(reload.stdout.is_empty(), "{reload:?}");
+    assert!(reload.stderr.is_empty(), "{reload:?}");
+    assert!(
+        mountpoint.is_dir(),
+        "the existing volume's own directory must survive reload untouched"
+    );
+    let ls = ociman(storage_dir.path(), &["volume", "ls", "-q"]);
+    assert_eq!(String::from_utf8_lossy(&ls.stdout).trim(), "reloadvol");
+}
+
+/// `ociman volume reload` takes no arguments at all, matching real
+/// `podman volume reload`'s own checked-directly `Args:
+/// validate.NoArgs`.
+#[test]
+fn volume_reload_rejects_any_argument() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let reload = ociman(storage_dir.path(), &["volume", "reload", "extra-arg"]);
+    assert!(!reload.status.success());
+}
