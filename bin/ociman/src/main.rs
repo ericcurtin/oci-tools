@@ -3215,6 +3215,22 @@ enum Command {
         /// already established for the identical reason).
         #[arg(long = "iidfile", value_name = "PATH")]
         iidfile: Option<PathBuf>,
+        /// Accepted for real CLI compatibility with real `podman
+        /// commit --quiet`/`-q`; has no effect: checked directly,
+        /// `~/git/podman/cmd/podman/containers/commit.go:81,104-106`
+        /// (`if !commitOptions.Quiet { commitOptions.Writer =
+        /// os.Stderr }`) -- real `--quiet`'s only real effect is
+        /// suppressing a real buildah progress-writer, never the
+        /// final `fmt.Println(response.Id)`, which happens
+        /// unconditionally either way. This project's own commit path
+        /// (`cmd_commit`/`commit_inner`) has no progress writer/
+        /// spinner anywhere at all to suppress in the first place --
+        /// a genuine, faithful no-op, the same "nothing to skip"
+        /// reasoning class `0512`-`0522` already established
+        /// (checked directly rather than assumed, tracing every
+        /// `println!` this function's own call chain reaches).
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Gracefully stop a running container: send it a signal (`TERM`
     /// by default) and wait up to `--time` seconds for it to exit on
@@ -5328,8 +5344,9 @@ enum ContainerCommand {
     /// field set -- see [`Command::Commit`]'s own doc comment for
     /// the exact semantics (including this project's own honestly
     /// narrower first-slice scope: no `--config`/`--format`/
-    /// `--quiet`/`--include-volumes`, matching the top-level
-    /// command's own identical gap), not repeated here.
+    /// `--include-volumes` -- `--quiet` closed this same gap in
+    /// `0523`, matching the top-level command's own identical
+    /// addition), not repeated here.
     Commit {
         /// Same as [`Command::Commit::container`].
         container: String,
@@ -5353,6 +5370,9 @@ enum ContainerCommand {
         /// Same as [`Command::Commit::iidfile`].
         #[arg(long = "iidfile", value_name = "PATH")]
         iidfile: Option<PathBuf>,
+        /// Same as [`Command::Commit::quiet`].
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// `podman container export`'s own real alias for the already-
     /// existing flat [`Command::Export`] -- checked directly, `~/git/
@@ -6480,6 +6500,7 @@ fn main() -> std::process::ExitCode {
                 change,
                 squash,
                 iidfile,
+                quiet: _,
             }) => cmd_commit(
                 &container,
                 image.as_deref(),
@@ -6880,6 +6901,7 @@ fn main() -> std::process::ExitCode {
                     change,
                     squash,
                     iidfile,
+                    quiet: _,
                 } => cmd_commit(
                     &container,
                     image.as_deref(),

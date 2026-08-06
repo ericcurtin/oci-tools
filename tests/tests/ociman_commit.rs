@@ -313,6 +313,61 @@ fn commit_with_no_image_argument_records_an_untagged_image() {
     assert_eq!(untagged["reference"], serde_json::Value::Null);
 }
 
+/// `commit --quiet`/`-q` (0523): accepted for real CLI compatibility,
+/// but changes nothing at all -- this project's own commit path has
+/// no progress-writer/spinner anywhere to suppress in the first
+/// place (see `Command::Commit`'s own doc comment for the full,
+/// checked-directly reasoning). Proven here by a real commit's own
+/// digest still being printed identically, with and without the
+/// flag.
+#[test]
+fn commit_quiet_flag_is_accepted_and_behaves_identically() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/commit-quiet:latest",
+        "exit 0",
+    );
+
+    let commit = ociman(storage_dir.path(), &["commit", "--quiet", &id]);
+    assert!(
+        commit.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let digest = String::from_utf8_lossy(&commit.stdout).trim().to_string();
+    assert!(digest.starts_with("sha256:"), "{commit:?}");
+}
+
+/// The `container commit` alias's own `--quiet` flag works too, not
+/// just the top-level command's.
+#[test]
+fn container_commit_quiet_flag_works_through_the_alias() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/container-commit-quiet:latest",
+        "exit 0",
+    );
+
+    let commit = ociman(storage_dir.path(), &["container", "commit", "--quiet", &id]);
+    assert!(
+        commit.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let digest = String::from_utf8_lossy(&commit.stdout).trim().to_string();
+    assert!(digest.starts_with("sha256:"), "{commit:?}");
+}
+
 /// `--iidfile <path>` writes the committed image's own digest
 /// (`sha256:<hex>`, no trailing newline) to that file after a
 /// successful commit -- matching real `podman commit --iidfile`
