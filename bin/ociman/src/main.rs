@@ -5587,6 +5587,111 @@ enum ContainerCommand {
         #[arg(short, long)]
         force: bool,
     },
+    /// `podman container update`'s own real alias for the already-
+    /// existing flat [`Command::Update`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/update.go:32-40`:
+    /// `containerUpdateCommand` (`Parent: containerCmd`) and
+    /// top-level `updateCommand` share the exact same `Args`/`Use`/
+    /// `Short`/`Long`/`RunE`/`ValidArgsFunction`, and both get the
+    /// identical flag set applied via the one shared `updateFlags
+    /// (cmd)` helper -- a byte-identical alias, the same shape
+    /// [`Self::Kill`] (`0492`) already established. Dispatches into
+    /// the same [`cmd_update`] `ociman update` itself already calls,
+    /// with the identical field set -- see [`Command::Update`]'s own
+    /// doc comment for the exact semantics, not repeated here.
+    Update {
+        /// Every field is the same as [`Command::Update`]'s own
+        /// identically-named one — flattened via a dedicated
+        /// [`ContainerUpdateArgs`] struct and boxed purely to keep
+        /// this smaller, otherwise-lightweight [`ContainerCommand`]
+        /// enum's own overall size down -- `clippy::large_enum_
+        /// variant` (checked directly: every other [`ContainerCommand`]
+        /// variant is tiny, so this one 21-field struct embedded
+        /// directly would dominate the whole enum's size, the exact
+        /// same reasoning [`Self::Run::args`]/[`Self::Create::args`]
+        /// already established for [`RunArgs`]); no behavior
+        /// difference at all, `clap` flattens through a `Box` exactly
+        /// the same way.
+        #[command(flatten)]
+        args: Box<ContainerUpdateArgs>,
+    },
+}
+
+/// The 21 fields [`ContainerCommand::Update`] shares byte-for-byte
+/// with the already-existing flat [`Command::Update`] — see its own
+/// doc comment for the exact semantics of each, not repeated here.
+/// A dedicated, boxed-when-embedded struct rather than individually
+/// re-declared fields purely to sidestep `clippy::large_enum_variant`
+/// (see [`ContainerCommand::Update::args`]'s own doc comment) — the
+/// original top-level [`Command::Update`] itself is left with its
+/// own individually-declared fields untouched, matching the same
+/// asymmetry `0506`/`0507` already established for [`RunArgs`] (only
+/// the smaller enum needs boxing, not the larger one it's shared
+/// with).
+#[derive(Debug, clap::Args)]
+struct ContainerUpdateArgs {
+    /// Same as [`Command::Update::id`].
+    id: Option<String>,
+    /// Same as [`Command::Update::latest`].
+    #[arg(short = 'l', long)]
+    latest: bool,
+    /// Same as [`Command::Update::memory`].
+    #[arg(long)]
+    memory: Option<String>,
+    /// Same as [`Command::Update::memory_swap`].
+    #[arg(long = "memory-swap", allow_hyphen_values = true)]
+    memory_swap: Option<String>,
+    /// Same as [`Command::Update::memory_reservation`].
+    #[arg(long = "memory-reservation")]
+    memory_reservation: Option<String>,
+    /// Same as [`Command::Update::cpus`].
+    #[arg(long)]
+    cpus: Option<f64>,
+    /// Same as [`Command::Update::pids_limit`].
+    #[arg(long = "pids-limit", allow_hyphen_values = true)]
+    pids_limit: Option<i64>,
+    /// Same as [`Command::Update::cpuset_cpus`].
+    #[arg(long = "cpuset-cpus")]
+    cpuset_cpus: Option<String>,
+    /// Same as [`Command::Update::cpuset_mems`].
+    #[arg(long = "cpuset-mems")]
+    cpuset_mems: Option<String>,
+    /// Same as [`Command::Update::cpu_period`].
+    #[arg(long = "cpu-period")]
+    cpu_period: Option<u64>,
+    /// Same as [`Command::Update::cpu_quota`].
+    #[arg(long = "cpu-quota")]
+    cpu_quota: Option<i64>,
+    /// Same as [`Command::Update::cpu_shares`].
+    #[arg(short = 'c', long = "cpu-shares")]
+    cpu_shares: Option<u64>,
+    /// Same as [`Command::Update::cpu_rt_period`].
+    #[arg(long = "cpu-rt-period")]
+    cpu_rt_period: Option<u64>,
+    /// Same as [`Command::Update::cpu_rt_runtime`].
+    #[arg(long = "cpu-rt-runtime", allow_hyphen_values = true)]
+    cpu_rt_runtime: Option<i64>,
+    /// Same as [`Command::Update::blkio_weight`].
+    #[arg(long = "blkio-weight")]
+    blkio_weight: Option<u16>,
+    /// Same as [`Command::Update::health_cmd`].
+    #[arg(long = "health-cmd", value_name = "COMMAND")]
+    health_cmd: Option<String>,
+    /// Same as [`Command::Update::health_interval`].
+    #[arg(long = "health-interval")]
+    health_interval: Option<String>,
+    /// Same as [`Command::Update::health_retries`].
+    #[arg(long = "health-retries")]
+    health_retries: Option<u32>,
+    /// Same as [`Command::Update::health_timeout`].
+    #[arg(long = "health-timeout")]
+    health_timeout: Option<String>,
+    /// Same as [`Command::Update::health_start_period`].
+    #[arg(long = "health-start-period")]
+    health_start_period: Option<String>,
+    /// Same as [`Command::Update::no_healthcheck`].
+    #[arg(long = "no-healthcheck")]
+    no_healthcheck: bool,
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -6755,6 +6860,71 @@ fn main() -> std::process::ExitCode {
                     latest,
                     force: _,
                 } => cmd_unmount(&containers, all, latest),
+                ContainerCommand::Update { args } => {
+                    let ContainerUpdateArgs {
+                        id,
+                        latest,
+                        memory,
+                        memory_swap,
+                        memory_reservation,
+                        cpus,
+                        pids_limit,
+                        cpuset_cpus,
+                        cpuset_mems,
+                        cpu_period,
+                        cpu_quota,
+                        cpu_shares,
+                        cpu_rt_period,
+                        cpu_rt_runtime,
+                        blkio_weight,
+                        health_cmd,
+                        health_interval,
+                        health_retries,
+                        health_timeout,
+                        health_start_period,
+                        no_healthcheck,
+                    } = *args;
+                    // Same real, checked-directly restriction the
+                    // top-level `Command::Update` arm already has --
+                    // see its own comment for the exact citation.
+                    anyhow::ensure!(
+                        !(latest && id.is_some()),
+                        "--latest and containers cannot be used together"
+                    );
+                    let id = match id {
+                        Some(id) => id,
+                        None => {
+                            anyhow::ensure!(
+                                latest,
+                                "update requires a name, id, or the \"--latest\" flag"
+                            );
+                            let containers = open_container_store()?;
+                            resolve_latest_container(&containers)?
+                        }
+                    };
+                    cmd_update(
+                        &id,
+                        memory.as_deref(),
+                        memory_swap.as_deref(),
+                        memory_reservation.as_deref(),
+                        cpus,
+                        pids_limit,
+                        cpuset_cpus.as_deref(),
+                        cpuset_mems.as_deref(),
+                        cpu_period,
+                        cpu_quota,
+                        cpu_shares,
+                        cpu_rt_period,
+                        cpu_rt_runtime,
+                        blkio_weight,
+                        health_cmd.as_deref(),
+                        health_interval.as_deref(),
+                        health_retries,
+                        health_timeout.as_deref(),
+                        health_start_period.as_deref(),
+                        no_healthcheck,
+                    )
+                }
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),

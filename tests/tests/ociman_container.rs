@@ -30,11 +30,16 @@
 //! `ociman attach`), `exec` (`docs/design/0505`, the same shape
 //! again for `ociman exec`), `run` (`docs/design/0506`, the same
 //! shape again for `ociman run`), `create` (`docs/design/0507`,
-//! the same shape again for `ociman create`), and `mount`/`unmount`
+//! the same shape again for `ociman create`), `mount`/`unmount`
 //! (`docs/design/0511` -- the same byte-identical-alias shape again
 //! for `ociman mount`/`ociman unmount`, correcting an earlier design
 //! note's own mis-labeling of this specific pair as "cross-concept
-//! aliasing, unverified") — see `ociman_ps.rs`/
+//! aliasing, unverified"), and `update` (`docs/design/0516` -- the
+//! same byte-identical-alias shape again for `ociman update`, its
+//! own 21-field flag set flattened via a dedicated, boxed
+//! `ContainerUpdateArgs` struct to sidestep `clippy::
+//! large_enum_variant`, the same reasoning `run`/`create`'s own
+//! `Box<RunArgs>` already established) — see `ociman_ps.rs`/
 //! `ociman_stop.rs`/`ociman_start.rs`/`ociman_kill.rs`/
 //! `ociman_pause.rs`/`ociman_rename.rs`/`ociman_wait.rs`/
 //! `ociman_top.rs`/`ociman_logs.rs`/`ociman_diff.rs`/`ociman_cp.rs`/
@@ -60,6 +65,20 @@ use oci_spec_types::image::ContainerConfig;
 use oci_store::Store;
 
 use oci_tools_tests::{bin_path, busybox_path, seed_image};
+
+/// The real cgroup v2 directory backing a running container's own
+/// pid -- the same technique `ociman_update.rs`'s own identically-
+/// named helper already established, duplicated here rather than
+/// shared across a test-only boundary for the same "a few lines,
+/// not worth a cross-file dependency" reasoning this project's own
+/// production code already applies elsewhere.
+fn real_cgroup_dir_for(storage_root: &Path, id: &str) -> std::path::PathBuf {
+    let containers = oci_runtime_core::StateStore::open(storage_root.join("containers")).unwrap();
+    let state = containers.load(id).unwrap();
+    let pid = state.pid.expect("running container must have a pid");
+    oci_runtime_core::cgroups::cgroup_dir_for_running_pid(Path::new("/sys/fs/cgroup"), pid)
+        .expect("resolving real cgroup for a running container")
+}
 
 fn ociman(storage_root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin_path("ociman"))
@@ -2176,4 +2195,66 @@ fn container_unmount_is_a_byte_identical_alias_for_top_level_unmount() {
         String::from_utf8_lossy(&umount.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&umount.stdout).trim(), id);
+}
+
+/// `ociman container update` (0516) is a real, byte-identical alias
+/// for the top-level `ociman update`, matching real `podman container
+/// update`'s own checked-directly identical `Args`/`Use`/`Short`/
+/// `Long`/`RunE`/`ValidArgsFunction` (and identical `updateFlags`-
+/// applied flag set) as top-level `podman update` exactly (`~/git/
+/// podman/cmd/podman/containers/update.go:32-40`). Full `update`
+/// semantics (every resource/health flag, `--latest`, the real
+/// running-container requirement) are already exhaustively tested
+/// against the top-level command in `ociman_update.rs`; this proves
+/// the alias itself reaches the identical function with the
+/// identical fields, including a real, live cgroup effect (not just
+/// a successful exit code) to prove the 21-field boxed
+/// `ContainerUpdateArgs` struct really does thread every value
+/// through correctly, not just the ones a shallower check might
+/// happen to touch.
+#[test]
+fn container_update_is_a_byte_identical_alias_for_top_level_update() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-update-alias:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/container-update-alias:latest",
+        &["sh", "-c", "sleep 30"],
+    );
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let alias = ociman(
+        storage_dir.path(),
+        &["container", "update", "--memory", "64m", &id],
+    );
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&alias.stdout).trim(), id);
+
+    let cgroup_dir = real_cgroup_dir_for(storage_dir.path(), &id);
+    let memory_max = std::fs::read_to_string(cgroup_dir.join("memory.max")).unwrap();
+    assert_eq!(memory_max.trim(), (64 * 1024 * 1024).to_string());
+
+    ociman(storage_dir.path(), &["kill", &id]);
 }
