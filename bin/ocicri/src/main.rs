@@ -46,6 +46,18 @@
 //! binary in the workspace linking `tokio`/`tonic`/`prost`: every
 //! other binary's own hot per-invocation startup path is completely
 //! unaffected.
+//!
+//! A real subcommand *does* exist, though — `ocicri version`
+//! (`docs/design/0532`), correcting an earlier, checked-directly-wrong
+//! claim this module's own doc comment used to make here ("real
+//! `cri-o` itself has no subcommands at all"): real `crio` does,
+//! checked directly (`~/git/cri-o/cmd/crio/main.go:161-168`:
+//! `app.Commands = criocli.DefaultCommands` plus `CheckCommand`/
+//! `ConfigCommand`/`PublishCommand`/`StatusCommand`/`VersionCommand`/
+//! `WipeCommand`) — a bare invocation with no subcommand at all is
+//! what runs the server (`app.Action`), the exact same "no
+//! subcommand" default this project's own `Cli::command: Option
+//! <Command>` still uses.
 
 mod bundle;
 mod container;
@@ -62,10 +74,12 @@ use anyhow::Context as _;
 use clap::Parser;
 use oci_cri_types as cri;
 
-/// Command-line interface. Real `cri-o` itself has no subcommands at
-/// all — invoking it just *is* running the server — so neither does
-/// `ocicri`; global flags plus `--listen` are everything this first
-/// slice needs.
+/// Command-line interface. A bare invocation (`command: None`) starts
+/// the server — matching real bare `crio`'s own identical `app.
+/// Action` default exactly (see this module's own doc comment for why
+/// real `crio` *does* have real subcommands too, despite what an
+/// earlier version of this doc comment used to claim). Global flags
+/// plus `--listen` apply either way.
 #[derive(Debug, Parser)]
 #[command(
     name = "ocicri",
@@ -73,6 +87,8 @@ use oci_cri_types as cri;
     version = oci_cli_common::version::long(env!("CARGO_PKG_VERSION")),
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     #[command(flatten)]
     global: oci_cli_common::GlobalArgs,
     /// Unix domain socket path to listen on — matching real `cri-o`'s
@@ -84,6 +100,26 @@ struct Cli {
     /// `$XDG_RUNTIME_DIR/ocicri` rootless).
     #[arg(long = "listen", value_name = "PATH")]
     listen: Option<PathBuf>,
+}
+
+/// See [`Cli::command`]'s own doc comment. Only `version` so far —
+/// real `crio`'s own other subcommands (`check`/`config`/`publish`/
+/// `status`/`wipe`) are all real, separate, much bigger gaps
+/// (respectively: a standalone healthcheck-config CLI, a config-file
+/// generator/validator, a systemd-notify-socket publisher, a runtime
+/// status dump, and an on-disk-state wipe tool) — each its own future
+/// increment, not folded in here.
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// "display detailed version information" (real `crio version`'s
+    /// own `Usage` string, quoted verbatim) — matching real `cri-o
+    /// version` exactly (checked directly, `~/git/cri-o/internal/
+    /// criocli/version.go:17-49`). Real `crio`'s own separate
+    /// `--json`/`-j` flag on this specific subcommand is folded into
+    /// this project's own already-global `--json` instead (matching
+    /// every other `ocicri`/`ociman` command's own identical
+    /// convention) rather than a second, redundant one.
+    Version,
 }
 
 fn default_socket_path() -> PathBuf {
@@ -113,6 +149,10 @@ fn main() -> std::process::ExitCode {
             git_hash = oci_cli_common::version::GIT_HASH,
             "ocicri starting"
         );
+
+        if let Some(Command::Version) = cli.command {
+            return cmd_version(cli.global.json);
+        }
 
         let socket_path = cli.listen.unwrap_or_else(default_socket_path);
 
@@ -159,4 +199,63 @@ async fn serve(socket_path: &std::path::Path) -> anyhow::Result<()> {
         .serve_with_incoming(incoming)
         .await
         .context("serving CRI gRPC requests")
+}
+
+/// `ocicri version`'s own report — the subset of real `crio version`'s
+/// own `Info` struct (`~/git/cri-o/internal/version/version.go:35-49`)
+/// this project has an honest, directly-checkable value for
+/// (`Version`/`GitCommit`/`Platform`), the same "keep the field names
+/// real crio itself uses, only for the fields with an honest value"
+/// shape `ociman version`'s own `VersionReport` already established
+/// for real `podman version` — deliberately omitting `GoVersion`/
+/// `Compiler`/`Linkmode`/`BuildTags`/`LDFlags` (this project isn't
+/// Go), `GitCommitDate`/`BuildDate` (no build-time timestamp
+/// embedding here, only the git hash), `GitTreeState` (no working-
+/// tree-dirty detection at build time), `SeccompEnabled`/
+/// `AppArmorEnabled` (no seccomp/AppArmor subsystem in this project at
+/// all yet), and `Dependencies` (real crio's own `--verbose`-only Go
+/// module list — not accepted here either, the exact same "real
+/// upstream field/flag with no honest Rust equivalent" reasoning).
+/// JSON key casing matches this project's own already-established
+/// `snake_case` convention (`ociman version`'s own `VersionReport`),
+/// not real crio's own `camelCase` struct tags — checked directly:
+/// `ociman version --json`'s own `git_commit`/`os_arch` never chased
+/// real podman's own JSON key spelling either, the same precedent.
+#[derive(Debug, serde::Serialize)]
+struct VersionReport {
+    version: String,
+    git_commit: String,
+    platform: String,
+}
+
+fn version_report() -> VersionReport {
+    let platform = oci_spec_types::image::Platform::host();
+    VersionReport {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        git_commit: oci_cli_common::version::GIT_HASH.to_string(),
+        platform: format!("{}/{}", platform.os, platform.architecture),
+    }
+}
+
+/// Plain-text output deliberately doesn't chase real crio's own
+/// reflection-driven `tabwriter` column alignment byte-for-byte
+/// (`(*Info).String()`, `~/git/cri-o/internal/version/version.go:228-
+/// 273`): that alignment is computed from *all* of real crio's own
+/// fields, most of which this report has no honest equivalent for at
+/// all (see [`VersionReport`]'s own doc comment) — chasing an exact
+/// column width real crio would only ever produce with fields this
+/// project can't honestly populate would be cargo-culting, not real
+/// compatibility. The three real field *names* below are still real
+/// crio's own exact identifiers, unlike `ociman version`'s own
+/// `podman`-style `"Git Commit"`/`"OS/Arch"` labels.
+fn cmd_version(json: bool) -> anyhow::Result<()> {
+    let report = version_report();
+    if json {
+        oci_cli_common::output::print_json(&report)?;
+        return Ok(());
+    }
+    println!("Version:    {}", report.version);
+    println!("GitCommit:  {}", report.git_commit);
+    println!("Platform:   {}", report.platform);
+    Ok(())
 }
