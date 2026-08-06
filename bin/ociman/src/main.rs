@@ -5463,6 +5463,66 @@ enum ContainerCommand {
         #[arg(short, long)]
         interactive: bool,
     },
+    /// `podman container mount`'s own real alias for the already-
+    /// existing flat [`Command::Mount`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/mount.go:41-48`:
+    /// `containerMountCommand` (`Parent: containerCmd`) and top-level
+    /// `mountCommand` share the exact same `Use`/`Short`/`Long`/
+    /// `Args`/`RunE`/`ValidArgsFunction`, and both get the identical
+    /// flag set applied via the one shared `mountFlags(cmd)` helper
+    /// (`mount.go:54-64`: `--all`/`-a`, `--format`, `--no-trunc`,
+    /// plus `--latest` via `validate.AddLatestFlag`) -- a
+    /// byte-identical alias, the same shape [`Self::Kill`] (`0492`)
+    /// already established. An earlier design note (`0510`) had
+    /// mis-labeled this pair as "cross-concept aliasing, unverified"
+    /// without actually checking this source; re-examined directly
+    /// this time and found the identical byte-for-byte alias shape
+    /// as every other already-ported verb here. Dispatches into the
+    /// same [`cmd_mount`] `ociman mount` itself already calls, with
+    /// the identical field set -- see [`Command::Mount`]'s own doc
+    /// comment for the exact semantics (including this project's own
+    /// honestly narrower first-slice scope: no `--format`/
+    /// `--no-trunc`, matching the top-level command's own identical
+    /// gap), not repeated here.
+    Mount {
+        /// Same as [`Command::Mount::containers`].
+        containers: Vec<String>,
+        /// Same as [`Command::Mount::all`].
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Same as [`Command::Mount::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+    },
+    /// `podman container unmount`'s own real alias for the already-
+    /// existing flat [`Command::Unmount`] -- checked directly, `~/git/
+    /// podman/cmd/podman/containers/unmount.go:38-51`:
+    /// `containerUnmountCommand` (`Parent: containerCmd`) and
+    /// top-level `unmountCommand` share the exact same `Use`/`Short`/
+    /// `Aliases` (`["umount"]`)/`Long`/`Args`/`RunE`/
+    /// `ValidArgsFunction`, and both get the identical flag set
+    /// applied via the one shared `unmountFlags(flags)` helper
+    /// (`unmount.go:57-59`: `--all`/`-a`, `--force`/`-f`, plus
+    /// `--latest` via `validate.AddLatestFlag`) -- a byte-identical
+    /// alias, the same shape [`Self::Kill`] (`0492`) already
+    /// established. Dispatches into the same [`cmd_unmount`] `ociman
+    /// unmount` itself already calls, with the identical field set --
+    /// see [`Command::Unmount`]'s own doc comment for the exact
+    /// semantics, not repeated here.
+    #[command(alias = "umount")]
+    Unmount {
+        /// Same as [`Command::Unmount::containers`].
+        containers: Vec<String>,
+        /// Same as [`Command::Unmount::all`].
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Same as [`Command::Unmount::latest`].
+        #[arg(short = 'l', long)]
+        latest: bool,
+        /// Same as [`Command::Unmount::force`].
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 /// `ociman image`'s own subcommand family (see [`Command::Image`]'s
@@ -6612,6 +6672,17 @@ fn main() -> std::process::ExitCode {
                     rm,
                     interactive,
                 } => cmd_create(*args, rm, interactive),
+                ContainerCommand::Mount {
+                    containers,
+                    all,
+                    latest,
+                } => cmd_mount(&containers, all, latest),
+                ContainerCommand::Unmount {
+                    containers,
+                    all,
+                    latest,
+                    force: _,
+                } => cmd_unmount(&containers, all, latest),
             },
             Some(Command::Image { command }) => match command {
                 ImageCommand::Exists { name } => cmd_image_exists(&name),

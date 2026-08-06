@@ -29,16 +29,21 @@
 //! stats`), `attach` (`docs/design/0504`, the same shape again for
 //! `ociman attach`), `exec` (`docs/design/0505`, the same shape
 //! again for `ociman exec`), `run` (`docs/design/0506`, the same
-//! shape again for `ociman run`), and `create` (`docs/design/0507`,
-//! the same shape again for `ociman create`) — see `ociman_ps.rs`/
+//! shape again for `ociman run`), `create` (`docs/design/0507`,
+//! the same shape again for `ociman create`), and `mount`/`unmount`
+//! (`docs/design/0511` -- the same byte-identical-alias shape again
+//! for `ociman mount`/`ociman unmount`, correcting an earlier design
+//! note's own mis-labeling of this specific pair as "cross-concept
+//! aliasing, unverified") — see `ociman_ps.rs`/
 //! `ociman_stop.rs`/`ociman_start.rs`/`ociman_kill.rs`/
 //! `ociman_pause.rs`/`ociman_rename.rs`/`ociman_wait.rs`/
 //! `ociman_top.rs`/`ociman_logs.rs`/`ociman_diff.rs`/`ociman_cp.rs`/
 //! `ociman_commit.rs`/`ociman_export.rs`/`ociman_stats.rs`/
 //! `ociman_attach.rs`/`ociman_exec.rs`/`ociman_run.rs`/
-//! `ociman_create.rs` for each top-level command's own much larger
-//! test suite; this file only proves each alias itself is byte-
-//! identical, not the aliased command's own full semantics again.
+//! `ociman_create.rs`/`ociman_mount.rs` for each top-level command's
+//! own much larger test suite; this file only proves each alias
+//! itself is byte-identical, not the aliased command's own full
+//! semantics again.
 //!
 //! `ociman container prune` removes every real, non-running container
 //! (this project's own `Created`/`Stopped`, never `Running`/`Paused`,
@@ -2040,4 +2045,135 @@ fn container_create_is_a_byte_identical_alias_for_top_level_create() {
     let ps = ociman(storage_dir.path(), &["ps", "-q"]);
     assert!(String::from_utf8_lossy(&ps.stdout).trim().is_empty());
     assert_eq!(all_ids(storage_dir.path()), vec![id]);
+}
+
+/// `ociman container mount` (0511) is a real, byte-identical alias
+/// for the top-level `ociman mount`, matching real `podman container
+/// mount`'s own checked-directly identical `Use`/`Short`/`Long`/
+/// `Args`/`RunE`/`ValidArgsFunction` (and identical `mountFlags`-
+/// applied flag set) as top-level `podman mount` exactly (`~/git/
+/// podman/cmd/podman/containers/mount.go:41-48`). Full `mount`
+/// semantics (bare-invocation listing, `--all`/`--latest`, the
+/// rootless-overlay gap itself) are already exhaustively tested
+/// against the top-level command in `ociman_mount.rs`; this only
+/// proves the alias itself reaches the identical function with the
+/// identical fields.
+#[test]
+fn container_mount_is_a_byte_identical_alias_for_top_level_mount() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    // `mount` doesn't support this project's own rootless-overlay
+    // rootfs optimization yet (`docs/design/0362`) -- force the
+    // real, full-extraction path instead, matching `ociman_mount.rs`'s
+    // own established convention.
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-mount-alias:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 0".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/container-mount-alias:latest"],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+
+    let alias = ociman(storage_dir.path(), &["container", "mount", &id]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    let printed = String::from_utf8_lossy(&alias.stdout).trim().to_string();
+    let expected = storage_dir
+        .path()
+        .join("containers")
+        .join(&id)
+        .join("rootfs");
+    assert_eq!(std::path::PathBuf::from(&printed), expected, "{alias:?}");
+}
+
+/// `ociman container unmount` (0511) is a real, byte-identical alias
+/// for the top-level `ociman unmount`, matching real `podman
+/// container unmount`'s own checked-directly identical `Use`/`Short`/
+/// `Aliases` (`["umount"]`)/`Long`/`Args`/`RunE`/`ValidArgsFunction`
+/// (and identical `unmountFlags`-applied flag set) as top-level
+/// `podman unmount` exactly (`~/git/podman/cmd/podman/containers/
+/// unmount.go:38-51`). Full `unmount` semantics (the real no-op
+/// itself, `--all`/`--latest`/`--force`) are already exhaustively
+/// tested against the top-level command in `ociman_mount.rs`; this
+/// only proves the alias itself reaches the identical function with
+/// the identical fields, plus the nested `umount` alias itself
+/// works.
+#[test]
+fn container_unmount_is_a_byte_identical_alias_for_top_level_unmount() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-unmount-alias:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 0".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/container-unmount-alias:latest"],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+
+    let alias = ociman(storage_dir.path(), &["container", "unmount", &id]);
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&alias.stdout).trim(), id);
+
+    // The nested `umount` alias itself, matching real podman's own
+    // identical `Aliases: []string{"umount"}` on both the top-level
+    // and nested commands.
+    let umount = ociman(storage_dir.path(), &["container", "umount", &id]);
+    assert!(
+        umount.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&umount.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&umount.stdout).trim(), id);
 }
