@@ -190,6 +190,49 @@ fn create_no_entry_flag_is_accepted_and_behaves_identically() {
     );
 }
 
+/// `create --root`/`-r` (`docs/design/0540`): accepted for real CLI
+/// compatibility with real distrobox's own cross-cutting `--root`,
+/// but changes nothing at all -- this project has no rootful/
+/// rootless distinction of any kind (see `Command::Create::root`'s
+/// own doc comment for the full, checked-directly reasoning).
+/// Proven here against a real box, still created exactly as a plain
+/// `create` would.
+#[test]
+fn create_root_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/create-root:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/create-root:latest",
+            "--name",
+            "rootbox",
+            "--root",
+        ],
+    );
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&create.stdout).trim(), "rootbox");
+    assert!(storage_dir.path().join("boxes").join("rootbox").is_dir());
+}
+
 #[test]
 fn create_refuses_a_name_already_in_use() {
     let Some(busybox) = busybox_path() else {

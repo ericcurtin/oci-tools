@@ -114,6 +114,45 @@ fn ephemeral_yes_flag_is_accepted_and_behaves_identically() {
     );
 }
 
+/// `ephemeral --root`/`-r` (`docs/design/0540`): accepted for real
+/// CLI compatibility with real distrobox's own cross-cutting
+/// `--root`, but changes nothing at all -- this project has no
+/// rootful/rootless distinction of any kind (see `Command::
+/// Create::root`'s own doc comment for the full, checked-directly
+/// reasoning).
+#[test]
+fn ephemeral_root_flag_is_accepted_and_behaves_identically() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    seed_ephemeral_base(storage_dir.path(), "ocibox-test/ephemeral-root-base:latest");
+
+    let out = ocibox(
+        storage_dir.path(),
+        &[
+            "ephemeral",
+            "--image",
+            "ocibox-test/ephemeral-root-base:latest",
+            "--root",
+            "--",
+            "/bin/echo",
+            "hello-ephemeral-root",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hello-ephemeral-root"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 #[test]
 fn ephemeral_forwards_the_containers_own_nonzero_exit_code() {
     if busybox_path().is_none() {

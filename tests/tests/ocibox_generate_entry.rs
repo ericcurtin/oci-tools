@@ -103,6 +103,38 @@ fn generate_entry_writes_a_real_desktop_launcher_with_the_default_icon() {
     );
 }
 
+/// `generate-entry --root`/`-r` (`docs/design/0540`): accepted for
+/// real CLI compatibility with real distrobox's own cross-cutting
+/// `--root`, but changes nothing at all -- this project has no
+/// rootful/rootless distinction of any kind (see `Command::
+/// Create::root`'s own doc comment for the full, checked-directly
+/// reasoning).
+#[test]
+fn generate_entry_root_flag_is_accepted_and_behaves_identically() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "genentry-root");
+
+    let generate = ocibox_with_home(
+        storage_dir.path(),
+        home_dir.path(),
+        &["generate-entry", "genentry-root", "--root"],
+    );
+    assert!(
+        generate.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&generate.stderr)
+    );
+    let entry_path = home_dir
+        .path()
+        .join(".local/share/applications/genentry-root.desktop");
+    assert!(entry_path.exists());
+}
+
 #[test]
 fn generate_entry_icon_overrides_the_default() {
     let Some(_busybox) = busybox_path() else {

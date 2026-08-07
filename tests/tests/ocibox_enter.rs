@@ -610,6 +610,41 @@ fn enter_no_tty_flag_and_both_real_aliases_are_accepted_and_behave_identically()
     }
 }
 
+/// `enter --root`/`-r` (`docs/design/0540`): accepted for real CLI
+/// compatibility with real distrobox's own cross-cutting `--root`,
+/// but changes nothing at all -- this project has no rootful/
+/// rootless distinction of any kind (see `Command::Create::root`'s
+/// own doc comment for the full, checked-directly reasoning).
+#[test]
+fn enter_root_flag_is_accepted_and_behaves_identically() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    make_box(&storage_dir, "rootenterbox");
+
+    let out = ocibox(
+        storage_dir.path(),
+        &[
+            "enter",
+            "--root",
+            "rootenterbox",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo hi",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+}
+
 /// `ocibox enter`'s own default behavior (a real, previously-missing
 /// merge this project's `enter` has never performed before now):
 /// the box's own `PATH` gets the real *host*'s own `$PATH` merged in,

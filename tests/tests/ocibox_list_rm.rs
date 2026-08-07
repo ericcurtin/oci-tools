@@ -130,6 +130,45 @@ fn list_no_color_flag_is_accepted_and_behaves_identically() {
     );
 }
 
+/// `list --root`/`-r` (`docs/design/0540`): accepted for real CLI
+/// compatibility with real distrobox's own cross-cutting `--root`,
+/// but changes nothing at all -- this project has no rootful/
+/// rootless distinction of any kind (see `Command::Create::root`'s
+/// own doc comment for the full, checked-directly reasoning).
+#[test]
+fn list_root_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/list-root:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/list-root:latest",
+            "--name",
+            "rootlistbox",
+        ],
+    );
+    assert!(create.status.success());
+
+    let plain = ocibox(storage_dir.path(), &["list"]);
+    assert!(plain.status.success());
+    let root = ocibox(storage_dir.path(), &["list", "--root"]);
+    assert!(root.status.success());
+    assert_eq!(plain.stdout, root.stdout);
+}
+
 #[test]
 fn list_json_reports_every_field_of_the_persisted_record() {
     let Some(busybox) = busybox_path() else {
@@ -339,6 +378,52 @@ fn rm_yes_flag_is_accepted_and_behaves_identically() {
         String::from_utf8_lossy(&rm.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&rm.stdout).trim(), "yesbox");
+    assert!(!box_dir.exists(), "the whole box directory should be gone");
+}
+
+/// `rm --root`/`-r` (`docs/design/0540`): accepted for real CLI
+/// compatibility with real distrobox's own cross-cutting `--root`,
+/// but changes nothing at all -- this project has no rootful/
+/// rootless distinction of any kind (see `Command::Create::root`'s
+/// own doc comment for the full, checked-directly reasoning). Proven
+/// here against a real box, which is still genuinely removed exactly
+/// as a plain `rm` would.
+#[test]
+fn rm_root_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/rm-root:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/rm-root:latest",
+            "--name",
+            "rootrmbox",
+        ],
+    );
+    assert!(create.status.success());
+    let box_dir = storage_dir.path().join("boxes").join("rootrmbox");
+    assert!(box_dir.is_dir());
+
+    let rm = ocibox(storage_dir.path(), &["rm", "rootrmbox", "--root"]);
+    assert!(
+        rm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&rm.stdout).trim(), "rootrmbox");
     assert!(!box_dir.exists(), "the whole box directory should be gone");
 }
 
@@ -731,6 +816,54 @@ fn stop_yes_flag_is_accepted_and_behaves_identically() {
     );
     assert!(
         storage_dir.path().join("boxes").join("stopyesbox").is_dir(),
+        "the box's own storage directory must survive stop completely untouched"
+    );
+}
+
+/// `stop --root`/`-r` (`docs/design/0540`): accepted for real CLI
+/// compatibility with real distrobox's own cross-cutting `--root`,
+/// but changes nothing at all -- this project has no rootful/
+/// rootless distinction of any kind (see `Command::Create::root`'s
+/// own doc comment for the full, checked-directly reasoning).
+#[test]
+fn stop_root_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/stop-root:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/stop-root:latest",
+            "--name",
+            "stoprootbox",
+        ],
+    );
+    assert!(create.status.success());
+
+    let stop = ocibox(storage_dir.path(), &["stop", "stoprootbox", "--root"]);
+    assert!(
+        stop.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        storage_dir
+            .path()
+            .join("boxes")
+            .join("stoprootbox")
+            .is_dir(),
         "the box's own storage directory must survive stop completely untouched"
     );
 }

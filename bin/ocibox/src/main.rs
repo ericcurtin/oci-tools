@@ -241,6 +241,32 @@ enum Command {
         /// has no `--no-entry` of its own either.
         #[arg(long = "no-entry")]
         no_entry: bool,
+        /// Accepted for real CLI compatibility with real distrobox's
+        /// own cross-cutting `--root`/`-r` flag (checked directly,
+        /// `~/git/distrobox/internal/cli/root.go:150-155,259-266`:
+        /// applied via the shared `withRoot` composition to `list`/
+        /// `generateEntry`/`create`/`enter`/`rm`/`stop`/`ephemeral` —
+        /// not declared locally on any one of those commands' own
+        /// `Flags` list, which is why a plain read of any single
+        /// command's own source file alone would miss it entirely);
+        /// has no effect. Real distrobox's own `--root` toggles
+        /// between a genuinely rootful and rootless container
+        /// manager (`~/git/distrobox/pkg/containermanager/providers/
+        /// podman.go`'s own `newPodman`/`p.root`, gating whether
+        /// generated commands run through `sudo`) — a real, live-
+        /// consumed value there, not dead code. This project's own
+        /// `ocibox` has no rootful/rootless distinction of any kind
+        /// at all: every box is always the real, checked-directly
+        /// equivalent of real distrobox's own rootless default, with
+        /// no alternate, privilege-elevated code path to switch into
+        /// in the first place, so accepting the flag is a genuine,
+        /// faithful no-op rather than a half-implemented
+        /// approximation of real root support. Real distrobox's own
+        /// `export` (unlike every other command here) never gets
+        /// `withRoot` applied at all — matched exactly: `ocibox
+        /// export` has no `--root` of its own either.
+        #[arg(long, short = 'r')]
+        root: bool,
     },
     /// List real, created boxes — matching real `distrobox list`
     /// (alias `ls`), narrowed to what this project's own boxes
@@ -275,6 +301,12 @@ enum Command {
         /// comment).
         #[arg(long = "no-color")]
         no_color: bool,
+        /// Same as [`Command::Create::root`] — see its own doc
+        /// comment for the full, checked-directly reasoning (real
+        /// distrobox's own cross-cutting `--root`/`-r`, applied to
+        /// `list` via the same shared `withRoot` composition).
+        #[arg(long, short = 'r')]
+        root: bool,
     },
     /// Remove one or more boxes entirely (each one's own rootfs and
     /// persisted record) — matching real `distrobox rm NAME
@@ -372,6 +404,12 @@ enum Command {
         /// mechanism for.
         #[arg(long, short = 'v')]
         verbose: bool,
+        /// Same as [`Command::Create::root`] — see its own doc
+        /// comment for the full, checked-directly reasoning (real
+        /// distrobox's own cross-cutting `--root`/`-r`, applied to
+        /// `rm` via the same shared `withRoot` composition).
+        #[arg(long, short = 'r')]
+        root: bool,
     },
     /// A real, checked-directly no-op: a box has no persisted running
     /// state at all (`docs/design/0207`/`0515` -- `ocibox enter` runs
@@ -423,6 +461,12 @@ enum Command {
         /// `0514`, for the identical reasoning).
         #[arg(long = "yes", short = 'Y')]
         yes: bool,
+        /// Same as [`Command::Create::root`] — see its own doc
+        /// comment for the full, checked-directly reasoning (real
+        /// distrobox's own cross-cutting `--root`/`-r`, applied to
+        /// `stop` via the same shared `withRoot` composition).
+        #[arg(long, short = 'r')]
+        root: bool,
     },
     /// Enter a box: runs a real, live, interactive command inside its
     /// own already-extracted rootfs — rootless namespaces (matching
@@ -533,6 +577,12 @@ enum Command {
         /// `--unshare-groups` concept of any kind.
         #[arg(long = "no-tty", short = 'T', short_alias = 'H')]
         no_tty: bool,
+        /// Same as [`Command::Create::root`] — see its own doc
+        /// comment for the full, checked-directly reasoning (real
+        /// distrobox's own cross-cutting `--root`/`-r`, applied to
+        /// `enter` via the same shared `withRoot` composition).
+        #[arg(long, short = 'r')]
+        root: bool,
     },
     /// Create a temporary box, run one command (or a default shell)
     /// inside it, and always remove it again afterward — matching
@@ -620,6 +670,12 @@ enum Command {
         /// defaults to a shell (see `ocibox enter`'s own doc comment)
         /// if empty.
         command: Vec<String>,
+        /// Same as [`Command::Create::root`] — see its own doc
+        /// comment for the full, checked-directly reasoning (real
+        /// distrobox's own cross-cutting `--root`/`-r`, applied to
+        /// `ephemeral` via the same shared `withRoot` composition).
+        #[arg(long, short = 'r')]
+        root: bool,
     },
     /// Export a binary or graphical application from inside a box onto
     /// the host — matching real `distrobox export`'s own `--bin`/
@@ -872,6 +928,13 @@ enum Command {
         /// fetch).
         #[arg(long, short = 'i', value_name = "ICON")]
         icon: Option<String>,
+        /// Same as [`Command::Create::root`] — see its own doc
+        /// comment for the full, checked-directly reasoning (real
+        /// distrobox's own cross-cutting `--root`/`-r`, applied to
+        /// `generate-entry` via the same shared `withRoot`
+        /// composition).
+        #[arg(long, short = 'r')]
+        root: bool,
     },
 }
 
@@ -895,6 +958,7 @@ fn main() -> std::process::ExitCode {
                 volume,
                 platform,
                 no_entry: _,
+                root: _,
             }) => cmd_create(
                 image.as_deref(),
                 clone.as_deref(),
@@ -905,7 +969,10 @@ fn main() -> std::process::ExitCode {
                 &volume,
                 platform.as_deref(),
             ),
-            Some(Command::List { no_color: _ }) => cmd_list(cli.global.json),
+            Some(Command::List {
+                no_color: _,
+                root: _,
+            }) => cmd_list(cli.global.json),
             Some(Command::Rm {
                 names,
                 force: _,
@@ -913,8 +980,14 @@ fn main() -> std::process::ExitCode {
                 rm_home: _,
                 all,
                 verbose: _,
+                root: _,
             }) => cmd_rm(&names, all),
-            Some(Command::Stop { names, all, yes: _ }) => cmd_stop(&names, all),
+            Some(Command::Stop {
+                names,
+                all,
+                yes: _,
+                root: _,
+            }) => cmd_stop(&names, all),
             Some(Command::Enter {
                 name,
                 command,
@@ -922,6 +995,7 @@ fn main() -> std::process::ExitCode {
                 no_workdir,
                 yes: _,
                 no_tty: _,
+                root: _,
             }) => cmd_enter(&name, &command, clean_path, no_workdir),
             Some(Command::Ephemeral {
                 image,
@@ -933,6 +1007,7 @@ fn main() -> std::process::ExitCode {
                 volume,
                 platform,
                 command,
+                root: _,
             }) => cmd_ephemeral(
                 image.as_deref(),
                 clone.as_deref(),
@@ -975,6 +1050,7 @@ fn main() -> std::process::ExitCode {
                 all,
                 delete,
                 icon,
+                root: _,
             }) => cmd_generate_entry(name.as_deref(), all, delete, icon.as_deref()),
             None => anyhow::bail!(
                 "no subcommand given (try `ocibox create --image ... --name ...`); \
