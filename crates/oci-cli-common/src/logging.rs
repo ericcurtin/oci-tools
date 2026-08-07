@@ -7,8 +7,30 @@ use anyhow::Context as _;
 
 use crate::args::GlobalArgs;
 
-/// Initialize global logging from the shared CLI flags.
+/// The `--log-level` default every `GlobalArgs` instance starts with
+/// (`GlobalArgs::log_level`'s own `default_value`) — matching real
+/// podman's own identical `defaultLogLevel` (`~/git/podman/cmd/
+/// podman/root.go:98-99`), and this function's own reference point
+/// for detecting whether `--log-level` was *also* explicitly given
+/// alongside `--debug` (see [`init`]'s own doc comment).
+const DEFAULT_LOG_LEVEL: &str = "warn";
+
+/// Initialize global logging from the shared CLI flags. `--debug`/
+/// `-D` (`0561`), when given, forces the filter to `"debug"` exactly
+/// like real `podman`/`docker -D`'s own identical flag — matching
+/// real podman's own checked-directly `loggingHook` exactly (`~/git/
+/// podman/cmd/podman/root.go:492-500`): combining it with an
+/// explicit, non-default `--log-level` is a real, immediate error
+/// (podman's own exact wording, `"Setting --log-level and --debug is
+/// not allowed"`), never a silent "one wins" resolution.
 pub fn init(args: &GlobalArgs) -> anyhow::Result<()> {
+    if args.debug {
+        anyhow::ensure!(
+            args.log_level == DEFAULT_LOG_LEVEL,
+            "Setting --log-level and --debug is not allowed"
+        );
+        return init_with_filter("debug");
+    }
     init_with_filter(&args.log_level)
 }
 
@@ -48,5 +70,26 @@ mod tests {
             tracing_subscriber::EnvFilter::try_new(filter)
                 .unwrap_or_else(|err| panic!("filter {filter:?} should parse: {err}"));
         }
+    }
+
+    /// `--debug` (`0561`) combined with a non-default `--log-level`
+    /// is a real, immediate error, matching real podman's own
+    /// `loggingHook` exactly -- fires before `init_with_filter` ever
+    /// reaches its own `try_init()` call, the same "safe to run
+    /// alongside every other test in this same process" property
+    /// [`rejects_invalid_filter`] above already relies on.
+    #[test]
+    fn debug_flag_conflicts_with_a_non_default_log_level() {
+        let args = GlobalArgs {
+            log_level: "error".to_string(),
+            json: false,
+            debug: true,
+        };
+        let err = init(&args).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Setting --log-level and --debug is not allowed"),
+            "unexpected error: {err:#}"
+        );
     }
 }

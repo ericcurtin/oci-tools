@@ -177,3 +177,73 @@ fn ocicri_json_flag_is_accepted_and_the_server_still_starts() {
          (a real argument-parsing failure would exit almost immediately)"
     );
 }
+
+/// `--debug`/`-D` (`docs/design/0561`, matching real `podman`/`docker
+/// -D`/`runc --debug`/`crun --debug`) parses on every clap binary --
+/// the same "no `unexpected argument`" check `json_flag_is_accepted_
+/// globally` already establishes for `--json`, both long and short
+/// forms.
+#[test]
+fn debug_flag_and_its_short_alias_are_accepted_globally() {
+    for bin in CLAP_BINS {
+        if *bin == "ocicri" {
+            continue;
+        }
+        for flag in ["--debug", "-D"] {
+            let out = run(bin, &[flag]);
+            let stderr = String::from_utf8(out.stderr).expect("utf-8 stderr");
+            assert!(
+                !stderr.contains("unexpected argument") && !stderr.contains("unrecognized"),
+                "{bin} {flag}: must be a recognized global flag: {stderr:?}"
+            );
+        }
+    }
+}
+
+/// `--debug` combined with a real, explicit, non-default
+/// `--log-level` is a real, immediate, clear error everywhere --
+/// matching real podman's own identical `loggingHook` conflict check
+/// exactly (see `oci_cli_common::logging::init`'s own doc comment for
+/// the exact citation), verified end to end through the real shared
+/// error-rendering path every other clap binary already uses.
+#[test]
+fn debug_flag_conflicts_with_an_explicit_log_level_everywhere() {
+    for bin in CLAP_BINS {
+        if *bin == "ocicri" {
+            continue;
+        }
+        let out = run(bin, &["--debug", "--log-level", "error"]);
+        assert!(!out.status.success(), "{bin}: {out:?}");
+        let stderr = String::from_utf8(out.stderr).expect("utf-8 stderr");
+        assert!(
+            stderr.contains("Setting --log-level and --debug is not allowed"),
+            "{bin}: {stderr:?}"
+        );
+    }
+}
+
+/// `ocicri --debug` specifically: the same "still running a moment
+/// later" liveness check `ocicri_json_flag_is_accepted_and_the_
+/// server_still_starts` already establishes for `--json` -- a real
+/// argument-parsing failure would exit almost immediately instead.
+#[test]
+fn ocicri_debug_flag_is_accepted_and_the_server_still_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("ocicri.sock");
+    let mut child = Command::new(bin_path("ocicri"))
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["--debug", "--listen", socket_path.to_str().unwrap()])
+        .spawn()
+        .expect("failed to spawn ocicri");
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let still_running = child.try_wait().unwrap().is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        still_running,
+        "ocicri --debug should still be running a moment later, not have exited already \
+         (a real argument-parsing failure would exit almost immediately)"
+    );
+}
