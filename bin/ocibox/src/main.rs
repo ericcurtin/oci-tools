@@ -293,6 +293,37 @@ enum Command {
         /// already established.
         #[arg(long = "absolutely-disable-root-password-i-am-really-positively-sure")]
         absolutely_disable_root_password_i_am_really_positively_sure: bool,
+        /// Accepted for real CLI compatibility with real `distrobox
+        /// create --verbose`/`-v`; a real, faithful no-op here.
+        /// Unlike `enter`/`ephemeral --verbose` (`docs/design/0557`,
+        /// the one real, live exception this project already found
+        /// and closed), `create`'s own copy is genuinely dead in real
+        /// distrobox itself — checked directly, exhaustive `grep
+        /// 'Bool("verbose")'` across `~/git/distrobox/internal/cli/`
+        /// and `~/git/distrobox/pkg/`: `create.go`'s own `createAction`
+        /// body never reads it at all (only `enter.go`/`rm.go`/
+        /// `generate-entry.go`/`root.go` do), and it's never forwarded
+        /// into `commands.CreateOptions{...}`
+        /// (`~/git/distrobox/internal/cli/create.go:200-224`, no
+        /// `Verbose` field in that literal) or the `GenerateEntryOptions
+        /// {...}` call either (`~/git/distrobox/pkg/commands/
+        /// create.go:163-176`). The one place a `verbose` bool could
+        /// still theoretically reach — container-manager construction
+        /// (`root.go:296-317`'s `withContainerManager` →
+        /// `providers.NewPodman(root, sudoCommand, verbose, ...)`,
+        /// `podman.go:27,41-51`) — is confirmed a dead end too: `grep
+        /// -rn "\.verbose\b" ~/git/distrobox/pkg/containermanager/`
+        /// only matches a test assertion
+        /// (`providers/clone_internal_test.go`), never any real
+        /// command-generation path — the exact same "genuinely dead
+        /// upstream" finding `docs/design/0536`'s own `rm --verbose`
+        /// note already made, holding identically here. No `-v` short
+        /// alias — unlike upstream's own `-v`, this project's
+        /// `--volume` above already owns that letter on this same
+        /// command (the identical real collision `0557` already hit
+        /// for `Ephemeral::verbose`, resolved the same way there).
+        #[arg(long = "verbose")]
+        verbose: bool,
     },
     /// List real, created boxes — matching real `distrobox list`
     /// (alias `ls`), narrowed to what this project's own boxes
@@ -1092,6 +1123,7 @@ fn main() -> std::process::ExitCode {
                 no_entry: _,
                 root: _,
                 absolutely_disable_root_password_i_am_really_positively_sure: _,
+                verbose: _,
             }) => cmd_create(
                 image.as_deref(),
                 clone.as_deref(),

@@ -277,6 +277,52 @@ fn create_nopasswd_flag_is_accepted_and_behaves_identically() {
     assert!(storage_dir.path().join("boxes").join("nopwbox").is_dir());
 }
 
+/// `--verbose` (`docs/design/0564`) is accepted for real CLI
+/// compatibility with real `distrobox create --verbose`/`-v`, but
+/// changes nothing at all -- this project's own `--verbose` is
+/// long-only here (no `-v` short alias, already owned by `--volume`
+/// on this same command), and genuinely dead in real distrobox
+/// itself for `create` specifically (see `Command::Create::verbose`'s
+/// own doc comment for the full, checked-directly reasoning -- unlike
+/// `enter`/`ephemeral --verbose`, `0557`'s own real, live exception).
+/// Proven here against a real box, still created exactly as a plain
+/// `create` would.
+#[test]
+fn create_verbose_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/create-verbose:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/create-verbose:latest",
+            "--name",
+            "verbosebox",
+            "--verbose",
+        ],
+    );
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&create.stdout).trim(), "verbosebox");
+    assert!(storage_dir.path().join("boxes").join("verbosebox").is_dir());
+}
+
 #[test]
 fn create_refuses_a_name_already_in_use() {
     let Some(busybox) = busybox_path() else {
