@@ -1706,6 +1706,120 @@ fn ps_filter_ancestor_matches_the_containers_own_image_reference() {
     assert!(String::from_utf8_lossy(&no_all.stdout).trim().is_empty());
 }
 
+/// `ociman ps --filter ancestor=<full-manifest-digest>` (`0567`),
+/// matching real `podman ps --filter ancestor=`'s own checked-
+/// directly narrow digest-matching rule (verified live against a
+/// real installed `podman 4.9.3` on this same host): a real, full,
+/// bare 64-hex manifest-digest ID matches, but neither a `sha256:`-
+/// prefixed form nor a short hex prefix does -- see
+/// `matches_ancestor_filter`'s own doc comment for the exact
+/// citation. Also confirms `--filter ancestor=<digest>` never turns
+/// on `ps`'s own `SIZE` column as a side effect of opening the image
+/// store for the digest lookup (a real bug caught and fixed while
+/// implementing this).
+#[test]
+fn ps_filter_ancestor_matches_a_real_full_manifest_digest_but_not_a_prefix_or_scheme() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-filter-ancestor-digest:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let digest = store
+        .resolve_image("docker.io/ociman-test/ps-filter-ancestor-digest:latest")
+        .unwrap()
+        .expect("the just-seeded image should resolve")
+        .manifest_digest
+        .hex()
+        .to_string();
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "ancestor-digest-ctr",
+            "ociman-test/ps-filter-ancestor-digest:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    assert!(!id.is_empty());
+
+    // The real, full, bare hex digest matches.
+    let full = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", &format!("ancestor={digest}"), "-q"],
+    );
+    assert!(full.status.success(), "{full:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&full.stdout).trim(),
+        id,
+        "a real, full, bare manifest-digest hex ID should match: {full:?}"
+    );
+
+    // A `sha256:`-prefixed full digest does NOT match -- checked
+    // directly against a real installed `podman 4.9.3`.
+    let scheme_prefixed = ociman(
+        storage_dir.path(),
+        &[
+            "ps",
+            "-a",
+            "--filter",
+            &format!("ancestor=sha256:{digest}"),
+            "-q",
+        ],
+    );
+    assert!(scheme_prefixed.status.success(), "{scheme_prefixed:?}");
+    assert!(
+        String::from_utf8_lossy(&scheme_prefixed.stdout)
+            .trim()
+            .is_empty(),
+        "a sha256:-prefixed digest should not match: {scheme_prefixed:?}"
+    );
+
+    // A short hex prefix does NOT match either -- same real,
+    // checked-directly-narrow rule.
+    let short_prefix = ociman(
+        storage_dir.path(),
+        &[
+            "ps",
+            "-a",
+            "--filter",
+            &format!("ancestor={}", &digest[..12]),
+            "-q",
+        ],
+    );
+    assert!(short_prefix.status.success(), "{short_prefix:?}");
+    assert!(
+        String::from_utf8_lossy(&short_prefix.stdout)
+            .trim()
+            .is_empty(),
+        "a short hex prefix should not match: {short_prefix:?}"
+    );
+
+    // A real bug caught and fixed while implementing this: opening
+    // the image store for the digest lookup must never turn on the
+    // `SIZE` column as a side effect -- only `--size` itself should.
+    let no_size_flag = ociman(
+        storage_dir.path(),
+        &["ps", "-a", "--filter", &format!("ancestor={digest}")],
+    );
+    assert!(no_size_flag.status.success(), "{no_size_flag:?}");
+    assert!(
+        !String::from_utf8_lossy(&no_size_flag.stdout).contains("SIZE"),
+        "the SIZE column should not appear without --size: {no_size_flag:?}"
+    );
+}
+
 /// `ociman ps --filter exited=` (0282), matching real `podman ps
 /// --filter exited=` exactly: matches a container with a real,
 /// recorded exit code equal to one of the given values, never one

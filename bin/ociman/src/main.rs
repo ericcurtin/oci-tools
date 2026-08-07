@@ -14052,12 +14052,34 @@ fn parse_ps_filters(filters: &[String]) -> anyhow::Result<PsFilters> {
 /// Whether `image_reference` (a container's own recorded
 /// `ANNOTATION_IMAGE`, e.g. `docker.io/library/busybox:latest`)
 /// matches one `--filter ancestor=` value -- see [`Command::Ps`]'s
-/// own doc comment for exactly which real, checked-directly rule this
-/// implements (name/tag substring matching only; an exact-full-
-/// manifest-digest match, and real docker/podman's own broader
-/// "or a descendant" image-lineage semantics, are both real,
-/// deliberately deferred candidates noted there).
-fn matches_ancestor_filter(image_reference: &str, want: &str) -> bool {
+/// own doc comment for exactly which real, checked-directly rules
+/// this implements: name/tag substring matching, and (`0567`) an
+/// exact, full, bare manifest-digest hex match. Real docker/podman's
+/// own broader "or a descendant" image-lineage semantics remains a
+/// real, deliberately deferred candidate (this project's own
+/// content-addressed store has no direct "parent image" graph at
+/// all).
+///
+/// `manifest_digest`, when given, is `s`'s own resolved image's real
+/// manifest digest (lowercase hex, no `sha256:` prefix — see
+/// [`cmd_ps`]'s own call site for exactly how and when this is
+/// resolved). Matched by exact, case-insensitive string equality only
+/// -- checked directly against a real installed `podman 4.9.3`:
+/// `ancestor=<full 64-hex ID>` matches, but neither a short prefix
+/// (`ancestor=e0e8b3cbfed6`) nor a `sha256:`-prefixed full ID
+/// (`ancestor=sha256:e0e8...`) does, confirmed live on the exact same
+/// installed binary today (`docs/design/0281`'s own original finding,
+/// re-verified unchanged). This project's own "image ID" convention
+/// project-wide is the manifest digest (not real docker/podman's own
+/// separate config-digest-based `IMAGE ID`) — the same already-
+/// established divergence every other image-ID-resolving command
+/// here (`rmi`/`inspect`/`images`) already has, not a new one
+/// introduced here.
+fn matches_ancestor_filter(
+    image_reference: &str,
+    want: &str,
+    manifest_digest: Option<&str>,
+) -> bool {
     if image_reference.contains(want) {
         return true;
     }
@@ -14065,9 +14087,13 @@ fn matches_ancestor_filter(image_reference: &str, want: &str) -> bool {
     // reference too -- checked directly against a real installed
     // `podman ps --filter ancestor=busybox` against a real
     // `docker.io/library/busybox:latest` container.
-    image_reference
+    if image_reference
         .strip_suffix(":latest")
         .is_some_and(|without_tag| without_tag.contains(want))
+    {
+        return true;
+    }
+    manifest_digest.is_some_and(|digest| digest.eq_ignore_ascii_case(want))
 }
 
 /// Resolve `reference` (a container id/`--name`, `before=`/`since=`'s
@@ -14173,11 +14199,46 @@ fn cmd_ps(
     let last = if latest { 1 } else { last };
     let filters = parse_ps_filters(filter)?;
     let containers = open_container_store()?;
-    // Only opened when actually needed -- `--size` is the only reason
-    // `ps` would ever need the image store at all, and real podman's
-    // own identical on-demand-only computation (`~/git/podman/pkg/ps/
-    // ps.go`) is the whole reason this is opt-in in the first place.
-    let store = size.then(open_store).transpose()?;
+    let container_records = containers.list().context("listing containers")?;
+    // `--filter ancestor=<full-manifest-digest>` (`0567`) is the
+    // *other* real reason `ps` would ever need the image store at all,
+    // besides `--size` -- see `matches_ancestor_filter`'s own doc
+    // comment for exactly which values qualify (a bare, full 64-hex
+    // string only). Only opened when actually needed, same reasoning
+    // `--size`'s own identical on-demand-only computation already
+    // establishes.
+    let ancestor_wants_digest_lookup = filters
+        .ancestor
+        .iter()
+        .any(|w| w.len() == 64 && w.bytes().all(|b| b.is_ascii_hexdigit()));
+    let store = (size || ancestor_wants_digest_lookup)
+        .then(open_store)
+        .transpose()?;
+    // Resolved once, up front, for every distinct image reference
+    // among this store's own containers -- keeps the per-container
+    // filter closure below infallible, the same reasoning
+    // `before_threshold`/`since_threshold` just below already
+    // establish. A container whose own recorded image can no longer
+    // be resolved (e.g. `rmi`'d since) simply has no entry here --
+    // its own `ancestor=` digest match then honestly fails, the same
+    // "absence over fabrication" convention this project already
+    // follows elsewhere.
+    let image_manifest_digests: std::collections::HashMap<&str, String> =
+        if ancestor_wants_digest_lookup {
+            let store = store.as_ref().expect("opened just above");
+            let mut map = std::collections::HashMap::new();
+            for s in &container_records {
+                if let Some(image_ref) = s.annotations.get(ANNOTATION_IMAGE)
+                    && !map.contains_key(image_ref.as_str())
+                    && let Ok(Some(record)) = store.resolve_image(image_ref)
+                {
+                    map.insert(image_ref.as_str(), record.manifest_digest.hex().to_string());
+                }
+            }
+            map
+        } else {
+            std::collections::HashMap::new()
+        };
     // A positive `--last`/`-n` overrides the default running-only
     // visibility rule too, matching real podman's own identical
     // `all := options.All || options.Last > 0` exactly (checked
@@ -14192,9 +14253,7 @@ fn cmd_ps(
     let since_threshold = (!filters.since.is_empty())
         .then(|| earliest_referenced_creation(&containers, &filters.since))
         .transpose()?;
-    let mut views: Vec<ContainerView> = containers
-        .list()
-        .context("listing containers")?
+    let mut views: Vec<ContainerView> = container_records
         .iter()
         .filter(|s| {
             let visible = if filters.status.is_empty() {
@@ -14299,10 +14358,11 @@ fn cmd_ps(
                     .get(ANNOTATION_IMAGE)
                     .map(String::as_str)
                     .unwrap_or("");
+                let digest = image_manifest_digests.get(image).map(String::as_str);
                 if !filters
                     .ancestor
                     .iter()
-                    .any(|want| matches_ancestor_filter(image, want))
+                    .any(|want| matches_ancestor_filter(image, want, digest))
                 {
                     return false;
                 }
@@ -14335,7 +14395,12 @@ fn cmd_ps(
         })
         .map(|s| {
             let mut view = ContainerView::from_state(s);
-            if let Some(store) = &store {
+            // `size` (the `--size` flag itself), not merely whether
+            // `store` happens to be open at all -- `0567`'s own
+            // `--filter ancestor=<digest>` may also need the store
+            // open, but must never turn on the size column as a
+            // side effect of that unrelated reason.
+            if size && let Some(store) = &store {
                 view.size = Some(compute_container_size(store, s));
             }
             view
