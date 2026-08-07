@@ -102,12 +102,12 @@ struct Cli {
     listen: Option<PathBuf>,
 }
 
-/// See [`Cli::command`]'s own doc comment. Only `version` so far —
-/// real `crio`'s own other subcommands (`check`/`config`/`publish`/
-/// `status`/`wipe`) are all real, separate, much bigger gaps
-/// (respectively: a standalone healthcheck-config CLI, a config-file
-/// generator/validator, a systemd-notify-socket publisher, a runtime
-/// status dump, and an on-disk-state wipe tool) — each its own future
+/// See [`Cli::command`]'s own doc comment. `version` (`0532`) and now
+/// `wipe` (`0542`) — real `crio`'s own remaining subcommands
+/// (`check`/`config`/`publish`/`status`) are all real, separate, much
+/// bigger gaps (respectively: a standalone healthcheck-config CLI, a
+/// config-file generator/validator, a systemd-notify-socket
+/// publisher, and a runtime status dump) — each its own future
 /// increment, not folded in here.
 #[derive(Debug, clap::Subcommand)]
 enum Command {
@@ -120,6 +120,49 @@ enum Command {
     /// every other `ocicri`/`ociman` command's own identical
     /// convention) rather than a second, redundant one.
     Version,
+    /// "wipe CRI-O's container and image storage" (real `crio wipe`'s
+    /// own `Usage` string, quoted verbatim, minus the image half — see
+    /// below) — matching real `crio wipe` exactly for the part this
+    /// project's own architecture can safely, precisely act on
+    /// (checked directly, `~/git/cri-o/internal/criocli/wipe.go:18-
+    /// 29`): removes every stored `ocicri` pod-sandbox/container
+    /// record and its bundle, unconditionally (see `cmd_wipe`'s own
+    /// doc comment).
+    ///
+    /// Deliberately narrower than real crio, in two checked-directly
+    /// ways:
+    ///
+    /// * No image wipe. Real crio's own `wipeCrio` (`wipe.go:135-153`)
+    ///   also deletes every image it considers "its own"
+    ///   (`getCrioContainersAndImages`, `wipe.go:161-193`, tagged via
+    ///   `storage.IsCrioContainer` — real `containers/storage`'s own
+    ///   per-tool metadata). This project's own `ocicri` deliberately
+    ///   shares one plain `oci_store` with `ociman` instead (see
+    ///   `image_service.rs`'s own module doc comment), which has no
+    ///   such per-tool ownership tagging at all: an indiscriminate
+    ///   image wipe here would risk deleting `ociman`'s own images
+    ///   too. Wiping only what this project can precisely,
+    ///   unambiguously identify as its own — container/sandbox
+    ///   records — is the honestly-scoped slice.
+    /// * `--force`/`-f` is a real, faithful no-op. Real crio's own
+    ///   `--force` only ever skips a version-file-based "did the node
+    ///   reboot / did crio upgrade since the last wipe" gate
+    ///   (`version.ShouldCrioWipe`) before deciding whether to wipe at
+    ///   all — checked directly, `wipe.go:44-60`. This project has no
+    ///   such version-file/unclean-shutdown-tracking concept at all (a
+    ///   real, pre-existing, separate gap, not introduced here), so
+    ///   there is no gate here to skip in the first place: every
+    ///   `ocicri wipe` invocation already wipes unconditionally,
+    ///   whether `--force` is given or not — accepted for real CLI
+    ///   compatibility, changing nothing, the same "nothing to skip"
+    ///   reasoning class `ociman commit --quiet` (`0523`) already
+    ///   established.
+    Wipe {
+        /// See this variant's own doc comment: accepted for real CLI
+        /// compatibility, a real, faithful no-op.
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 fn default_socket_path() -> PathBuf {
@@ -150,8 +193,10 @@ fn main() -> std::process::ExitCode {
             "ocicri starting"
         );
 
-        if let Some(Command::Version) = cli.command {
-            return cmd_version(cli.global.json);
+        match cli.command {
+            Some(Command::Version) => return cmd_version(cli.global.json),
+            Some(Command::Wipe { force: _ }) => return cmd_wipe(cli.global.json),
+            None => {}
         }
 
         let socket_path = cli.listen.unwrap_or_else(default_socket_path);
@@ -257,5 +302,72 @@ fn cmd_version(json: bool) -> anyhow::Result<()> {
     println!("Version:    {}", report.version);
     println!("GitCommit:  {}", report.git_commit);
     println!("Platform:   {}", report.platform);
+    Ok(())
+}
+
+/// [`Command::Wipe`]'s own report — every container/pod-sandbox
+/// record this run actually removed, in the same newest-first order
+/// `records::load_all` already returns them in.
+#[derive(Debug, Default, serde::Serialize)]
+struct WipeReport {
+    containers: Vec<String>,
+    pod_sandboxes: Vec<String>,
+}
+
+/// `ocicri wipe` (see [`Command::Wipe`]'s own doc comment for the
+/// exact real-vs-narrowed-here semantics): removes every stored
+/// container and pod-sandbox record and its bundle, unconditionally.
+///
+/// Deliberately no live-process handling (no SIGKILL-and-wait cascade
+/// the way `RemoveContainer`/`RemovePodSandbox`'s own forceful RPC
+/// paths have — see `runtime_service.rs`'s own `force_kill_and_
+/// reconcile`): matches real crio's own identical `deleteContainer`
+/// (`wipe.go:169-181`), which likewise only ever unmounts and deletes
+/// storage, with no explicit kill step of its own either. Real crio's
+/// primary invocation model for this command is a systemd
+/// `ExecStartPre` run *before* the server itself starts (checked
+/// directly against the reasoning in `wipe.go`'s own unclean-shutdown
+/// handling) — this project's own identical assumption (not running
+/// concurrently against a live `ocicri` server on the same storage
+/// root) is the same honest scope, not a shortcut.
+fn cmd_wipe(json: bool) -> anyhow::Result<()> {
+    let storage_root = oci_cli_common::storage::default_root();
+    let mut report = WipeReport::default();
+
+    let container_root = container::container_root(&storage_root);
+    for record in container::load_all(&container_root).with_context(|| {
+        format!(
+            "reading container records from {}",
+            container_root.display()
+        )
+    })? {
+        bundle::remove(&storage_root, &record.id)
+            .with_context(|| format!("removing bundle for container {}", record.id))?;
+        container::remove(&container_root, &record.id)
+            .with_context(|| format!("removing container record {}", record.id))?;
+        if !json {
+            println!("Deleted container {}", record.id);
+        }
+        report.containers.push(record.id);
+    }
+
+    let sandbox_root = sandbox::sandbox_root(&storage_root);
+    for record in sandbox::load_all(&sandbox_root).with_context(|| {
+        format!(
+            "reading pod sandbox records from {}",
+            sandbox_root.display()
+        )
+    })? {
+        sandbox::remove(&sandbox_root, &record.id)
+            .with_context(|| format!("removing pod sandbox record {}", record.id))?;
+        if !json {
+            println!("Deleted pod sandbox {}", record.id);
+        }
+        report.pod_sandboxes.push(record.id);
+    }
+
+    if json {
+        oci_cli_common::output::print_json(&report)?;
+    }
     Ok(())
 }
