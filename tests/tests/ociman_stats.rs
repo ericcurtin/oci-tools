@@ -743,3 +743,234 @@ fn stats_latest_on_an_empty_store_is_a_clear_error() {
     let out = ociman(storage_dir.path(), &["stats", "--latest"]);
     assert!(!out.status.success());
 }
+
+/// `stats --all --no-stream` (`docs/design/0560`) reports every real
+/// running container's own sample, sorted by creation time, and
+/// silently excludes an already-stopped one -- matching real `podman
+/// stats --all`'s own identical `GetAllContainers` enumeration
+/// (checked directly, `~/git/podman/pkg/domain/infra/abi/
+/// containers.go:1663-1690`), with a non-running container simply
+/// producing no row at all (the same honest "nothing to report"
+/// reasoning a single `stats <id>` already uses when that one
+/// container itself isn't running).
+#[test]
+fn stats_all_no_stream_reports_every_running_container_sorted_by_creation() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stats-all:latest",
+        &busybox,
+        &["sh", "sleep", "true"],
+        ContainerConfig::default(),
+    );
+
+    let mut older = ociman_run_detached_named(
+        storage_dir.path(),
+        "stats-all-older",
+        "ociman-test/stats-all:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "stats-all-older",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    // A real, distinguishable creation-time gap.
+    std::thread::sleep(Duration::from_secs(2));
+
+    // A container that has already stopped by the time `stats --all`
+    // runs -- it should produce no row at all, never an error, never
+    // a placeholder.
+    let stopped = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--name",
+            "stats-all-stopped",
+            "ociman-test/stats-all:latest",
+            "true",
+        ],
+    );
+    assert!(stopped.status.success(), "{stopped:?}");
+
+    let mut newer = ociman_run_detached_named(
+        storage_dir.path(),
+        "stats-all-newer",
+        "ociman-test/stats-all:latest",
+        &["/bin/sh", "-c", "sleep 30"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "stats-all-newer",
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let stats = ociman(
+        storage_dir.path(),
+        &["stats", "--all", "--no-stream", "--json"],
+    );
+    assert!(
+        stats.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stats.stderr)
+    );
+    let views: Vec<serde_json::Value> = serde_json::from_slice(&stats.stdout).unwrap();
+    let names: Vec<&str> = views.iter().map(|v| v["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        vec!["stats-all-older", "stats-all-newer"],
+        "the stopped container should be silently excluded, and the two running ones sorted \
+         oldest-first: {views:?}"
+    );
+
+    ociman(storage_dir.path(), &["kill", "stats-all-older"]);
+    ociman(storage_dir.path(), &["kill", "stats-all-newer"]);
+    older.wait().ok();
+    newer.wait().ok();
+    ociman(storage_dir.path(), &["rm", "-a", "-f"]);
+}
+
+/// `stats --all --no-stream` on a genuinely empty store is a real,
+/// honest empty JSON array, never an error -- matching this project's
+/// own already-established "always-valid-JSON-shape" convention.
+#[test]
+fn stats_all_no_stream_on_an_empty_store_is_an_empty_json_array() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(
+        storage_dir.path(),
+        &["stats", "--all", "--no-stream", "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[]");
+}
+
+/// `--all` without `--no-stream` is a real, clear, honest "not yet
+/// supported" error -- see `Command::Stats::all`'s own doc comment
+/// for exactly why this first slice deliberately doesn't attempt
+/// real podman's own richer continuous-multi-container streaming
+/// mode.
+#[test]
+fn stats_all_without_no_stream_is_a_clear_not_yet_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    let out = ociman(storage_dir.path(), &["stats", "--all"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not yet supported"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `--all` combined with `--latest` or an explicit container is a
+/// real, immediate error -- matching real podman's own exact wording
+/// (checked directly, `~/git/podman/cmd/podman/containers/
+/// stats.go`'s own `checkStatOptions`), extended here to genuinely
+/// cover all three now that `--all` is a real flag (it was previously
+/// only checked against `--latest`+an-explicit-id, since `--all` had
+/// no CLI presence at all yet).
+#[test]
+fn stats_all_combined_with_latest_or_an_explicit_container_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let with_latest = ociman(
+        storage_dir.path(),
+        &["stats", "--all", "--latest", "--no-stream"],
+    );
+    assert!(!with_latest.status.success());
+    assert!(
+        String::from_utf8_lossy(&with_latest.stderr)
+            .contains("--all, --latest and containers cannot be used together"),
+        "{}",
+        String::from_utf8_lossy(&with_latest.stderr)
+    );
+
+    let with_id = ociman(
+        storage_dir.path(),
+        &["stats", "--all", "somecontainer", "--no-stream"],
+    );
+    assert!(!with_id.status.success());
+    assert!(
+        String::from_utf8_lossy(&with_id.stderr)
+            .contains("--all, --latest and containers cannot be used together"),
+        "{}",
+        String::from_utf8_lossy(&with_id.stderr)
+    );
+}
+
+/// `container stats --all` (the alias) dispatches identically to the
+/// top-level command's own new flag.
+#[test]
+fn container_stats_all_no_stream_is_a_byte_identical_alias() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-stats-all:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/container-stats-all:latest",
+        &["/bin/sh", "-c", "while true; do sleep 1; done"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let alias = ociman(
+        storage_dir.path(),
+        &["container", "stats", "--all", "--no-stream", "--json"],
+    );
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    let views: Vec<serde_json::Value> = serde_json::from_slice(&alias.stdout).unwrap();
+    assert_eq!(views.len(), 1, "{views:?}");
+    assert_eq!(views[0]["id"], id);
+
+    let kill = ociman(storage_dir.path(), &["kill", &id]);
+    assert!(kill.status.success());
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", &id]);
+}

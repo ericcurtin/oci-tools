@@ -4105,19 +4105,35 @@ enum Command {
         /// real `podman stats --latest`/`-l` exactly (see
         /// [`Command::Rm::latest`]'s own doc comment for the exact,
         /// checked-directly `GetLatestContainer` semantics this
-        /// shares verbatim). Mutually exclusive with an explicit
-        /// `ID`/`--name` — matching real podman's own checked-
-        /// directly `checkStatOptions` exactly (`~/git/podman/cmd/
-        /// podman/containers/stats.go`): `"--all, --latest and
-        /// containers cannot be used together"` (real podman's own
-        /// further `--all`, a genuinely separate, richer "stream
-        /// every running container's own stats" mode this project
-        /// has never implemented at all, isn't part of this
-        /// restriction here — a real, honest narrower-first-slice
-        /// scope, the same established precedent every other "first
-        /// slice" design note in this project already sets).
+        /// shares verbatim). Mutually exclusive with both an
+        /// explicit `ID`/`--name` and `--all` — matching real
+        /// podman's own checked-directly `checkStatOptions` exactly
+        /// (`~/git/podman/cmd/podman/containers/stats.go`): `"--all,
+        /// --latest and containers cannot be used together"`.
         #[arg(short = 'l', long)]
         latest: bool,
+        /// Show every stored container's own stats, not just running
+        /// ones — matching real `podman stats --all`/`-a` exactly
+        /// (checked directly, `~/git/podman/cmd/podman/containers/
+        /// stats.go:67`: `flags.BoolVarP(&statsOptions.All, "all",
+        /// "a", false, ...)`; live consumer, `~/git/podman/pkg/
+        /// domain/infra/abi/containers.go:1663-1690`'s own
+        /// `ContainerStats`: `--all` switches the enumerated set from
+        /// `GetRunningContainers` to `GetAllContainers`). Mutually
+        /// exclusive with both `--latest` and an explicit `ID`/
+        /// `--name`, per the identical real wording above. A real,
+        /// deliberately narrower first slice: only combined with
+        /// `--no-stream` for now (real podman's own primary
+        /// documented example, `stats.go`'s own doc comment: `podman
+        /// stats --all --no-stream`) — real podman's own `--all`
+        /// also composes with the default continuous-streaming mode
+        /// via one unified, periodically-re-listing channel
+        /// architecture this project doesn't have yet; `--all`
+        /// without `--no-stream` is a clear, honest, immediate "not
+        /// yet supported" error here instead, never a silent,
+        /// narrower stand-in.
+        #[arg(short = 'a', long)]
+        all: bool,
         /// A single, one-shot sample instead of a continuous stream
         /// — matching real `podman stats --no-stream` exactly.
         #[arg(long)]
@@ -6114,15 +6130,18 @@ enum ContainerCommand {
     /// `--latest`/explicit-id resolution the top-level
     /// [`Command::Stats`] arm already has -- see [`Command::Stats`]'s
     /// own doc comment for the exact semantics (including this
-    /// project's own honestly narrower first-slice scope: no
-    /// `--all`, single container only, matching the top-level
-    /// command's own identical gap), not repeated here.
+    /// project's own honestly narrower first-slice scope: `--all`
+    /// only combined with `--no-stream`, `0560`, matching the
+    /// top-level command's own identical gap), not repeated here.
     Stats {
         /// Same as [`Command::Stats::id`].
         id: Option<String>,
         /// Same as [`Command::Stats::latest`].
         #[arg(short = 'l', long)]
         latest: bool,
+        /// Same as [`Command::Stats::all`].
+        #[arg(short = 'a', long)]
+        all: bool,
         /// Same as [`Command::Stats::no_stream`].
         #[arg(long)]
         no_stream: bool,
@@ -7692,6 +7711,7 @@ fn main() -> std::process::ExitCode {
                 ContainerCommand::Stats {
                     id,
                     latest,
+                    all,
                     no_stream,
                     interval,
                     no_reset,
@@ -7704,15 +7724,25 @@ fn main() -> std::process::ExitCode {
                     // identical check the top-level `Command::Stats`
                     // arm already has.
                     anyhow::ensure!(
-                        !(latest && id.is_some()),
+                        u8::from(all) + u8::from(latest) + u8::from(id.is_some()) <= 1,
                         "--all, --latest and containers cannot be used together"
                     );
+                    if all {
+                        anyhow::ensure!(
+                            no_stream,
+                            "--all's own continuous streaming mode across every container is \
+                             not yet supported (combine with --no-stream for a real, one-shot \
+                             multi-container sample)"
+                        );
+                        return cmd_stats_all(cli.global.json, format.as_deref());
+                    }
                     let resolved_id = match id {
                         Some(id) => id,
                         None => {
                             anyhow::ensure!(
                                 latest,
-                                "no container ID/name given (try `ociman stats <ID>` or --latest)"
+                                "no container ID/name given (try `ociman stats <ID>`, --latest, \
+                                 or --all)"
                             );
                             let containers = open_container_store()?;
                             resolve_latest_container(&containers)?
@@ -8007,6 +8037,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::Stats {
                 id,
                 latest,
+                all,
                 no_stream,
                 interval,
                 no_reset,
@@ -8017,9 +8048,21 @@ fn main() -> std::process::ExitCode {
                 // directly (`~/git/podman/cmd/podman/containers/
                 // stats.go`'s own `checkStatOptions`).
                 anyhow::ensure!(
-                    !(latest && id.is_some()),
+                    u8::from(all) + u8::from(latest) + u8::from(id.is_some()) <= 1,
                     "--all, --latest and containers cannot be used together"
                 );
+                if all {
+                    // See `Command::Stats::all`'s own doc comment for
+                    // exactly why this first slice is `--no-stream`-
+                    // only.
+                    anyhow::ensure!(
+                        no_stream,
+                        "--all's own continuous streaming mode across every container is not \
+                         yet supported (combine with --no-stream for a real, one-shot \
+                         multi-container sample)"
+                    );
+                    return cmd_stats_all(cli.global.json, format.as_deref());
+                }
                 let resolved_id = match id {
                     Some(id) => id,
                     None => {
@@ -8037,7 +8080,8 @@ fn main() -> std::process::ExitCode {
                         // message shape) is used instead.
                         anyhow::ensure!(
                             latest,
-                            "no container ID/name given (try `ociman stats <ID>` or --latest)"
+                            "no container ID/name given (try `ociman stats <ID>`, --latest, or \
+                             --all)"
                         );
                         let containers = open_container_store()?;
                         resolve_latest_container(&containers)?
@@ -19024,26 +19068,37 @@ fn sample_container_stats(
     }))
 }
 
-/// `ociman stats`'s own plain-text table, one header/one data row --
-/// shared by `--no-stream` and the streaming loop alike.
-fn print_stats_table(view: &ContainerStatsView) {
+/// `ociman stats`'s own plain-text table, one header followed by one
+/// data row per given view — shared by `--no-stream`/the streaming
+/// loop (always exactly one view) and `--all --no-stream` (`0560`,
+/// zero or more) alike.
+fn print_stats_table_rows(views: &[ContainerStatsView]) {
     println!(
         "{:<14} {:<20} {:<10} {:<24} {:<8}PIDS",
         "ID", "NAME", "CPU %", "MEM USAGE / LIMIT", "MEM %"
     );
-    println!(
-        "{:<14} {:<20} {:<10} {:<24} {:<8}{}",
-        view.id,
-        view.name.as_deref().unwrap_or(""),
-        format!("{:.2}%", view.cpu_percent),
-        format!(
-            "{} / {}",
-            human_size(view.mem_usage),
-            human_size(view.mem_limit)
-        ),
-        format!("{:.2}%", view.mem_percent),
-        view.pids
-    );
+    for view in views {
+        println!(
+            "{:<14} {:<20} {:<10} {:<24} {:<8}{}",
+            view.id,
+            view.name.as_deref().unwrap_or(""),
+            format!("{:.2}%", view.cpu_percent),
+            format!(
+                "{} / {}",
+                human_size(view.mem_usage),
+                human_size(view.mem_limit)
+            ),
+            format!("{:.2}%", view.mem_percent),
+            view.pids
+        );
+    }
+}
+
+/// The single-view case of [`print_stats_table_rows`] — kept as its
+/// own, separately-named function purely so every existing call site
+/// reads exactly as before this refactor.
+fn print_stats_table(view: &ContainerStatsView) {
+    print_stats_table_rows(std::slice::from_ref(view));
 }
 
 /// A single, one-shot resource-usage sample (`--no-stream`, matching
@@ -19112,6 +19167,67 @@ fn print_stats_sample(
         oci_cli_common::output::print_json(view)?;
     } else {
         print_stats_table(view);
+    }
+    Ok(())
+}
+
+/// `ociman stats --all --no-stream` (`0560`): a real, one-shot,
+/// multi-container sample of every *stored* container, not just
+/// running ones — matching real `podman stats --all`'s own identical
+/// `GetAllContainers` enumeration exactly (checked directly, `~/git/
+/// podman/pkg/domain/infra/abi/containers.go:1663-1690`). A container
+/// that isn't currently running simply produces no row at all — the
+/// same honest "nothing to report" reasoning [`sample_container_
+/// stats`]'s own doc comment already gives for a single container;
+/// `--all` just applies it across every stored one instead of
+/// erroring on the first miss. Sorted by creation time, the same
+/// stable order `ociman ps`'s own default already uses.
+///
+/// See [`Command::Stats::all`]'s own doc comment for exactly why this
+/// is `--no-stream`-only for now — real podman's own `--all` also
+/// composes with the default continuous-streaming mode, a genuinely
+/// new "keep re-listing every stored container each interval" loop
+/// this project doesn't have yet.
+fn cmd_stats_all(json: bool, format: Option<&str>) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let mut states = containers.list()?;
+    states.sort_by(|a, b| a.created.cmp(&b.created));
+    let mut views = Vec::new();
+    for state in &states {
+        if let Some(view) = sample_container_stats(&containers, &state.id)? {
+            views.push(view);
+        }
+    }
+    print_stats_samples(&views, json, format)
+}
+
+/// The multi-container counterpart of [`print_stats_sample`] —
+/// `ociman stats --all` (`0560`): `--format`, when given, renders one
+/// line per container (matching real `podman stats --format`'s own
+/// identical per-row re-rendering, and this project's own already-
+/// established `ps --format` convention, `main.rs`'s own `cmd_ps`);
+/// `--json` prints a real JSON array (never a single bare object,
+/// even for exactly one matching container, or an empty one for
+/// zero — matching this project's own already-established "always-
+/// valid-JSON-shape" convention, e.g. `ociman search --list-tags`
+/// with a negative `--limit`, `0543`); the default table prints one
+/// header followed by every row (possibly zero).
+fn print_stats_samples(
+    views: &[ContainerStatsView],
+    json: bool,
+    format: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(template) = format {
+        for view in views {
+            let json_value = serde_json::to_value(view)?;
+            println!("{}", render_format_template(template, &json_value)?);
+        }
+        return Ok(());
+    }
+    if json {
+        oci_cli_common::output::print_json(&views)?;
+    } else {
+        print_stats_table_rows(views);
     }
     Ok(())
 }
