@@ -195,6 +195,48 @@ fn ephemeral_root_flag_is_accepted_and_behaves_identically() {
     );
 }
 
+/// `--absolutely-disable-root-password-i-am-really-positively-sure`
+/// (`docs/design/0549`) is accepted for real CLI compatibility with
+/// real `distrobox ephemeral`'s own identical inherited flag, but
+/// changes nothing at all -- see `Command::Create::absolutely_
+/// disable_root_password_i_am_really_positively_sure`'s own doc
+/// comment for the full, checked-directly reasoning.
+#[test]
+fn ephemeral_nopasswd_flag_is_accepted_and_behaves_identically() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    seed_ephemeral_base(
+        storage_dir.path(),
+        "ocibox-test/ephemeral-nopasswd-base:latest",
+    );
+
+    let out = ocibox(
+        storage_dir.path(),
+        &[
+            "ephemeral",
+            "--image",
+            "ocibox-test/ephemeral-nopasswd-base:latest",
+            "--absolutely-disable-root-password-i-am-really-positively-sure",
+            "--",
+            "/bin/echo",
+            "hello-ephemeral-nopasswd",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hello-ephemeral-nopasswd"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 #[test]
 fn ephemeral_forwards_the_containers_own_nonzero_exit_code() {
     if busybox_path().is_none() {

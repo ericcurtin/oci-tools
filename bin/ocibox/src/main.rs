@@ -267,6 +267,32 @@ enum Command {
         /// export` has no `--root` of its own either.
         #[arg(long, short = 'r')]
         root: bool,
+        /// Accepted for real CLI compatibility with real `distrobox
+        /// create --absolutely-disable-root-password-i-am-really-
+        /// positively-sure` (no short alias upstream either); a real,
+        /// faithful no-op here — checked directly, `~/git/distrobox/
+        /// internal/cli/create.go:170-173,216`: the flag is real and
+        /// live-consumed, wired into `CreateOptions.Nopasswd`, which
+        /// `~/git/distrobox/pkg/containermanager/providers/podman.go:
+        /// 379-381` turns into one extra bind mount on the generated
+        /// container-create command, `--volume /dev/null:/run/
+        /// .nopasswd:ro` — but that marker is only ever *read* by
+        /// `distrobox-init`'s own rootful-vs-rootless detection
+        /// heuristic (`~/git/distrobox/internal/inside-distrobox/
+        /// assets/distrobox-init:234-246`), itself only reachable at
+        /// all when the container can read a bind-mounted *real
+        /// host* `/run/host/etc/shadow` as uid 0 — i.e. only in real
+        /// distrobox's own genuinely rootful mode. This project's own
+        /// `ocibox` has no rootful/rootless distinction of any kind
+        /// (`root`'s own doc comment just above), no `/run/host`
+        /// mount, and no `distrobox-init`-equivalent script running
+        /// inside its own containers at all — there is no code path
+        /// here that could ever consume this marker in the first
+        /// place, the identical "genuine, faithful no-op, not a
+        /// half-implemented approximation" reasoning `--root` (0540)
+        /// already established.
+        #[arg(long = "absolutely-disable-root-password-i-am-really-positively-sure")]
+        absolutely_disable_root_password_i_am_really_positively_sure: bool,
     },
     /// List real, created boxes — matching real `distrobox list`
     /// (alias `ls`), narrowed to what this project's own boxes
@@ -697,6 +723,16 @@ enum Command {
         /// `ephemeral` via the same shared `withRoot` composition).
         #[arg(long, short = 'r')]
         root: bool,
+        /// Same as [`Command::Create::absolutely_disable_root_
+        /// password_i_am_really_positively_sure`] — matching real
+        /// `distrobox ephemeral`'s own identical inherited flag
+        /// (checked directly: `~/git/distrobox/internal/cli/
+        /// ephemeral.go:22-24`'s own `ignoredFlags` list only ever
+        /// strips `"compatibility"`/`"no-entry"`, never this one, and
+        /// `ephemeral.go:94` wires it into `Nopasswd` again, same as
+        /// `create` does).
+        #[arg(long = "absolutely-disable-root-password-i-am-really-positively-sure")]
+        absolutely_disable_root_password_i_am_really_positively_sure: bool,
     },
     /// Export a binary or graphical application from inside a box onto
     /// the host — matching real `distrobox export`'s own `--bin`/
@@ -980,6 +1016,7 @@ fn main() -> std::process::ExitCode {
                 platform,
                 no_entry: _,
                 root: _,
+                absolutely_disable_root_password_i_am_really_positively_sure: _,
             }) => cmd_create(
                 image.as_deref(),
                 clone.as_deref(),
@@ -1029,6 +1066,7 @@ fn main() -> std::process::ExitCode {
                 platform,
                 command,
                 root: _,
+                absolutely_disable_root_password_i_am_really_positively_sure: _,
             }) => cmd_ephemeral(
                 image.as_deref(),
                 clone.as_deref(),

@@ -233,6 +233,50 @@ fn create_root_flag_is_accepted_and_behaves_identically() {
     assert!(storage_dir.path().join("boxes").join("rootbox").is_dir());
 }
 
+/// `--absolutely-disable-root-password-i-am-really-positively-sure`
+/// (`docs/design/0549`) is accepted for real CLI compatibility with
+/// real `distrobox create`'s own identical flag, but changes nothing
+/// at all -- this project has no rootful/rootless distinction of any
+/// kind (see `Command::Create::absolutely_disable_root_password_i_
+/// am_really_positively_sure`'s own doc comment for the full,
+/// checked-directly reasoning). Proven here against a real box, still
+/// created exactly as a plain `create` would.
+#[test]
+fn create_nopasswd_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/create-nopasswd:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/create-nopasswd:latest",
+            "--name",
+            "nopwbox",
+            "--absolutely-disable-root-password-i-am-really-positively-sure",
+        ],
+    );
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&create.stdout).trim(), "nopwbox");
+    assert!(storage_dir.path().join("boxes").join("nopwbox").is_dir());
+}
+
 #[test]
 fn create_refuses_a_name_already_in_use() {
     let Some(busybox) = busybox_path() else {
