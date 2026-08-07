@@ -1937,6 +1937,60 @@ fn container_attach_is_a_byte_identical_alias_for_top_level_attach() {
     );
 }
 
+/// `container attach --sig-proxy` (`docs/design/0559`) parses and
+/// dispatches identically to the top-level `attach`'s own identical
+/// flag -- full forwarding semantics are already exhaustively proven
+/// against the top-level command in `ociman_attach.rs`; this only
+/// proves the alias accepts the flag at all and doesn't disturb a
+/// plain, unaffected run.
+#[test]
+fn container_attach_accepts_sig_proxy_false() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-attach-sig-proxy:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 0.3; exit 0".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/container-attach-sig-proxy:latest",
+        &[],
+    );
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let alias = ociman(
+        storage_dir.path(),
+        &["container", "attach", "--sig-proxy=false", &id],
+    );
+    assert_eq!(
+        alias.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+}
+
 /// `ociman container exec` (0505) is a real, byte-identical alias for
 /// the top-level `ociman exec`, matching real `podman container
 /// exec`'s own checked-directly identical `Use`/`Short`/`Long`/

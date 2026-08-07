@@ -391,3 +391,182 @@ fn attach_latest_on_an_empty_store_is_a_clear_error() {
     let out = ociman(storage_dir.path(), &["attach", "--latest"]);
     assert!(!out.status.success());
 }
+
+/// `attach --sig-proxy` (`docs/design/0559`, on by default) forwards
+/// every real signal `ociman attach` itself receives straight to the
+/// attached container's own init process -- proven end to end here: a
+/// real trap handler *inside* the container prints a distinguishing
+/// message and exits with a distinguishing code, only reachable if
+/// the signal genuinely arrived there (not merely killing the
+/// `attach` process itself, which a plain, unhandled `SIGTERM` would
+/// do by default with no `--sig-proxy` at all).
+#[test]
+fn attach_sig_proxy_forwards_a_real_signal_into_the_container() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/attach-sig-proxy:latest",
+        &busybox,
+        &["sh", "sleep", "trap"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "trap 'echo GOT_TERM; exit 42' TERM; while true; do sleep 1; done".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/attach-sig-proxy:latest",
+        &[],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let attach = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["attach", &id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman attach");
+
+    // Give `attach` a moment to actually reach its own signal-install
+    // step before sending anything -- the container itself is
+    // already confirmed running above, so this is generous, not
+    // load-bearing for correctness (a signal sent too early would
+    // just use the default disposition instead, failing this test
+    // loudly rather than silently passing).
+    std::thread::sleep(Duration::from_millis(300));
+
+    let attach_pid = attach.id() as i32;
+    #[allow(unsafe_code)]
+    let ret = unsafe { libc::kill(attach_pid, libc::SIGTERM) };
+    assert_eq!(ret, 0, "failed to signal the attach process itself");
+
+    let output = attach
+        .wait_with_output()
+        .expect("failed to wait for ociman attach");
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "attach's own exit code should be the container's real exit code from its own trap; \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("GOT_TERM"),
+        "the container's own trap handler should have run: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "stopped", Duration::from_secs(20)),
+        "stopped"
+    );
+
+    ociman(storage_dir.path(), &["rm", &id]);
+}
+
+/// `attach --sig-proxy=false` disables the forwarding entirely --
+/// matching real `podman attach --sig-proxy=false`'s own identical
+/// escape hatch: a signal sent to the `attach` process itself now
+/// just uses the default disposition (killing `attach` outright,
+/// never reaching the container), leaving the container running
+/// completely untouched.
+#[test]
+fn attach_sig_proxy_false_leaves_the_container_running() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/attach-sig-proxy-off:latest",
+        &busybox,
+        &["sh", "sleep", "trap"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "trap 'echo GOT_TERM; exit 42' TERM; while true; do sleep 1; done".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+
+    ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/attach-sig-proxy-off:latest",
+        &[],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let attach = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["attach", "--sig-proxy=false", &id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman attach");
+
+    std::thread::sleep(Duration::from_millis(300));
+
+    let attach_pid = attach.id() as i32;
+    #[allow(unsafe_code)]
+    let ret = unsafe { libc::kill(attach_pid, libc::SIGTERM) };
+    assert_eq!(ret, 0, "failed to signal the attach process itself");
+
+    let output = attach
+        .wait_with_output()
+        .expect("failed to wait for ociman attach");
+    assert!(
+        !output.status.success(),
+        "the attach process itself should have died from the unhandled SIGTERM"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("GOT_TERM"),
+        "the container should never have received the signal at all: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        wait_for_status(storage_dir.path(), &id, "running", Duration::from_secs(5)),
+        "running",
+        "the container should still be running, completely untouched"
+    );
+
+    ociman(storage_dir.path(), &["kill", &id]);
+    ociman(storage_dir.path(), &["rm", &id]);
+}

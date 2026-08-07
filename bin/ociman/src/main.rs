@@ -2849,10 +2849,15 @@ enum Command {
     /// an already-detached, already-running container's own stdin
     /// could be reattached to later, the same real, still-deferred
     /// gap `cmd_start`'s own doc comment already names directly. No
-    /// `--no-stdin`/`--detach-keys`/`--sig-proxy` flags are offered at
-    /// all here, rather than silently accepting and ignoring them —
-    /// matching this project's own established "never accept a flag
-    /// this command can't actually honor" convention.
+    /// `--no-stdin`/`--detach-keys` flags are offered at all here,
+    /// rather than silently accepting and ignoring them — matching
+    /// this project's own established "never accept a flag this
+    /// command can't actually honor" convention. `--sig-proxy`
+    /// (`0559`) *is* offered — a one-directional, host-to-container
+    /// forwarding concern that needs no reattachable stdin channel at
+    /// all, separable from that same gap (`docs/design/0504`'s own
+    /// "still out of scope" note explicitly separated it out this
+    /// way already).
     Attach {
         /// The container's ID or `--name` — omit when using
         /// `--latest`.
@@ -2875,6 +2880,41 @@ enum Command {
         /// or the latest flag"`).
         #[arg(short = 'l', long)]
         latest: bool,
+        /// Proxy every signal this process itself receives straight
+        /// to the attached container's own init process — matching
+        /// real `podman attach --sig-proxy`'s own identical, default-
+        /// on behavior exactly (checked directly, `~/git/podman/cmd/
+        /// podman/containers/attach.go:52`; live consumer
+        /// `~/git/podman/pkg/domain/infra/abi/terminal/
+        /// sigproxy_commn.go`'s own `ProxySignals`, a background
+        /// goroutine forwarding every caught signal via `ctr.Kill`).
+        /// A real, previously-missing functional gap, not a no-op:
+        /// without this, a real `Ctrl-C` during `ociman attach` only
+        /// killed the *attach* process itself, leaving the container
+        /// running untouched — a real, observable divergence from
+        /// real podman/docker, where the same `Ctrl-C` is, by
+        /// default, forwarded straight into the container (and
+        /// typically kills it too). Every signal is forwarded except
+        /// `SIGCHLD`/`SIGPIPE`/`SIGURG` (real podman's own documented
+        /// reasons, checked directly, `~/git/podman/pkg/signal/
+        /// signal_linux.go`'s own `isSignalIgnoredBySigProxy`: meant
+        /// for the CLI process itself, Go-runtime preemption noise,
+        /// and ditto) and `SIGSTOP`/`SIGKILL` (can never be caught by
+        /// any process at all, `sigaction(2)`'s own documented
+        /// restriction — real podman's own identical exclusion list
+        /// omits `SIGKILL` for the same reason, only naming `SIGSTOP`
+        /// explicitly, since Go's own signal-catching API silently
+        /// ignores a request to catch either). See
+        /// [`install_sig_proxy`]'s own doc comment for exactly how
+        /// this is implemented and why no teardown is needed.
+        #[arg(
+            long = "sig-proxy",
+            default_value_t = true,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            action = clap::ArgAction::Set
+        )]
+        sig_proxy: bool,
     },
     /// Restart a container: stop it first if it's currently running
     /// (same signal/timeout escalation as `ociman stop`), then start
@@ -6114,15 +6154,24 @@ enum ContainerCommand {
     /// latest resolution the top-level [`Command::Attach`] arm
     /// already has -- see [`Command::Attach`]'s own doc comment for
     /// the exact semantics (including this project's own honestly
-    /// narrower first-slice scope: no `--no-stdin`/`--detach-keys`/
-    /// `--sig-proxy` at all, matching the top-level command's own
-    /// identical gap), not repeated here.
+    /// narrower first-slice scope: no `--no-stdin`/`--detach-keys` at
+    /// all, matching the top-level command's own identical gap;
+    /// `--sig-proxy`, `0559`, is offered on both).
     Attach {
         /// Same as [`Command::Attach::id`].
         id: Option<String>,
         /// Same as [`Command::Attach::latest`].
         #[arg(short = 'l', long)]
         latest: bool,
+        /// Same as [`Command::Attach::sig_proxy`].
+        #[arg(
+            long = "sig-proxy",
+            default_value_t = true,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            action = clap::ArgAction::Set
+        )]
+        sig_proxy: bool,
     },
     /// `podman container exec`'s own real alias for the already-
     /// existing flat [`Command::Exec`] -- checked directly, `~/git/
@@ -7107,7 +7156,11 @@ fn main() -> std::process::ExitCode {
                 };
                 cmd_start(&resolved_id, attach)
             }
-            Some(Command::Attach { id, latest }) => {
+            Some(Command::Attach {
+                id,
+                latest,
+                sig_proxy,
+            }) => {
                 // An explicit `id` always wins over `--latest`
                 // outright, matching real podman's own checked-
                 // directly behavior exactly -- see `Command::Attach::
@@ -7124,7 +7177,7 @@ fn main() -> std::process::ExitCode {
                         resolve_latest_container(&containers)?
                     }
                 };
-                cmd_attach(&resolved_id)
+                cmd_attach(&resolved_id, sig_proxy)
             }
             Some(Command::Restart {
                 ids,
@@ -7674,7 +7727,11 @@ fn main() -> std::process::ExitCode {
                         format.as_deref(),
                     )
                 }
-                ContainerCommand::Attach { id, latest } => {
+                ContainerCommand::Attach {
+                    id,
+                    latest,
+                    sig_proxy,
+                } => {
                     // An explicit `id` always wins over `--latest`
                     // outright, matching real podman's own checked-
                     // directly behavior exactly -- the identical
@@ -7692,7 +7749,7 @@ fn main() -> std::process::ExitCode {
                             resolve_latest_container(&containers)?
                         }
                     };
-                    cmd_attach(&resolved_id)
+                    cmd_attach(&resolved_id, sig_proxy)
                 }
                 ContainerCommand::Exec {
                     positional,
@@ -16419,7 +16476,7 @@ fn cmd_start(id: &str, attach: bool) -> anyhow::Result<()> {
 /// container in this same process), so attaching to a container an
 /// entirely separate, earlier invocation started works identically to
 /// `cmd_start`'s own `--attach` path.
-fn cmd_attach(id: &str) -> anyhow::Result<()> {
+fn cmd_attach(id: &str, sig_proxy: bool) -> anyhow::Result<()> {
     let containers = open_container_store()?;
     let resolved = resolve_container_id(&containers, id)?;
     let state = containers.load(&resolved)?;
@@ -16429,8 +16486,112 @@ fn cmd_attach(id: &str) -> anyhow::Result<()> {
         "you can only attach to a running container (container {id:?}'s own current status is \
          {status})"
     );
+    if sig_proxy {
+        // `effective_status() == Running` above already guarantees
+        // `pid` is `Some` (see its own doc comment).
+        let pid = state.pid.expect("a running container always has a pid");
+        install_sig_proxy(pid);
+    }
     let exit_code = attach_and_wait_for_exit(&containers, &resolved)?;
     std::process::exit(exit_code);
+}
+
+/// The target pid `--sig-proxy`'s installed handlers forward every
+/// caught signal to, or `0` when no handler is currently active.
+/// `AtomicI32` rather than a `Mutex`/`RefCell`: reading and writing it
+/// must be async-signal-safe (the load happens *inside* a real signal
+/// handler, [`sig_proxy_handler`] below) — a relaxed atomic load/store
+/// is, unlike almost anything else a handler could touch (matching
+/// real podman's own reasoning for using a plain, unsynchronized
+/// channel send from its own signal-catching goroutine, `~/git/
+/// podman/pkg/domain/infra/abi/terminal/sigproxy_commn.go`).
+static SIG_PROXY_TARGET_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The real signal handler [`install_sig_proxy`] installs for every
+/// forwarded signal: a plain `kill(2)` of the currently-configured
+/// target pid with the exact signal that was just caught — both
+/// async-signal-safe operations (`kill(2)` itself, and a relaxed
+/// atomic load), matching real podman's own identical "forward
+/// whatever was caught, unmodified" behavior.
+extern "C" fn sig_proxy_handler(signal: libc::c_int) {
+    let pid = SIG_PROXY_TARGET_PID.load(std::sync::atomic::Ordering::Relaxed);
+    if pid > 0 {
+        // SAFETY: `kill(2)` is async-signal-safe; `pid`/`signal` are
+        // plain integers, no pointers involved.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+}
+
+/// Every signal real podman's own `--sig-proxy` forwards — checked
+/// directly, `~/git/podman/pkg/signal/signal_linux.go`'s own
+/// `isSignalIgnoredBySigProxy`: every signal this project already
+/// recognizes ([`oci_runtime_core::signal`]) except `SIGCHLD`/
+/// `SIGPIPE`/`SIGURG` (real podman's own documented reasons: meant
+/// for the CLI process itself, Go-runtime preemption noise, and
+/// ditto) and `SIGSTOP`/`SIGKILL` (can never be caught by any process
+/// at all, `sigaction(2)`'s own documented restriction).
+const SIG_PROXY_FORWARDED_SIGNALS: &[libc::c_int] = &[
+    libc::SIGHUP,
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGILL,
+    libc::SIGTRAP,
+    libc::SIGABRT,
+    libc::SIGBUS,
+    libc::SIGFPE,
+    libc::SIGUSR1,
+    libc::SIGSEGV,
+    libc::SIGUSR2,
+    libc::SIGALRM,
+    libc::SIGTERM,
+    libc::SIGSTKFLT,
+    libc::SIGCONT,
+    libc::SIGTSTP,
+    libc::SIGTTIN,
+    libc::SIGTTOU,
+    libc::SIGXCPU,
+    libc::SIGXFSZ,
+    libc::SIGVTALRM,
+    libc::SIGPROF,
+    libc::SIGWINCH,
+    libc::SIGIO,
+    libc::SIGPWR,
+    libc::SIGSYS,
+];
+
+/// Installs [`sig_proxy_handler`] for every signal in
+/// [`SIG_PROXY_FORWARDED_SIGNALS`], forwarding each one this process
+/// itself receives straight to `pid` — `ociman attach --sig-proxy`
+/// (`0559`), matching real `podman attach --sig-proxy`'s own default-
+/// on behavior exactly (`~/git/podman/pkg/domain/infra/abi/terminal/
+/// sigproxy_commn.go`'s own `ProxySignals`). Never torn down again:
+/// [`cmd_attach`]'s own caller always calls `std::process::exit`
+/// immediately after its one attach loop returns, the same real "the
+/// whole process exits right after, so nothing needs restoring"
+/// reasoning real podman's own identical `ProxySignals` relies on too
+/// (it never itself calls a `signal.Reset`-equivalent either).
+fn install_sig_proxy(pid: i32) {
+    SIG_PROXY_TARGET_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
+    for &signal in SIG_PROXY_FORWARDED_SIGNALS {
+        // SAFETY: a plain `sigaction(2)` registering a real,
+        // `extern "C"` handler for one signal at a time — the
+        // standard, well-established pattern for installing a signal
+        // handler from Rust via raw `libc`. `action` is a fully
+        // zeroed, then fully initialized, plain-old-data struct
+        // before being passed by reference; the old-disposition out
+        // parameter is null since nothing here ever needs it back.
+        #[allow(unsafe_code)]
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = sig_proxy_handler as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
+    }
 }
 
 /// Stream a just-(re)started container's own live output to stdout,
