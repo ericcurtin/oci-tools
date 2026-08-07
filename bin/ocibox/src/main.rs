@@ -861,36 +861,31 @@ enum Command {
         /// gave it one).
         #[arg(long = "enter-flags", value_name = "FLAGS", allow_hyphen_values = true)]
         enter_flags: Option<String>,
-        /// Run the exported `--bin` as `sudo` inside the box —
+        /// Run the exported `--bin`/`--app` as `sudo` inside the box —
         /// matching real `distrobox export --sudo`/`-S`'s own core
         /// idea exactly (checked directly, `~/git/distrobox/internal/
         /// inside-distrobox/assets/distrobox-export:270-296`), with
-        /// two real, deliberate, honestly-documented simplifications
+        /// one real, deliberate, honestly-documented simplification
         /// this project's own entirely host-side, static-wrapper
-        /// export model can't faithfully replicate:
+        /// export model can't faithfully replicate: real distrobox
+        /// additionally detects `doas`/`su-exec` inside the box (each
+        /// taking priority over plain `sudo` if present) and probes
+        /// whether `sudo` itself can run passwordless (`sudo -S
+        /// test`) before falling back to plain `sudo`. Both checks
+        /// need a real, *live* command run inside the box at export
+        /// time; this project's own export never launches anything
+        /// live at all (checked directly, `rootfs_bin.is_file()` — a
+        /// plain, static rootfs path check, the same convention this
+        /// flag reuses below for `sudo` itself). This slice only ever
+        /// looks for plain `/usr/bin/sudo` in the box's own rootfs
+        /// statically — `doas`/`su-exec` detection is a real,
+        /// separate, deliberately deferred gap, not silently dropped.
         ///
-        /// 1. Real distrobox additionally detects `doas`/`su-exec`
-        ///    inside the box (each taking priority over plain `sudo`
-        ///    if present) and probes whether `sudo` itself can run
-        ///    passwordless (`sudo -S test`) before falling back to
-        ///    plain `sudo`. Both checks need a real, *live* command
-        ///    run inside the box at export time; this project's own
-        ///    `--bin` export never launches anything live at all
-        ///    (checked directly, `rootfs_bin.is_file()` — a plain,
-        ///    static rootfs path check, the same convention this flag
-        ///    reuses below for `sudo` itself). This first slice only
-        ///    ever looks for plain `/usr/bin/sudo` in the box's own
-        ///    rootfs statically — `doas`/`su-exec` detection is a
-        ///    real, separate, deliberately deferred gap, not silently
-        ///    dropped.
-        /// 2. `--app`'s own generated desktop entry doesn't wire this
-        ///    flag in at all yet (a clear, immediate error if given
-        ///    together) -- real distrobox's own identical `sudo_
-        ///    prefix` mechanism applies to both `--bin` and `--app`
-        ///    alike, but closing the `--app` half needs its own,
-        ///    separate verification of exactly how a desktop entry's
-        ///    `Exec=` line embeds it, not assumed from the `--bin`
-        ///    case alone.
+        /// Applies identically to `--app`'s own generated desktop
+        /// entry's rewritten `Exec=` line (`0555`) -- real
+        /// distrobox's own identical `sudo_prefix` mechanism applies
+        /// to both `--bin` and `--app` alike
+        /// (`distrobox-export:291,567`), and so does this one.
         ///
         /// A box with no `/usr/bin/sudo` at all is a real, immediate,
         /// clear error at export time -- matching this project's own
@@ -2381,9 +2376,6 @@ fn cmd_export(box_name: &str, args: ExportArgs) -> anyhow::Result<()> {
     match (app, bin) {
         (Some(_), Some(_)) => anyhow::bail!("choose only one of --app or --bin"),
         (None, None) => anyhow::bail!("either --app or --bin is required"),
-        (Some(_), None) if sudo => {
-            anyhow::bail!("--sudo is only supported with --bin (not yet with --app)")
-        }
         (Some(app), None) => cmd_export_app(
             box_name,
             app,
@@ -2392,6 +2384,7 @@ fn cmd_export(box_name: &str, args: ExportArgs) -> anyhow::Result<()> {
             export_label,
             extra_flags,
             enter_flags,
+            sudo,
         ),
         (None, Some(bin)) => cmd_export_bin(
             box_name,
@@ -2840,6 +2833,7 @@ fn remove_exported_icon_file(dest: &Path) {
 /// prefix, never an already-canonical *flatpak*-prefixed absolute
 /// path, a real, minor gap in real distrobox itself this project
 /// deliberately doesn't go further than).
+#[allow(clippy::too_many_arguments)]
 fn rewrite_desktop_file(
     content: &str,
     box_name: &str,
@@ -2848,6 +2842,7 @@ fn rewrite_desktop_file(
     label: &str,
     extra_flags: Option<&str>,
     enter_flags: Option<&str>,
+    sudo: bool,
 ) -> String {
     let mut out = format!("# {APP_EXPORT_MARKER}\n# box: {box_name}\n");
     for line in content.lines() {
@@ -2877,7 +2872,17 @@ fn rewrite_desktop_file(
             // shape exactly (see `Command::Export::enter_flags`'s own
             // doc comment).
             let enter = enter_flags.map(|f| format!(" {f}")).unwrap_or_default();
-            out.push_str(&format!("Exec=ocibox enter {box_name}{enter} -- {rest}\n"));
+            // `--sudo` (`0555`), if given, is inserted right after
+            // the `--` separator and before the rest of the original
+            // `Exec=` value -- matching real distrobox's own
+            // identical `container_command_prefix` shape exactly
+            // (`--${sudo_prefix:+ ${sudo_prefix}} `, `distrobox-
+            // export:291`), the same position `--bin`'s own template
+            // already uses for it (`0525`).
+            let sudo_prefix = if sudo { "sudo " } else { "" };
+            out.push_str(&format!(
+                "Exec=ocibox enter {box_name}{enter} -- {sudo_prefix}{rest}\n"
+            ));
             continue;
         }
         if let Some(new_icon) = icon_rewrite
@@ -3020,6 +3025,7 @@ fn desktop_file_display_name(content: &str) -> String {
 /// an icon file has no equivalent marker of its own — matching real
 /// distrobox's own identical, unconditional-but-tolerant removal
 /// there, see [`remove_exported_icon_file`]).
+#[allow(clippy::too_many_arguments)]
 fn cmd_export_app(
     box_name: &str,
     app: &str,
@@ -3028,6 +3034,7 @@ fn cmd_export_app(
     export_label: Option<&str>,
     extra_flags: Option<&str>,
     enter_flags: Option<&str>,
+    sudo: bool,
 ) -> anyhow::Result<()> {
     validate_box_name(box_name)?;
     let box_dir = boxes_root().join(box_name);
@@ -3082,6 +3089,18 @@ fn cmd_export_app(
         return Ok(());
     }
 
+    // `--sudo`'s own real target -- see [`Command::Export::sudo`]'s
+    // own doc comment for exactly why this checks only for plain
+    // `/usr/bin/sudo`, statically, matching `cmd_export_bin`'s own
+    // identical check exactly (`0525`).
+    if sudo {
+        anyhow::ensure!(
+            rootfs.join("usr/bin/sudo").is_file(),
+            "cannot find /usr/bin/sudo inside box {box_name:?} (--sudo needs sudo already \
+             installed there)"
+        );
+    }
+
     std::fs::create_dir_all(&export_dir)
         .with_context(|| format!("creating {}", export_dir.display()))?;
     for src in &desktop_files {
@@ -3116,6 +3135,7 @@ fn cmd_export_app(
             &label,
             extra_flags,
             enter_flags,
+            sudo,
         );
         let dest_name = exported_desktop_file_name(box_name, src)?;
         let dest_file = export_dir.join(&dest_name);

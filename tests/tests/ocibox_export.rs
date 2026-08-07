@@ -1704,22 +1704,90 @@ fn export_bin_sudo_without_sudo_installed_is_a_clear_error() {
     );
 }
 
-/// `--sudo` combined with `--app` is a clear error -- this project's
-/// own generated desktop entry doesn't wire `--sudo` in at all yet
-/// (see `Command::Export::sudo`'s own doc comment for why).
+/// `export --app --sudo`/`-S` (`0555`): prefixes the rewritten
+/// `.desktop` file's own `Exec=` line with `sudo ` right after the
+/// `--` separator -- matching real `distrobox export --sudo`'s own
+/// identical `sudo_prefix` mechanism applying to `--app` too (see
+/// `Command::Export::sudo`'s own doc comment), the same real gap
+/// `0525` had deliberately left open for `--app`.
 #[test]
-fn export_app_and_sudo_together_is_a_clear_error() {
+fn export_app_sudo_flag_prefixes_the_rewritten_exec_line_with_sudo() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
     let storage_dir = tempfile::tempdir().unwrap();
-    Store::open(storage_dir.path()).unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(&storage_dir, "testbox", SAMPLE_DESKTOP_FILE);
+    let sudo_dir = storage_dir.path().join("boxes/testbox/rootfs/usr/bin");
+    std::fs::create_dir_all(&sudo_dir).unwrap();
+    std::fs::write(sudo_dir.join("sudo"), b"#!/bin/sh\nexec \"$@\"\n").unwrap();
+    let export_dir = tempfile::tempdir().unwrap();
 
     let export = ocibox(
         storage_dir.path(),
-        &["export", "--box", "anybox", "--app", "anyapp", "--sudo"],
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+            "--sudo",
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let contents =
+        std::fs::read_to_string(export_dir.path().join("testbox-myapp.desktop")).unwrap();
+    assert!(
+        contents
+            .lines()
+            .any(|l| l == "Exec=ocibox enter testbox -- sudo /usr/bin/myapp --flag"),
+        "{contents:?}"
+    );
+}
+
+/// `export --app --sudo` on a box with no `/usr/bin/sudo` at all is a
+/// real, immediate, clear error -- the same "fail clearly and early"
+/// convention `export --bin --sudo` already established (`0525`).
+#[test]
+fn export_app_sudo_without_sudo_installed_is_a_clear_error() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    write_desktop_file(&storage_dir, "testbox", SAMPLE_DESKTOP_FILE);
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--app",
+            "My App",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+            "--sudo",
+        ],
     );
     assert!(!export.status.success());
     assert!(
-        String::from_utf8_lossy(&export.stderr).contains("--sudo"),
+        String::from_utf8_lossy(&export.stderr).contains("sudo"),
         "{}",
         String::from_utf8_lossy(&export.stderr)
+    );
+    assert!(
+        !export_dir.path().join("testbox-myapp.desktop").exists(),
+        "no desktop file should have been written at all"
     );
 }

@@ -90,9 +90,9 @@ export-time-only feature, not part of any launch/run hot path -- no
 ## Deliberately still out of scope
 
 `doas`/`su-exec` detection (needs the same live-probe machinery this
-project's static export model has never had), the passwordless-
-`sudo -S` capability probe (needs live execution too), and wiring
-`--sudo` into `--app`'s own generated desktop entry (needs its own,
-separate verification of exactly how a desktop entry's `Exec=` line
-would embed it) all remain open candidates for future increments.
+project's static export model has never had) and the passwordless-
+`sudo -S` capability probe (needs live execution too) remain open
+candidates for future increments. Wiring `--sudo` into `--app`'s own
+generated desktop entry -- listed here as open at the time -- was
+closed by `0555`.
 </content>
