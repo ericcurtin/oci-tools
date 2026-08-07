@@ -4022,6 +4022,26 @@ enum Command {
         /// real, immediate error.
         #[arg(long = "format", value_name = "TEMPLATE")]
         format: Option<String>,
+        /// Accepted for real CLI compatibility with real `podman
+        /// stats --no-trunc`; a real, total no-op here — checked
+        /// directly, `~/git/podman/cmd/podman/containers/stats.go:
+        /// 61,73,190-195`: real podman's own identical flag only ever
+        /// affects one thing, the table's own `ID` column
+        /// (`(*containerStats).ID()`: the full container ID instead
+        /// of its own first 12 characters) — no other column's own
+        /// formatter method ever reads `notrunc` at all. This
+        /// project's own container ids are already always the short,
+        /// 12-hex-character form (`short_id`) with no separate, longer
+        /// form to reveal in the first place — the exact same "no
+        /// real truncation to undo for this column" reasoning
+        /// `Command::Ps::no_trunc`'s own doc comment already
+        /// established for the identical ID-column case there
+        /// (`ociman stats`'s own table has no *other* truncated
+        /// column at all, unlike `ps`'s own separate `Command()`
+        /// truncation, so this is a total no-op here, not merely a
+        /// partial one).
+        #[arg(long = "no-trunc")]
+        no_trunc: bool,
     },
     /// Block until one or more containers stop, then print each one's
     /// own real exit code, one per line, in the order given — matching
@@ -5908,10 +5928,10 @@ enum ContainerCommand {
     /// `Long`/`Args`/`RunE`/`ValidArgsFunction`, and both get the
     /// identical flag set applied via the one shared `statFlags(cmd)`
     /// helper (`--all`/`-a`, `--format`, `--no-reset`, `--no-stream`,
-    /// `--interval`) plus `validate.AddLatestFlag` -- a byte-identical
-    /// alias, the same shape [`Self::Kill`] (`0492`) already
-    /// established. Dispatches into the same [`cmd_stats`] `ociman
-    /// stats` itself already calls, replaying the identical
+    /// `--interval`, `--no-trunc`) plus `validate.AddLatestFlag` -- a
+    /// byte-identical alias, the same shape [`Self::Kill`] (`0492`)
+    /// already established. Dispatches into the same [`cmd_stats`]
+    /// `ociman stats` itself already calls, replaying the identical
     /// `--latest`/explicit-id resolution the top-level
     /// [`Command::Stats`] arm already has -- see [`Command::Stats`]'s
     /// own doc comment for the exact semantics (including this
@@ -5936,6 +5956,9 @@ enum ContainerCommand {
         /// Same as [`Command::Stats::format`].
         #[arg(long = "format", value_name = "TEMPLATE")]
         format: Option<String>,
+        /// Same as [`Command::Stats::no_trunc`].
+        #[arg(long = "no-trunc")]
+        no_trunc: bool,
     },
     /// `podman container attach`'s own real alias for the already-
     /// existing flat [`Command::Attach`] -- checked directly, `~/git/
@@ -7467,6 +7490,7 @@ fn main() -> std::process::ExitCode {
                     interval,
                     no_reset,
                     format,
+                    no_trunc: _,
                 } => {
                     // Matches real podman's own exact wording, checked
                     // directly (`~/git/podman/cmd/podman/containers/
@@ -7773,6 +7797,7 @@ fn main() -> std::process::ExitCode {
                 interval,
                 no_reset,
                 format,
+                no_trunc: _,
             }) => {
                 // Matches real podman's own exact wording, checked
                 // directly (`~/git/podman/cmd/podman/containers/

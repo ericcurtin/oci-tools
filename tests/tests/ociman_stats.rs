@@ -297,6 +297,80 @@ fn stats_no_stream_table_output_has_the_real_expected_columns() {
     ociman(storage_dir.path(), &["rm", &id]);
 }
 
+/// `--no-trunc` (`docs/design/0545`) is a real, total no-op here --
+/// see `Command::Stats::no_trunc`'s own doc comment for the exact,
+/// checked-directly reasoning (real podman's own identical flag only
+/// ever un-truncates the table's own `ID` column, and this project's
+/// own container ids are already always the short, 12-hex-character
+/// form with no separate, longer form to reveal). Asserts the ID
+/// column is the exact same 12-hex-character id either way -- proving
+/// `--no-trunc` doesn't (and has nothing to) change it.
+#[test]
+fn stats_no_trunc_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stats-no-trunc:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/stats-no-trunc:latest",
+        &["/bin/sh", "-c", "while true; do sleep 1; done"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let plain = ociman(storage_dir.path(), &["stats", &id, "--no-stream"]);
+    assert!(
+        plain.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let no_trunc = ociman(
+        storage_dir.path(),
+        &["stats", &id, "--no-stream", "--no-trunc"],
+    );
+    assert!(
+        no_trunc.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&no_trunc.stderr)
+    );
+
+    let plain_stdout = String::from_utf8_lossy(&plain.stdout);
+    let no_trunc_stdout = String::from_utf8_lossy(&no_trunc.stdout);
+    // Both contain the exact same, full (and only) 12-hex-character
+    // id -- no additional truncation was ever applied to either.
+    assert!(plain_stdout.contains(&id), "{plain_stdout:?}");
+    assert!(no_trunc_stdout.contains(&id), "{no_trunc_stdout:?}");
+    assert_eq!(
+        id.len(),
+        12,
+        "this project's own ids are always 12 hex chars"
+    );
+
+    let kill = ociman(storage_dir.path(), &["kill", &id]);
+    assert!(kill.status.success());
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", &id]);
+}
+
 /// Bare `ociman stats <id>` (no `--no-stream`) is a clear, loud error
 /// -- continuous streaming isn't implemented yet, see `cmd_stats`'s
 /// own doc comment -- never a silent hang or a silently different
