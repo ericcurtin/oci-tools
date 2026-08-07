@@ -76,7 +76,7 @@ mod diff;
 pub use diff::{Change, ChangeKind, Snapshot, changes};
 
 mod export;
-pub use export::{export, export_tree};
+pub use export::{export, export_single_path_tree, export_tree};
 
 mod compress;
 pub use compress::{compress_for_storage, decompress_verifying};
@@ -146,17 +146,39 @@ const WHITEOUT_OPAQUE_MARKER: &str = ".wh..wh..opq";
 /// comment). `dest` must already exist.
 pub fn apply(reader: impl Read, compression: Compression, dest: &Path) -> Result<()> {
     match compression {
-        Compression::None => apply_tar(reader, dest),
-        Compression::Gzip => apply_tar(flate2::read::GzDecoder::new(reader), dest),
+        Compression::None => apply_tar(reader, dest, true),
+        Compression::Gzip => apply_tar(flate2::read::GzDecoder::new(reader), dest, true),
         Compression::Zstd => {
             let decoder = ruzstd::decoding::StreamingDecoder::new(reader)
                 .map_err(|e| LayerError::InvalidZstd(e.to_string()))?;
-            apply_tar(decoder, dest)
+            apply_tar(decoder, dest, true)
         }
     }
 }
 
-fn apply_tar(reader: impl Read, dest: &Path) -> Result<()> {
+/// Extract a *plain* tar stream (never gzip/zstd-compressed — real
+/// `podman cp`'s own stdin-streaming side only ever validates the raw
+/// bytes look like an uncompressed tar too, checked directly against
+/// `~/git/podman/cmd/podman/containers/cp.go:399`'s own `archive.
+/// IsArchivePath`) onto `dest`, with **no** OCI whiteout
+/// interpretation at all — unlike [`apply`], a `.wh.<name>` entry here
+/// is written out as a real, literal file named exactly that, never
+/// treated as a delete marker. This project's own `ociman cp -
+/// CONTAINER:DEST`/`ociman container cp - CONTAINER:DEST` (`docs/
+/// design/0553`) is the one real consumer: an arbitrary user-supplied
+/// tar of plain file content has no OCI-layer semantics of its own at
+/// all, and a literal `.wh.foo` file inside it (however unlikely)
+/// must land on disk exactly as given, not be silently swallowed as
+/// if it were a real image layer's own delete marker — a genuine
+/// correctness distinction, not a cosmetic one. `dest` must already
+/// exist. Shares every other extraction safety net [`apply`] already
+/// has (`safe_join`'s own path-escape rejection, hardlink/symlink
+/// handling, permission bits, `created_dirs` memoization).
+pub fn extract_plain_tar(reader: impl Read, dest: &Path) -> Result<()> {
+    apply_tar(reader, dest, false)
+}
+
+fn apply_tar(reader: impl Read, dest: &Path, handle_whiteouts: bool) -> Result<()> {
     // Tracks paths this call has already written, so an opaque-
     // directory whiteout (which can appear anywhere relative to this
     // layer's own real entries for the same directory in the stream)
@@ -215,13 +237,13 @@ fn apply_tar(reader: impl Read, dest: &Path) -> Result<()> {
             .and_then(|n| n.to_str())
             .unwrap_or_default();
 
-        if file_name == WHITEOUT_OPAQUE_MARKER {
+        if handle_whiteouts && file_name == WHITEOUT_OPAQUE_MARKER {
             if let Some(dir) = target.parent() {
                 make_opaque(dir, &written)?;
             }
             continue;
         }
-        if let Some(removed_name) = file_name.strip_prefix(WHITEOUT_PREFIX) {
+        if handle_whiteouts && let Some(removed_name) = file_name.strip_prefix(WHITEOUT_PREFIX) {
             let removed = target
                 .parent()
                 .map(|p| p.join(removed_name))
@@ -591,6 +613,53 @@ mod tests {
 
         assert!(!dir.path().join("gone.txt").exists());
         assert!(!dir.path().join(".wh.gone.txt").exists());
+    }
+
+    /// The real, checked-directly correctness distinction
+    /// [`extract_plain_tar`]'s own doc comment cites (`docs/design/
+    /// 0553`): a literal `.wh.<name>` entry in an arbitrary,
+    /// user-supplied tar (real `podman cp`'s own stdin-streaming
+    /// case, never a real OCI image layer) must land on disk exactly
+    /// as given -- never silently interpreted as a delete marker for
+    /// some unrelated pre-existing `<name>`, unlike [`apply`]'s own
+    /// identical-looking entry just above
+    /// (`whiteout_removes_a_file_from_a_lower_layer`).
+    /// Genuinely non-tar input is a real, immediate error -- the same
+    /// "fails on the very first malformed header" behavior real
+    /// podman's own `archive.IsArchivePath` check relies on (`~/git/
+    /// container-libs/storage/pkg/archive/archive.go:139-153`: it's
+    /// just a real attempt to read the first tar header, nothing more
+    /// -- functionally identical to what `tar::Archive::entries`
+    /// already does here on its own first `.next()` call), matching
+    /// real `podman cp - CONTAINER:DEST`'s own "source must be a
+    /// (compressed) tar archive when copying from stdin" outcome in
+    /// spirit even though the exact wording differs (a low-level
+    /// I/O-parsing error here, not a dedicated CLI-validation one).
+    #[test]
+    fn extract_plain_tar_of_non_tar_input_is_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let garbage = b"this is definitely not a tar file, just plain garbage bytes padded out";
+        assert!(extract_plain_tar(&garbage[..], dir.path()).is_err());
+    }
+
+    #[test]
+    fn extract_plain_tar_writes_a_literal_wh_prefixed_file_instead_of_treating_it_as_a_whiteout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("innocent.txt"), b"must survive").unwrap();
+
+        let data = build_tar(&[Entry::File(".wh.innocent.txt", b"a real, literal file")]);
+        extract_plain_tar(data.as_slice(), dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join("innocent.txt")).unwrap(),
+            b"must survive",
+            "a plain tar's own .wh.-prefixed entry must never delete an unrelated file"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(".wh.innocent.txt")).unwrap(),
+            b"a real, literal file",
+            "the .wh.-prefixed entry itself must be written out literally"
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@
 //! correct, passing outcome for that one test).
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use oci_spec_types::image::ContainerConfig;
 use oci_store::Store;
@@ -669,4 +669,216 @@ fn cp_archive_chowns_to_the_destination_containers_own_user_when_privileged_enou
         0,
         "--archive should chown to the destination container's own primary gid (0, root)"
     );
+}
+
+fn tar_entry_names(bytes: &[u8]) -> Vec<String> {
+    let mut archive = tar::Archive::new(bytes);
+    let mut names: Vec<String> = archive
+        .entries()
+        .unwrap()
+        .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// `-` as `DEST_PATH` (`docs/design/0553`): a single file source
+/// streams to stdout as a real tar with exactly one entry named by
+/// its own basename -- matching real `podman cp ctr:/etc/passwd -`'s
+/// own checked-directly, live-verified shape exactly.
+#[test]
+fn cp_stdout_streams_a_single_file_tarred_under_its_own_basename() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/cp-stdout-file:latest",
+        true,
+    );
+    let rootfs = container_rootfs(storage_dir.path(), &id);
+    std::fs::write(Path::new(&rootfs).join("greeting.txt"), "hello stdout").unwrap();
+
+    let cp = ociman(
+        storage_dir.path(),
+        &["cp", &format!("{id}:/greeting.txt"), "-"],
+    );
+    assert!(
+        cp.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cp.stderr)
+    );
+    assert_eq!(
+        tar_entry_names(&cp.stdout),
+        vec!["greeting.txt".to_string()]
+    );
+
+    let mut archive = tar::Archive::new(cp.stdout.as_slice());
+    let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+    let mut content = String::new();
+    std::io::Read::read_to_string(&mut entry, &mut content).unwrap();
+    assert_eq!(content, "hello stdout");
+}
+
+/// A directory source streams with its own basename as the top-level
+/// entry, children nested underneath -- matching real `podman cp
+/// ctr:/etc -`'s own checked-directly, live-verified shape.
+#[test]
+fn cp_stdout_streams_a_directory_with_its_own_basename_as_the_top_level_entry() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/cp-stdout-dir:latest",
+        true,
+    );
+    let rootfs = container_rootfs(storage_dir.path(), &id);
+    std::fs::create_dir_all(Path::new(&rootfs).join("mydir/sub")).unwrap();
+    std::fs::write(Path::new(&rootfs).join("mydir/a.txt"), "a").unwrap();
+    std::fs::write(Path::new(&rootfs).join("mydir/sub/b.txt"), "b").unwrap();
+
+    let cp = ociman(storage_dir.path(), &["cp", &format!("{id}:/mydir"), "-"]);
+    assert!(
+        cp.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cp.stderr)
+    );
+    assert_eq!(
+        tar_entry_names(&cp.stdout),
+        vec![
+            "mydir".to_string(),
+            "mydir/a.txt".to_string(),
+            "mydir/sub".to_string(),
+            "mydir/sub/b.txt".to_string(),
+        ]
+    );
+}
+
+/// `-` as `SRC_PATH` (`docs/design/0553`): a real tar piped on stdin
+/// extracts correctly into an already-existing container directory --
+/// matching real `podman cp - ctr:/existing-dir`'s own identical
+/// stdin-streaming behavior.
+#[test]
+fn cp_stdin_extracts_a_tar_into_an_existing_container_directory() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id =
+        seed_and_run_stopped_container(storage_dir.path(), "ociman-test/cp-stdin:latest", true);
+    let rootfs = container_rootfs(storage_dir.path(), &id);
+    std::fs::create_dir_all(Path::new(&rootfs).join("existing-dir")).unwrap();
+
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        let content = b"streamed via stdin";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "streamed.txt", &content[..])
+            .unwrap();
+        builder.finish().unwrap();
+    }
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["cp", "-", &format!("{id}:/existing-dir")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman");
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), &tar_bytes).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&rootfs).join("existing-dir/streamed.txt")).unwrap(),
+        "streamed via stdin"
+    );
+}
+
+/// A destination that doesn't already resolve to a real directory is
+/// a clear, immediate error when streaming from stdin -- matching
+/// real `podman cp - ctr:/dest`'s own exact, checked-directly wording
+/// (`~/git/podman/cmd/podman/containers/cp.go:375-377`).
+#[test]
+fn cp_stdin_requires_the_destination_to_already_be_a_real_directory() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/cp-stdin-not-a-dir:latest",
+        true,
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["cp", "-", &format!("{id}:/does-not-exist-at-all")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman");
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"irrelevant").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("destination must be a directory"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Genuinely non-tar stdin input is a real, immediate error, not a
+/// silent no-op or a confusing low-level panic.
+#[test]
+fn cp_stdin_of_non_tar_input_is_a_clear_error() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/cp-stdin-garbage:latest",
+        true,
+    );
+    let rootfs = container_rootfs(storage_dir.path(), &id);
+    std::fs::create_dir_all(Path::new(&rootfs).join("existing-dir2")).unwrap();
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["cp", "-", &format!("{id}:/existing-dir2")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman");
+    std::io::Write::write_all(
+        child.stdin.as_mut().unwrap(),
+        b"this is definitely not a tar file, just plain garbage bytes padded out",
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
 }

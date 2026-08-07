@@ -155,6 +155,57 @@ pub fn export_tree(root: &Path, writer: impl Write, forced_mtime: Option<i64>) -
     writer.flush().map_err(LayerError::Io)
 }
 
+/// Like [`export_tree`], but for a *single* file/directory/symlink at
+/// `path`, tarred under its own basename as the one top-level entry
+/// (with the same recursive descent for a directory) — matching real
+/// `docker cp`/`podman cp`'s own "the archive represents `SRC_PATH`
+/// itself, named by its own basename" streaming-to-stdout shape
+/// (checked directly against a real installed `podman 4.9.3`: `podman
+/// cp ctr:/etc/passwd -` produces a tar whose one entry is named
+/// `passwd`; `podman cp ctr:/etc -` produces one whose top-level entry
+/// is `etc`, with `etc/group` etc. nested under it — genuinely
+/// different from [`export_tree`]'s own "root's children become
+/// top-level entries, root itself is never an entry" shape, which is
+/// what real podman's own identical `podman cp ctr:/ -` uses instead,
+/// since `/` has no basename of its own to wrap with). This project's
+/// own `ociman cp SRC_PATH -`/`ociman container cp SRC_PATH -`
+/// (`docs/design/0553`) is the one real consumer.
+///
+/// Shares [`export_tree`]'s own identical "never crosses a mount-point
+/// boundary" safety net when `path` is a directory (see that
+/// function's own doc comment for exactly why that matters) — the
+/// same real, checked-directly-hit bug this project's own `ociman
+/// export` already found and fixed, equally reachable here (e.g. a
+/// still-running container's own live-mounted `/proc` as `SRC_PATH`).
+pub fn export_single_path_tree(
+    path: &Path,
+    writer: impl Write,
+    forced_mtime: Option<i64>,
+) -> Result<()> {
+    let parent = path.parent().unwrap_or(Path::new("/"));
+    let name = path
+        .file_name()
+        .map_or_else(|| PathBuf::from("/"), PathBuf::from);
+
+    let mut builder = tar::Builder::new(writer);
+    builder.follow_symlinks(false);
+    let mut seen_inodes = std::collections::HashMap::new();
+
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_dir() {
+        let mut paths = vec![name.clone()];
+        collect_paths(parent, &name, metadata.dev(), &mut paths)?;
+        for entry in &paths {
+            write_entry(&mut builder, parent, entry, &mut seen_inodes, forced_mtime)?;
+        }
+    } else {
+        write_entry(&mut builder, parent, &name, &mut seen_inodes, forced_mtime)?;
+    }
+
+    let mut writer = builder.into_inner().map_err(LayerError::Io)?;
+    writer.flush().map_err(LayerError::Io)
+}
+
 fn collect_paths(
     root: &Path,
     relative: &Path,
@@ -643,6 +694,83 @@ mod tests {
         let archive_bytes = export_tree_bytes(dir.path());
         let mut archive = tar::Archive::new(archive_bytes.as_slice());
         assert_eq!(archive.entries().unwrap().count(), 0);
+    }
+
+    fn export_single_path_tree_bytes(path: &Path) -> Vec<u8> {
+        let mut out = Vec::new();
+        export_single_path_tree(path, &mut out, None).unwrap();
+        out
+    }
+
+    /// A single *file* source is archived under its own bare basename
+    /// alone, with no parent-directory entries at all -- matching real
+    /// `podman cp ctr:/etc/passwd -`'s own checked-directly, live-
+    /// verified shape (one entry, named `passwd`).
+    #[test]
+    fn export_single_path_tree_of_a_file_has_exactly_one_entry_named_by_its_own_basename() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("a/b/passwd"), b"real content");
+
+        let archive_bytes = export_single_path_tree_bytes(&dir.path().join("a/b/passwd"));
+        let mut archive = tar::Archive::new(archive_bytes.as_slice());
+        let entries: Vec<_> = archive.entries().unwrap().map(|e| e.unwrap()).collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].path().unwrap().to_string_lossy(),
+            "passwd",
+            "must not include any parent-directory entries"
+        );
+    }
+
+    /// A *directory* source is archived with its own basename as the
+    /// top-level entry, its children nested underneath -- matching
+    /// real `podman cp ctr:/etc -`'s own checked-directly, live-
+    /// verified shape (`etc`, `etc/group`, ...), genuinely different
+    /// from `export_tree`'s own "root's children are the top-level
+    /// entries" shape.
+    #[test]
+    fn export_single_path_tree_of_a_directory_includes_its_own_basename_as_the_top_level_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("a/etc/group"), b"group content");
+        write_file(&dir.path().join("a/etc/sub/nested.txt"), b"nested content");
+
+        let archive_bytes = export_single_path_tree_bytes(&dir.path().join("a/etc"));
+        let mut archive = tar::Archive::new(archive_bytes.as_slice());
+        let mut paths: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "etc".to_string(),
+                "etc/group".to_string(),
+                "etc/sub".to_string(),
+                "etc/sub/nested.txt".to_string(),
+            ]
+        );
+    }
+
+    /// Re-extracting an `export_single_path_tree` archive (via
+    /// [`crate::extract_plain_tar`], since this is never a real OCI
+    /// layer) onto a fresh, empty directory reproduces the exact same
+    /// content under the exact same basename -- a full write/read
+    /// round trip, not just an isolated tar-content check.
+    #[test]
+    fn export_single_path_tree_round_trips_through_extract_plain_tar() {
+        let source = tempfile::tempdir().unwrap();
+        write_file(&source.path().join("a/etc/group"), b"real content");
+
+        let archive_bytes = export_single_path_tree_bytes(&source.path().join("a/etc"));
+
+        let dest = tempfile::tempdir().unwrap();
+        crate::extract_plain_tar(archive_bytes.as_slice(), dest.path()).unwrap();
+        assert_eq!(
+            fs::read(dest.path().join("etc/group")).unwrap(),
+            b"real content"
+        );
     }
 
     /// `forced_mtime` overrides a real file's own real, live mtime --

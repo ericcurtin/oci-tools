@@ -3108,7 +3108,27 @@ enum Command {
     /// matching real `docker cp`/`podman cp` exactly (see `cmd_cp`'s
     /// own doc comment for the one real gap this doesn't cover yet: a
     /// container using this project's own rootless-overlay-rootfs
-    /// optimization, 0110).
+    /// optimization, 0110). `-` as either `SRC_PATH` or `DEST_PATH`
+    /// streams a real tar archive to/from stdout/stdin instead of a
+    /// literal host path named `-` (`docs/design/0553`, closing a gap
+    /// `docs/design/0146` had explicitly deferred) — matching real
+    /// `docker cp`/`podman cp`'s own identical documented feature
+    /// (checked directly, `~/git/podman/cmd/podman/containers/cp.go:
+    /// 29`'s own `cpDescription`, and live-verified against a real
+    /// installed `podman 4.9.3`): container-side `-` is never
+    /// meaningful (`-` only ever refers to the *host*-filesystem side
+    /// of the operation, checked directly — real podman's own
+    /// `hostPath == "-"` checks only ever apply to the argument that
+    /// *isn't* `[CONTAINER:]`-prefixed), so this only applies within
+    /// [`cmd_cp`]'s own container-to-host/host-to-container branches,
+    /// never its container-to-container one (which, by construction,
+    /// can never have `-` on either side to begin with — see
+    /// [`parse_user_input`]'s own doc comment for exactly why).
+    /// Deliberately no real-terminal guard on the stdout side (unlike
+    /// `ociman save`/`export`, `0550`/`0552`) — checked directly, real
+    /// `podman cp` itself never calls `term.IsTerminal` anywhere in
+    /// `cp.go` at all, a real, checked-directly *absence* faithfully
+    /// matched here rather than "improved upon".
     Cp {
         /// `[CONTAINER:]SRC_PATH` — exactly one of `src`/`dest` must
         /// have a `CONTAINER:` prefix.
@@ -14524,6 +14544,7 @@ fn cmd_rm(
 /// optimization still fails clearly rather than silently copying into
 /// the wrong (empty) place.
 fn cmd_cp(src: &str, dest: &str, overwrite: bool, archive: bool) -> anyhow::Result<()> {
+    use std::io::Write as _;
     let (src_container, src_path) = parse_user_input(src);
     let (dest_container, dest_path) = parse_user_input(dest);
 
@@ -14552,11 +14573,67 @@ fn cmd_cp(src: &str, dest: &str, overwrite: bool, archive: bool) -> anyhow::Resu
             // `Command::Cp::archive`'s own doc comment).
             let (root, _state) = resolve_container_root(&container, "cp")?;
             let real_src = resolve_container_path(&root, &src_path)?;
+            // `-` as `DEST_PATH` (`docs/design/0553`): stream a tar of
+            // `SRC_PATH` to stdout instead of a literal host path
+            // named `-` -- see `Command::Cp`'s own doc comment for the
+            // exact real-podman citation. Deliberately no terminal
+            // guard here (unlike `ociman save`/`export`, `0550`/
+            // `0552`): checked directly, real `podman cp` itself never
+            // calls `term.IsTerminal` anywhere in `cp.go` at all, on
+            // either the stdin or stdout side -- a real, checked-
+            // directly *absence*, faithfully matched rather than
+            // "improved upon" here.
+            if dest_path == "-" {
+                let stdout = std::io::stdout();
+                let mut writer = std::io::BufWriter::new(stdout.lock());
+                // `SRC_PATH` resolving to the container's own rootfs
+                // root itself (`ociman cp CONTAINER:/ -`) streams every
+                // one of its children as top-level entries, matching
+                // real `podman cp ctr:/ -`'s own identical shape
+                // (live-verified: `/` has no basename of its own to
+                // wrap with) -- any other path is wrapped under its
+                // own basename instead, matching real podman's own
+                // identical `podman cp ctr:/etc -`/`ctr:/etc/passwd -`
+                // shapes (see `oci_layer::export_single_path_tree`'s
+                // own doc comment for the exact citations).
+                let result = if real_src == root {
+                    oci_layer::export_tree(&real_src, &mut writer, None)
+                } else {
+                    oci_layer::export_single_path_tree(&real_src, &mut writer, None)
+                };
+                result.with_context(|| {
+                    format!("streaming {src_path:?} from container {container:?} to stdout")
+                })?;
+                return writer.flush().context("flushing archive to stdout");
+            }
             copy_cp_path(&real_src, Path::new(&dest_path), overwrite, None)
         }
         (None, Some(container)) => {
             let (root, state) = resolve_container_root(&container, "cp")?;
             let real_dest = resolve_container_path(&root, &dest_path)?;
+            // `-` as `SRC_PATH` (`docs/design/0553`): extract a tar
+            // read from stdin into `DEST_PATH` instead of treating a
+            // literal host path named `-` -- see `Command::Cp`'s own
+            // doc comment for the exact real-podman citation
+            // (`~/git/podman/cmd/podman/containers/cp.go:346-348,
+            // 373-376`). `DEST_PATH` must already exist as a real
+            // directory (real podman's own exact, checked-directly
+            // wording: `"destination must be a directory when copying
+            // from stdin"`) -- an arbitrary user-supplied tar has no
+            // single "this is the one thing being copied" path of its
+            // own the way a container/host source path does, so there
+            // is nothing sensible to auto-create a parent for the way
+            // `copy_cp_path`'s own file-onto-directory logic does.
+            if src_path == "-" {
+                anyhow::ensure!(
+                    real_dest.is_dir(),
+                    "ociman cp: destination must be a directory when copying from stdin"
+                );
+                let stdin = std::io::stdin();
+                return oci_layer::extract_plain_tar(stdin.lock(), &real_dest).with_context(|| {
+                    format!("extracting stdin tar archive into container {container:?}")
+                });
+            }
             let chown = archive
                 .then(|| container_primary_uid_gid(&state))
                 .transpose()?;
