@@ -4121,17 +4121,14 @@ enum Command {
         /// `ContainerStats`: `--all` switches the enumerated set from
         /// `GetRunningContainers` to `GetAllContainers`). Mutually
         /// exclusive with both `--latest` and an explicit `ID`/
-        /// `--name`, per the identical real wording above. A real,
-        /// deliberately narrower first slice: only combined with
-        /// `--no-stream` for now (real podman's own primary
-        /// documented example, `stats.go`'s own doc comment: `podman
-        /// stats --all --no-stream`) — real podman's own `--all`
-        /// also composes with the default continuous-streaming mode
-        /// via one unified, periodically-re-listing channel
-        /// architecture this project doesn't have yet; `--all`
-        /// without `--no-stream` is a clear, honest, immediate "not
-        /// yet supported" error here instead, never a silent,
-        /// narrower stand-in.
+        /// `--name`, per the identical real wording above. Composes
+        /// with the default continuous-streaming mode too (0570,
+        /// closing `0560`'s own originally-deferred gap): each
+        /// interval re-lists every stored container from scratch,
+        /// matching real podman's own identical re-invoked
+        /// `computeStats` closure exactly — see
+        /// [`cmd_stats_all_streaming`]'s own doc comment for the full,
+        /// checked-directly reasoning.
         #[arg(short = 'a', long)]
         all: bool,
         /// A single, one-shot sample instead of a continuous stream
@@ -6152,10 +6149,9 @@ enum ContainerCommand {
     /// `ociman stats` itself already calls, replaying the identical
     /// `--latest`/explicit-id resolution the top-level
     /// [`Command::Stats`] arm already has -- see [`Command::Stats`]'s
-    /// own doc comment for the exact semantics (including this
-    /// project's own honestly narrower first-slice scope: `--all`
-    /// only combined with `--no-stream`, `0560`, matching the
-    /// top-level command's own identical gap), not repeated here.
+    /// own doc comment for the exact semantics (including `--all`'s
+    /// own full streaming support, `0560`/`0570`, matching the
+    /// top-level command's own identical scope), not repeated here.
     Stats {
         /// Same as [`Command::Stats::id`].
         id: Option<String>,
@@ -7751,13 +7747,15 @@ fn main() -> std::process::ExitCode {
                         "--all, --latest and containers cannot be used together"
                     );
                     if all {
-                        anyhow::ensure!(
-                            no_stream,
-                            "--all's own continuous streaming mode across every container is \
-                             not yet supported (combine with --no-stream for a real, one-shot \
-                             multi-container sample)"
+                        if no_stream {
+                            return cmd_stats_all(cli.global.json, format.as_deref());
+                        }
+                        return cmd_stats_all_streaming(
+                            interval,
+                            no_reset,
+                            cli.global.json,
+                            format.as_deref(),
                         );
-                        return cmd_stats_all(cli.global.json, format.as_deref());
                     }
                     let resolved_id = match id {
                         Some(id) => id,
@@ -8075,16 +8073,15 @@ fn main() -> std::process::ExitCode {
                     "--all, --latest and containers cannot be used together"
                 );
                 if all {
-                    // See `Command::Stats::all`'s own doc comment for
-                    // exactly why this first slice is `--no-stream`-
-                    // only.
-                    anyhow::ensure!(
-                        no_stream,
-                        "--all's own continuous streaming mode across every container is not \
-                         yet supported (combine with --no-stream for a real, one-shot \
-                         multi-container sample)"
+                    if no_stream {
+                        return cmd_stats_all(cli.global.json, format.as_deref());
+                    }
+                    return cmd_stats_all_streaming(
+                        interval,
+                        no_reset,
+                        cli.global.json,
+                        format.as_deref(),
                     );
-                    return cmd_stats_all(cli.global.json, format.as_deref());
                 }
                 let resolved_id = match id {
                     Some(id) => id,
@@ -19264,34 +19261,80 @@ fn print_stats_sample(
     Ok(())
 }
 
-/// `ociman stats --all --no-stream` (`0560`): a real, one-shot,
-/// multi-container sample of every *stored* container, not just
-/// running ones — matching real `podman stats --all`'s own identical
+/// One real sample across *every* stored container, not just running
+/// ones — matching real `podman stats --all`'s own identical
 /// `GetAllContainers` enumeration exactly (checked directly, `~/git/
-/// podman/pkg/domain/infra/abi/containers.go:1663-1690`). A container
-/// that isn't currently running simply produces no row at all — the
-/// same honest "nothing to report" reasoning [`sample_container_
-/// stats`]'s own doc comment already gives for a single container;
-/// `--all` just applies it across every stored one instead of
-/// erroring on the first miss. Sorted by creation time, the same
-/// stable order `ociman ps`'s own default already uses.
-///
-/// See [`Command::Stats::all`]'s own doc comment for exactly why this
-/// is `--no-stream`-only for now — real podman's own `--all` also
-/// composes with the default continuous-streaming mode, a genuinely
-/// new "keep re-listing every stored container each interval" loop
-/// this project doesn't have yet.
-fn cmd_stats_all(json: bool, format: Option<&str>) -> anyhow::Result<()> {
-    let containers = open_container_store()?;
+/// podman/pkg/domain/infra/abi/containers.go:1663-1690`,
+/// `computeStats`). A container that isn't currently running simply
+/// produces no row at all — the same honest "nothing to report"
+/// reasoning [`sample_container_stats`]'s own doc comment already
+/// gives for a single container; `--all` just applies it across every
+/// stored one instead of erroring on the first miss. Sorted by
+/// creation time, the same stable order `ociman ps`'s own default
+/// already uses. Shared by both `--all --no-stream` (`0560`, a single
+/// call) and `--all`'s own default continuous-streaming mode (0570,
+/// re-called each interval — matching real podman's own identical
+/// `computeStats` being re-invoked in a loop, `containers.go:1738-
+/// 1739`, rather than one enumeration reused throughout).
+fn sample_all_container_stats(containers: &StateStore) -> anyhow::Result<Vec<ContainerStatsView>> {
     let mut states = containers.list()?;
     states.sort_by(|a, b| a.created.cmp(&b.created));
     let mut views = Vec::new();
     for state in &states {
-        if let Some(view) = sample_container_stats(&containers, &state.id)? {
+        if let Some(view) = sample_container_stats(containers, &state.id)? {
             views.push(view);
         }
     }
+    Ok(views)
+}
+
+/// `ociman stats --all --no-stream` (`0560`): a real, one-shot,
+/// multi-container sample of every stored container — see
+/// [`sample_all_container_stats`]'s own doc comment for the exact
+/// enumeration semantics this shares with the streaming mode below.
+fn cmd_stats_all(json: bool, format: Option<&str>) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let views = sample_all_container_stats(&containers)?;
     print_stats_samples(&views, json, format)
+}
+
+/// `ociman stats --all` without `--no-stream` (0570, closing `0560`'s
+/// own explicitly-deferred gap): a real, continuous, re-listing
+/// stream across every stored container, matching real `podman stats
+/// --all`'s own default streaming mode exactly (checked directly,
+/// `~/git/podman/pkg/domain/infra/abi/containers.go:1663-1690`): each
+/// interval re-runs the *entire* enumeration (`GetAllContainers`)
+/// from scratch, not just re-sampling a fixed set captured once — a
+/// container created or removed between intervals is picked up or
+/// dropped immediately, exactly like real podman's own loop. Real
+/// podman's own `--all`/default (no explicit container) cases are
+/// both marked `queryAll = true`, which silently skips a container
+/// that vanishes between listing and sampling rather than ending the
+/// whole stream (`computeStats`'s own `errors.Is(err, define.
+/// ErrCtrRemoved) || ...` skip list) — this project's own
+/// [`sample_container_stats`] already has the equivalent honest
+/// "not running any more" skip built in via its `Ok(None)` return, so
+/// no separate error-classification is needed here. Unlike the
+/// single-container streaming loop in [`cmd_stats`], this one never
+/// ends on its own — matching real podman's own identical behavior of
+/// looping forever (even printing a genuinely empty table when
+/// nothing is running) until interrupted (e.g. `Ctrl+C`).
+fn cmd_stats_all_streaming(
+    interval: u64,
+    no_reset: bool,
+    json: bool,
+    format: Option<&str>,
+) -> anyhow::Result<()> {
+    let containers = open_container_store()?;
+    let is_terminal = std::io::stdout().is_terminal();
+    loop {
+        let views = sample_all_container_stats(&containers)?;
+        if !no_reset && is_terminal {
+            print!("\x1b[2J\x1b[1;1H");
+        }
+        print_stats_samples(&views, json, format)?;
+        std::thread::sleep(std::time::Duration::from_secs(interval));
+    }
 }
 
 /// The multi-container counterpart of [`print_stats_sample`] —

@@ -867,22 +867,180 @@ fn stats_all_no_stream_on_an_empty_store_is_an_empty_json_array() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[]");
 }
 
-/// `--all` without `--no-stream` is a real, clear, honest "not yet
-/// supported" error -- see `Command::Stats::all`'s own doc comment
-/// for exactly why this first slice deliberately doesn't attempt
-/// real podman's own richer continuous-multi-container streaming
-/// mode.
+/// `--all` without `--no-stream` (`docs/design/0570`, closing `0560`'s
+/// own originally-deferred gap): a real, continuous, re-listing
+/// stream across every stored container -- proven here by reading at
+/// least two full samples (two separate `CPU %` header lines) off a
+/// real, still-running child process before killing it; the process
+/// must still be alive at that point (a real, unbounded stream, not
+/// something that silently exits early), matching real `podman stats
+/// --all`'s own default streaming mode exactly.
 #[test]
-fn stats_all_without_no_stream_is_a_clear_not_yet_error() {
+fn stats_all_streaming_reports_repeated_samples_and_never_ends_on_its_own() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
     let storage_dir = tempfile::tempdir().unwrap();
-    Store::open(storage_dir.path()).unwrap();
-    let out = ociman(storage_dir.path(), &["stats", "--all"]);
-    assert!(!out.status.success());
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("not yet supported"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stats-all-stream:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
     );
+
+    let mut run = ociman_run_detached_named(
+        storage_dir.path(),
+        "streamallbox",
+        "ociman-test/stats-all-stream:latest",
+        &["/bin/sh", "-c", "while true; do sleep 1; done"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+    assert_eq!(
+        wait_for_container_status(storage_dir.path(), &id, "running", Duration::from_secs(20)),
+        "running"
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["stats", "--all", "--interval", "1", "--no-reset"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman stats --all");
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut header_count = 0usize;
+    let mut collected = String::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while header_count < 2 && Instant::now() < deadline {
+        let mut line = String::new();
+        use std::io::BufRead;
+        let n = reader.read_line(&mut line).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        if line.contains("CPU %") {
+            header_count += 1;
+        }
+        collected.push_str(&line);
+    }
+
+    assert!(
+        header_count >= 2,
+        "expected at least two real, separate samples before the stream would ever end on its \
+         own; got: {collected:?}"
+    );
+    assert!(
+        collected.contains(&id[..12.min(id.len())]) || collected.contains("streamallbox"),
+        "expected the real running container's own id/name in at least one sample: {collected:?}"
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the --all streaming mode should never end on its own -- it should still be running \
+         right now, exactly like real `podman stats --all`'s own default mode"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let kill = ociman(storage_dir.path(), &["kill", &id]);
+    assert!(kill.status.success());
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", &id]);
+}
+
+/// The default streaming mode across every stored container keeps
+/// re-listing from scratch each interval -- a container created
+/// *after* the stream already started is picked up on a later sample,
+/// matching real podman's own identical re-invoked `computeStats`
+/// closure exactly (checked directly, `~/git/podman/pkg/domain/infra/
+/// abi/containers.go:1663-1690`), not a fixed set captured once at
+/// startup.
+#[test]
+fn stats_all_streaming_picks_up_a_container_created_after_the_stream_started() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if !systemd_user_session_available() {
+        eprintln!("skipping: no reachable `systemd --user` session");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/stats-all-late:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["stats", "--all", "--interval", "1", "--no-reset"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman stats --all");
+
+    // Give the stream a moment to print at least one real, genuinely
+    // empty sample (no containers exist yet at all) before creating
+    // one.
+    std::thread::sleep(Duration::from_millis(1200));
+
+    let mut run = ociman_run_detached_named(
+        storage_dir.path(),
+        "latecomerbox",
+        "ociman-test/stats-all-late:latest",
+        &["/bin/sh", "-c", "while true; do sleep 1; done"],
+    );
+    let id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert!(!id.is_empty());
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut collected = String::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut found = false;
+    while Instant::now() < deadline {
+        let mut line = String::new();
+        use std::io::BufRead;
+        let n = reader.read_line(&mut line).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        collected.push_str(&line);
+        if line.contains("latecomerbox") {
+            found = true;
+            break;
+        }
+    }
+
+    assert!(
+        found,
+        "the newly-created container should have been picked up by a later re-listed sample: \
+         {collected:?}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let kill = ociman(storage_dir.path(), &["kill", &id]);
+    assert!(kill.status.success());
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", &id]);
 }
 
 /// `--all` combined with `--latest` or an explicit container is a
