@@ -1378,6 +1378,47 @@ enum Command {
         /// exact same syntax/semantics.
         #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         tls_verify: bool,
+        /// Cap the number of tags returned — matching real `podman
+        /// search --limit` exactly (checked directly, `~/git/podman/
+        /// cmd/podman/images/search.go:91-93`: `flags.IntVar(&
+        /// searchOptions.Limit, "limit", 0, ...)`, `0` its own real
+        /// "unset" sentinel). Real podman's own `--list-tags` mode
+        /// (`~/git/container-libs/common/libimage/search.go:257-283`,
+        /// `searchRepositoryTags`) fetches the *entire*, fully-
+        /// paginated tag list first (this project's own [`Client::
+        /// list_tags`] already ports the identical pagination, see
+        /// `docs/design/0371`) and only *then* truncates: `0`/unset
+        /// caps at a real, hardcoded default of 25
+        /// (`searchMaxQueries`), live-verified against a real
+        /// installed `podman 4.9.3` (`search --list-tags` with no
+        /// `--limit` at all returns exactly 25 rows for a repository
+        /// with far more tags than that); any other value overrides
+        /// that default. This closes a real, pre-existing bug in this
+        /// project's own previously-unconditional, unbounded
+        /// `cmd_search`, not just an optional flag: before this,
+        /// `ociman search --list-tags` on a many-tagged repository
+        /// already returned every tag, never capping at 25 the way
+        /// real podman's own default always has.
+        ///
+        /// A negative value is accepted, not rejected (real podman's
+        /// own CLI layer never validates this flag's own sign either)
+        /// -- but is a genuine, checked-directly real-podman quirk,
+        /// not a guess: `options.Limit != 0` still overrides the
+        /// default with the negative value itself, and Go's own
+        /// `for i := range limit` with a negative `limit` iterates
+        /// zero times — live-verified: `podman search --list-tags
+        /// --limit -1 ...` exits `0` with completely empty output,
+        /// not even its own usual `NAME`/`TAG` header row (real
+        /// podman's own `if len(searchReport) == 0 { return nil }`,
+        /// checked directly at `search.go:158-160`, runs before any
+        /// printing at all) -- matched here too (see `cmd_search`'s
+        /// own doc comment for the one deliberate JSON-mode
+        /// divergence). `allow_negative_numbers` lets `--limit -1`
+        /// parse as a value rather than an unrecognized flag, the
+        /// same real, space-separated syntax real podman's own
+        /// pflag-based CLI already accepts.
+        #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+        limit: i64,
     },
     /// Log in to a container registry, matching real `docker login`/
     /// `podman login`'s own auth-file format exactly (`--username`/
@@ -6661,7 +6702,8 @@ fn main() -> std::process::ExitCode {
                 term,
                 list_tags,
                 tls_verify,
-            }) => cmd_search(&term, list_tags, tls_verify, cli.global.json),
+                limit,
+            }) => cmd_search(&term, list_tags, tls_verify, limit, cli.global.json),
             Some(Command::Login {
                 registry,
                 username,
@@ -8139,10 +8181,33 @@ fn cmd_push(
     Ok(())
 }
 
+/// Real `podman search --list-tags`'s own hardcoded default result
+/// cap (`searchMaxQueries`, checked directly, `~/git/container-libs/
+/// common/libimage/search.go:23`) — see [`Command::Search::limit`]'s
+/// own doc comment.
+const DEFAULT_SEARCH_LIMIT: usize = 25;
+
 /// `ociman search --list-tags` — see [`Command::Search`]'s own doc
 /// comment for the exact real scope this implements and the free-text
 /// search mode it deliberately doesn't.
-fn cmd_search(term: &str, list_tags: bool, tls_verify: bool, json: bool) -> anyhow::Result<()> {
+///
+/// One deliberate divergence from real podman for `--json`: real
+/// podman prints *nothing at all* (not even an empty `[]`) for zero
+/// results (see [`Command::Search::limit`]'s own doc comment) --
+/// this project's own `--json` always emits a real, valid JSON value
+/// even for an empty result, matching every other `ociman` command's
+/// own `--json` convention (e.g. `ociman images --json` on an empty
+/// store prints `[]`, never nothing). The plain-text path *does*
+/// match real podman's own exact "no header at all for zero results"
+/// behavior, since that's directly, simply reproducible without
+/// giving up valid-JSON-always.
+fn cmd_search(
+    term: &str,
+    list_tags: bool,
+    tls_verify: bool,
+    limit: i64,
+    json: bool,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         list_tags,
         "ociman search: free-text registry search isn't supported yet -- pass --list-tags to \
@@ -8151,12 +8216,29 @@ fn cmd_search(term: &str, list_tags: bool, tls_verify: bool, json: bool) -> anyh
     let reference =
         Reference::parse(term).with_context(|| format!("parsing image reference {term:?}"))?;
     let mut client = oci_registry::client_for(reference.registry_host(), tls_verify);
-    let tags = client
+    let mut tags = client
         .list_tags(&reference)
         .with_context(|| format!("listing tags for {}", reference.familiar_repository()))?;
 
+    // `--limit`/real default cap of 25 (see `Command::Search::limit`'s
+    // own doc comment): `0` (unset) falls back to the real default;
+    // any other value -- including a negative one, matching real
+    // podman's own checked-directly "zero iterations" quirk -- wins
+    // instead. `Vec::truncate` is already a no-op when its own
+    // argument is `>=` the current length, so a `--limit` larger than
+    // the real tag count needs no separate `min(...)` at all.
+    let effective_limit = if limit != 0 {
+        usize::try_from(limit).unwrap_or(0)
+    } else {
+        DEFAULT_SEARCH_LIMIT
+    };
+    tags.truncate(effective_limit);
+
     if json {
         oci_cli_common::output::print_json(&tags)?;
+        return Ok(());
+    }
+    if tags.is_empty() {
         return Ok(());
     }
     println!("NAME\tTAG");
