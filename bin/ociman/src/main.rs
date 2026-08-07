@@ -3360,6 +3360,32 @@ enum Command {
         /// `println!` this function's own call chain reaches).
         #[arg(short, long)]
         quiet: bool,
+        /// `Format` of the resulting image manifest and metadata —
+        /// matching real `podman commit --format`/`-f` exactly
+        /// (checked directly, `~/git/podman/cmd/podman/containers/
+        /// commit.go:64-65`: `flags.StringVarP(&commitOptions.Format,
+        /// "format", "f", "oci", ...)`; `~/git/podman/pkg/domain/
+        /// infra/abi/containers.go:645-654`'s own `ContainerCommit`:
+        /// `"oci"`/`"docker"` are the only two real values, anything
+        /// else a real, immediate `"unrecognized image format %q"`
+        /// error — verified live against a real installed `podman
+        /// 4.9.3` too, not assumed from source alone). `"oci"` (the
+        /// default) is a true no-op, matching this project's own
+        /// already-existing, only-ever-OCI behavior exactly. `"docker"`
+        /// is a real, honest, immediate error instead of a silent
+        /// mislabel: this project has no Docker Schema2 image writer
+        /// anywhere at all (checked directly, `oci-store`'s own
+        /// `describe`/manifest-writing code only ever emits real
+        /// OCI media types) — a genuine, deliberately narrower first
+        /// slice, not a no-op like `"oci"` is. This is independent of
+        /// `--message`'s own already-established, documented
+        /// divergence (its own doc comment above): real podman's own
+        /// identical `-f docker`-only restriction on `--message`
+        /// never actually arises here, since `--format docker` itself
+        /// is already rejected outright before any such interaction
+        /// could ever matter.
+        #[arg(short = 'f', long, default_value = "oci")]
+        format: String,
     },
     /// Gracefully stop a running container: send it a signal (`TERM`
     /// by default) and wait up to `--time` seconds for it to exit on
@@ -5714,10 +5740,10 @@ enum ContainerCommand {
     /// `ociman commit` itself already calls, with the identical
     /// field set -- see [`Command::Commit`]'s own doc comment for
     /// the exact semantics (including this project's own honestly
-    /// narrower first-slice scope: no `--config`/`--format`/
-    /// `--include-volumes` -- `--quiet` closed this same gap in
-    /// `0523`, matching the top-level command's own identical
-    /// addition), not repeated here.
+    /// narrower first-slice scope: no `--config`/`--include-volumes`
+    /// -- `--quiet` closed the same class of gap in `0523`, `--format`
+    /// in `0537`, matching the top-level command's own identical
+    /// additions), not repeated here.
     Commit {
         /// Same as [`Command::Commit::container`].
         container: String,
@@ -5744,6 +5770,9 @@ enum ContainerCommand {
         /// Same as [`Command::Commit::quiet`].
         #[arg(short, long)]
         quiet: bool,
+        /// Same as [`Command::Commit::format`].
+        #[arg(short = 'f', long, default_value = "oci")]
+        format: String,
     },
     /// `podman container export`'s own real alias for the already-
     /// existing flat [`Command::Export`] -- checked directly, `~/git/
@@ -6885,6 +6914,7 @@ fn main() -> std::process::ExitCode {
                 squash,
                 iidfile,
                 quiet: _,
+                format,
             }) => cmd_commit(
                 &container,
                 image.as_deref(),
@@ -6894,6 +6924,7 @@ fn main() -> std::process::ExitCode {
                 &change,
                 squash,
                 iidfile.as_deref(),
+                &format,
                 cli.global.json,
             ),
             Some(Command::Stop {
@@ -7303,6 +7334,7 @@ fn main() -> std::process::ExitCode {
                     squash,
                     iidfile,
                     quiet: _,
+                    format,
                 } => cmd_commit(
                     &container,
                     image.as_deref(),
@@ -7312,6 +7344,7 @@ fn main() -> std::process::ExitCode {
                     &change,
                     squash,
                     iidfile.as_deref(),
+                    &format,
                     cli.global.json,
                 ),
                 ContainerCommand::Export { id, output } => cmd_export(&id, output.as_deref()),
@@ -14657,8 +14690,25 @@ fn cmd_commit(
     change: &[String],
     squash: bool,
     iidfile: Option<&Path>,
+    format: &str,
     json: bool,
 ) -> anyhow::Result<()> {
+    // `--format`/`-f` (see `Command::Commit::format`'s own doc
+    // comment): validated first, before any other work at all --
+    // matching real podman's own exact wording for an unrecognized
+    // value, checked directly (`~/git/podman/pkg/domain/infra/abi/
+    // containers.go:645-654`). `"docker"` is a real, honest,
+    // immediate error rather than a silent mislabel: this project has
+    // no Docker Schema2 image writer anywhere at all.
+    match format {
+        "oci" => {}
+        "docker" => anyhow::bail!(
+            "--format docker is not supported: this project only ever writes real OCI-format \
+             manifests/configs, never Docker Schema2"
+        ),
+        other => anyhow::bail!("unrecognized image format {other:?}"),
+    }
+
     // Parsed and validated *before* ever resolving the container or
     // pausing anything: a bad `--change` value should fail fast, with
     // no pointless freeze/thaw or wasted diff work first.

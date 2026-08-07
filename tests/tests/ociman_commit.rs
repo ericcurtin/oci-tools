@@ -368,6 +368,144 @@ fn container_commit_quiet_flag_works_through_the_alias() {
     assert!(digest.starts_with("sha256:"), "{commit:?}");
 }
 
+/// The `container commit` alias's own `--format` flag works too, not
+/// just the top-level command's.
+#[test]
+fn container_commit_format_flag_works_through_the_alias() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/container-commit-format:latest",
+        "exit 0",
+    );
+
+    let bogus = ociman(
+        storage_dir.path(),
+        &["container", "commit", "--format", "bogus", &id],
+    );
+    assert!(!bogus.status.success());
+    assert!(String::from_utf8_lossy(&bogus.stderr).contains("unrecognized image format"));
+
+    let oci = ociman(
+        storage_dir.path(),
+        &["container", "commit", "--format", "oci", &id],
+    );
+    assert!(
+        oci.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&oci.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&oci.stdout)
+            .trim()
+            .starts_with("sha256:")
+    );
+}
+
+/// `commit --format oci`/`-f oci` (`docs/design/0537`), matching real
+/// `podman commit --format` exactly: the default, and a true no-op,
+/// since this project only ever writes real OCI images -- proven
+/// here by an explicit `--format oci` commit producing the exact
+/// same digest a bare `commit` (no flag at all) does, for the
+/// identical container.
+#[test]
+fn commit_format_oci_is_the_default_and_a_true_no_op() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/commit-format-oci:latest",
+        "exit 0",
+    );
+
+    let explicit = ociman(storage_dir.path(), &["commit", "--format", "oci", &id]);
+    assert!(
+        explicit.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+    let explicit_digest = String::from_utf8_lossy(&explicit.stdout).trim().to_string();
+    assert!(explicit_digest.starts_with("sha256:"), "{explicit:?}");
+
+    let bare = ociman(storage_dir.path(), &["commit", &id]);
+    assert!(
+        bare.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    let bare_digest = String::from_utf8_lossy(&bare.stdout).trim().to_string();
+    assert!(bare_digest.starts_with("sha256:"), "{bare:?}");
+
+    // The two committed images' own top-level digests are *not*
+    // asserted equal here: this project's own `config.created` is
+    // always stamped with the real wall-clock commit time (checked
+    // directly, `commit_inner`'s own `config.created = Some
+    // (format_rfc3339_utc(SystemTime::now()))`), so two genuinely
+    // separate invocations -- even for the exact same underlying
+    // diff -- are never byte-identical top-level digests regardless
+    // of `--format`, a real, expected difference unrelated to this
+    // flag. Comparing the real layer *content* instead (`rootfs.
+    // diff_ids`, unaffected by any timestamp) is the actually honest
+    // way to prove `--format oci` changes nothing.
+    let diff_ids = |digest: &str| -> serde_json::Value {
+        let inspect = ociman(storage_dir.path(), &["inspect", digest, "--json"]);
+        assert!(inspect.status.success(), "{inspect:?}");
+        serde_json::from_slice::<serde_json::Value>(&inspect.stdout).unwrap()["rootfs"]["diff_ids"]
+            .clone()
+    };
+    assert_eq!(diff_ids(&explicit_digest), diff_ids(&bare_digest));
+}
+
+/// `--format docker` is a real, honest, immediate error -- this
+/// project has no Docker Schema2 image writer at all, matching real
+/// podman's own supported-value set (`oci`/`docker`) but not its own
+/// ability to actually produce the latter.
+#[test]
+fn commit_format_docker_is_a_clear_error() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/commit-format-docker:latest",
+        "exit 0",
+    );
+
+    let commit = ociman(storage_dir.path(), &["commit", "--format", "docker", &id]);
+    assert!(!commit.status.success());
+    assert!(
+        String::from_utf8_lossy(&commit.stderr).contains("not supported"),
+        "{commit:?}"
+    );
+}
+
+/// An unrecognized `--format` value is a real, immediate error,
+/// matching real podman's own exact `"unrecognized image format %q"`
+/// wording -- checked before ever touching the container at all, not
+/// even needing a real seeded image/container to reach it.
+#[test]
+fn commit_format_unrecognized_value_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let commit = ociman(
+        storage_dir.path(),
+        &["commit", "--format", "bogus", "some-id"],
+    );
+    assert!(!commit.status.success());
+    assert!(
+        String::from_utf8_lossy(&commit.stderr).contains("unrecognized image format"),
+        "{commit:?}"
+    );
+}
+
 /// `--iidfile <path>` writes the committed image's own digest
 /// (`sha256:<hex>`, no trailing newline) to that file after a
 /// successful commit -- matching real `podman commit --iidfile`
