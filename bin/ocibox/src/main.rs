@@ -1082,6 +1082,29 @@ enum Command {
         /// composition).
         #[arg(long, short = 'r')]
         root: bool,
+        /// Accepted for real CLI compatibility with real `distrobox
+        /// generate-entry --verbose`/`-v`; a real, faithful no-op —
+        /// checked directly (`0568`), the same "genuinely dead
+        /// upstream" shape `docs/design/0536`/`0564` already
+        /// established for `rm`/`create --verbose`, not `0557`'s own
+        /// `enter`/`ephemeral --verbose` exception. `~/git/distrobox/
+        /// internal/cli/generate-entry.go` declares no local
+        /// `--verbose` flag of its own (only `delete`/`icon`/`all`),
+        /// reading the inherited root-level global one instead
+        /// (`generate-entry.go:60`: `Verbose: cmd.Bool("verbose")`,
+        /// landing in `GenerateEntryOptions.Verbose`,
+        /// `~/git/distrobox/pkg/commands/generate_entry.go:35`) —
+        /// exhaustively confirmed never read anywhere else in that
+        /// same 356-line file (`grep -c "Verbose"` finds only the one
+        /// struct-field declaration itself). The one place a
+        /// `verbose` bool could still theoretically reach —
+        /// container-manager construction (`root.go:296-317`'s
+        /// `withContainerManager` → `providers.NewPodman(...,
+        /// verbose, ...)`, `podman.go:27,41-51`) — is the identical
+        /// confirmed dead end `0536`/`0564` already traced for
+        /// `rm`/`create`, holding the same way here.
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
 }
 
@@ -1220,6 +1243,7 @@ fn main() -> std::process::ExitCode {
                 delete,
                 icon,
                 root: _,
+                verbose: _,
             }) => cmd_generate_entry(name.as_deref(), all, delete, icon.as_deref()),
             None => anyhow::bail!(
                 "no subcommand given (try `ocibox create --image ... --name ...`); \

@@ -135,6 +135,54 @@ fn generate_entry_root_flag_is_accepted_and_behaves_identically() {
     assert!(entry_path.exists());
 }
 
+/// `generate-entry --verbose`/`-v` (`docs/design/0568`): accepted for
+/// real CLI compatibility with real `distrobox generate-entry
+/// --verbose`, but changes nothing at all -- genuinely dead upstream
+/// (see `Command::GenerateEntry::verbose`'s own doc comment for the
+/// full, checked-directly reasoning), the same "no-op" class
+/// `0536`/`0564` already established for `rm`/`create --verbose`.
+/// Proven here for both the long and short form, against both a real
+/// generate and a real `--delete`.
+#[test]
+fn generate_entry_verbose_flag_and_its_short_alias_are_accepted_and_behave_identically() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "genentry-verbose");
+
+    for flag in ["--verbose", "-v"] {
+        let generate = ocibox_with_home(
+            storage_dir.path(),
+            home_dir.path(),
+            &["generate-entry", "genentry-verbose", flag],
+        );
+        assert!(
+            generate.status.success(),
+            "{flag}: stderr: {}",
+            String::from_utf8_lossy(&generate.stderr)
+        );
+        let entry_path = home_dir
+            .path()
+            .join(".local/share/applications/genentry-verbose.desktop");
+        assert!(entry_path.exists(), "{flag}: entry should exist");
+
+        let delete = ocibox_with_home(
+            storage_dir.path(),
+            home_dir.path(),
+            &["generate-entry", "genentry-verbose", "--delete", flag],
+        );
+        assert!(
+            delete.status.success(),
+            "{flag}: stderr: {}",
+            String::from_utf8_lossy(&delete.stderr)
+        );
+        assert!(!entry_path.exists(), "{flag}: entry should be removed");
+    }
+}
+
 #[test]
 fn generate_entry_icon_overrides_the_default() {
     let Some(_busybox) = busybox_path() else {
