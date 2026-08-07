@@ -4014,6 +4014,35 @@ enum Command {
         /// only then discovering the bad one.
         #[arg(long)]
         ignore: bool,
+        /// Wait for the first of the given containers to satisfy the
+        /// wanted condition, print only its own exit code, and ignore
+        /// every other one — matching real `podman wait
+        /// --exit-first-match` exactly (checked directly, `~/git/
+        /// podman/cmd/podman/containers/wait.go:60-61`; real docker
+        /// has no equivalent flag at all, confirmed absent). Real
+        /// `ContainerWait`/`waitExitOnFirst` (`~/git/podman/pkg/
+        /// domain/infra/abi/containers.go:188-192,218-249`) races
+        /// every resolved container concurrently, each independently
+        /// polling the exact same condition set the non-racing path
+        /// uses, and returns as soon as the *first* one reports —
+        /// matched here by one real OS thread per target, each
+        /// running the identical polling loop [`cmd_wait`]'s own
+        /// default (non-racing) path already uses, racing over a
+        /// shared channel. A container this call would otherwise
+        /// silently skip under `--ignore` (already resolved to
+        /// nonexistent) never enters the race at all, matching real
+        /// podman's own identical `if c.doesNotExist { continue }`
+        /// before ever spawning that container's own goroutine — but
+        /// if *every* given target is skipped that way, this project
+        /// deliberately does **not** reproduce real podman's own
+        /// checked-directly consequence in that exact case (no
+        /// goroutine is ever spawned for any of them, so its own
+        /// `<-waitChannel` blocks forever — a real, genuine upstream
+        /// deadlock, not a simplification on this project's part):
+        /// this prints the same `-1` the non-racing path already
+        /// prints for a single such container instead.
+        #[arg(long)]
+        exit_first_match: bool,
     },
     /// Rename an existing container — matching real `docker rename`/
     /// `podman rename`.
@@ -5563,16 +5592,16 @@ enum ContainerCommand {
     /// exact same `Use`/`Short`/`Long`/`RunE`/`ValidArgsFunction`, and
     /// both get the identical flag set applied via the one shared
     /// `waitFlags(cmd)` helper (`--interval`/`-i`, `--ignore`,
-    /// `--condition`, and the not-yet-ported `--exit-first-match` --
-    /// see [`Command::Wait`]'s own doc comment for exactly why this
-    /// project's own simpler lifecycle can't reach every real
-    /// condition value either) plus `validate.AddLatestFlag` -- a
-    /// byte-identical alias, the same shape [`Self::Kill`] (`0492`)
-    /// already established. Dispatches into the same [`cmd_wait`]
-    /// `ociman wait` itself already calls, replaying the identical
-    /// `--latest`/explicit-ids resolution the top-level
-    /// [`Command::Wait`] arm already has -- see [`Command::Wait`]'s
-    /// own doc comment for the exact semantics, not repeated here.
+    /// `--condition`, `--exit-first-match` -- see [`Command::Wait`]'s
+    /// own doc comment for exactly why this project's own simpler
+    /// lifecycle can't reach every real condition value either) plus
+    /// `validate.AddLatestFlag` -- a byte-identical alias, the same
+    /// shape [`Self::Kill`] (`0492`) already established. Dispatches
+    /// into the same [`cmd_wait`] `ociman wait` itself already calls,
+    /// replaying the identical `--latest`/explicit-ids resolution the
+    /// top-level [`Command::Wait`] arm already has -- see
+    /// [`Command::Wait`]'s own doc comment for the exact semantics,
+    /// not repeated here.
     Wait {
         /// Same as [`Command::Wait::ids`].
         ids: Vec<String>,
@@ -5588,6 +5617,9 @@ enum ContainerCommand {
         /// Same as [`Command::Wait::ignore`].
         #[arg(long)]
         ignore: bool,
+        /// Same as [`Command::Wait::exit_first_match`].
+        #[arg(long)]
+        exit_first_match: bool,
     },
     /// `podman container top`'s own real alias for the already-
     /// existing flat [`Command::Top`] -- checked directly, `~/git/
@@ -7231,6 +7263,7 @@ fn main() -> std::process::ExitCode {
                     interval,
                     condition,
                     ignore,
+                    exit_first_match,
                 } => {
                     // Matches real podman's own exact wording, checked
                     // directly (`~/git/podman/cmd/podman/containers/
@@ -7250,7 +7283,7 @@ fn main() -> std::process::ExitCode {
                         );
                         ids
                     };
-                    cmd_wait(&ids, interval, &condition, ignore)
+                    cmd_wait(&ids, interval, &condition, ignore, exit_first_match)
                 }
                 ContainerCommand::Top { positional, latest } => {
                     // Manual disambiguation, matching real podman's
@@ -7707,6 +7740,7 @@ fn main() -> std::process::ExitCode {
                 interval,
                 condition,
                 ignore,
+                exit_first_match,
             }) => {
                 // Matches real podman's own exact wording, checked
                 // directly (`~/git/podman/cmd/podman/containers/
@@ -7725,7 +7759,7 @@ fn main() -> std::process::ExitCode {
                     );
                     ids
                 };
-                cmd_wait(&ids, interval, &condition, ignore)
+                cmd_wait(&ids, interval, &condition, ignore, exit_first_match)
             }
             Some(Command::Rename { id, name }) => cmd_rename(&id, &name),
             Some(Command::Top { positional, latest }) => {
@@ -16479,6 +16513,7 @@ fn cmd_wait(
     interval_ms: u64,
     condition: &[String],
     ignore: bool,
+    exit_first_match: bool,
 ) -> anyhow::Result<()> {
     let containers = open_container_store()?;
 
@@ -16506,6 +16541,10 @@ fn cmd_wait(
         }
     }
 
+    if exit_first_match {
+        return wait_exit_first_match(containers.root(), &resolved, interval_ms, &wanted);
+    }
+
     for r in resolved {
         let Some(resolved_id) = r else {
             println!("-1");
@@ -16516,11 +16555,7 @@ fn cmd_wait(
             let status = display_status(&state);
             if wanted.contains(&status) {
                 let exit_code: i32 = if status == Status::Stopped {
-                    state
-                        .annotations
-                        .get(ANNOTATION_EXIT_CODE)
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(-1)
+                    wait_for_and_read_exit_code(&containers, &resolved_id)
                 } else {
                     -1
                 };
@@ -16530,6 +16565,111 @@ fn cmd_wait(
             std::thread::sleep(std::time::Duration::from_millis(interval_ms));
         }
     }
+    Ok(())
+}
+
+/// The real exit code for a container [`display_status`] already
+/// reports as [`Status::Stopped`] — but only after making sure the
+/// container's own detached *keeper* process has genuinely finished
+/// writing that final state (exit code included), not just that
+/// `effective_status`'s own pid-liveness derivation already thinks
+/// so. A real, previously-latent bug in [`cmd_wait`]'s own sequential
+/// loop, found and fixed here: `effective_status` can report
+/// `Stopped` purely because the container's own recorded pid is no
+/// longer alive, even while the *raw*, on-disk status is still
+/// `Running`/`Creating` (see [`wait_for_keeper_to_finalize`]'s own
+/// doc comment, `docs/design/0154`, already established for
+/// `stop_container`'s own identical situation) — a poll landing in
+/// exactly that narrow window would previously read back a real
+/// container's own exit code as a spurious `-1`, its own recorded
+/// [`ANNOTATION_EXIT_CODE`] not written yet. Normally far too narrow
+/// a window to ever actually observe (the keeper's own finalization
+/// write typically lands within milliseconds of the process dying),
+/// but genuinely widened enough to hit under heavy host contention
+/// (many concurrent processes delaying the keeper's own scheduling) —
+/// found this way while adding `--exit-first-match`'s own more
+/// heavily concurrent polling (0538), which made it far more likely
+/// to actually manifest, but the exact same race already existed
+/// here regardless.
+fn wait_for_and_read_exit_code(containers: &StateStore, resolved_id: &str) -> i32 {
+    wait_for_keeper_to_finalize(containers, resolved_id);
+    containers
+        .load(resolved_id)
+        .ok()
+        .and_then(|state| {
+            state
+                .annotations
+                .get(ANNOTATION_EXIT_CODE)
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(-1)
+}
+
+/// `ociman wait --exit-first-match` (0538) — see [`Command::Wait::
+/// exit_first_match`]'s own doc comment for the full real-vs-this-
+/// project reasoning, including the one deliberate divergence from a
+/// real, checked-directly upstream deadlock this project doesn't
+/// reproduce.
+fn wait_exit_first_match(
+    root: &Path,
+    resolved: &[Option<String>],
+    interval_ms: u64,
+    wanted: &[Status],
+) -> anyhow::Result<()> {
+    let real_targets: Vec<&str> = resolved.iter().filter_map(|r| r.as_deref()).collect();
+    if real_targets.is_empty() {
+        // See this function's own doc comment: every given target
+        // was already resolved to nonexistent (tolerated only because
+        // `--ignore` was given) — matching the ordinary, non-racing
+        // per-container loop's own identical "-1 for one such
+        // container" value, not real podman's own checked-directly
+        // hang in this exact case (no goroutine is ever spawned for
+        // any of them there, so its own `<-waitChannel` never
+        // receives at all).
+        println!("-1");
+        return Ok(());
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let wanted = wanted.to_vec();
+    for id in real_targets {
+        let tx = tx.clone();
+        let root = root.to_path_buf();
+        let id = id.to_string();
+        let wanted = wanted.clone();
+        std::thread::spawn(move || {
+            let Ok(containers) = StateStore::open(&root) else {
+                return;
+            };
+            loop {
+                let Ok(state) = containers.load(&id) else {
+                    return;
+                };
+                let status = display_status(&state);
+                if wanted.contains(&status) {
+                    let exit_code: i32 = if status == Status::Stopped {
+                        // See `wait_for_and_read_exit_code`'s own doc
+                        // comment for the exact real race this closes
+                        // -- this racing path's own heavier
+                        // concurrency is what actually surfaced it.
+                        wait_for_and_read_exit_code(&containers, &id)
+                    } else {
+                        -1
+                    };
+                    let _ = tx.send(exit_code);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+            }
+        });
+    }
+
+    // At least one real target exists (checked above), so at least
+    // one thread will eventually send — this never blocks forever.
+    let exit_code = rx
+        .recv()
+        .context("waiting for the first matching container")?;
+    println!("{exit_code}");
     Ok(())
 }
 

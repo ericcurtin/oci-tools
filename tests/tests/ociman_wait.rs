@@ -493,3 +493,241 @@ fn wait_latest_on_an_empty_store_is_a_clear_error() {
     let out = ociman(storage_dir.path(), &["wait", "--latest"]);
     assert!(!out.status.success());
 }
+
+fn ociman_run_detached_named(
+    storage_root: &Path,
+    name: &str,
+    image: &str,
+    container_args: &[&str],
+) -> std::process::Child {
+    Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_root)
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["run", "--name", name, image])
+        .args(container_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn ociman run")
+}
+
+/// `wait --exit-first-match` (`docs/design/0538`), matching real
+/// `podman wait --exit-first-match` exactly: given two genuinely
+/// still-running containers with very different completion times,
+/// only the *first* one's own real exit code is ever printed, well
+/// before the slower one would otherwise finish -- proven here by a
+/// real wall-clock bound tighter than the slow container's own sleep
+/// duration, and exactly one line of output regardless of how many
+/// containers were given.
+///
+/// The slow container's own sleep is deliberately *very* long (not
+/// just "a few seconds longer" than the fast one): each container's
+/// own transition to `Stopped` is only recorded once its own
+/// detached *keeper* process (see `docs/design/0154`'s own doc
+/// comment) gets scheduled to actually finalize that write, a real,
+/// already-documented source of variable latency under heavy *host*
+/// contention (not a bug in `--exit-first-match` itself) -- a merely
+/// few-seconds gap between the two containers' own sleep durations
+/// was observed to occasionally flip under genuinely heavy concurrent
+/// load on this project's own shared dev host (several independent
+/// `opencode` sessions each running their own full test suites at
+/// once), even though the race mechanism itself was working
+/// correctly. A large enough gap makes that real scheduling variance
+/// irrelevant to this test's own result.
+#[test]
+fn wait_exit_first_match_prints_only_the_first_containers_own_exit_code() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/wait-exit-first:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+
+    let mut slow = ociman_run_detached_named(
+        storage_dir.path(),
+        "wait-exit-first-slow",
+        "ociman-test/wait-exit-first:latest",
+        &["/bin/sh", "-c", "sleep 60; exit 3"],
+    );
+    let mut fast = ociman_run_detached_named(
+        storage_dir.path(),
+        "wait-exit-first-fast",
+        "ociman-test/wait-exit-first:latest",
+        &["/bin/sh", "-c", "sleep 1; exit 7"],
+    );
+    // Only the *slow* container's own "running" status is actually
+    // load-bearing for this test's own premise (a real race against
+    // something genuinely still running for a full 60s) -- the fast
+    // one is deliberately *not* asserted to still be "running" at
+    // this exact instant: under enough host contention, its own 1s
+    // sleep could already be done (and its own state fully finalized)
+    // by the time this check runs, which is still a perfectly valid
+    // -- if less interesting -- exercise of the exact same race
+    // (`--exit-first-match` still needs to detect an already-matched
+    // container and win immediately either way).
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "wait-exit-first-slow",
+            "running",
+            Duration::from_secs(20),
+        ),
+        "running"
+    );
+
+    let started = Instant::now();
+    let wait = ociman(
+        storage_dir.path(),
+        &[
+            "wait",
+            "--exit-first-match",
+            "wait-exit-first-slow",
+            "wait-exit-first-fast",
+        ],
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        wait.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&wait.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&wait.stdout).trim(),
+        "7",
+        "the fast container's own exit code should win the race"
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "--exit-first-match should return well before the slow container's own 60s sleep: \
+         {elapsed:?}"
+    );
+
+    let _ = ociman(storage_dir.path(), &["kill", "wait-exit-first-slow"]);
+    slow.wait().ok();
+    fast.wait().ok();
+}
+
+/// Real `ContainerWait`'s own identical "a container already resolved
+/// to nonexistent under `--ignore` never enters the race at all"
+/// behavior -- but if *every* given target is skipped that way, this
+/// project deliberately does not reproduce real podman's own checked-
+/// directly hang in that exact case (see `Command::Wait::
+/// exit_first_match`'s own doc comment); this must return almost
+/// immediately with `-1`, not block at all.
+#[test]
+fn wait_exit_first_match_with_only_ignored_nonexistent_containers_prints_negative_one() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let started = Instant::now();
+    let wait = ociman(
+        storage_dir.path(),
+        &[
+            "wait",
+            "--exit-first-match",
+            "--ignore",
+            "no-such-container-1",
+            "no-such-container-2",
+        ],
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        wait.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&wait.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&wait.stdout).trim(), "-1");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "must never hang, matching the non-racing path's own identical immediate '-1': \
+         {elapsed:?}"
+    );
+}
+
+/// A real target combined with an `--ignore`d nonexistent one: the
+/// nonexistent one never enters the race at all, but the real one
+/// still does, and its own exit code is what gets printed.
+#[test]
+fn wait_exit_first_match_ignores_a_nonexistent_container_and_waits_for_the_real_one() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/wait-exit-first-mixed:latest",
+        &busybox,
+        &["sh", "sleep"],
+        ContainerConfig::default(),
+    );
+    let mut run = ociman_run_detached_named(
+        storage_dir.path(),
+        "wait-exit-first-mixed-real",
+        "ociman-test/wait-exit-first-mixed:latest",
+        &["/bin/sh", "-c", "sleep 1; exit 9"],
+    );
+    assert_eq!(
+        wait_for_container_status_by_name(
+            storage_dir.path(),
+            "wait-exit-first-mixed-real",
+            "running",
+            Duration::from_secs(20),
+        ),
+        "running"
+    );
+
+    let wait = ociman(
+        storage_dir.path(),
+        &[
+            "wait",
+            "--exit-first-match",
+            "--ignore",
+            "no-such-container",
+            "wait-exit-first-mixed-real",
+        ],
+    );
+    assert!(
+        wait.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&wait.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&wait.stdout).trim(), "9");
+
+    run.wait().ok();
+}
+
+fn wait_for_container_status_by_name(
+    storage_root: &Path,
+    name: &str,
+    want: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = ociman(storage_root, &["ps", "-a", "--json"]);
+        if out.status.success()
+            && let Ok(views) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            && let Some(entry) = views
+                .as_array()
+                .and_then(|a| a.iter().find(|e| e["name"] == name))
+        {
+            let status = entry["status"].as_str().unwrap_or_default().to_string();
+            if status == want || Instant::now() >= deadline {
+                return status;
+            }
+        } else if Instant::now() >= deadline {
+            return String::new();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

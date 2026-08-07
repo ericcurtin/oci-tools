@@ -1339,6 +1339,55 @@ fn container_wait_is_a_byte_identical_alias_for_top_level_wait() {
     assert_eq!(String::from_utf8_lossy(&alias.stdout).trim(), "42");
 }
 
+/// The `container wait` alias's own `--exit-first-match` flag
+/// (`docs/design/0538`) works too, not just the top-level command's
+/// -- full race semantics are already exhaustively tested against
+/// the top-level command in `ociman_wait.rs`; this only proves the
+/// flag itself reaches the identical function through the alias.
+#[test]
+fn container_wait_exit_first_match_flag_works_through_the_alias() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-wait-exit-first:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 5".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/container-wait-exit-first:latest"],
+    );
+    assert_eq!(run.status.code(), Some(5));
+    let id = all_ids(storage_dir.path())
+        .into_iter()
+        .next()
+        .expect("the just-run container should exist");
+
+    let alias = ociman(
+        storage_dir.path(),
+        &["container", "wait", "--exit-first-match", &id],
+    );
+    assert!(
+        alias.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&alias.stdout).trim(), "5");
+}
+
 /// `ociman container top` (0497) is a real, byte-identical alias for
 /// the top-level `ociman top`, matching real `podman container top`'s
 /// own checked-directly identical `Use`/`Short`/`Long`/`RunE`/
