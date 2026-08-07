@@ -4644,6 +4644,20 @@ enum Command {
         /// this host's, `GOARCH`-style).
         #[arg(long)]
         arch: Option<String>,
+        /// Suppress the progress spinner — matching real `podman
+        /// import --quiet`/`-q` exactly (checked directly, `~/git/
+        /// podman/cmd/podman/images/import.go:88`: `flags.BoolVarP(&
+        /// importOpts.Quiet, "quiet", "q", false, "Suppress output")`,
+        /// `~/git/podman/pkg/domain/infra/abi/images.go:524-526`: `if
+        /// !options.Quiet { importOptions.Writer = os.Stderr }` — the
+        /// exact same progress-writer-gating pattern already
+        /// established here for `ociman pull`/`push`/`save`/`load
+        /// --quiet`, `0417`/`0428`/`0548`; `import` was simply the one
+        /// remaining sibling in that same family that had never been
+        /// given the flag). See `Command::Pull::quiet`'s own doc
+        /// comment for the identical real semantics this shares.
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Display detailed version information, matching real `docker
     /// version`/`podman version` exactly for the "no remote server, no
@@ -6626,6 +6640,9 @@ enum ImageCommand {
         /// Same as [`Command::Import::arch`].
         #[arg(long)]
         arch: Option<String>,
+        /// Same as [`Command::Import::quiet`].
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// `podman image inspect`'s own real alias for the already-
     /// existing flat [`Command::Inspect`], forced to image-only
@@ -7881,6 +7898,7 @@ fn main() -> std::process::ExitCode {
                     change,
                     os,
                     arch,
+                    quiet,
                 } => cmd_import(
                     &path,
                     reference.as_deref(),
@@ -7888,6 +7906,7 @@ fn main() -> std::process::ExitCode {
                     &change,
                     os.as_deref(),
                     arch.as_deref(),
+                    quiet,
                     cli.global.json,
                 ),
                 ImageCommand::Inspect { reference, format } => cmd_inspect(
@@ -8121,6 +8140,7 @@ fn main() -> std::process::ExitCode {
                 change,
                 os,
                 arch,
+                quiet,
             }) => cmd_import(
                 &path,
                 reference.as_deref(),
@@ -8128,6 +8148,7 @@ fn main() -> std::process::ExitCode {
                 &change,
                 os.as_deref(),
                 arch.as_deref(),
+                quiet,
                 cli.global.json,
             ),
             Some(Command::Version) => cmd_version(cli.global.json),
@@ -8572,6 +8593,7 @@ fn cmd_load(input: Option<&Path>, quiet: bool, json: bool) -> anyhow::Result<()>
 /// crate's own two-tempfile precedent in `archive.rs`'s
 /// `append_layer_decompressed`/`ingest_docker_archive_layer` for the
 /// same shape used elsewhere.
+#[allow(clippy::too_many_arguments)]
 fn cmd_import(
     path: &str,
     reference: Option<&str>,
@@ -8579,6 +8601,7 @@ fn cmd_import(
     change: &[String],
     os: Option<&str>,
     arch: Option<&str>,
+    quiet: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     use std::io::{Read as _, Seek as _};
@@ -8607,7 +8630,7 @@ fn cmd_import(
     };
     let chained = std::io::Cursor::new(peek[..peeked].to_vec()).chain(reader);
 
-    let progress = oci_cli_common::progress::spinner("importing".to_string());
+    let progress = oci_cli_common::progress::spinner_unless_quiet(quiet, "importing".to_string());
     let result = (|| -> anyhow::Result<(oci_spec_types::Digest, oci_store::Ingested)> {
         let mut plain = tempfile::NamedTempFile::new()
             .context("creating a scratch file to normalize the imported tar")?;

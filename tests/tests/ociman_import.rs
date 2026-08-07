@@ -147,6 +147,64 @@ fn import_creates_a_single_layer_image_and_tags_it() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), "hello from import\n");
 }
 
+/// `--quiet`/`-q` (`docs/design/0554`): the progress spinner only
+/// ever draws to stderr, and is already automatically hidden whenever
+/// stderr isn't a real terminal (true of this whole automated suite)
+/// -- so `--quiet` has no separately observable stdout/stderr
+/// difference to assert on here (same established limitation every
+/// other spinner-backed command in this project already has, see
+/// `oci_cli_common::progress`'s own module doc comment, and the same
+/// "accepted, still imports correctly" test shape `ociman_save.rs`'s
+/// own `save_quiet_still_writes_a_correct_archive` already
+/// established for its own identical flag). What *is* real and
+/// checkable: the flag is accepted and the image it imports is still
+/// correct.
+#[test]
+fn import_quiet_still_imports_correctly() {
+    let Some(busybox) = oci_tools_tests::busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let tar_bytes = make_busybox_tar(&busybox, &["cat"], &[("hello.txt", b"hello, quiet\n")]);
+    let tar_path = storage_dir.path().join("in.tar");
+    std::fs::write(&tar_path, &tar_bytes).unwrap();
+
+    let import = ociman(
+        storage_dir.path(),
+        &[
+            "import",
+            "--quiet",
+            tar_path.to_str().unwrap(),
+            "example.com/import-quiet-test:v1",
+        ],
+    );
+    assert!(
+        import.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    let digest = String::from_utf8_lossy(&import.stdout).trim().to_string();
+    assert!(digest.starts_with("sha256:"), "{digest:?}");
+
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "--rm",
+            "example.com/import-quiet-test:v1",
+            "cat",
+            "hello.txt",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "hello, quiet\n");
+}
+
 #[test]
 fn import_with_no_reference_creates_an_untagged_image() {
     let storage_dir = tempfile::tempdir().unwrap();
