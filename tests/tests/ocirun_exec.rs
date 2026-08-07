@@ -1386,3 +1386,93 @@ fn exec_detach_exits_zero_even_though_the_detached_command_will_eventually_fail(
         &["delete", "--force", "exec-detach-fail-test"],
     );
 }
+
+/// `exec --process-label`/`--apparmor` (`docs/design/0562`, matching
+/// real `runc exec --process-label`/`--apparmor`/`crun exec
+/// --process-label`/`--apparmor` exactly) are real, previously-
+/// unrecognized flags -- given with a real, non-empty value, this
+/// project's own honest lack of any SELinux/AppArmor support at all
+/// is a clear, immediate error rather than silently pretending to
+/// apply either. Given with an empty value (or not given at all),
+/// both are a true no-op -- exec still runs normally.
+#[test]
+fn exec_process_label_and_apparmor_reject_a_real_value_but_accept_an_empty_one() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/sh", "-c", "sleep 30"]);
+
+    let create = ocirun_create(root_dir.path(), bundle_dir.path(), "exec-lsm-test");
+    assert!(create.status.success(), "{create:?}");
+    let start = ocirun(root_dir.path(), &["start", "exec-lsm-test"]);
+    assert!(start.status.success());
+    assert_eq!(
+        wait_for_status(
+            root_dir.path(),
+            "exec-lsm-test",
+            "running",
+            Duration::from_secs(5)
+        ),
+        "running"
+    );
+
+    let apparmor_real_value = ocirun(
+        root_dir.path(),
+        &[
+            "exec",
+            "--apparmor",
+            "some-profile",
+            "exec-lsm-test",
+            "/bin/true",
+        ],
+    );
+    assert!(!apparmor_real_value.status.success());
+    assert!(
+        String::from_utf8_lossy(&apparmor_real_value.stderr).contains("not yet supported"),
+        "{apparmor_real_value:?}"
+    );
+
+    let process_label_real_value = ocirun(
+        root_dir.path(),
+        &[
+            "exec",
+            "--process-label",
+            "system_u:object_r:some_t:s0",
+            "exec-lsm-test",
+            "/bin/true",
+        ],
+    );
+    assert!(!process_label_real_value.status.success());
+    assert!(
+        String::from_utf8_lossy(&process_label_real_value.stderr).contains("not yet supported"),
+        "{process_label_real_value:?}"
+    );
+
+    let apparmor_empty = ocirun(
+        root_dir.path(),
+        &["exec", "--apparmor", "", "exec-lsm-test", "/bin/true"],
+    );
+    assert!(
+        apparmor_empty.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&apparmor_empty.stderr)
+    );
+
+    let process_label_empty = ocirun(
+        root_dir.path(),
+        &["exec", "--process-label", "", "exec-lsm-test", "/bin/true"],
+    );
+    assert!(
+        process_label_empty.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&process_label_empty.stderr)
+    );
+
+    let unaffected = ocirun(root_dir.path(), &["exec", "exec-lsm-test", "/bin/true"]);
+    assert!(unaffected.status.success(), "{unaffected:?}");
+
+    ocirun(root_dir.path(), &["delete", "--force", "exec-lsm-test"]);
+}

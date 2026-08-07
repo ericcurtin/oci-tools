@@ -474,6 +474,37 @@ enum Command {
         /// still required, exactly as before this flag existed.
         #[arg(short = 'p', long = "process", value_name = "FILE")]
         process: Option<PathBuf>,
+        /// Set the SELinux process label for the exec'd process —
+        /// matching real `runc exec --process-label`/`crun exec
+        /// --process-label` exactly (checked directly, `~/git/runc/
+        /// exec.go:86-89,247-249`: `p.SelinuxLabel = l`; `~/git/crun/
+        /// src/exec.c:83,147,311-312`: `process->selinux_label =
+        /// xstrdup(...)`). This project has no SELinux support
+        /// anywhere at all (`docs/design/0408`/`0509` both already
+        /// named this real, still-open gap) — an empty/omitted value
+        /// (the overwhelming common case, matching both reference
+        /// tools' own identical "unset means don't touch it"
+        /// default) is a true no-op; a real, non-empty value is a
+        /// clear, immediate "not yet supported" error rather than
+        /// silently pretending to apply a label this project can
+        /// never actually enforce — the same honest convention
+        /// `ociman run --security-opt apparmor=`/`label=` (`bin/
+        /// ociman/src/main.rs`) already established for the
+        /// identical real gap on the higher-level tool's own side.
+        #[arg(long = "process-label", value_name = "VALUE")]
+        process_label: Option<String>,
+        /// Set the AppArmor profile for the exec'd process — matching
+        /// real `runc exec --apparmor`/`crun exec --apparmor` exactly
+        /// (checked directly, `~/git/runc/exec.go:90-93,244-246`:
+        /// `p.ApparmorProfile = ap`; `~/git/crun/src/exec.c:84,151,
+        /// 314-315`: `process->apparmor_profile = xstrdup(...)`).
+        /// Same real gap, same honest treatment, as [`Self::Exec::
+        /// process_label`]'s own doc comment: this project has no
+        /// AppArmor support anywhere at all, so an empty/omitted
+        /// value is a true no-op, and a real, non-empty value is a
+        /// clear, immediate "not yet supported" error.
+        #[arg(long = "apparmor", value_name = "VALUE")]
+        apparmor: Option<String>,
         /// Command and arguments to run inside the container — omit
         /// when using `--process`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -872,23 +903,44 @@ fn main() -> std::process::ExitCode {
                 detach,
                 pid_file,
                 process,
+                process_label,
+                apparmor,
                 args,
-            }) => cmd_exec(
-                &root,
-                &id,
-                user.as_deref(),
-                &additional_gids,
-                cwd.as_deref(),
-                &env,
-                &args,
-                preserve_fds,
-                &cap,
-                ignore_paused,
-                no_new_privs,
-                detach,
-                pid_file.as_deref(),
-                process.as_deref(),
-            ),
+            }) => {
+                // See `Command::Exec::process_label`/`apparmor`'s own
+                // doc comments (`0562`): a real, non-empty value is a
+                // clear, immediate "not yet supported" error, never
+                // silently ignored -- this project has no SELinux/
+                // AppArmor support anywhere at all.
+                if let Some(value) = process_label.filter(|v| !v.is_empty()) {
+                    anyhow::bail!(
+                        "--process-label {value:?} is not yet supported (this project has no \
+                         SELinux support anywhere at all)"
+                    );
+                }
+                if let Some(value) = apparmor.filter(|v| !v.is_empty()) {
+                    anyhow::bail!(
+                        "--apparmor {value:?} is not yet supported (this project has no \
+                         AppArmor support anywhere at all)"
+                    );
+                }
+                cmd_exec(
+                    &root,
+                    &id,
+                    user.as_deref(),
+                    &additional_gids,
+                    cwd.as_deref(),
+                    &env,
+                    &args,
+                    preserve_fds,
+                    &cap,
+                    ignore_paused,
+                    no_new_privs,
+                    detach,
+                    pid_file.as_deref(),
+                    process.as_deref(),
+                )
+            }
             Some(Command::Features) => oci_cli_common::output::print_json(&features::features()),
             Some(Command::Ps {
                 id,
