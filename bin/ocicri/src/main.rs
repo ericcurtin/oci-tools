@@ -102,13 +102,16 @@ struct Cli {
     listen: Option<PathBuf>,
 }
 
-/// See [`Cli::command`]'s own doc comment. `version` (`0532`) and now
-/// `wipe` (`0542`) — real `crio`'s own remaining subcommands
-/// (`check`/`config`/`publish`/`status`) are all real, separate, much
-/// bigger gaps (respectively: a standalone healthcheck-config CLI, a
-/// config-file generator/validator, a systemd-notify-socket
-/// publisher, and a runtime status dump) — each its own future
-/// increment, not folded in here.
+/// See [`Cli::command`]'s own doc comment. `version` (`0532`),
+/// `wipe` (`0542`), and now `publish` (`0565`) — real `crio`'s own
+/// remaining subcommands (`check`/`config`/`status`) are all real,
+/// separate, much bigger gaps (respectively: a standalone
+/// healthcheck-config CLI, a config-file generator/validator, and a
+/// runtime status dump) — each its own future increment, not folded
+/// in here. (`0532`'s own note, and this enum's own doc comment
+/// before this change, mischaracterized `publish` as "a systemd-
+/// notify-socket publisher" — a real, checked-directly mistake,
+/// corrected by [`Command::Publish`]'s own doc comment below.)
 #[derive(Debug, clap::Subcommand)]
 enum Command {
     /// "display detailed version information" (real `crio version`'s
@@ -163,6 +166,41 @@ enum Command {
         #[arg(short, long)]
         force: bool,
     },
+    /// "receive shimv2 events" (real `crio publish`'s own `Usage`
+    /// string, quoted verbatim) — matching real `crio publish` exactly
+    /// (checked directly, `~/git/cri-o/internal/criocli/publish.go:
+    /// 7-25`, and its own real, top-level registration, `~/git/cri-o/
+    /// cmd/crio/main.go:161-168`): a real, faithful no-op, not a
+    /// "systemd-notify-socket publisher" as `0532`'s own note and this
+    /// enum's own doc comment previously, incorrectly, described it
+    /// (a real mistake corrected here). Real crio's own `PublishCommand`
+    /// is genuinely inert — `Action: func(c *cli.Context) error {
+    /// return nil }`, unconditionally, never reading either flag,
+    /// never touching stdin, never dialing anywhere — vestigial
+    /// boilerplate inherited from containerd's own shimv2 `publish`
+    /// command template (`~/git/containerd/cmd/containerd/command/
+    /// publish.go:41-88`, which *does* read a real protobuf event
+    /// from stdin and dial containerd's own events gRPC service —
+    /// cri-o's own copy strips all of that real behavior out, keeping
+    /// only the `Name`/`Usage`/flag shape). Confirmed nothing in
+    /// cri-o's own codebase ever invokes `crio publish` itself either
+    /// (`grep -rn "PublishCommand"` outside `vendor`/tests finds only
+    /// its own registration and definition). `--topic`/`--namespace`
+    /// (both hidden from real crio's own `--help`, unlike here — see
+    /// `oci_cli_common::args::GlobalArgs::debug`'s own doc comment,
+    /// `0561`, for this project's own established "never hide a real,
+    /// working flag" convention) are accepted and immediately
+    /// discarded, exactly like `Wipe::force` just above.
+    Publish {
+        /// See this variant's own doc comment: accepted for real CLI
+        /// compatibility, a real, faithful no-op.
+        #[arg(long)]
+        topic: Option<String>,
+        /// See this variant's own doc comment: accepted for real CLI
+        /// compatibility, a real, faithful no-op.
+        #[arg(long)]
+        namespace: Option<String>,
+    },
 }
 
 fn default_socket_path() -> PathBuf {
@@ -196,6 +234,10 @@ fn main() -> std::process::ExitCode {
         match cli.command {
             Some(Command::Version) => return cmd_version(cli.global.json),
             Some(Command::Wipe { force: _ }) => return cmd_wipe(cli.global.json),
+            Some(Command::Publish {
+                topic: _,
+                namespace: _,
+            }) => return Ok(()),
             None => {}
         }
 
