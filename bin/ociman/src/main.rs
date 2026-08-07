@@ -8391,6 +8391,24 @@ fn cmd_save(
     quiet: bool,
     json: bool,
 ) -> anyhow::Result<()> {
+    // A real, previously-unnoticed bug this closes (`docs/design/
+    // 0550`): with no `--output`, real `podman save` refuses outright
+    // the moment stdout is a real interactive terminal -- checked
+    // directly, `~/git/podman/cmd/podman/images/save.go:110-115`
+    // (`if term.IsTerminal(int(fi.Fd())) { return errors.New(
+    // "refusing to save to terminal. Use -o flag or redirect") }`),
+    // live-verified via a real pty against a real installed `podman
+    // 4.9.3`. Before this, `ociman save` (with no `--output`) wrote
+    // the raw, binary tar archive straight onto the terminal and
+    // exited `0` -- live-verified against this project's own binary
+    // through the same real pty, corrupting the terminal's own state.
+    // Checked first, before ever resolving the image or doing any
+    // other work, matching real podman's own identical "fail fast,
+    // before anything else" placement at the very top of its own
+    // `save` function.
+    if output.is_none() && std::io::stdout().is_terminal() {
+        anyhow::bail!("refusing to save to terminal. Use -o flag or redirect");
+    }
     let store = open_store()?;
     let resolved = resolve_image_by_reference_or_id(&store, reference_str)?
         .ok_or_else(|| anyhow::anyhow!("{reference_str}: no such image in local storage"))?;

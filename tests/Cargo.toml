@@ -22,7 +22,7 @@ hyper-util.workspace = true
 libc.workspace = true
 oci-cri-types.workspace = true
 oci-runtime-core.workspace = true
-rustix = { workspace = true, features = ["fs"] }
+rustix = { workspace = true, features = ["fs", "pty"] }
 tempfile.workspace = true
 tokio.workspace = true
 tonic.workspace = true

@@ -272,6 +272,75 @@ fn save_with_no_output_flag_writes_the_archive_straight_to_stdout_and_nothing_el
     assert!(entries.contains_key(&format!("blobs/sha256/{}", record.manifest_digest.hex())));
 }
 
+/// A real, previously-unnoticed bug this closes (`docs/design/0550`):
+/// with no `--output`, real `podman save` refuses outright the moment
+/// stdout is a real interactive terminal (checked directly, `~/git/
+/// podman/cmd/podman/images/save.go:110-115`, live-verified against a
+/// real installed `podman 4.9.3` via a real pty). Before this fix,
+/// `ociman save` (no `--output`) wrote the raw, binary tar archive
+/// straight onto the terminal and exited `0` -- live-verified against
+/// this project's own binary the same way.
+///
+/// A real pty (not just a pipe -- `Command::output()`'s own captured
+/// stdout is never a terminal, so this exact bug could hide behind
+/// every other test in this file) is opened directly via `rustix::
+/// pty`, the same real "does the OS itself consider this fd a
+/// terminal" check `std::io::IsTerminal` itself ultimately asks.
+#[test]
+fn save_refuses_to_write_to_a_real_terminal() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/save-terminal:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let pty_main =
+        rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
+            .expect("opening a pty");
+    rustix::pty::grantpt(&pty_main).expect("grantpt");
+    rustix::pty::unlockpt(&pty_main).expect("unlockpt");
+    let slave_name = rustix::pty::ptsname(&pty_main, Vec::new()).expect("ptsname");
+    let slave_path = std::path::PathBuf::from(slave_name.to_string_lossy().into_owned());
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&slave_path)
+        .expect("opening the pty's own slave side");
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["save", "ociman-test/save-terminal:latest"])
+        .stdin(std::process::Stdio::null())
+        .stdout(slave)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman");
+    let status = child.wait().expect("waiting for ociman");
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    // `pty_main` (the master side) must outlive the child's own run --
+    // dropped only now that it's done.
+    drop(pty_main);
+
+    assert!(
+        !status.success(),
+        "ociman save must refuse to write raw archive bytes to a real terminal"
+    );
+    assert!(
+        stderr.contains("refusing to save to terminal"),
+        "stderr: {stderr:?}"
+    );
+}
+
 #[test]
 fn save_quiet_still_writes_a_correct_archive() {
     // The progress spinner only ever draws to stderr, and is already
