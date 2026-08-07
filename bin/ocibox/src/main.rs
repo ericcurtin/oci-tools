@@ -364,6 +364,23 @@ enum Command {
         /// `list` via the same shared `withRoot` composition).
         #[arg(long, short = 'r')]
         root: bool,
+        /// Accepted for real CLI compatibility with real distrobox's
+        /// own inherited root-level `--verbose`/`-v` global flag; a
+        /// real, faithful no-op — checked directly (`0569`), the same
+        /// "genuinely dead upstream" shape `docs/design/0536`/`0564`/
+        /// `0568` already established for `rm`/`create`/
+        /// `generate-entry --verbose`. `~/git/distrobox/internal/cli/
+        /// list.go` declares only its own local `--no-color` flag and
+        /// never calls `cmd.Bool("verbose")` anywhere in that file,
+        /// nor does `~/git/distrobox/pkg/commands/list.go` (an
+        /// exhaustive `grep -n "[Vv]erbose"` across both finds zero
+        /// matches) — this command's own real output has nothing a
+        /// verbosity level could ever change, the same "no
+        /// running/stopped state, no color codes" gap this doc
+        /// comment's own `--no-color` note (`0515`) already
+        /// established.
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
     /// Remove one or more boxes entirely (each one's own rootfs and
     /// persisted record) — matching real `distrobox rm NAME
@@ -1160,6 +1177,7 @@ fn main() -> std::process::ExitCode {
             Some(Command::List {
                 no_color: _,
                 root: _,
+                verbose: _,
             }) => cmd_list(cli.global.json),
             Some(Command::Rm {
                 names,

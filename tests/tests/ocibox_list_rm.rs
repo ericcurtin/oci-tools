@@ -169,6 +169,54 @@ fn list_root_flag_is_accepted_and_behaves_identically() {
     assert_eq!(plain.stdout, root.stdout);
 }
 
+/// `list --verbose`/`-v` (`docs/design/0569`): accepted for real CLI
+/// compatibility with real distrobox's own inherited root-level
+/// `--verbose`/`-v` global flag, but changes nothing at all --
+/// genuinely dead upstream (see `Command::List::verbose`'s own doc
+/// comment for the full, checked-directly reasoning), the same
+/// "no-op" class `0536`/`0564`/`0568` already established for
+/// `rm`/`create`/`generate-entry --verbose`. Proven for both the long
+/// and short form.
+#[test]
+fn list_verbose_flag_and_its_short_alias_are_accepted_and_behave_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ocibox-test/list-verbose:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+    let create = ocibox(
+        storage_dir.path(),
+        &[
+            "create",
+            "--image",
+            "ocibox-test/list-verbose:latest",
+            "--name",
+            "verboselistbox",
+        ],
+    );
+    assert!(create.status.success());
+
+    let plain = ocibox(storage_dir.path(), &["list"]);
+    assert!(plain.status.success());
+    for flag in ["--verbose", "-v"] {
+        let verbose = ocibox(storage_dir.path(), &["list", flag]);
+        assert!(
+            verbose.status.success(),
+            "{flag}: stderr: {}",
+            String::from_utf8_lossy(&verbose.stderr)
+        );
+        assert_eq!(plain.stdout, verbose.stdout, "{flag}: output should match");
+    }
+}
+
 #[test]
 fn list_json_reports_every_field_of_the_persisted_record() {
     let Some(busybox) = busybox_path() else {
