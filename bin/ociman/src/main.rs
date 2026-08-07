@@ -4746,7 +4746,30 @@ enum Command {
     /// rather than filled in with something misleading) and a
     /// `BuiltTime` (this project's own build doesn't currently record
     /// one — also omitted, rather than a fake/placeholder timestamp).
-    Version,
+    Version {
+        /// Render a single field via a Go-template-*lite* string
+        /// (`--format`/`-f`, matching real `podman version --format`/
+        /// `docker version --format` exactly — checked directly,
+        /// `~/git/podman/cmd/podman/system/version.go:39`) — same
+        /// engine and scope as `ociman info`/`inspect`/`ps`/`images`/
+        /// `volume ls --format` (`0332`-`0335`): `{{.field}}`
+        /// placeholders only, no pipelines/functions/control flow,
+        /// field names this project's own JSON output field names
+        /// directly (`{{.version}}`, `{{.git_commit}}`,
+        /// `{{.os_arch}}`). Takes priority over `--json`/the default
+        /// plain-text report when given; an unresolvable field path
+        /// is a real, immediate error. A real, previously-missing
+        /// gap: `docs/design/0162`'s own "what this doesn't do yet"
+        /// note explicitly named this, reasoning at the time that no
+        /// other command in this project's CLI surface had the
+        /// Go-template engine either — stale as of `0332` onward,
+        /// which built exactly that engine everywhere else, leaving
+        /// `version` the one command left behind by its own neighbor
+        /// `info` (`0563`, closing the gap now that the engine it
+        /// was waiting on has long since existed).
+        #[arg(short, long = "format", value_name = "TEMPLATE")]
+        format: Option<String>,
+    },
     /// Display system information, matching real `docker info`/
     /// `podman info`'s own general shape (`host`/`store`/`version`
     /// sections) — a deliberately much narrower first slice of real
@@ -8276,7 +8299,7 @@ fn main() -> std::process::ExitCode {
                 quiet,
                 cli.global.json,
             ),
-            Some(Command::Version) => cmd_version(cli.global.json),
+            Some(Command::Version { format }) => cmd_version(cli.global.json, format.as_deref()),
             Some(Command::Info { format }) => cmd_info(cli.global.json, format.as_deref()),
         }
     })
@@ -9076,9 +9099,14 @@ fn version_report() -> VersionReport {
     }
 }
 
-fn cmd_version(json: bool) -> anyhow::Result<()> {
+fn cmd_version(json: bool, format: Option<&str>) -> anyhow::Result<()> {
     let report = version_report();
 
+    if let Some(template) = format {
+        let json_value = serde_json::to_value(&report)?;
+        println!("{}", render_format_template(template, &json_value)?);
+        return Ok(());
+    }
     if json {
         oci_cli_common::output::print_json(&report)?;
         return Ok(());
