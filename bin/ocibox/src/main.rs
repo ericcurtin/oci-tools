@@ -513,7 +513,25 @@ enum Command {
         name: String,
         /// The command to run inside the box, and its own arguments —
         /// defaults to a shell (see this command's own doc comment)
-        /// if empty.
+        /// if empty. `trailing_var_arg`/`allow_hyphen_values` (the
+        /// same attribute pair `ociman run`'s own `RunArgs::args`
+        /// already established) so a command whose own arguments
+        /// look like flags (`ocibox enter mybox ls -la`) parses
+        /// without needing an explicit `--` first — matching real
+        /// `distrobox enter`'s own identical, checked-directly
+        /// behavior (`~/git/distrobox/internal/cli/parse.go:9-15,
+        /// 69-116`, `PrepareArgs`/`splitExecCommand`: the first bare,
+        /// non-flag token after the box name is where the real
+        /// command begins, with a `"--"` spliced in automatically
+        /// from then on — verified against real distrobox's own unit
+        /// test, `~/git/distrobox/internal/cli/parse_internal_test.go:
+        /// 67-70`, `"command word before its own flag"`: `enter suse
+        /// vim --help` passes `--help` straight to `vim`, never
+        /// triggering distrobox's own help). A real, checked-directly
+        /// usability bug this closes, not a missing-but-inapplicable
+        /// flag: before this, `ocibox enter mybox ls -la` was a real,
+        /// immediate clap parse error.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
         /// Reset `PATH` inside the box to the bare FHS standard
         /// (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
@@ -668,7 +686,10 @@ enum Command {
         platform: Option<String>,
         /// The command to run inside the box, and its own arguments —
         /// defaults to a shell (see `ocibox enter`'s own doc comment)
-        /// if empty.
+        /// if empty. Same `trailing_var_arg`/`allow_hyphen_values`
+        /// fix as [`Command::Enter::command`] — see its own doc
+        /// comment for the exact real-distrobox citation.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
         /// Same as [`Command::Create::root`] — see its own doc
         /// comment for the full, checked-directly reasoning (real
@@ -1989,21 +2010,51 @@ fn enter_and_get_exit_code(
 }
 
 /// Removes exactly one box's own directory (its rootfs and persisted
-/// record alike) and prints its name — the one real removal primitive
-/// both a single-name `ocibox rm <NAME>` and `ocibox rm --all` (one
-/// call per already-listed box) share.
+/// record alike) — no output of its own. Validated for exactly the
+/// same reason `cmd_create` validates its own `--name` before ever
+/// joining it onto `boxes_root()` — a `name` containing `/` (or `..`)
+/// would otherwise let this function's own `remove_dir_all` reach an
+/// arbitrary path outside `boxes_root()` entirely, a real
+/// path-traversal hazard, not just a cosmetic naming rule.
 ///
-/// Validated for exactly the same reason `cmd_create` validates its
-/// own `--name` before ever joining it onto `boxes_root()` — a `name`
-/// containing `/` (or `..`) would otherwise let this function's own
-/// `remove_dir_all` reach an arbitrary path outside `boxes_root()`
-/// entirely, a real path-traversal hazard, not just a cosmetic naming
-/// rule.
-fn remove_one_box(name: &str) -> anyhow::Result<()> {
+/// Split out from [`remove_one_box`] (0544) specifically so `ocibox
+/// ephemeral`'s own internal cleanup step can call it directly,
+/// without that function's own `println!` — a real, previously-
+/// unnoticed stdout-contamination bug found while adding this same
+/// increment's own `trailing_var_arg` test: `ocibox ephemeral`'s own
+/// cleanup used to unconditionally print the generated box's own
+/// name to stdout right after the entered command's own real output,
+/// with no separating newline (visible the moment a test asserted an
+/// exact `-n`-suppressed `echo` output). Real `distrobox ephemeral`
+/// never does this: its own internal cleanup call to `rm` prints
+/// nothing at all on success (checked directly, `~/git/distrobox/
+/// pkg/commands/rm.go`'s own `Execute` has no success-path `Print*`
+/// call whatsoever, only warnings/errors), and even a cleanup
+/// *failure*'s own warning is deliberately routed to stderr, never
+/// stdout (`~/git/distrobox/internal/cli/ephemeral.go:109`:
+/// `ui.NewPrinter(os.Stderr, true)`, specifically so it can never
+/// contaminate the entered command's own real output) — exactly
+/// matching this project's own pre-existing `eprintln!` for a
+/// cleanup failure in `cmd_ephemeral` already.
+fn remove_box_dir(name: &str) -> anyhow::Result<()> {
     validate_box_name(name)?;
     let box_dir = boxes_root().join(name);
     anyhow::ensure!(box_dir.is_dir(), "{name}: no such box");
     std::fs::remove_dir_all(&box_dir).with_context(|| format!("removing {}", box_dir.display()))?;
+    Ok(())
+}
+
+/// [`remove_box_dir`] plus printing the removed name — matching real
+/// `podman rm`/`docker rm`'s own established, already-tested
+/// convention (a container/box name/id printed on a successful
+/// removal), a deliberate, pre-existing, already-tested choice this
+/// project made for its own standalone `ocibox rm` independent of
+/// real `distrobox rm`'s own silent-on-success behavior (see
+/// [`remove_box_dir`]'s own doc comment) — the one real removal
+/// primitive both a single-name `ocibox rm <NAME>` and `ocibox rm
+/// --all` (one call per already-listed box) share.
+fn remove_one_box(name: &str) -> anyhow::Result<()> {
+    remove_box_dir(name)?;
     println!("{name}");
     Ok(())
 }
@@ -2181,8 +2232,11 @@ fn cmd_ephemeral(
     // own identical `defer`-based cleanup. A cleanup failure is only
     // ever reported as a warning: it must never replace or hide
     // `result`'s own real outcome, which is what this command is
-    // actually supposed to report.
-    if let Err(e) = remove_one_box(&name) {
+    // actually supposed to report. `remove_box_dir`, not
+    // `remove_one_box` — see the former's own doc comment for why a
+    // successful cleanup here must stay completely silent, matching
+    // real `distrobox ephemeral`'s own identical behavior exactly.
+    if let Err(e) = remove_box_dir(&name) {
         eprintln!("warning: ocibox ephemeral: failed to remove {name}: {e:#}");
     }
 

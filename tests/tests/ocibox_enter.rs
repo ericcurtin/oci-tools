@@ -87,6 +87,45 @@ fn enter_runs_an_explicit_command_and_forwards_its_exit_code() {
     );
 }
 
+/// `trailing_var_arg`/`allow_hyphen_values` (`docs/design/0544`): a
+/// command whose own arguments look like flags (`/bin/sh -c ...`)
+/// parses correctly with *no* explicit `--` at all -- matching real
+/// `distrobox enter`'s own identical behavior (checked directly,
+/// `~/git/distrobox/internal/cli/parse.go`'s own `PrepareArgs`/
+/// `splitExecCommand`). Before this fix, this exact invocation was a
+/// real, immediate clap parse error (`unexpected argument '-c'
+/// found`).
+#[test]
+fn enter_runs_a_command_with_its_own_flag_like_arguments_without_a_leading_double_dash() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+
+    let ok = ocibox(
+        storage_dir.path(),
+        &["enter", "testbox", "/bin/sh", "-c", "exit 0"],
+    );
+    assert!(
+        ok.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    let failing = ocibox(
+        storage_dir.path(),
+        &["enter", "testbox", "/bin/sh", "-c", "exit 42"],
+    );
+    assert_eq!(
+        failing.status.code(),
+        Some(42),
+        "stderr: {}",
+        String::from_utf8_lossy(&failing.stderr)
+    );
+}
+
 #[test]
 fn enter_defaults_to_a_shell_when_no_command_is_given() {
     if busybox_path().is_none() {

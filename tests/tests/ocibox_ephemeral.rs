@@ -75,6 +75,48 @@ fn ephemeral_runs_a_command_and_removes_the_box_afterward() {
     );
 }
 
+/// `trailing_var_arg`/`allow_hyphen_values` (`docs/design/0544`): a
+/// command whose own arguments look like flags (`/bin/echo -n ...`)
+/// parses correctly with *no* explicit `--` at all -- matching real
+/// `distrobox ephemeral`'s own identical inherited behavior (see
+/// `ocibox enter`'s own identical test/doc comment for the exact
+/// real-distrobox citation). Before this fix, this exact invocation
+/// was a real, immediate clap parse error (`unexpected argument '-n'
+/// found`).
+#[test]
+fn ephemeral_runs_a_command_with_its_own_flag_like_arguments_without_a_leading_double_dash() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    seed_ephemeral_base(
+        storage_dir.path(),
+        "ocibox-test/ephemeral-no-dashdash:latest",
+    );
+
+    let out = ocibox(
+        storage_dir.path(),
+        &[
+            "ephemeral",
+            "--image",
+            "ocibox-test/ephemeral-no-dashdash:latest",
+            "/bin/echo",
+            "-n",
+            "hello-ephemeral",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // `-n` suppresses the trailing newline `echo` would otherwise
+    // add -- proving it reached the real command as a real flag,
+    // not just as a literal, un-flagged argument.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello-ephemeral");
+}
+
 /// `--yes`/`-Y` is accepted for real CLI compatibility with real
 /// `distrobox ephemeral --yes`/`-Y` (inherited from `distrobox
 /// create`'s own identical flag, checked directly, `~/git/distrobox/
