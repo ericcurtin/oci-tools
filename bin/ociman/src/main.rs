@@ -15020,6 +15020,29 @@ fn cmd_unmount(ids: &[String], all: bool, latest: bool) -> anyhow::Result<()> {
 /// `cmd_diff`'s/`cmd_cp`'s own `resolve_container_root`, so the same
 /// rootless-overlay-rootfs gap (`docs/design/0146`) applies here too.
 fn cmd_export(id: &str, output: Option<&Path>) -> anyhow::Result<()> {
+    // A real, previously-unnoticed bug this closes (`docs/design/
+    // 0552`, the `export`-side sibling of `save`'s/`load`'s own
+    // identical fixes, `0550`/`0551`): with no `--output`, real
+    // `podman export` refuses outright the moment stdout is a real
+    // interactive terminal -- checked directly, `~/git/podman/cmd/
+    // podman/containers/export.go:74-75` (`if term.IsTerminal(int(
+    // file.Fd())) { return errors.New("refusing to export to
+    // terminal. Use -o flag or redirect") } `), live-verified against
+    // a real installed `podman 4.9.3`. Before this, `ociman export`
+    // (with no `--output`) wrote the raw, binary tar archive straight
+    // onto the terminal -- live-verified against this project's own
+    // binary through the same real, held-open pty technique `save`'s/
+    // `load`'s own fixes already established, corrupting the
+    // terminal's own state exactly like `save`'s prior bug did.
+    // Checked first, before ever resolving the container or doing any
+    // other work, matching real podman's own identical "fail fast,
+    // before anything else" placement (checked directly: `export.go`'s
+    // own `ContainerExport` call, the point container resolution
+    // actually happens, is the very last line of the function, well
+    // after this check).
+    if output.is_none() && std::io::stdout().is_terminal() {
+        anyhow::bail!("refusing to export to terminal. Use -o flag or redirect");
+    }
     let (root, _state) = resolve_container_root(id, "export")?;
 
     use std::io::Write as _;

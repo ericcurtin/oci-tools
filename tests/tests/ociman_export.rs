@@ -95,6 +95,73 @@ fn export_of_an_unknown_container_is_a_clear_error() {
     assert!(!export.status.success());
 }
 
+/// A real, previously-unnoticed bug this closes (`docs/design/0552`,
+/// the `export`-side sibling of `ociman save`'s/`load`'s own
+/// identical fixes, `0550`/`0551`): with no `--output`, real `podman
+/// export` refuses outright the moment stdout is a real interactive
+/// terminal (checked directly, `~/git/podman/cmd/podman/containers/
+/// export.go:74-75`, live-verified against a real installed `podman
+/// 4.9.3`). Before this fix, `ociman export` (with no `--output`)
+/// wrote the raw, binary tar archive straight onto the terminal --
+/// live-verified against this project's own binary through a real,
+/// held-open pty, corrupting the terminal's own state exactly like
+/// `save`'s own prior bug did.
+///
+/// Uses a deliberately unresolvable container id: real podman's own
+/// identical check (and this project's own fix) runs *before* the
+/// container is ever resolved, so this proves the check's own
+/// ordering too -- the error is genuinely about the terminal, not
+/// "no such container" (see `cmd_export`'s own doc comment for the
+/// exact citation proving real podman's own `ContainerExport` call,
+/// where resolution actually happens, is the very last line of its
+/// own function).
+#[test]
+fn export_refuses_to_write_to_a_real_terminal() {
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let pty_main =
+        rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
+            .expect("opening a pty");
+    rustix::pty::grantpt(&pty_main).expect("grantpt");
+    rustix::pty::unlockpt(&pty_main).expect("unlockpt");
+    let slave_name = rustix::pty::ptsname(&pty_main, Vec::new()).expect("ptsname");
+    let slave_path = std::path::PathBuf::from(slave_name.to_string_lossy().into_owned());
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&slave_path)
+        .expect("opening the pty's own slave side");
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["export", "never-existed"])
+        .stdin(Stdio::null())
+        .stdout(slave)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman");
+    let status = child.wait().expect("waiting for ociman");
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    // `pty_main` (the master side) must outlive the child's own run --
+    // dropped only now that it's done.
+    drop(pty_main);
+
+    assert!(
+        !status.success(),
+        "ociman export must refuse to write raw archive bytes to a real terminal"
+    );
+    assert!(
+        stderr.contains("refusing to export to terminal"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("no such container") && !stderr.contains("does not exist"),
+        "the terminal check must fire before container resolution: {stderr:?}"
+    );
+}
+
 #[test]
 fn export_writes_every_real_file_verbatim_no_whiteouts_no_layer_semantics() {
     let Some(_busybox) = busybox_path() else {
