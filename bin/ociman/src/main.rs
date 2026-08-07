@@ -1338,6 +1338,23 @@ enum Command {
         /// return err }`, no logging-and-continuing fallback at all).
         #[arg(long = "digestfile", value_name = "PATH")]
         digestfile: Option<PathBuf>,
+        /// Suppress the progress spinner — matching real `podman
+        /// push --quiet`/`-q` exactly (checked directly, `~/git/
+        /// podman/cmd/podman/images/push.go:110,181-182`:
+        /// `flags.BoolVarP(&pushOptions.Quiet, "quiet", "q", ...)`,
+        /// `if !pushOptions.Quiet { pushOptions.Writer = os.Stderr }`
+        /// — real podman's own identical progress-writer-gating
+        /// pattern `ociman pull --quiet`/`save --quiet`/`load --quiet`
+        /// already established here, `0417`). This flag is real and
+        /// visible in real podman's own normal (non-`podman-remote`)
+        /// mode — checked directly, `push.go:136-144`: it's only ever
+        /// `MarkHidden` under `registry.IsRemote()`, a client/server
+        /// split this project has no equivalent of at all, so that
+        /// conditional hiding never applies here either way. Never
+        /// affects the final digest/`--json` output either way, the
+        /// same as `pull --quiet`'s own identical guarantee.
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Search a registry — matching real `podman search`'s own
     /// `--list-tags` mode exactly (checked directly,
@@ -6520,6 +6537,9 @@ enum ImageCommand {
         /// Same as [`Command::Push::digestfile`].
         #[arg(long = "digestfile", value_name = "PATH")]
         digestfile: Option<PathBuf>,
+        /// Same as [`Command::Push::quiet`].
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// `podman image save`'s own real alias for top-level `podman
     /// save` — checked directly, `~/git/podman/cmd/podman/images/
@@ -6781,10 +6801,12 @@ fn main() -> std::process::ExitCode {
                 reference,
                 tls_verify,
                 digestfile,
+                quiet,
             }) => cmd_push(
                 &reference,
                 tls_verify,
                 digestfile.as_deref(),
+                quiet,
                 cli.global.json,
             ),
             Some(Command::Search {
@@ -7809,10 +7831,12 @@ fn main() -> std::process::ExitCode {
                     reference,
                     tls_verify,
                     digestfile,
+                    quiet,
                 } => cmd_push(
                     &reference,
                     tls_verify,
                     digestfile.as_deref(),
+                    quiet,
                     cli.global.json,
                 ),
                 ImageCommand::Save {
@@ -8224,6 +8248,7 @@ fn cmd_push(
     reference_str: &str,
     tls_verify: bool,
     digestfile: Option<&Path>,
+    quiet: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let store = open_store()?;
@@ -8249,7 +8274,10 @@ fn cmd_push(
         .with_context(|| format!("parsing image reference {:?}", record.reference))?;
     let mut client = oci_registry::client_for(reference.registry_host(), tls_verify);
 
-    let progress = oci_cli_common::progress::spinner(format!("pushing {}", reference.familiar()));
+    let progress = oci_cli_common::progress::spinner_unless_quiet(
+        quiet,
+        format!("pushing {}", reference.familiar()),
+    );
     let result = oci_registry::push_image(&mut client, &store, &reference, record)
         .with_context(|| format!("pushing {reference}"));
     progress.finish_and_clear();

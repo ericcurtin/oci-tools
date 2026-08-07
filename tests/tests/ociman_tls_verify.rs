@@ -472,6 +472,60 @@ fn push_digestfile_writes_the_exact_digest_stdout_already_prints() {
     );
 }
 
+/// `push --quiet`/`-q` (`docs/design/0548`): suppresses the progress
+/// spinner (drawn to stderr, already automatically hidden whenever
+/// stderr isn't a real terminal — same established limitation every
+/// other spinner-backed command in this project already has, see
+/// `oci_cli_common::progress`'s own module doc comment, and the same
+/// "accepted, still pushes correctly" test shape `ociman_save.rs`'s
+/// own `save_quiet_still_writes_a_correct_archive` already
+/// established for its own identical flag) — a real, successful push
+/// still reaches the registry and reports the exact same digest
+/// either way.
+#[test]
+fn push_quiet_still_pushes_correctly_and_reports_the_same_digest() {
+    let source_mock = start_mock_with_a_real_image();
+    let storage_dir = tempfile::tempdir().unwrap();
+    let pull = ociman(
+        storage_dir.path(),
+        &[
+            "pull",
+            "--tls-verify=false",
+            &format!("{}/testrepo:latest", source_mock.addr),
+        ],
+    );
+    assert!(pull.status.success());
+    let expected_digest = String::from_utf8_lossy(&pull.stdout).trim().to_string();
+
+    let dest_mock = MockPushRegistry::start();
+    let tag = ociman(
+        storage_dir.path(),
+        &[
+            "tag",
+            &format!("{}/testrepo:latest", source_mock.addr),
+            &format!("{}/testrepo:latest", dest_mock.addr),
+        ],
+    );
+    assert!(tag.status.success());
+
+    let push = ociman(
+        storage_dir.path(),
+        &[
+            "push",
+            "--tls-verify=false",
+            "--quiet",
+            &format!("{}/testrepo:latest", dest_mock.addr),
+        ],
+    );
+    assert!(
+        push.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&push.stderr)
+    );
+    let pushed_digest = String::from_utf8_lossy(&push.stdout).trim().to_string();
+    assert_eq!(pushed_digest, expected_digest);
+}
+
 #[test]
 fn push_without_tls_verify_false_refuses_plain_http_by_default() {
     let source_mock = start_mock_with_a_real_image();
