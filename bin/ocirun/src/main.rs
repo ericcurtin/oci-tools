@@ -743,6 +743,28 @@ enum Command {
         /// clear error instead).
         #[arg(long)]
         stats: bool,
+        /// Set the stats collection interval — matching real `runc
+        /// events --interval` exactly (checked directly, `~/git/runc/
+        /// events.go:29-46`, and live-verified against a real
+        /// installed `runc 1.3.4`): a Go-`time.ParseDuration`-*like*
+        /// value, default `5s`. Real runc validates this
+        /// unconditionally, right after confirming the container
+        /// exists but *before* ever branching on `--stats` — even
+        /// though its own value is only actually consumed by the
+        /// periodic (non-`--stats`) mode this project doesn't
+        /// implement at all: `duration := context.Duration
+        /// ("interval"); if duration <= 0 { return errors.New
+        /// ("duration interval must be greater than 0") }` runs
+        /// either way, confirmed live: `runc events --interval 0
+        /// --stats <running-container>` is a real, immediate error
+        /// with that exact message, not a silently-ignored flag.
+        /// This project's own `--stats`-only implementation replicates
+        /// that same real validation faithfully — accepted, checked,
+        /// but its own actual value never used for anything, matching
+        /// real runc's own identical "value validated on a path that
+        /// never reads it" quirk exactly.
+        #[arg(long, default_value = "5s")]
+        interval: String,
     },
 }
 
@@ -913,7 +935,11 @@ fn main() -> std::process::ExitCode {
             ),
             Some(Command::Pause { id }) => cmd_pause(&root, &id),
             Some(Command::Resume { id }) => cmd_resume(&root, &id),
-            Some(Command::Events { id, stats }) => cmd_events(&root, &id, stats),
+            Some(Command::Events {
+                id,
+                stats,
+                interval,
+            }) => cmd_events(&root, &id, stats, &interval),
         }
     })
 }
@@ -2005,7 +2031,57 @@ struct EventsPids {
 /// honest "not yet" error instead of a half-implemented
 /// approximation, the same shape `ociman stats`'s own "pass
 /// --no-stream" error already established for the identical reason.
-fn cmd_events(root: &Path, id: &str, stats: bool) -> anyhow::Result<()> {
+/// Parses a `runc events --interval`-style Go-`time.ParseDuration`-
+/// *like* value — the same compound-unit shape `ociman`'s own
+/// `parse_simple_duration` already established (a small, deliberate
+/// per-binary duplicate for ~20 lines rather than a new shared-crate
+/// dependency, this project's own already-established convention),
+/// plus a real, checked-directly special case Go's own
+/// `time.ParseDuration` gives a bare, unit-less `"0"` (confirmed
+/// live against a real installed `runc 1.3.4`: `runc events
+/// --interval 0 --stats <container>` is accepted as a real, parsed
+/// zero duration — not a parse error — then separately rejected by
+/// the real `duration <= 0` check, see [`cmd_events`]'s own doc
+/// comment). `ms` is accepted alongside `h`/`m`/`s` (real Go
+/// durations support it too, and `--interval`'s own real default
+/// unit granularity makes it a plausible real value here, unlike
+/// `parse_simple_duration`'s own callers).
+fn parse_go_style_duration(s: &str) -> Option<Duration> {
+    if s == "0" {
+        return Some(Duration::ZERO);
+    }
+    if s.is_empty() {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut idx = 0;
+    let mut total_secs = 0f64;
+    while idx < bytes.len() {
+        let num_start = idx;
+        while idx < bytes.len() && (bytes[idx].is_ascii_digit() || bytes[idx] == b'.') {
+            idx += 1;
+        }
+        if idx == num_start {
+            return None;
+        }
+        let amount: f64 = s[num_start..idx].parse().ok()?;
+        let unit_start = idx;
+        while idx < bytes.len() && bytes[idx].is_ascii_alphabetic() {
+            idx += 1;
+        }
+        let seconds_per_unit = match &s[unit_start..idx] {
+            "h" => 3600.0,
+            "m" => 60.0,
+            "s" => 1.0,
+            "ms" => 0.001,
+            _ => return None,
+        };
+        total_secs += amount * seconds_per_unit;
+    }
+    Some(Duration::from_secs_f64(total_secs))
+}
+
+fn cmd_events(root: &Path, id: &str, stats: bool, interval: &str) -> anyhow::Result<()> {
     if !stats {
         anyhow::bail!(
             "ocirun events: periodic/OOM-notify mode isn't implemented yet -- pass --stats \
@@ -2015,6 +2091,19 @@ fn cmd_events(root: &Path, id: &str, stats: bool) -> anyhow::Result<()> {
     let store = StateStore::open(root)
         .with_context(|| format!("opening container state root {}", root.display()))?;
     let state = store.load(id)?;
+    // `--interval` (see `Command::Events::interval`'s own doc
+    // comment): validated here, matching real runc's own exact
+    // order -- right after confirming the container exists, before
+    // the running check below -- even though this project's own
+    // one-shot `--stats` path never actually reads the parsed value
+    // for anything else, matching real runc's own identical
+    // checked-directly quirk.
+    let parsed_interval = parse_go_style_duration(interval)
+        .ok_or_else(|| anyhow::anyhow!("invalid duration {interval:?} for --interval"))?;
+    anyhow::ensure!(
+        !parsed_interval.is_zero(),
+        "duration interval must be greater than 0"
+    );
     if state.effective_status() == Status::Stopped {
         anyhow::bail!("container with id {id} is not running");
     }
@@ -2433,5 +2522,50 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    // `parse_go_style_duration` (`Command::Events::interval`, 0539)
+    // is pure, process-free parsing logic worth its own direct unit
+    // tests, matching `parse_memory_limit`'s own identical reasoning
+    // above.
+
+    #[test]
+    fn parse_go_style_duration_accepts_the_bare_zero_special_case() {
+        assert_eq!(parse_go_style_duration("0").unwrap(), Duration::ZERO);
+    }
+
+    #[test]
+    fn parse_go_style_duration_accepts_plain_units() {
+        assert_eq!(
+            parse_go_style_duration("5s").unwrap(),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_go_style_duration("1m").unwrap(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            parse_go_style_duration("1h").unwrap(),
+            Duration::from_secs(3600)
+        );
+        assert_eq!(
+            parse_go_style_duration("500ms").unwrap(),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn parse_go_style_duration_accepts_compound_units() {
+        assert_eq!(
+            parse_go_style_duration("1m30s").unwrap(),
+            Duration::from_secs(90)
+        );
+    }
+
+    #[test]
+    fn parse_go_style_duration_rejects_garbage_and_empty() {
+        assert!(parse_go_style_duration("").is_none());
+        assert!(parse_go_style_duration("bogus").is_none());
+        assert!(parse_go_style_duration("5x").is_none());
     }
 }

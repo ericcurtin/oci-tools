@@ -220,3 +220,160 @@ fn events_stats_of_a_stopped_container_is_a_clear_error() {
     let delete = ocirun(root_dir.path(), &["delete", "events-stopped-test"]);
     assert!(delete.status.success());
 }
+
+/// `events --interval` (`docs/design/0539`), matching real `runc
+/// events --interval` exactly: `--interval 0` is a real, immediate
+/// error with real runc's own exact wording, verified live against a
+/// real installed `runc 1.3.4` -- even on a genuinely running
+/// container, and even though this project's own one-shot `--stats`
+/// path never actually reads the parsed value for anything else.
+#[test]
+fn events_stats_interval_zero_is_a_clear_error() {
+    let Some((_bundle_dir, root_dir, cgroup_dir)) =
+        create_and_start_with_real_cgroup("events-interval-zero-test")
+    else {
+        return;
+    };
+
+    let events = ocirun(
+        root_dir.path(),
+        &[
+            "events",
+            "--interval",
+            "0",
+            "--stats",
+            "events-interval-zero-test",
+        ],
+    );
+    assert!(!events.status.success());
+    assert!(
+        String::from_utf8_lossy(&events.stderr)
+            .contains("duration interval must be greater than 0"),
+        "{}",
+        String::from_utf8_lossy(&events.stderr)
+    );
+
+    cleanup(root_dir.path(), "events-interval-zero-test", &cgroup_dir);
+}
+
+/// An unparseable `--interval` value is also a real, immediate error
+/// -- matching real runc's own equivalent flag-parse failure (checked
+/// directly, `runc events --interval bogus --stats <ctr>`: `Incorrect
+/// Usage: invalid value "bogus" for flag -interval: parse error`),
+/// even though this project's own message wording isn't chased
+/// byte-for-byte (a real, immediate error either way, not a silently
+/// accepted garbage value).
+#[test]
+fn events_stats_unparseable_interval_is_a_clear_error() {
+    let Some((_bundle_dir, root_dir, cgroup_dir)) =
+        create_and_start_with_real_cgroup("events-interval-bogus-test")
+    else {
+        return;
+    };
+
+    let events = ocirun(
+        root_dir.path(),
+        &[
+            "events",
+            "--interval",
+            "bogus",
+            "--stats",
+            "events-interval-bogus-test",
+        ],
+    );
+    assert!(!events.status.success());
+    assert!(
+        String::from_utf8_lossy(&events.stderr).contains("invalid duration"),
+        "{}",
+        String::from_utf8_lossy(&events.stderr)
+    );
+
+    cleanup(root_dir.path(), "events-interval-bogus-test", &cgroup_dir);
+}
+
+/// A real, positive `--interval` behaves identically to the default
+/// (no flag at all) -- the one-shot `--stats` report's own real
+/// content never actually depends on the interval value, matching
+/// real runc's own identical "validated, but never consumed on this
+/// path" behavior.
+#[test]
+fn events_stats_with_a_valid_interval_behaves_identically_to_the_default() {
+    let Some((_bundle_dir, root_dir, cgroup_dir)) =
+        create_and_start_with_real_cgroup("events-interval-valid-test")
+    else {
+        return;
+    };
+    std::thread::sleep(Duration::from_millis(50));
+
+    for interval in ["3s", "500ms", "1m"] {
+        let events = ocirun(
+            root_dir.path(),
+            &[
+                "events",
+                "--interval",
+                interval,
+                "--stats",
+                "events-interval-valid-test",
+            ],
+        );
+        assert!(
+            events.status.success(),
+            "--interval {interval}: stderr: {}",
+            String::from_utf8_lossy(&events.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&events.stdout);
+        let line = stdout.lines().next().expect("one real JSON line");
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("real JSON");
+        assert_eq!(parsed["type"], serde_json::json!("stats"));
+        assert_eq!(
+            parsed["id"],
+            serde_json::json!("events-interval-valid-test")
+        );
+    }
+
+    cleanup(root_dir.path(), "events-interval-valid-test", &cgroup_dir);
+}
+
+/// `--interval`'s own validation runs *before* the "is the container
+/// running" check -- matching real runc's own exact order (right
+/// after confirming the container exists, before ever branching on
+/// `--stats`) -- proven here against an already-*stopped* container,
+/// which would otherwise report a completely different error
+/// ("is not running") if the order were reversed.
+#[test]
+fn events_stats_interval_validation_runs_before_the_running_check() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    write_bundle(bundle_dir.path(), &busybox, &["/bin/true"]);
+
+    let create = ocirun_create(root_dir.path(), bundle_dir.path(), "events-order-test");
+    assert!(create.status.success());
+    let start = ocirun(root_dir.path(), &["start", "events-order-test"]);
+    assert!(start.status.success());
+    wait_for_status(
+        root_dir.path(),
+        "events-order-test",
+        "stopped",
+        Duration::from_secs(5),
+    );
+
+    let events = ocirun(
+        root_dir.path(),
+        &["events", "--interval", "0", "--stats", "events-order-test"],
+    );
+    assert!(!events.status.success());
+    assert!(
+        String::from_utf8_lossy(&events.stderr)
+            .contains("duration interval must be greater than 0"),
+        "expected the interval error to take priority over the (also real) \"is not running\" \
+         one, matching real runc's own exact validation order: {}",
+        String::from_utf8_lossy(&events.stderr)
+    );
+
+    let delete = ocirun(root_dir.path(), &["delete", "events-order-test"]);
+    assert!(delete.status.success());
+}
