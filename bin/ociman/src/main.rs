@@ -3259,10 +3259,10 @@ enum Command {
     /// the image it was created from — matching real `docker commit`/
     /// `podman commit` exactly for the "one new layer, on top of the
     /// exact same base layers" case (see `cmd_commit`'s own doc
-    /// comment for what's deliberately out of scope for now: `--config`/
-    /// `--include-volumes`, and the same rootless-overlay-rootfs gap
-    /// `cp`/`diff` already have; `--squash` *is* supported, see the
-    /// `squash` field below).
+    /// comment for what's deliberately out of scope for now: `--config`,
+    /// and the same rootless-overlay-rootfs gap `cp`/`diff` already
+    /// have; `--squash` and `--include-volumes` *are* both supported,
+    /// see their own fields below).
     Commit {
         /// The container's ID or `--name`.
         container: String,
@@ -3386,6 +3386,35 @@ enum Command {
         /// could ever matter.
         #[arg(short = 'f', long, default_value = "oci")]
         format: String,
+        /// Add every mount this container itself declares (beyond the
+        /// fixed proc/dev/sys/... set every container gets
+        /// unconditionally) to the resulting image's own
+        /// `config.Volumes` map -- matching real `podman commit
+        /// --include-volumes` exactly (checked directly, `~/git/
+        /// podman/cmd/podman/containers/commit.go:83`:
+        /// `flags.BoolVar(&commitOptions.IncludeVolumes,
+        /// "include-volumes", false, ...)`, wired through `~/git/
+        /// podman/pkg/domain/infra/abi/containers.go:677` into
+        /// `~/git/podman/libpod/container_commit.go:137-155`, which
+        /// adds every one of the container's own declared mount
+        /// destinations -- `c.config.UserVolumes` -- when the flag is
+        /// given). Reuses the exact same "list every mount beyond the
+        /// fixed default set" primitive `ociman inspect`'s own
+        /// `mounts` field already established (`extra_mounts`), and
+        /// writes them the exact same way `--change VOLUME` already
+        /// does (`ImageConfig.config.volumes`, a bare `{}` per path --
+        /// see [`Self::change`]'s own doc comment). Without this flag
+        /// (real podman's own default), nothing is added here either,
+        /// matching real podman's own identical default exactly: its
+        /// own unflagged path only ever adds *anonymous* named
+        /// volumes among a container's declared mounts, and this
+        /// project has already established, twice over, that it has
+        /// no anonymous-named-volume concept of any kind to add (see
+        /// `Command::Run`'s and `Command::Create`'s own `volume`
+        /// field doc comments) -- a faithful port of that default,
+        /// not a shortcut.
+        #[arg(long = "include-volumes")]
+        include_volumes: bool,
     },
     /// Gracefully stop a running container: send it a signal (`TERM`
     /// by default) and wait up to `--time` seconds for it to exit on
@@ -5772,10 +5801,11 @@ enum ContainerCommand {
     /// `ociman commit` itself already calls, with the identical
     /// field set -- see [`Command::Commit`]'s own doc comment for
     /// the exact semantics (including this project's own honestly
-    /// narrower first-slice scope: no `--config`/`--include-volumes`
+    /// narrower first-slice scope: no `--config`
     /// -- `--quiet` closed the same class of gap in `0523`, `--format`
-    /// in `0537`, matching the top-level command's own identical
-    /// additions), not repeated here.
+    /// in `0537`, `--include-volumes` in `0541`, matching the
+    /// top-level command's own identical additions), not repeated
+    /// here.
     Commit {
         /// Same as [`Command::Commit::container`].
         container: String,
@@ -5805,6 +5835,9 @@ enum ContainerCommand {
         /// Same as [`Command::Commit::format`].
         #[arg(short = 'f', long, default_value = "oci")]
         format: String,
+        /// Same as [`Command::Commit::include_volumes`].
+        #[arg(long = "include-volumes")]
+        include_volumes: bool,
     },
     /// `podman container export`'s own real alias for the already-
     /// existing flat [`Command::Export`] -- checked directly, `~/git/
@@ -6947,6 +6980,7 @@ fn main() -> std::process::ExitCode {
                 iidfile,
                 quiet: _,
                 format,
+                include_volumes,
             }) => cmd_commit(
                 &container,
                 image.as_deref(),
@@ -6957,6 +6991,7 @@ fn main() -> std::process::ExitCode {
                 squash,
                 iidfile.as_deref(),
                 &format,
+                include_volumes,
                 cli.global.json,
             ),
             Some(Command::Stop {
@@ -7368,6 +7403,7 @@ fn main() -> std::process::ExitCode {
                     iidfile,
                     quiet: _,
                     format,
+                    include_volumes,
                 } => cmd_commit(
                     &container,
                     image.as_deref(),
@@ -7378,6 +7414,7 @@ fn main() -> std::process::ExitCode {
                     squash,
                     iidfile.as_deref(),
                     &format,
+                    include_volumes,
                     cli.global.json,
                 ),
                 ContainerCommand::Export { id, output } => cmd_export(&id, output.as_deref()),
@@ -14725,6 +14762,7 @@ fn cmd_commit(
     squash: bool,
     iidfile: Option<&Path>,
     format: &str,
+    include_volumes: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     // `--format`/`-f` (see `Command::Commit::format`'s own doc
@@ -14776,6 +14814,7 @@ fn cmd_commit(
         &change_instructions,
         squash,
         iidfile,
+        include_volumes,
         json,
         &root,
         &state,
@@ -14815,6 +14854,7 @@ fn commit_inner(
     change: &[oci_dockerfile::Instruction],
     squash: bool,
     iidfile: Option<&Path>,
+    include_volumes: bool,
     json: bool,
     root: &Path,
     state: &oci_runtime_core::PersistedState,
@@ -14912,6 +14952,24 @@ fn commit_inner(
     }
     if let Some(author) = author {
         config.author = Some(author.to_string());
+    }
+    if include_volumes {
+        // Real podman's own `IncludeVolumes` (see `Command::Commit::
+        // include_volumes`'s own doc comment): every mount this
+        // container itself declares beyond the fixed proc/dev/sys/...
+        // set, added to the new image's own `config.Volumes` -- the
+        // exact same "list every mount beyond the fixed default set"
+        // primitive `ociman inspect`'s own `mounts` field already
+        // established (`extra_mounts`), written the exact same way
+        // `--change VOLUME` already does. Applied *before* `--change`
+        // below so an explicit `--change VOLUME=...`/a later
+        // `--change` still wins for any overlapping path -- the same
+        // "explicit --change always wins over inherited data"
+        // precedent `--annotation` already established (0522).
+        for mount in extra_mounts(state) {
+            let cc = config.config.get_or_insert_with(ContainerConfig::default);
+            cc.volumes.insert(mount.destination, serde_json::json!({}));
+        }
     }
     for instruction in change {
         apply_change_instruction(&mut config, instruction)?;

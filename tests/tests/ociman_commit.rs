@@ -1325,3 +1325,120 @@ fn commit_change_rejects_an_unparseable_instruction() {
     );
     assert!(!commit.status.success());
 }
+
+/// `--include-volumes` (0541): every mount the container itself
+/// declares beyond the fixed proc/dev/sys/... set is added to the
+/// resulting image's own `config.Volumes` -- matching real `podman
+/// commit --include-volumes` exactly (checked directly, `~/git/
+/// podman/libpod/container_commit.go:137-155`). Without the flag
+/// (real podman's own default), nothing is added: this project has
+/// no anonymous-named-volume concept to fall back to, matching real
+/// podman's own identical unflagged behavior exactly (its own
+/// default only ever adds *anonymous* named volumes).
+#[test]
+fn commit_include_volumes_adds_declared_mount_destinations_but_only_when_given() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        storage_dir.path().join(".rootless-overlay-supported"),
+        "false",
+    )
+    .unwrap();
+    let host_vol = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/commit-include-volumes-base:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 0".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &[
+            "run",
+            "-v",
+            &format!("{}:/data", host_vol.path().display()),
+            "ociman-test/commit-include-volumes-base:latest",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let ps = ociman(storage_dir.path(), &["ps", "-a", "-q"]);
+    let id = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+    assert!(!id.is_empty());
+
+    // Without --include-volumes: no Volumes at all.
+    let commit_default = ociman(
+        storage_dir.path(),
+        &[
+            "commit",
+            &id,
+            "ociman-test/commit-include-volumes-default:latest",
+        ],
+    );
+    assert!(
+        commit_default.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&commit_default.stderr)
+    );
+    let inspect_default = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "ociman-test/commit-include-volumes-default:latest",
+            "--json",
+        ],
+    );
+    assert!(inspect_default.status.success());
+    let config_default: serde_json::Value =
+        serde_json::from_slice(&inspect_default.stdout).unwrap();
+    assert!(
+        config_default["config"].get("Volumes").is_none(),
+        "config: {config_default}"
+    );
+
+    // With --include-volumes: the declared /data mount is added.
+    let commit_flagged = ociman(
+        storage_dir.path(),
+        &[
+            "commit",
+            "--include-volumes",
+            &id,
+            "ociman-test/commit-include-volumes-flagged:latest",
+        ],
+    );
+    assert!(
+        commit_flagged.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&commit_flagged.stderr)
+    );
+    let inspect_flagged = ociman(
+        storage_dir.path(),
+        &[
+            "inspect",
+            "ociman-test/commit-include-volumes-flagged:latest",
+            "--json",
+        ],
+    );
+    assert!(inspect_flagged.status.success());
+    let config_flagged: serde_json::Value =
+        serde_json::from_slice(&inspect_flagged.stdout).unwrap();
+    assert_eq!(
+        config_flagged["config"]["Volumes"]["/data"],
+        serde_json::json!({})
+    );
+}
