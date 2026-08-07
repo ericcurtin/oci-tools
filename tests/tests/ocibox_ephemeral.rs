@@ -529,3 +529,57 @@ fn ephemeral_requires_exactly_one_of_image_or_clone() {
         String::from_utf8_lossy(&both.stderr)
     );
 }
+
+/// `ephemeral --verbose` (`docs/design/0557`, no `-v` short alias --
+/// see `Command::Ephemeral::verbose`'s own doc comment for why)
+/// forces this invocation's own log filter to `debug`, exactly like
+/// `enter --verbose` -- the same real, checked-directly behavior
+/// change, not a no-op.
+#[test]
+fn ephemeral_verbose_flag_forces_debug_level_logging() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    seed_ephemeral_base(storage_dir.path(), "ocibox-test/ephemeral-verbose:latest");
+
+    let baseline = ocibox(
+        storage_dir.path(),
+        &[
+            "ephemeral",
+            "--image",
+            "ocibox-test/ephemeral-verbose:latest",
+            "--",
+            "/bin/echo",
+            "hi",
+        ],
+    );
+    assert!(baseline.status.success(), "{baseline:?}");
+    assert!(
+        !String::from_utf8_lossy(&baseline.stderr).contains("ocibox starting"),
+        "the default `warn` filter should suppress the debug line: {baseline:?}"
+    );
+
+    let out = ocibox(
+        storage_dir.path(),
+        &[
+            "ephemeral",
+            "--image",
+            "ocibox-test/ephemeral-verbose:latest",
+            "--verbose",
+            "--",
+            "/bin/echo",
+            "hi",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ocibox starting"),
+        "--verbose should have forced debug-level logging: {out:?}"
+    );
+}

@@ -627,6 +627,37 @@ enum Command {
         /// `enter` via the same shared `withRoot` composition).
         #[arg(long, short = 'r')]
         root: bool,
+        /// Show more verbosity — matching real `distrobox --verbose`/
+        /// `-v`'s own root-level, inherited global flag (checked
+        /// directly, `~/git/distrobox/internal/cli/root.go:76-81`).
+        /// Unlike `docs/design/0536`'s own identical-looking `ocibox
+        /// rm --verbose` (a real, faithful no-op there — traced
+        /// directly to genuinely dead code in real distrobox itself
+        /// for every consumer except this one), `enter` **is** the
+        /// one real, live exception `0536`'s own note already found:
+        /// `generateEnterCommand`'s own `verbose` parameter
+        /// (`~/git/distrobox/pkg/containermanager/providers/
+        /// podman.go:809-823`, `docker.go:729,734-735` identically)
+        /// prepends `--log-level debug` to the real `podman`/`docker
+        /// exec` invocation `enter` actually runs. This project
+        /// never shells out to a real `podman`/`docker` binary at all
+        /// (a from-scratch reimplementation), so there is no such
+        /// invocation to prepend a flag onto — but it already has the
+        /// exact same real intent's own general mechanism, already
+        /// wired into every binary including this one:
+        /// [`oci_cli_common::args::GlobalArgs::log_level`]. Forcing
+        /// that filter to `"debug"` for this one invocation (see
+        /// `main`'s own startup sequence) is a real, honest behavior
+        /// change — turning up this process's own real log output,
+        /// the same practical effect upstream's flag has — through
+        /// this project's own already-real mechanism rather than a
+        /// shelled-out flag it has no equivalent of. Unconditional,
+        /// matching real distrobox's own identical unconditional
+        /// override (an explicit `--log-level` also given loses,
+        /// exactly like upstream's own `--log-level debug` always
+        /// wins regardless of whatever else was already configured).
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
     /// Create a temporary box, run one command (or a default shell)
     /// inside it, and always remove it again afterward — matching
@@ -733,6 +764,15 @@ enum Command {
         /// `create` does).
         #[arg(long = "absolutely-disable-root-password-i-am-really-positively-sure")]
         absolutely_disable_root_password_i_am_really_positively_sure: bool,
+        /// Same as [`Command::Enter::verbose`] — matching real
+        /// `distrobox ephemeral --verbose`'s own identical inherited
+        /// global flag. No `-v` short alias here — unlike `Enter`,
+        /// `-v` is already this project's own established convenience
+        /// alias for `--volume` above (the same real short-flag
+        /// collision `docs/design/0536` already found and worked
+        /// around for `Create`/`Ephemeral`).
+        #[arg(long = "verbose")]
+        verbose: bool,
     },
     /// Export a binary or graphical application from inside a box onto
     /// the host — matching real `distrobox export`'s own `--bin`/
@@ -993,7 +1033,23 @@ enum Command {
 fn main() -> std::process::ExitCode {
     oci_cli_common::run_main(|| {
         let cli = Cli::parse();
-        oci_cli_common::logging::init(&cli.global)?;
+        // `enter`/`ephemeral --verbose` (`docs/design/0557`) forces
+        // this one invocation's own log filter to `"debug"`,
+        // unconditionally overriding whatever `--log-level` would
+        // otherwise apply — see [`Command::Enter::verbose`]'s own doc
+        // comment for the exact, checked-directly reasoning this
+        // mirrors from real distrobox's own identical unconditional
+        // `--log-level debug` override.
+        let force_debug = matches!(
+            &cli.command,
+            Some(Command::Enter { verbose: true, .. })
+                | Some(Command::Ephemeral { verbose: true, .. })
+        );
+        if force_debug {
+            oci_cli_common::logging::init_with_filter("debug")?;
+        } else {
+            oci_cli_common::logging::init(&cli.global)?;
+        }
         tracing::debug!(
             git_hash = oci_cli_common::version::GIT_HASH,
             "ocibox starting"
@@ -1049,6 +1105,7 @@ fn main() -> std::process::ExitCode {
                 yes: _,
                 no_tty: _,
                 root: _,
+                verbose: _,
             }) => cmd_enter(&name, &command, clean_path, no_workdir),
             Some(Command::Ephemeral {
                 image,
@@ -1062,6 +1119,7 @@ fn main() -> std::process::ExitCode {
                 command,
                 root: _,
                 absolutely_disable_root_password_i_am_really_positively_sure: _,
+                verbose: _,
             }) => cmd_ephemeral(
                 image.as_deref(),
                 clone.as_deref(),

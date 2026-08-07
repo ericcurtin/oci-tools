@@ -839,3 +839,85 @@ fn enter_no_workdir_flag_starts_from_home_instead_of_the_real_cwd() {
         format!("{}\n", home_dir.path().display())
     );
 }
+
+/// `enter --verbose`/`-v` (`docs/design/0557`) is a real, checked-
+/// directly behavior change -- unlike `--no-tty`/`--root` above, this
+/// one genuinely forces this invocation's own log filter to `debug`,
+/// making the `"ocibox starting"` debug line (suppressed by the
+/// default `warn` filter) actually appear on stderr. Both the long
+/// and short form are checked; a plain `enter` with neither is
+/// confirmed to still succeed without that line.
+#[test]
+fn enter_verbose_flag_and_its_short_alias_force_debug_level_logging() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    make_box(&storage_dir, "verbose-box");
+
+    let baseline = ocibox(
+        storage_dir.path(),
+        &["enter", "verbose-box", "--", "/bin/echo", "hi"],
+    );
+    assert!(baseline.status.success(), "{baseline:?}");
+    assert!(
+        !String::from_utf8_lossy(&baseline.stderr).contains("ocibox starting"),
+        "the default `warn` filter should suppress the debug line: {baseline:?}"
+    );
+
+    for flag in ["--verbose", "-v"] {
+        let out = ocibox(
+            storage_dir.path(),
+            &["enter", flag, "verbose-box", "--", "/bin/echo", "hi"],
+        );
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("ocibox starting"),
+            "{flag} should have forced debug-level logging: {out:?}"
+        );
+    }
+}
+
+/// `enter --verbose` unconditionally overrides even an explicit,
+/// conflicting `--log-level` -- matching real distrobox's own
+/// identical unconditional `--log-level debug` override (checked
+/// directly, see `Command::Enter::verbose`'s own doc comment).
+#[test]
+fn enter_verbose_overrides_an_explicit_conflicting_log_level() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+    make_box(&storage_dir, "verbose-override-box");
+
+    let out = ocibox(
+        storage_dir.path(),
+        &[
+            "--log-level",
+            "error",
+            "enter",
+            "--verbose",
+            "verbose-override-box",
+            "--",
+            "/bin/echo",
+            "hi",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ocibox starting"),
+        "--verbose should win over an explicit --log-level error: {out:?}"
+    );
+}
