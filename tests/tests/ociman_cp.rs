@@ -508,3 +508,165 @@ fn cp_against_an_unknown_container_is_a_clear_error() {
     );
     assert!(!cp.status.success());
 }
+
+/// `--archive`/`-a` (`docs/design/0546`, default `true`): copying a
+/// file into a container chowns it to the destination container's own
+/// primary uid/gid, matching real `podman cp --archive` exactly. This
+/// project's own `busybox` fixture image declares no `USER` at all,
+/// so its default resolved user is `0:0` (root) -- copying in as an
+/// unprivileged host user can never *observe* that chown actually
+/// taking effect (`CAP_CHOWN` is required to chown to any uid other
+/// than your own), but it must never fail the copy either: the
+/// underlying `set_owner` primitive already tolerates `EPERM`
+/// (matching `ociman build`'s own identical, already-tested `--chown`
+/// tolerance). This is the "doesn't break the common, unprivileged
+/// case" half of the coverage; see
+/// `cp_archive_chowns_to_the_destination_containers_own_user_when_
+/// privileged_enough` below for the real, observable-difference half,
+/// which only runs as real root.
+#[test]
+fn cp_archive_default_never_fails_the_copy_even_when_the_chown_cannot_apply() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/cp-archive-default:latest",
+        true,
+    );
+
+    let host_src = storage_dir.path().join("host_src.txt");
+    std::fs::write(&host_src, "hello from host").unwrap();
+
+    let cp = ociman(
+        storage_dir.path(),
+        &[
+            "cp",
+            host_src.to_str().unwrap(),
+            &format!("{id}:/archived.txt"),
+        ],
+    );
+    assert!(
+        cp.status.success(),
+        "--archive (the default) must never fail the copy just because the chown itself \
+         couldn't apply: {}",
+        String::from_utf8_lossy(&cp.stderr)
+    );
+}
+
+/// `--archive=false`: the copied file keeps exactly the source's own
+/// original ownership -- deterministic regardless of privilege, since
+/// no chown is ever attempted at all. Uses the *calling test
+/// process's own* real uid/gid (the same "guaranteed to succeed
+/// either way" trick `ociman_build.rs`'s own
+/// `copy_chown_is_reflected_in_the_committed_layers_own_tar_header`
+/// already established): a freshly-created host file is always owned
+/// by the process that created it, so this assertion holds whether
+/// the test itself happens to run rootless or as real root.
+#[test]
+fn cp_archive_false_never_chowns_and_keeps_the_source_files_own_ownership() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/cp-archive-false:latest",
+        true,
+    );
+    let rootfs = container_rootfs(storage_dir.path(), &id);
+
+    let host_src = storage_dir.path().join("host_src.txt");
+    std::fs::write(&host_src, "hello from host").unwrap();
+    let my_uid = rustix::process::getuid().as_raw();
+    let my_gid = rustix::process::getgid().as_raw();
+
+    let cp = ociman(
+        storage_dir.path(),
+        &[
+            "cp",
+            "--archive=false",
+            host_src.to_str().unwrap(),
+            &format!("{id}:/noarchive.txt"),
+        ],
+    );
+    assert!(
+        cp.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cp.stderr)
+    );
+    let copied = Path::new(&rootfs).join("noarchive.txt");
+    let metadata = std::fs::metadata(&copied).unwrap();
+    use std::os::unix::fs::MetadataExt as _;
+    assert_eq!(metadata.uid(), my_uid, "--archive=false must never chown");
+    assert_eq!(metadata.gid(), my_gid, "--archive=false must never chown");
+}
+
+/// The real, observable-difference half of `--archive`'s own coverage
+/// (see `cp_archive_default_never_fails_the_copy_even_when_the_chown_
+/// cannot_apply`'s own doc comment for the unprivileged half): only
+/// real root has `CAP_CHOWN` enough to chown a file to a uid other
+/// than its own, so this test explicitly chowns the source file to a
+/// *different* uid first, then confirms `--archive` (the default)
+/// really does override that with the destination container's own
+/// resolved primary user (`0:0`, this project's own busybox fixture's
+/// real default) -- matching real `podman cp --archive`'s own
+/// documented behavior exactly (checked directly, `~/git/podman/cmd/
+/// podman/containers/cp.go:60`). Skipped entirely when not running as
+/// real root, the same convention `ociman_build.rs`'s own
+/// `chown_to_a_different_uid_is_tolerated_not_fatal_when_unprivileged`
+/// already established for the identical constraint.
+#[test]
+fn cp_archive_chowns_to_the_destination_containers_own_user_when_privileged_enough() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    if rustix::process::getuid().as_raw() != 0 {
+        eprintln!("skipping: not running as real root, --archive's chown cannot be observed");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    let id = seed_and_run_stopped_container(
+        storage_dir.path(),
+        "ociman-test/cp-archive-privileged:latest",
+        true,
+    );
+    let rootfs = container_rootfs(storage_dir.path(), &id);
+
+    let host_src = storage_dir.path().join("host_src.txt");
+    std::fs::write(&host_src, "hello from host").unwrap();
+    // A uid genuinely different from both 0 and whatever this test
+    // process itself already owns the file as.
+    rustix::fs::chown(&host_src, Some(rustix::fs::Uid::from_raw(1)), None).unwrap();
+
+    let cp = ociman(
+        storage_dir.path(),
+        &[
+            "cp",
+            host_src.to_str().unwrap(),
+            &format!("{id}:/archived.txt"),
+        ],
+    );
+    assert!(
+        cp.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cp.stderr)
+    );
+    let copied = Path::new(&rootfs).join("archived.txt");
+    let metadata = std::fs::metadata(&copied).unwrap();
+    use std::os::unix::fs::MetadataExt as _;
+    assert_eq!(
+        metadata.uid(),
+        0,
+        "--archive should chown to the destination container's own primary uid (0, root)"
+    );
+    assert_eq!(
+        metadata.gid(),
+        0,
+        "--archive should chown to the destination container's own primary gid (0, root)"
+    );
+}

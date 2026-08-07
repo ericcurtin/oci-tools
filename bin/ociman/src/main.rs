@@ -3102,6 +3102,36 @@ enum Command {
         /// vice versa) at the destination.
         #[arg(long)]
         overwrite: bool,
+        /// Chown copied files to the destination container's own
+        /// primary uid/gid — matching real `podman cp --archive`/`-a`
+        /// exactly (checked directly, `~/git/podman/cmd/podman/
+        /// containers/cp.go:60`: a plain, visible, default-`true`
+        /// flag — unlike the two truly inert, `MarkHidden`'d flags
+        /// right below it in that same file, `--extract`/`--pause`,
+        /// which this project correctly never ported, see
+        /// `docs/design/0500`). Applies whenever the *destination* is
+        /// a container -- host-to-container and container-to-
+        /// container alike (checked directly: `cp.go`'s own
+        /// `copyContainerToContainer`'s `destContainerCopy` passes the
+        /// identical `Chown: chown` too, `cp.go:183`) -- but never for
+        /// container-to-host (`copyFromContainer`, `cp.go:204-`, never
+        /// references `chown` at all: there is no destination
+        /// container to chown to). The target uid/gid is the
+        /// destination container's own already-resolved
+        /// `process.user.uid`/`gid` (`container_primary_uid_gid`),
+        /// exactly matching real podman's own `getContainerUser`
+        /// (`~/git/podman/libpod/container_copy_common.go:190-198`).
+        ///
+        /// This project's own previous, permanently-`None`-chown
+        /// default was a real, previously-unnoticed divergence from
+        /// real podman's own identical default (`true`), not merely a
+        /// missing opt-in — live-verified against a real installed
+        /// `podman 4.9.3`: copying a file into a container running as
+        /// a non-root `--user` chowned it to that user by default,
+        /// and `--archive=false` left it owned by the copying
+        /// process's own uid instead.
+        #[arg(short, long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        archive: bool,
     },
     /// List every real, on-disk path that differs between a
     /// container's own current filesystem and the base image it was
@@ -5829,15 +5859,20 @@ enum ContainerCommand {
     /// exact same `Use`/`Short`/`Long`/`Args`/`RunE`/
     /// `ValidArgsFunction`, and both get the identical flag set
     /// applied via the one shared `cpFlags(cmd)` helper (`--overwrite`,
-    /// plus the hidden, deprecated-NOP `--archive`/`-a`/`--extract`/
-    /// `--pause`, deliberately not ported here either, matching this
-    /// project's own already-established convention of skipping
-    /// internal/hidden/deprecated flags with no real effect) -- a
-    /// byte-identical alias, the same shape [`Self::Kill`] (`0492`)
-    /// already established. Dispatches into the same [`cmd_cp`]
-    /// `ociman cp` itself already calls, with the identical field
-    /// set -- see [`Command::Cp`]'s own doc comment for the exact
-    /// semantics, not repeated here.
+    /// `--archive`/`-a`, plus the genuinely hidden, deprecated-NOP
+    /// `--extract`/`--pause`, deliberately not ported here either,
+    /// matching this project's own already-established convention of
+    /// skipping internal/hidden/deprecated flags with no real effect
+    /// -- **correcting a previously-wrong claim this same doc comment
+    /// used to make**, which grouped `--archive` in with those two:
+    /// unlike `--extract`/`--pause`, `--archive` is neither
+    /// `MarkHidden`'d nor inert, see `Command::Cp::archive`'s own doc
+    /// comment for the real, checked-directly, live-verified
+    /// citation, added in `0546`) -- a byte-identical alias, the same
+    /// shape [`Self::Kill`] (`0492`) already established. Dispatches
+    /// into the same [`cmd_cp`] `ociman cp` itself already calls, with
+    /// the identical field set -- see [`Command::Cp`]'s own doc
+    /// comment for the exact semantics, not repeated here.
     Cp {
         /// Same as [`Command::Cp::src`].
         src: String,
@@ -5846,6 +5881,9 @@ enum ContainerCommand {
         /// Same as [`Command::Cp::overwrite`].
         #[arg(long)]
         overwrite: bool,
+        /// Same as [`Command::Cp::archive`].
+        #[arg(short, long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        archive: bool,
     },
     /// `podman container commit`'s own real alias for the already-
     /// existing flat [`Command::Commit`] -- checked directly, `~/git/
@@ -7003,7 +7041,8 @@ fn main() -> std::process::ExitCode {
                 src,
                 dest,
                 overwrite,
-            }) => cmd_cp(&src, &dest, overwrite),
+                archive,
+            }) => cmd_cp(&src, &dest, overwrite, archive),
             Some(Command::Diff { id, latest, format }) => {
                 // An explicit `id` always wins over `--latest`
                 // outright, matching real podman's own checked-
@@ -7456,7 +7495,8 @@ fn main() -> std::process::ExitCode {
                     src,
                     dest,
                     overwrite,
-                } => cmd_cp(&src, &dest, overwrite),
+                    archive,
+                } => cmd_cp(&src, &dest, overwrite, archive),
                 ContainerCommand::Commit {
                     container,
                     image,
@@ -14342,7 +14382,7 @@ fn cmd_rm(
 /// container copy where only the destination happens to use the
 /// optimization still fails clearly rather than silently copying into
 /// the wrong (empty) place.
-fn cmd_cp(src: &str, dest: &str, overwrite: bool) -> anyhow::Result<()> {
+fn cmd_cp(src: &str, dest: &str, overwrite: bool, archive: bool) -> anyhow::Result<()> {
     let (src_container, src_path) = parse_user_input(src);
     let (dest_container, dest_path) = parse_user_input(dest);
 
@@ -14353,26 +14393,63 @@ fn cmd_cp(src: &str, dest: &str, overwrite: bool) -> anyhow::Result<()> {
     match (src_container, dest_container) {
         (Some(src_container), Some(dest_container)) => {
             let (src_root, _state) = resolve_container_root(&src_container, "cp")?;
-            let (dest_root, _state) = resolve_container_root(&dest_container, "cp")?;
+            let (dest_root, dest_state) = resolve_container_root(&dest_container, "cp")?;
             let real_src = resolve_container_path(&src_root, &src_path)?;
             let real_dest = resolve_container_path(&dest_root, &dest_path)?;
-            copy_cp_path(&real_src, &real_dest, overwrite)
+            // `--archive` applies here too (container-to-container),
+            // matching real podman's own `copyContainerToContainer`
+            // exactly -- see `Command::Cp::archive`'s own doc comment.
+            let chown = archive
+                .then(|| container_primary_uid_gid(&dest_state))
+                .transpose()?;
+            copy_cp_path(&real_src, &real_dest, overwrite, chown)
         }
         (Some(container), None) => {
+            // container-to-host: real podman's own `copyFromContainer`
+            // never references `chown` at all -- there is no
+            // destination container to chown to (see
+            // `Command::Cp::archive`'s own doc comment).
             let (root, _state) = resolve_container_root(&container, "cp")?;
             let real_src = resolve_container_path(&root, &src_path)?;
-            copy_cp_path(&real_src, Path::new(&dest_path), overwrite)
+            copy_cp_path(&real_src, Path::new(&dest_path), overwrite, None)
         }
         (None, Some(container)) => {
-            let (root, _state) = resolve_container_root(&container, "cp")?;
+            let (root, state) = resolve_container_root(&container, "cp")?;
             let real_dest = resolve_container_path(&root, &dest_path)?;
-            copy_cp_path(Path::new(&src_path), &real_dest, overwrite)
+            let chown = archive
+                .then(|| container_primary_uid_gid(&state))
+                .transpose()?;
+            copy_cp_path(Path::new(&src_path), &real_dest, overwrite, chown)
         }
         (None, None) => anyhow::bail!(
             "ociman cp: neither {src:?} nor {dest:?} names a container -- exactly one of \
              SRC_PATH/DEST_PATH must be `CONTAINER:PATH`"
         ),
     }
+}
+
+/// The primary uid/gid a container's own init process runs as -- the
+/// exact numeric identity `ociman cp --archive`'s own chown-to-
+/// destination targets, matching real podman's own `getContainerUser`
+/// (`~/git/podman/libpod/container_copy_common.go:190-198`). This
+/// project already resolves and stores this directly on
+/// `process.user.uid`/`gid` in the container's own generated
+/// `config.json` at creation time (from `--user`, or the image's own
+/// default `USER`, either way already fully resolved to plain numbers
+/// there — no `/etc/passwd` name lookup needed again here, unlike real
+/// podman's own `getContainerUser`, which re-resolves it at copy time).
+fn container_primary_uid_gid(
+    state: &oci_runtime_core::PersistedState,
+) -> anyhow::Result<(u32, u32)> {
+    let bundle = oci_runtime_core::Bundle::load(Path::new(&state.bundle))
+        .with_context(|| format!("loading bundle from {}", state.bundle))?;
+    let user = bundle
+        .spec
+        .process
+        .as_ref()
+        .map(|p| &p.user)
+        .ok_or_else(|| anyhow::anyhow!("bundle at {} has no process section", state.bundle))?;
+    Ok((user.uid, user.gid))
 }
 
 /// The exact syntax-only parsing rule real podman's own
@@ -14460,7 +14537,12 @@ fn resolve_container_path(root: &Path, container_relative_path: &str) -> anyhow:
 /// at that exact literal path — matching real `podman cp --overwrite`
 /// exactly, without it that's a clear, real error; with it, the
 /// conflicting destination is removed first.
-fn copy_cp_path(src: &Path, dest: &Path, overwrite: bool) -> anyhow::Result<()> {
+fn copy_cp_path(
+    src: &Path,
+    dest: &Path,
+    overwrite: bool,
+    chown: Option<(u32, u32)>,
+) -> anyhow::Result<()> {
     let src_metadata = std::fs::symlink_metadata(src)
         .with_context(|| format!("{}: no such file or directory", src.display()))?;
     let dest_metadata = std::fs::symlink_metadata(dest).ok();
@@ -14490,7 +14572,7 @@ fn copy_cp_path(src: &Path, dest: &Path, overwrite: bool) -> anyhow::Result<()> 
         _ => {}
     }
 
-    build::copy_path_recursive(src, &real_dest, None, None, None)
+    build::copy_path_recursive(src, &real_dest, None, chown, None)
 }
 
 /// `docker diff`/`podman diff`'s own `--format json` shape exactly
