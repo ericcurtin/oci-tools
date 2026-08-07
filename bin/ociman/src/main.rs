@@ -4701,8 +4701,7 @@ enum SystemCommand {
     /// `SIZE (PERCENT%)` reclaimable formatting) — see [`cmd_system_df`]'s
     /// own doc comment for exactly how each column is computed and the
     /// one deliberate simplification from real podman's own precise
-    /// per-image "unique size" cross-sharing calculation. `--format`
-    /// is still ahead.
+    /// per-image "unique size" cross-sharing calculation.
     Df {
         /// Show a real, per-item breakdown (one row per image/
         /// container/volume) instead of just the aggregate summary —
@@ -4715,6 +4714,35 @@ enum SystemCommand {
         /// divergence, not an oversight.
         #[arg(short, long)]
         verbose: bool,
+        /// Render one line per row (`Images`/`Containers`/`Local
+        /// Volumes`) via a Go-template-*lite* string — matching real
+        /// `podman system df --format` exactly for the summary shape
+        /// (checked directly, `~/git/podman/cmd/podman/system/df.go:
+        /// 47-49,141-146`: real podman's own default (no `--format`)
+        /// already renders the identical three-row shape via
+        /// `{{range . }}{{.Type}}\t{{.Total}}\t{{.Active}}\t{{.Size}}\t
+        /// {{.Reclaimable}}\n{{end -}}`, so `--format` is really just
+        /// letting the caller substitute their own per-row template
+        /// for that one) — same engine and scope as `ociman inspect`/
+        /// `ps`/`images`/`volume ls`/`stats`/`history --format`
+        /// (`0332`-`0338`, `0545`): `{{.field}}` placeholders only, no
+        /// pipelines/functions/control flow, one render call per row
+        /// (matching this project's own already-established "no
+        /// `{{range}}` needed in the user's own template" convention
+        /// for every other multi-row `--format`, a deliberate,
+        /// already-precedented narrowing of real podman's own richer
+        /// Go-template semantics there). Field names: `type`
+        /// (`"Images"`/`"Containers"`/`"Local Volumes"`), `total`,
+        /// `active`, `size_bytes`, `reclaimable_bytes` — this
+        /// project's own field-naming convention, not real podman's
+        /// own capitalized `Type`/`Total`/`Active`/`Size`/
+        /// `Reclaimable`. Only applies to the summary shape (real
+        /// podman's own checked-directly `"cannot combine --format
+        /// and --verbose flags"` restriction, `df.go:59`, ported
+        /// verbatim rather than inventing a verbose-shape template of
+        /// this project's own).
+        #[arg(long = "format", value_name = "TEMPLATE")]
+        format: Option<String>,
     },
     /// Wipe this project's own real storage back to a pristine, empty
     /// state in one call — matching real `podman system reset`'s own
@@ -6889,7 +6917,9 @@ fn main() -> std::process::ExitCode {
                 filter,
             }) => cmd_prune(cli.global.json, all, &filter),
             Some(Command::System { command }) => match command {
-                SystemCommand::Df { verbose } => cmd_system_df(cli.global.json, verbose),
+                SystemCommand::Df { verbose, format } => {
+                    cmd_system_df(cli.global.json, verbose, format.as_deref())
+                }
                 SystemCommand::Reset { force: _ } => cmd_system_reset(),
                 SystemCommand::Prune {
                     all,
@@ -10713,6 +10743,22 @@ struct SystemDfView {
     volumes: SystemDfRow,
 }
 
+/// One row of `ociman system df --format`'s own per-row rendering --
+/// see [`SystemCommand::Df::format`]'s own doc comment for exactly
+/// why this is a separate shape from [`SystemDfView`] (the flat,
+/// three-named-fields shape `--json` already uses): `--format`
+/// matches real podman's own per-`Type`-row `[]*dfSummary` shape
+/// instead, just with this project's own field-naming convention.
+#[derive(Debug, Serialize)]
+struct SystemDfFormatRow {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    total: u64,
+    active: u64,
+    size_bytes: u64,
+    reclaimable_bytes: u64,
+}
+
 /// One row of `ociman system df -v`'s own per-image breakdown —
 /// matching real `podman system df -v`'s own `REPOSITORY`/`TAG`/
 /// `IMAGE ID`/`CREATED`/`SIZE`/`SHARED SIZE`/`UNIQUE SIZE`/
@@ -10929,10 +10975,15 @@ fn cmd_system_reset() -> anyhow::Result<()> {
 }
 
 /// `-v`/`--verbose` (the real per-image/per-container/per-volume
-/// breakdown table) and `--format` are still ahead — this is
-/// deliberately just the summary real `podman system df` prints with
-/// neither flag given.
-fn cmd_system_df(json: bool, verbose: bool) -> anyhow::Result<()> {
+/// breakdown table) has no `--format` of its own — matching real
+/// podman's own checked-directly `"cannot combine --format and
+/// --verbose flags"` restriction (see [`SystemCommand::Df::format`]'s
+/// own doc comment).
+fn cmd_system_df(json: bool, verbose: bool, format: Option<&str>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !(verbose && format.is_some()),
+        "cannot combine --format and --verbose flags"
+    );
     let store = open_store()?;
     let containers = open_container_store()?;
     let volume_store = open_volume_store()?;
@@ -10998,6 +11049,25 @@ fn cmd_system_df(json: bool, verbose: bool) -> anyhow::Result<()> {
         } else {
             volumes.active += 1;
         }
+    }
+
+    if let Some(template) = format {
+        for (kind, row) in [
+            ("Images", &images),
+            ("Containers", &container_rows),
+            ("Local Volumes", &volumes),
+        ] {
+            let format_row = SystemDfFormatRow {
+                kind,
+                total: row.total,
+                active: row.active,
+                size_bytes: row.size_bytes,
+                reclaimable_bytes: row.reclaimable_bytes,
+            };
+            let json_value = serde_json::to_value(&format_row)?;
+            println!("{}", render_format_template(template, &json_value)?);
+        }
+        return Ok(());
     }
 
     if json {

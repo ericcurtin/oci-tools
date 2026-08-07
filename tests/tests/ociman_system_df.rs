@@ -490,3 +490,100 @@ fn df_verbose_text_output_keeps_columns_separated_even_when_a_command_overflows(
         &["rm", "--force", "df-verbose-overflow-test"],
     );
 }
+
+/// `--format` (`docs/design/0547`): one line per row, matching real
+/// `podman system df --format` exactly for the summary shape (real
+/// podman's own checked-directly restriction against combining it
+/// with `--verbose`, `~/git/podman/cmd/podman/system/df.go:59`, is
+/// covered separately below).
+#[test]
+fn df_format_renders_one_line_per_row_with_this_projects_own_field_names() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let out = ociman(
+        storage_dir.path(),
+        &[
+            "system",
+            "df",
+            "--format",
+            "{{.type}}|{{.total}}|{{.active}}|{{.size_bytes}}|{{.reclaimable_bytes}}",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert_eq!(lines[0], "Images|0|0|0|0");
+    assert_eq!(lines[1], "Containers|0|0|0|0");
+    assert_eq!(lines[2], "Local Volumes|0|0|0|0");
+}
+
+/// A real, non-zero row (via a real image) is rendered correctly too
+/// -- not just the degenerate empty-store case above.
+#[test]
+fn df_format_reports_a_real_images_own_size() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/df-format-image:latest",
+        &busybox,
+        &["sh"],
+        ContainerConfig::default(),
+    );
+
+    let out = ociman(
+        storage_dir.path(),
+        &["system", "df", "--format", "{{.type}}:{{.total}}"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Images:1"), "{stdout:?}");
+}
+
+/// `--format`/`--verbose` together is a real, immediate error --
+/// matching real `podman system df`'s own checked-directly exact
+/// wording (`df.go:59`).
+#[test]
+fn df_format_and_verbose_together_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let out = ociman(
+        storage_dir.path(),
+        &["system", "df", "--format", "{{.type}}", "--verbose"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot combine --format and --verbose"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// An unresolvable field path is a real, immediate error, matching
+/// every other `--format`-enabled command's own identical convention.
+#[test]
+fn df_format_with_an_unknown_field_is_a_clear_error() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    Store::open(storage_dir.path()).unwrap();
+
+    let out = ociman(
+        storage_dir.path(),
+        &["system", "df", "--format", "{{.no_such_field}}"],
+    );
+    assert!(!out.status.success());
+}
