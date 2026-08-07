@@ -3238,3 +3238,94 @@ fn ps_format_takes_priority_and_errors_on_an_unknown_field() {
         String::from_utf8_lossy(&bad.stderr)
     );
 }
+
+/// `--sync` (`docs/design/0556`) is a real, total no-op here -- see
+/// `Command::Ps::sync`'s own doc comment for the exact, checked-
+/// directly reasoning (real podman's own identical flag forces a
+/// fresh OCI-runtime status query instead of trusting a cached,
+/// conmon-exit-file-derived value; this project's own
+/// `effective_status` already unconditionally re-derives status from
+/// a live `/proc/<pid>` check on every read, so there's nothing left
+/// for `--sync` to force). Asserts `ociman ps -a` produces the exact
+/// same output with and without `--sync`, for both a still-running
+/// and an already-stopped container.
+#[test]
+fn ps_sync_flag_is_accepted_and_behaves_identically() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/ps-sync:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+
+    let mut run = ociman_run_detached(
+        storage_dir.path(),
+        "ociman-test/ps-sync:latest",
+        &["/bin/sh", "-c", "while true; do sleep 1; done"],
+    );
+    let running_id = only_container_id(storage_dir.path(), Duration::from_secs(20));
+    assert_eq!(
+        wait_for_container_status(
+            storage_dir.path(),
+            &running_id,
+            "running",
+            Duration::from_secs(20)
+        ),
+        "running"
+    );
+
+    let stopped = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/ps-sync:latest", "true"],
+    );
+    assert!(stopped.status.success(), "{stopped:?}");
+
+    let without_sync = ociman(storage_dir.path(), &["ps", "-a"]);
+    assert!(without_sync.status.success());
+    let with_sync = ociman(storage_dir.path(), &["ps", "-a", "--sync"]);
+    assert!(with_sync.status.success());
+    assert_eq!(without_sync.stdout, with_sync.stdout);
+
+    let kill = ociman(storage_dir.path(), &["kill", &running_id]);
+    assert!(kill.status.success());
+    run.wait().unwrap();
+    ociman(storage_dir.path(), &["rm", &running_id]);
+}
+
+/// `container list --sync` (the alias's own identical field, see
+/// `ContainerCommand::List::sync`'s own doc comment) is accepted too,
+/// dispatching into the exact same no-op.
+#[test]
+fn container_list_sync_flag_is_accepted() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image(
+        &store,
+        "ociman-test/container-list-sync:latest",
+        &busybox,
+        &["sh", "true"],
+        ContainerConfig::default(),
+    );
+    let run = ociman(
+        storage_dir.path(),
+        &["run", "ociman-test/container-list-sync:latest", "true"],
+    );
+    assert!(run.status.success(), "{run:?}");
+
+    let without_sync = ociman(storage_dir.path(), &["container", "list", "-a"]);
+    assert!(without_sync.status.success());
+    let with_sync = ociman(storage_dir.path(), &["container", "list", "-a", "--sync"]);
+    assert!(with_sync.status.success());
+    assert_eq!(without_sync.stdout, with_sync.stdout);
+}

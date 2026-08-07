@@ -2702,6 +2702,25 @@ enum Command {
         /// directly: neither overrides or ignores it).
         #[arg(long, value_enum)]
         sort: Option<PsSortKey>,
+        /// Accepted for real CLI compatibility with `podman ps
+        /// --sync`; has no effect. Real podman's own identical flag
+        /// (`~/git/podman/cmd/podman/containers/ps.go`) forces a
+        /// container's status to be re-queried from the OCI runtime
+        /// rather than trusting a cached, conmon-exit-file-derived
+        /// value — its own doc comment explains this exists because
+        /// "Podman does not explicitly query the OCI runtime for
+        /// container status" most of the time
+        /// (`~/git/podman/libpod/container_api.go`'s own `Sync`).
+        /// This project has no such cached value to begin with:
+        /// [`oci_runtime_core::state::PersistedState::effective_
+        /// status`] unconditionally re-derives `Stopped` from a real,
+        /// live `/proc/<pid>` liveness check on every single read
+        /// (matching runc/crun's own identical choice, per its own
+        /// doc comment) — `ociman ps` is therefore already always
+        /// doing what `--sync` forces podman to do on demand, so
+        /// there is nothing left for this flag to actually change.
+        #[arg(long)]
+        sync: bool,
     },
     /// "Initialize one or more containers, creating the OCI spec and
     /// mounts for inspection" (real podman's own doc string, quoted
@@ -5291,6 +5310,9 @@ enum ContainerCommand {
         /// Same as [`Command::Ps::sort`].
         #[arg(long, value_enum)]
         sort: Option<PsSortKey>,
+        /// Same as [`Command::Ps::sync`].
+        #[arg(long)]
+        sync: bool,
     },
     /// Remove every real, non-running container (`Created` or
     /// `Stopped`, this project's own vocabulary — never `Running`/
@@ -7048,6 +7070,7 @@ fn main() -> std::process::ExitCode {
                 format,
                 size,
                 sort,
+                sync: _,
             }) => cmd_ps(
                 all,
                 quiet,
@@ -7337,6 +7360,7 @@ fn main() -> std::process::ExitCode {
                     format,
                     size,
                     sort,
+                    sync: _,
                 } => cmd_ps(
                     all,
                     quiet,
