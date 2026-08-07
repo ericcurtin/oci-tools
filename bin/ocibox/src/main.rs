@@ -938,6 +938,30 @@ enum Command {
         /// that may not actually exist).
         #[arg(long, short = 'S')]
         sudo: bool,
+        /// Accepted for real CLI compatibility with real `distrobox
+        /// export --verbose`/`-v`; has no effect. Real distrobox's
+        /// own `export` is a shell script (checked directly,
+        /// `~/git/distrobox/internal/inside-distrobox/assets/
+        /// distrobox-export:120-122,203-204`): `--verbose` sets
+        /// `verbose=1`, then a single `set -o xtrace` right after
+        /// arg parsing makes bash itself echo every subsequent
+        /// command the script runs, expanded, to stderr for the
+        /// rest of its own execution — a genuinely live effect,
+        /// unlike several other `--verbose` consumers this project
+        /// already found dead in real distrobox itself (`docs/
+        /// design/0536`). Unlike `enter`/`ephemeral --verbose`
+        /// (`0557`), which genuinely surfaces this project's own
+        /// pre-existing `tracing::debug!` instrumentation on their
+        /// own real launch/cgroup hot path when forced to `debug`
+        /// level, `cmd_export`'s own implementation (checked
+        /// directly: no `tracing::debug!`/`trace!` call anywhere in
+        /// it) has no equivalent per-step trace output of its own to
+        /// surface at all — forcing `--log-level debug` here would
+        /// only ever print the one universal `"ocibox starting"`
+        /// line already common to every command regardless of this
+        /// flag, not a genuine, `xtrace`-equivalent behavior change.
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
     /// Generate (or `--delete`) a real, standalone desktop launcher
     /// for entering a whole box — matching real `distrobox generate-
@@ -1142,6 +1166,7 @@ fn main() -> std::process::ExitCode {
                 extra_flags,
                 enter_flags,
                 sudo,
+                verbose: _,
             }) => cmd_export(
                 &box_name,
                 ExportArgs {

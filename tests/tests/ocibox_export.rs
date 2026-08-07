@@ -1791,3 +1791,62 @@ fn export_app_sudo_without_sudo_installed_is_a_clear_error() {
         "no desktop file should have been written at all"
     );
 }
+
+/// `export --verbose`/`-v` (`docs/design/0558`) is a real, total
+/// no-op here -- see `Command::Export::verbose`'s own doc comment
+/// for the exact, checked-directly reasoning (real distrobox's own
+/// identical flag drives a shell `set -o xtrace`, but `cmd_export`
+/// has no equivalent per-step trace output of its own to force at
+/// all). Asserts the generated wrapper is byte-identical with and
+/// without the flag, and both the long and short form are accepted.
+#[test]
+fn export_bin_verbose_flag_and_its_short_alias_are_accepted_and_behave_identically() {
+    if busybox_path().is_none() {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    }
+    let storage_dir = tempfile::tempdir().unwrap();
+    make_box(&storage_dir, "testbox");
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let baseline = ocibox(
+        storage_dir.path(),
+        &[
+            "export",
+            "--box",
+            "testbox",
+            "--bin",
+            "/bin/echo",
+            "--export-path",
+            export_dir.path().to_str().unwrap(),
+        ],
+    );
+    assert!(baseline.status.success(), "{baseline:?}");
+    let baseline_contents = std::fs::read_to_string(export_dir.path().join("echo")).unwrap();
+
+    for flag in ["--verbose", "-v"] {
+        let out = ocibox(
+            storage_dir.path(),
+            &[
+                "export",
+                "--box",
+                "testbox",
+                "--bin",
+                "/bin/echo",
+                "--export-path",
+                export_dir.path().to_str().unwrap(),
+                flag,
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let contents = std::fs::read_to_string(export_dir.path().join("echo")).unwrap();
+        assert_eq!(
+            contents, baseline_contents,
+            "{flag} changed the generated wrapper: {contents:?}"
+        );
+    }
+}
