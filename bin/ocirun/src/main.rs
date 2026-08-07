@@ -1662,7 +1662,32 @@ fn kill_all(root: &Path, id: &str, signal: i32) -> anyhow::Result<()> {
 fn cmd_delete(root: &Path, id: &str, force: bool) -> anyhow::Result<()> {
     let store = StateStore::open(root)
         .with_context(|| format!("opening container state root {}", root.display()))?;
-    let state = store.load(id)?;
+    // `--force` on a container that doesn't exist at all is a real,
+    // previously-missing gap (`0566`): both real reference runtimes
+    // agree on the identical rule (checked directly, `~/git/runc/
+    // delete.go:47-64`'s own `getContainer`/`ErrNotExist` branch;
+    // `~/git/crun/src/libcrun/container.c:1833-1852`'s own
+    // `container_delete_internal`) — a best-effort removal of any
+    // stray leftover directory is always attempted regardless of
+    // `--force` (in case `state.json` alone is missing but the
+    // directory itself still exists), but the resulting "does not
+    // exist" error is only ever absorbed into success when `--force`
+    // is given; without it, the original error still surfaces
+    // unchanged, matching both runtimes' own identical fallthrough.
+    // Live-verified by hand against a real installed `runc`/`crun`:
+    // `runc`/`crun delete --force <missing-id>` both exit `0`
+    // silently; without `--force`, both exit `1` with a real error.
+    let state = match store.load(id) {
+        Ok(state) => state,
+        Err(err @ oci_runtime_core::state::StateError::NotFound(_)) => {
+            let _ = store.remove(id);
+            if force {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+        Err(e) => return Err(e.into()),
+    };
     let status = state.effective_status();
 
     // Matches real runc's `delete`: a still-`Running` container refuses

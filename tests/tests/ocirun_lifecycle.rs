@@ -480,6 +480,49 @@ fn delete_a_never_started_container_kills_it_without_force() {
     assert!(!after.status.success());
 }
 
+/// `delete --force` on a container that doesn't exist at all is a
+/// real, silent success (`docs/design/0566`), matching real runc/
+/// crun's own identical rule exactly (checked directly against real
+/// installed binaries: `runc`/`crun delete --force <missing-id>` both
+/// exit `0` silently) — a genuine fix, not merely matching an
+/// already-correct default: before this, `ocirun delete --force` on a
+/// missing id was a hard error, unlike both reference runtimes.
+#[test]
+fn delete_force_on_a_nonexistent_container_is_a_silent_success() {
+    let root_dir = tempfile::tempdir().unwrap();
+
+    let deleted = ocirun(
+        root_dir.path(),
+        &["delete", "--force", "totally-nonexistent-id"],
+    );
+    assert!(
+        deleted.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    assert!(
+        deleted.stdout.is_empty() && deleted.stderr.is_empty(),
+        "should be completely silent: {deleted:?}"
+    );
+}
+
+/// Without `--force`, deleting a nonexistent container is still a
+/// real, immediate error — matching real runc/crun's own identical
+/// behavior there too (checked directly: both exit `1` with a real
+/// error) — `0566`'s own fix only ever applies when `--force` is
+/// given, never silently swallowing this error otherwise.
+#[test]
+fn delete_without_force_on_a_nonexistent_container_is_still_a_clear_error() {
+    let root_dir = tempfile::tempdir().unwrap();
+
+    let deleted = ocirun(root_dir.path(), &["delete", "totally-nonexistent-id"]);
+    assert!(!deleted.status.success());
+    assert!(
+        String::from_utf8_lossy(&deleted.stderr).contains("does not exist"),
+        "{deleted:?}"
+    );
+}
+
 /// `delete` must remove the cgroup directory `create` migrated the
 /// container's process into — the kernel does not do this on its own
 /// (see `docs/design/0027`), and unlike `run` (which has the bundle
