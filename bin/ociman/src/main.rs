@@ -8471,6 +8471,31 @@ struct LoadResult {
 }
 
 fn cmd_load(input: Option<&Path>, quiet: bool, json: bool) -> anyhow::Result<()> {
+    // A real, previously-unnoticed bug this closes (`docs/design/
+    // 0551`, the `load`-side sibling of `save`'s own identical fix,
+    // `0550`): with no `--input`, real `podman load` refuses outright
+    // the moment stdin is a real interactive terminal -- checked
+    // directly, `~/git/podman/cmd/podman/images/load.go:91-92` (`if
+    // term.IsTerminal(int(os.Stdin.Fd())) { return errors.New(
+    // "cannot read from terminal, use command-line redirection or
+    // the --input flag") }`), live-verified against a real installed
+    // `podman 4.9.3`. Before this, `ociman load` (with no `--input`)
+    // just blocked forever reading from stdin -- live-verified
+    // against this project's own binary through a real, held-open
+    // pty (a plain pipe/`script`'s own stdin wiring isn't enough to
+    // reproduce this: only a genuinely open terminal with nothing
+    // typed yet reproduces the real hang), arguably a worse outcome
+    // than `save`'s own bug (silent corruption): a silent, indefinite
+    // hang with no feedback at all, instead of a quick, clear error.
+    // Checked first, before ever opening the store or doing any other
+    // work, matching real podman's own identical "fail fast, before
+    // anything else" placement at the very top of its own `load`
+    // function.
+    if input.is_none() && std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "cannot read from terminal, use command-line redirection or the --input flag"
+        );
+    }
     let store = open_store()?;
 
     let progress =

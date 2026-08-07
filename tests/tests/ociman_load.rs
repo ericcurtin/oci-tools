@@ -48,6 +48,72 @@ fn load_of_a_non_archive_file_is_a_clear_error() {
     assert!(!load.status.success());
 }
 
+/// A real, previously-unnoticed bug this closes (`docs/design/0551`,
+/// the `load`-side sibling of `ociman save`'s own identical fix,
+/// `0550`): with no `--input`, real `podman load` refuses outright
+/// the moment stdin is a real interactive terminal (checked directly,
+/// `~/git/podman/cmd/podman/images/load.go:91-92`, live-verified
+/// against a real installed `podman 4.9.3`). Before this fix, `ociman
+/// load` (with no `--input`) just blocked forever reading from
+/// stdin -- live-verified against this project's own binary through a
+/// real, held-open pty, arguably worse than `save`'s own bug (silent
+/// corruption): a silent, indefinite hang with no feedback at all.
+///
+/// A real pty (not just a pipe -- a plain `Stdio::piped()` isn't a
+/// terminal either, so this exact bug could otherwise hide behind
+/// every other test in this file) is opened directly via `rustix::
+/// pty`, the same technique `ociman_save.rs`'s own `save_refuses_to_
+/// write_to_a_real_terminal` already established for the identical
+/// class of check. Nothing is ever written to the pty's own master
+/// side -- if the fix genuinely checks `is_terminal()` *before* ever
+/// attempting to read, this returns instantly with a real error,
+/// never blocking at all; a `wait_timeout`-free plain `child.wait()`
+/// is safe here specifically because a real fix can never hang on
+/// this call, unlike a direct, unbounded read from the pty itself
+/// would be.
+#[test]
+fn load_refuses_to_read_from_a_real_terminal() {
+    let storage_dir = tempfile::tempdir().unwrap();
+
+    let pty_main =
+        rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
+            .expect("opening a pty");
+    rustix::pty::grantpt(&pty_main).expect("grantpt");
+    rustix::pty::unlockpt(&pty_main).expect("unlockpt");
+    let slave_name = rustix::pty::ptsname(&pty_main, Vec::new()).expect("ptsname");
+    let slave_path = std::path::PathBuf::from(slave_name.to_string_lossy().into_owned());
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&slave_path)
+        .expect("opening the pty's own slave side");
+
+    let mut child = Command::new(bin_path("ociman"))
+        .env("OCI_TOOLS_STORAGE_ROOT", storage_dir.path())
+        .env_remove("OCI_TOOLS_LOG")
+        .args(["load"])
+        .stdin(slave)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ociman");
+    let status = child.wait().expect("waiting for ociman");
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    // `pty_main` (the master side) must outlive the child's own run --
+    // dropped only now that it's done.
+    drop(pty_main);
+
+    assert!(
+        !status.success(),
+        "ociman load must refuse to read from a real terminal, never block forever on it"
+    );
+    assert!(
+        stderr.contains("cannot read from terminal"),
+        "stderr: {stderr:?}"
+    );
+}
+
 #[test]
 fn load_of_a_missing_input_file_is_a_clear_error() {
     let storage_dir = tempfile::tempdir().unwrap();
