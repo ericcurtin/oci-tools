@@ -255,28 +255,27 @@ fn diff_with_no_deliberate_changes_at_all_reports_no_base_image_files_as_changed
     );
     let view: serde_json::Value = serde_json::from_slice(&diff.stdout).unwrap();
     // The container's own runtime creates real, empty mount-point
-    // directories for /dev, /proc, /sys before mounting over them --
-    // a real, pre-existing (and correct: real docker/podman's own
-    // `diff` shows these too) part of the added set, not something
-    // this test should treat as a false positive. Nothing from the
-    // base image itself (busybox, its own applets, /etc, ...) should
-    // ever appear anywhere in the report.
-    // Each field is omitted entirely (not an empty array) when empty
-    // -- matches real podman's own `ChangesReportJSON`'s own
-    // `omitempty` tags exactly.
+    // directories for `/dev`/`/proc`/`/sys` before mounting over them
+    // -- but real podman/docker never actually show these in a real
+    // `diff`, live-verified directly against a real installed `podman
+    // 4.9.3` (`~/git/podman/libpod/diff.go`'s own `initInodes` map,
+    // unconditionally filtered out of every diff, checked directly --
+    // this test previously asserted the *opposite*, a real, previously
+    // -unnoticed bug fixed in `docs/design/0573`). Nothing at all
+    // should appear in the report for a container with no deliberate
+    // changes -- each field is omitted entirely (not an empty array)
+    // when empty either way, matching real podman's own
+    // `ChangesReportJSON`'s own `omitempty` tags exactly.
     let empty = Vec::new();
     let all_paths: Vec<&str> = ["changed", "added", "deleted"]
         .iter()
         .flat_map(|key| view[key].as_array().unwrap_or(&empty).iter())
         .map(|v| v.as_str().unwrap())
         .collect();
-    for path in &all_paths {
-        assert!(
-            matches!(*path, "/dev" | "/proc" | "/sys"),
-            "unexpected diff entry for a container with no deliberate changes: {path:?} \
-             (full report: {all_paths:?})"
-        );
-    }
+    assert!(
+        all_paths.is_empty(),
+        "unexpected diff entries for a container with no deliberate changes: {all_paths:?}"
+    );
 }
 
 #[test]

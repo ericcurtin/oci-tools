@@ -4080,13 +4080,18 @@ enum Command {
     /// [`InspectType::Image`], never falling back to a container —
     /// see [`ImageCommand::Inspect`]'s own doc comment). Real podman
     /// also nests `mount`/`unmount`/`diff` under this same family —
-    /// each genuinely more involved than a pure alias (`mount`/
-    /// `unmount` there alias the *container* mount/unmount commands,
-    /// a cross-concept aliasing shape; `image diff` computes a real,
-    /// new "image vs. its own parent layer" comparison this project
-    /// has no equivalent logic for at all, unlike `ociman diff`'s
-    /// own container-only scope) — real, deliberately deferred gaps
-    /// for a future increment, not yet ported.
+    /// each genuinely more involved than a pure alias, unlike every
+    /// name above (`mount`/`unmount` alias the *container* mount/
+    /// unmount commands there, a cross-concept aliasing shape; `image
+    /// diff` computes a real "image vs. its own parent layer"
+    /// comparison this project has its own separate logic for,
+    /// unlike `ociman diff`'s own container-only scope). `mount`/
+    /// `unmount` are real, already-ported, genuinely-not-alias
+    /// subcommands of their own (0519/0520 — correcting this same
+    /// comment's own earlier, three-times-repeated `0481`/`0482`/
+    /// `0499` mischaracterization of them as aliases, itself already
+    /// corrected in `ImageCommand::Mount`'s own doc comment); `diff`
+    /// (0573) closes the one gap that genuinely remained.
     Image {
         #[command(subcommand)]
         command: ImageCommand,
@@ -6810,6 +6815,42 @@ enum ImageCommand {
         #[arg(long = "format", short = 'f', value_name = "TEMPLATE")]
         format: Option<String>,
     },
+    /// Every real path that differs between an image's own last layer
+    /// and the layer immediately beneath it (0573) — matching real
+    /// `podman image diff IMAGE`'s own single-positional case exactly
+    /// (checked directly, `~/git/podman/cmd/podman/images/diff.go`,
+    /// `~/git/podman/libpod/diff.go`'s own `GetDiff`: with no second
+    /// positional given, `r.store.Changes("", toLayer)` diffs the
+    /// image's own top layer against nothing but its own direct
+    /// parent layer — never the *whole* image's cumulative content
+    /// from scratch). This project has no per-layer storage graph to
+    /// query a "parent layer" out of directly (unlike real `container-
+    /// libs/storage`), so the equivalent result is computed instead:
+    /// every layer but the last is extracted into one scratch
+    /// directory, a [`oci_layer::Snapshot`] captured of *that* state,
+    /// then the last layer extracted on top of the exact same
+    /// directory before diffing — the same "same directory, two
+    /// points in time" shape [`cmd_diff`]'s own doc comment already
+    /// establishes as the one that sidesteps `oci_layer::apply`'s own
+    /// deliberate no-mtime-restoration behavior (re-extracting the
+    /// same content into two *separate* directories would otherwise
+    /// make every regular file spuriously look "changed"). An image
+    /// with only one layer therefore diffs against a genuinely empty
+    /// directory — every real path shows as added, matching real
+    /// podman's own identical behavior for a single-layer image,
+    /// live-verified directly against a real installed `podman
+    /// 4.9.3`. Real podman's own second, explicit `IMAGE` positional
+    /// (diff against a genuinely different, named image rather than
+    /// this same image's own immediate parent) remains a real,
+    /// deliberately deferred gap — a separate, future increment, not
+    /// this narrower first slice.
+    Diff {
+        /// The image's tag reference or real/short ID.
+        image: String,
+        /// Same as [`Command::Diff::format`].
+        #[arg(long = "format", value_name = "TEMPLATE")]
+        format: Option<String>,
+    },
     /// Mount (extracting if not already cached) one or more images'
     /// own real root filesystems, printing each one's own real cache
     /// path — matching real `podman image mount IMAGE [IMAGE...]`'s
@@ -8089,6 +8130,9 @@ fn main() -> std::process::ExitCode {
                     false,
                     InspectType::Image,
                 ),
+                ImageCommand::Diff { image, format } => {
+                    cmd_image_diff(&image, cli.global.json, format.as_deref())
+                }
                 ImageCommand::Mount { images, all } => cmd_image_mount(&images, all),
                 ImageCommand::Unmount {
                     images,
@@ -15189,18 +15233,102 @@ const BASE_SNAPSHOT_FILENAME: &str = "base-snapshot.json";
 /// of it would ever show anything real at all — `resolve_container_
 /// root` already rejects this case before `cmd_diff` ever gets this
 /// far).
-fn cmd_diff(id: &str, json: bool, format: Option<&str>) -> anyhow::Result<()> {
-    // `--format`, when given, wins outright over the global `--json`
-    // flag -- matching real podman's own identical per-command-flag-
-    // over-global precedence. Only the literal `json` is ever
-    // accepted (checked directly, `~/git/podman/cmd/podman/diff/
-    // diff.go`); anything else is a real, immediate error, real
-    // podman's own exact message reused verbatim.
-    let json = match format {
-        Some("json") => true,
+/// `--format`, when given, wins outright over the global `--json`
+/// flag -- matching real podman's own identical per-command-flag-
+/// over-global precedence. Only the literal `json` is ever accepted
+/// (checked directly, `~/git/podman/cmd/podman/diff/diff.go`);
+/// anything else is a real, immediate error, real podman's own exact
+/// message reused verbatim. Shared by [`cmd_diff`] (container) and
+/// [`cmd_image_diff`] (image, `0573`) — both real `podman diff`/
+/// `podman image diff` accept the exact same, narrower-than-usual
+/// `--format` grammar.
+fn resolve_diff_format(json: bool, format: Option<&str>) -> anyhow::Result<bool> {
+    match format {
+        Some("json") => Ok(true),
         Some(_) => anyhow::bail!("only supported value for '--format' is 'json'"),
-        None => json,
-    };
+        None => Ok(json),
+    }
+}
+
+/// Paths real `podman diff`/`podman image diff` never report at all,
+/// regardless of what a plain filesystem walk would otherwise show —
+/// checked directly, `~/git/podman/libpod/diff.go`'s own `initInodes`
+/// map, applied unconditionally to *both* container and image diffs
+/// by the one shared `GetDiff` both real subcommands call through
+/// (`for _, c := range changes { if initInodes[c.Path] { continue }
+/// ... }`) — not a container-only or image-only special case. Ported
+/// verbatim, including three paths (`/run/notify`, `/run/.
+/// containerenv`, `/run/podman-init`) this project has no equivalent
+/// concept of at all yet (harmless to keep: nothing here ever creates
+/// them, so they can never match anyway) — real fidelity to the
+/// actual upstream list rather than a hand-trimmed subset. Found and
+/// fixed here (0573) as a real, previously-unnoticed divergence in
+/// the *already-shipped* `cmd_diff` (`0146`-`0149`): live-verified
+/// directly against a real installed `podman 4.9.3` that a genuinely
+/// started container's own `podman diff` never shows `/dev`/`/proc`/
+/// `/sys` at all — a pre-existing test (`ociman_diff.rs`) had
+/// incorrectly asserted the *opposite*, that real podman "shows these
+/// too", without ever having checked directly.
+const DIFF_EXCLUDED_PATHS: &[&str] = &[
+    "/dev",
+    "/etc/hostname",
+    "/etc/hosts",
+    "/etc/resolv.conf",
+    "/etc/mtab",
+    "/proc",
+    "/run",
+    "/run/notify",
+    "/run/.containerenv",
+    "/run/secrets",
+    "/run/podman-init",
+    "/sys",
+];
+
+/// Drop every [`DIFF_EXCLUDED_PATHS`] entry from `changes` — shared by
+/// [`cmd_diff`]/[`cmd_image_diff`], applied right after computing the
+/// real, raw filesystem diff and before either prints/serializes it.
+fn filter_diff_changes(changes: Vec<oci_layer::Change>) -> Vec<oci_layer::Change> {
+    changes
+        .into_iter()
+        .filter(|change| {
+            let path = format!("/{}", change.path.display());
+            !DIFF_EXCLUDED_PATHS.contains(&path.as_str())
+        })
+        .collect()
+}
+
+/// Print `changes` either as real podman's own `--format json`/
+/// `DiffReport` shape or as the default plain-text `A`/`C`/`D` table
+/// — shared by [`cmd_diff`] (container) and [`cmd_image_diff`]
+/// (image, `0573`), which otherwise differ only in how `changes`
+/// itself gets computed.
+fn print_diff_changes(changes: &[oci_layer::Change], json: bool) -> anyhow::Result<()> {
+    if json {
+        let mut report = DiffReport::default();
+        for change in changes {
+            let path = format!("/{}", change.path.display());
+            match change.kind {
+                oci_layer::ChangeKind::Added => report.added.push(path),
+                oci_layer::ChangeKind::Modified => report.changed.push(path),
+                oci_layer::ChangeKind::Deleted => report.deleted.push(path),
+            }
+        }
+        oci_cli_common::output::print_json(&report)?;
+        return Ok(());
+    }
+    for change in changes {
+        let marker = match change.kind {
+            oci_layer::ChangeKind::Added => "A",
+            oci_layer::ChangeKind::Modified => "C",
+            oci_layer::ChangeKind::Deleted => "D",
+        };
+        println!("{marker} /{}", change.path.display());
+    }
+    Ok(())
+}
+
+fn cmd_diff(id: &str, json: bool, format: Option<&str>) -> anyhow::Result<()> {
+    let json = resolve_diff_format(json, format)?;
 
     let (root, state) = resolve_container_root(id, "diff")?;
     let snapshot_path = Path::new(&state.bundle).join(BASE_SNAPSHOT_FILENAME);
@@ -15217,28 +15345,82 @@ fn cmd_diff(id: &str, json: bool, format: Option<&str>) -> anyhow::Result<()> {
     let changes = oci_layer::changes(&root, &before).with_context(|| {
         format!("diffing container {id:?}'s own filesystem against its base image")
     })?;
+    let changes = filter_diff_changes(changes);
 
-    if json {
-        let mut report = DiffReport::default();
-        for change in &changes {
-            let path = format!("/{}", change.path.display());
-            match change.kind {
-                oci_layer::ChangeKind::Added => report.added.push(path),
-                oci_layer::ChangeKind::Modified => report.changed.push(path),
-                oci_layer::ChangeKind::Deleted => report.deleted.push(path),
-            }
-        }
-        oci_cli_common::output::print_json(&report)?;
-        return Ok(());
+    print_diff_changes(&changes, json)?;
+    Ok(())
+}
+
+/// `ociman image diff` — see [`ImageCommand::Diff`]'s own doc comment
+/// for the exact real, checked-directly "last layer vs. its own
+/// direct parent" semantics and why this project computes it by
+/// extraction rather than a stored per-layer graph. Every layer but
+/// the last is applied into one scratch directory first (a real,
+/// temporary directory this function owns start to finish, never the
+/// shared, permanent `oci_store::ensure_cached` rootfs cache — that
+/// cache is keyed by a *whole* manifest's own digest, and always
+/// holds the full, already-extracted result, not a deliberately
+/// partial "everything but the last layer" state this needs instead);
+/// an image with only one layer therefore starts from a genuinely
+/// empty directory, matching real podman's own identical single-layer
+/// behavior (live-verified against a real installed `podman 4.9.3`:
+/// every path shows as added).
+fn cmd_image_diff(image: &str, json: bool, format: Option<&str>) -> anyhow::Result<()> {
+    let json = resolve_diff_format(json, format)?;
+
+    let store = open_store()?;
+    let resolved = resolve_image_by_reference_or_id(&store, image)?
+        .ok_or_else(|| anyhow::anyhow!("{image}: image not known"))?;
+    let record = resolved.record();
+    let manifest = store
+        .image_manifest(record)
+        .with_context(|| format!("reading manifest for {}", record.reference))?;
+
+    let scratch_dir = tempfile::tempdir().context("creating a scratch directory for the diff")?;
+    let (parent_layers, last_layer) = match manifest.layers.split_last() {
+        Some((last, parents)) => (parents, Some(last)),
+        None => (&[][..], None),
+    };
+    for layer in parent_layers {
+        let compression = compression_for_media_type(&layer.media_type)
+            .with_context(|| format!("layer {}", layer.digest))?;
+        let blob = store
+            .open_blob(&layer.digest)
+            .with_context(|| format!("opening layer blob {}", layer.digest))?;
+        oci_layer::apply(blob, compression, scratch_dir.path())
+            .with_context(|| format!("applying layer {}", layer.digest))?;
     }
-    for change in &changes {
-        let marker = match change.kind {
-            oci_layer::ChangeKind::Added => "A",
-            oci_layer::ChangeKind::Modified => "C",
-            oci_layer::ChangeKind::Deleted => "D",
-        };
-        println!("{marker} /{}", change.path.display());
-    }
+    let before = oci_layer::Snapshot::capture(scratch_dir.path()).with_context(|| {
+        format!(
+            "capturing {}'s own parent-layer state",
+            scratch_dir.path().display()
+        )
+    })?;
+
+    let changes = if let Some(layer) = last_layer {
+        let compression = compression_for_media_type(&layer.media_type)
+            .with_context(|| format!("layer {}", layer.digest))?;
+        let blob = store
+            .open_blob(&layer.digest)
+            .with_context(|| format!("opening layer blob {}", layer.digest))?;
+        oci_layer::apply(blob, compression, scratch_dir.path())
+            .with_context(|| format!("applying layer {}", layer.digest))?;
+        oci_layer::changes(scratch_dir.path(), &before).with_context(|| {
+            format!("diffing image {image:?}'s own last layer against its parent")
+        })?
+    } else {
+        // A real, honest empty diff for a genuinely layerless image
+        // (`FROM scratch` with no filesystem-touching instructions at
+        // all, `0175`/`0193`'s own zero-layer builds) -- there is no
+        // "last layer" to diff at all, so there is nothing to report,
+        // matching this project's own already-established "nothing to
+        // report, not an error" convention rather than a contrived
+        // special case.
+        Vec::new()
+    };
+    let changes = filter_diff_changes(changes);
+
+    print_diff_changes(&changes, json)?;
     Ok(())
 }
 
