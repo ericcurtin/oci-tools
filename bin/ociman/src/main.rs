@@ -5431,28 +5431,39 @@ enum ContainerCommand {
         #[arg(long = "filter")]
         filter: Vec<String>,
     },
-    /// Create a new, separate container from the exact same image and
-    /// effective config as an already-existing one -- matching real
-    /// `podman container clone` exactly for this project's own first,
-    /// deliberately narrower slice (checked directly, `~/git/podman/
-    /// cmd/podman/containers/clone.go`/`~/git/podman/pkg/domain/
-    /// infra/abi/containers.go`'s own `ContainerClone`): unlike real
-    /// podman's own much larger flag surface (every `create`-time
-    /// resource/health/etc. override, plus a positional `IMAGE`
-    /// argument that pulls a genuinely *different* image for the
-    /// clone), this first slice only ever clones from the exact same
+    /// Create a new, separate container from the exact same effective
+    /// config as an already-existing one, optionally rooted in a
+    /// genuinely *different* image -- matching real `podman container
+    /// clone` exactly for this project's own first, deliberately
+    /// narrower slice (checked directly, `~/git/podman/cmd/podman/
+    /// containers/clone.go`/`~/git/podman/pkg/domain/infra/abi/
+    /// containers.go`'s own `ContainerClone`): unlike real podman's
+    /// own much larger flag surface (every `create`-time resource/
+    /// health/etc. override), this first slice accepts only the exact
+    /// same three positionals real podman's own `Use: "clone [options]
+    /// CONTAINER NAME IMAGE"` documents -- `IMAGE` (0571, closing a
+    /// gap `0474`'s own doc comment originally flagged as "a real,
+    /// deliberately deferred gap, not yet accepted at all") swaps
+    /// which image's own layers the clone's fresh rootfs is extracted
+    /// from; every other part of the config -- command, env, resource
+    /// limits, labels, hostname -- still comes from the source
+    /// container's own current `config.json` unchanged, exactly
+    /// matching real podman's own checked-directly `ConfigToSpec`
+    /// behavior (`~/git/podman/pkg/specgen/generate/container.go:
+    /// 379-431`: the new `Image` only
+    /// ever seeds `specgen.NewSpecGenerator`'s own rootfs-resolution
+    /// field *before* the container's own live config is unmarshaled
+    /// on top of it -- process/env/resources are always the source's
+    /// own, never re-derived from the new image). Omitted entirely
+    /// (real podman's own `len(args) == 2` case): the exact same
     /// image the source container itself already used
-    /// ([`ANNOTATION_IMAGE`]) -- a positional `IMAGE` override is a
-    /// real, deliberately deferred gap, not yet accepted at all. The
-    /// clone gets a fresh, independent rootfs extracted from that same
-    /// image (never a copy of the source's own current, possibly-
-    /// modified one -- matching real podman's own identical "a
-    /// genuinely new container, storage-wise" semantics), a byte-for-
-    /// byte copy of the source's own current `config.json` otherwise
-    /// (command, env, resource limits, labels, hostname, everything
-    /// already baked into it), and is always left `Created` (never
-    /// started) unless `--run` says otherwise -- the exact same "no
-    /// new runtime concept needed" reasoning `ociman create` itself
+    /// ([`ANNOTATION_IMAGE`]). Either way the clone gets a fresh,
+    /// independent rootfs extraction (never a copy of the source's
+    /// own current, possibly-modified one -- matching real podman's
+    /// own identical "a genuinely new container, storage-wise"
+    /// semantics), and is always left `Created` (never started)
+    /// unless `--run` says otherwise -- the exact same "no new
+    /// runtime concept needed" reasoning `ociman create` itself
     /// already established. Prints only the new container's own id,
     /// matching real podman's own checked-directly bare-id output
     /// exactly.
@@ -5464,8 +5475,29 @@ enum ContainerCommand {
         /// first free `N` if that's already taken too, matching real
         /// podman's own identical checked-directly collision-
         /// avoidance algorithm exactly (`~/git/podman/pkg/specgen/
-        /// generate/container.go`'s own `CheckName`).
+        /// generate/container.go`'s own `CheckName`). Required
+        /// whenever `IMAGE` is also given -- real podman's own exact
+        /// positional-consumption rule (checked directly, `clone.go`'s
+        /// own `switch len(args)`: `case 2` assigns `args[1]` to
+        /// `Name` unconditionally, so a bare second positional is
+        /// always the name, never an image, exactly like clap's own
+        /// identical left-to-right optional-positional consumption
+        /// here).
         name: Option<String>,
+        /// Extract the clone's own fresh rootfs from a genuinely
+        /// *different* image instead of the source container's own
+        /// recorded one -- matching real `podman container clone
+        /// CONTAINER NAME IMAGE`'s own third positional exactly (see
+        /// this command's own doc comment for the full, checked-
+        /// directly reasoning on exactly what does and doesn't change
+        /// when this is given). Pulled according to this project's
+        /// own already-established default policy (`--pull missing`)
+        /// -- real podman's own identical default (`~/git/podman/
+        /// cmd/podman/common/create_opts.go`'s own `DefineCreateDefaults`:
+        /// `opts.Pull = policy()`), since this first slice doesn't
+        /// accept every `create`-time override real podman's own
+        /// richer flag surface does.
+        image: Option<String>,
         /// Remove the source container after successfully creating
         /// the clone -- matching real `podman container clone
         /// --destroy` exactly. Requires the source to already be
@@ -7471,10 +7503,18 @@ fn main() -> std::process::ExitCode {
                 ContainerCommand::Clone {
                     container,
                     name,
+                    image,
                     destroy,
                     force,
                     run,
-                } => cmd_clone(&container, name.as_deref(), destroy, force, run),
+                } => cmd_clone(
+                    &container,
+                    name.as_deref(),
+                    image.as_deref(),
+                    destroy,
+                    force,
+                    run,
+                ),
                 ContainerCommand::Cleanup {
                     containers,
                     all,
@@ -13147,6 +13187,7 @@ fn cmd_container_prune(json: bool, filter: &[String]) -> anyhow::Result<()> {
 fn cmd_clone(
     container: &str,
     name: Option<&str>,
+    image: Option<&str>,
     destroy: bool,
     force: bool,
     run: bool,
@@ -13162,18 +13203,53 @@ fn cmd_clone(
     let source_bundle = oci_runtime_core::Bundle::load(&source_bundle_dir)
         .with_context(|| format!("loading bundle from {}", source_bundle_dir.display()))?;
 
-    let image_ref = source_state
-        .annotations
-        .get(ANNOTATION_IMAGE)
-        .with_context(|| format!("container {container:?} has no recorded image to clone from"))?
-        .clone();
     let store = open_store()?;
-    let record = store
-        .resolve_image(&image_ref)
-        .with_context(|| format!("resolving image {image_ref:?}"))?
-        .with_context(|| {
-            format!("image {image_ref:?} (used to create container {container:?}) no longer exists")
-        })?;
+    // A genuinely different `IMAGE` positional (0571) resolves/pulls
+    // just like `ociman create`'s own image argument does (real or
+    // short id tried first, matching `resolve_image_by_id_only`'s own
+    // already-established "an id almost always also parses as some
+    // syntactically valid but nonsense tag reference" ordering
+    // rationale) — omitted entirely, the clone still resolves the
+    // exact same image the source container itself already used
+    // ([`ANNOTATION_IMAGE`]), the original, narrower first-slice
+    // behavior.
+    let (image_ref, record) = match image {
+        Some(image) => match resolve_image_by_id_only(&store, image)? {
+            Some(record) => (record.reference.clone(), record),
+            None => {
+                let reference = Reference::parse(image)
+                    .with_context(|| format!("parsing image reference {image:?}"))?;
+                let record = resolve_or_pull(
+                    &store,
+                    &reference,
+                    true,
+                    PullPolicy::Missing,
+                    &Platform::host(),
+                    false,
+                )?;
+                (reference.to_string(), record)
+            }
+        },
+        None => {
+            let image_ref = source_state
+                .annotations
+                .get(ANNOTATION_IMAGE)
+                .with_context(|| {
+                    format!("container {container:?} has no recorded image to clone from")
+                })?
+                .clone();
+            let record = store
+                .resolve_image(&image_ref)
+                .with_context(|| format!("resolving image {image_ref:?}"))?
+                .with_context(|| {
+                    format!(
+                        "image {image_ref:?} (used to create container {container:?}) no \
+                         longer exists"
+                    )
+                })?;
+            (image_ref, record)
+        }
+    };
     let manifest = store
         .image_manifest(&record)
         .with_context(|| format!("reading manifest for {image_ref:?}"))?;
@@ -13216,6 +13292,15 @@ fn cmd_clone(
 
     let mut annotations = source_state.annotations.clone();
     annotations.insert(ANNOTATION_NAME.to_string(), new_name);
+    // A genuinely different `IMAGE` positional (0571) re-records the
+    // clone's own new image reference rather than silently keeping
+    // the source's own stale one -- everything else this project
+    // tracks about the source (`ANNOTATION_CMD`, labels, ...) is left
+    // exactly as copied above, matching this command's own doc
+    // comment: only the rootfs source changes, never the config.
+    if image.is_some() {
+        annotations.insert(ANNOTATION_IMAGE.to_string(), image_ref.clone());
+    }
     let (new_id, mut new_state) = create_container_record(&containers, &annotations)?;
     let new_bundle_dir = containers.container_dir(&new_id);
     let new_rootfs_dir = new_bundle_dir.join("rootfs");

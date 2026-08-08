@@ -1,11 +1,13 @@
-//! `ociman container clone` integration tests (`docs/design/0474`):
-//! this project's own first, deliberately narrower slice of real
-//! `podman container clone` — always clones from the exact same image
-//! the source container itself already used (no positional `IMAGE`
-//! override yet), a fresh, independent rootfs extracted from that
-//! image, a byte-for-byte copy of the source's own current
-//! `config.json` otherwise, and always left `Created` unless `--run`
-//! says otherwise.
+//! `ociman container clone` integration tests (`docs/design/0474`,
+//! `0571`): this project's own first, deliberately narrower slice of
+//! real `podman container clone` — clones from the exact same image
+//! the source container itself already used unless a positional
+//! `IMAGE` is given (`0571`), in which case the clone's own fresh
+//! rootfs is extracted from *that* image instead while every other
+//! part of the config (command, env, labels, ...) still comes from
+//! the source's own current `config.json` unchanged, matching real
+//! podman's own checked-directly `ConfigToSpec` behavior exactly. The
+//! clone is always left `Created` unless `--run` says otherwise.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -14,7 +16,7 @@ use std::time::{Duration, Instant};
 use oci_spec_types::image::ContainerConfig;
 use oci_store::Store;
 
-use oci_tools_tests::{bin_path, busybox_path, seed_image};
+use oci_tools_tests::{bin_path, busybox_path, seed_image, seed_image_with_files};
 
 fn ociman(storage_root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin_path("ociman"))
@@ -473,4 +475,225 @@ fn clone_of_an_unknown_container_is_a_clear_error() {
         "{}",
         String::from_utf8_lossy(&clone.stderr)
     );
+}
+
+/// A positional `IMAGE` (`docs/design/0571`) extracts the clone's own
+/// fresh rootfs from a genuinely *different* image than the source's
+/// own recorded one -- proven with two distinguishably-seeded images
+/// (each with its own marker file) -- while every other part of the
+/// config still comes from the source container's own current
+/// `config.json` unchanged: the clone's own `command` field matches
+/// the source's explicit command, not the new image's own default
+/// `cmd`, matching real podman's own checked-directly `ConfigToSpec`
+/// behavior exactly (see `Command::Clone`'s own doc comment).
+#[test]
+fn clone_with_a_different_image_extracts_its_rootfs_but_keeps_the_sources_own_config() {
+    let Some(busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(storage_dir.path()).unwrap();
+    seed_image_with_files(
+        &store,
+        "ociman-test/clone-image-a:latest",
+        &busybox,
+        &["sh", "true"],
+        &[("marker-a.txt", b"this is image a")],
+        ContainerConfig {
+            cmd: Some(vec!["true".to_string()]),
+            ..Default::default()
+        },
+    );
+    seed_image_with_files(
+        &store,
+        "ociman-test/clone-image-b:latest",
+        &busybox,
+        &["sh", "true"],
+        &[("marker-b.txt", b"this is image b")],
+        ContainerConfig {
+            cmd: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "exit 42".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "clone-image-source",
+            "ociman-test/clone-image-a:latest",
+            "sh",
+            "-c",
+            "echo source-cmd-marker",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let source_id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+    let clone = ociman(
+        storage_dir.path(),
+        &[
+            "container",
+            "clone",
+            "clone-image-source",
+            "clone-image-dest",
+            "ociman-test/clone-image-b:latest",
+        ],
+    );
+    assert!(
+        clone.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    let clone_id = String::from_utf8_lossy(&clone.stdout).trim().to_string();
+
+    // The clone's own recorded image is the new one, not the
+    // source's -- normalized the same way a real `ociman pull` would
+    // leave it (`seed_image`'s own doc comment).
+    let clone_json = inspect_json(storage_dir.path(), &clone_id);
+    assert_eq!(
+        clone_json["image"],
+        "docker.io/ociman-test/clone-image-b:latest"
+    );
+    assert_eq!(
+        inspect_json(storage_dir.path(), &source_id)["image"],
+        "docker.io/ociman-test/clone-image-a:latest"
+    );
+
+    // The clone's own command is still the source's explicit one, not
+    // image b's own default `cmd` -- proving the config, not just the
+    // id string, was faithfully copied rather than re-derived from
+    // the new image.
+    assert_eq!(clone_json["command"], "sh -c echo source-cmd-marker");
+
+    // The clone's own real rootfs genuinely has image b's marker
+    // file, not image a's -- proving the rootfs extraction itself
+    // really did come from the new image, not just its name being
+    // recorded.
+    let rootfs = clone_json["rootfs"].as_str().unwrap();
+    assert!(Path::new(rootfs).join("marker-b.txt").exists());
+    assert!(!Path::new(rootfs).join("marker-a.txt").exists());
+
+    // Starting the clone and attaching runs the source's own command
+    // for real, inside image b's own real rootfs.
+    let start = ociman(storage_dir.path(), &["start", "--attach", &clone_id]);
+    assert!(start.status.success(), "{start:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&start.stdout).trim(),
+        "source-cmd-marker"
+    );
+}
+
+/// Real podman's own exact positional-consumption rule: a *second*
+/// positional (no third) is always the new name, never an image --
+/// even if it happens to look like one. Matching this via clap's own
+/// identical left-to-right optional-positional consumption, not a
+/// special case of this project's own.
+#[test]
+fn clone_with_only_two_positionals_treats_the_second_as_a_name_never_an_image() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    seed(
+        storage_dir.path(),
+        "ociman-test/clone-two-positional:latest",
+    );
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "two-positional-source",
+            "ociman-test/clone-two-positional:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+    let source_id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+    let clone = ociman(
+        storage_dir.path(),
+        &[
+            "container",
+            "clone",
+            "two-positional-source",
+            "alpine-1.0.0",
+        ],
+    );
+    assert!(
+        clone.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    let clone_id = String::from_utf8_lossy(&clone.stdout).trim().to_string();
+
+    // The "tag-shaped" second positional became the new container's
+    // own literal name, and the clone still used the source's own
+    // recorded image -- exactly like real podman's own `case 2`.
+    let by_name = ociman(storage_dir.path(), &["inspect", "alpine-1.0.0", "--json"]);
+    assert!(by_name.status.success(), "{by_name:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&by_name.stdout).unwrap()["id"],
+        clone_id
+    );
+    let clone_json = inspect_json(storage_dir.path(), &clone_id);
+    assert_eq!(
+        clone_json["image"],
+        "docker.io/ociman-test/clone-two-positional:latest"
+    );
+    assert_eq!(
+        inspect_json(storage_dir.path(), &source_id)["image"],
+        clone_json["image"]
+    );
+}
+
+/// A positional `IMAGE` that isn't already stored locally attempts a
+/// real pull (`--pull missing`, this project's own default policy,
+/// matching real podman's own identical default) -- proven here
+/// against an address nothing is listening on (the same
+/// `UNREACHABLE_HOST` pattern `ociman_pull_policy.rs`'s own tests
+/// already establish, avoiding any real network dependency), which is
+/// a real, immediate error, never a silent fallback to the source's
+/// own image.
+#[test]
+fn clone_with_an_unresolvable_image_is_a_clear_error() {
+    let Some(_busybox) = busybox_path() else {
+        eprintln!("skipping: busybox not found on $PATH");
+        return;
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    seed(storage_dir.path(), "ociman-test/clone-bad-image:latest");
+
+    let create = ociman(
+        storage_dir.path(),
+        &[
+            "create",
+            "--name",
+            "bad-image-source",
+            "ociman-test/clone-bad-image:latest",
+            "true",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+
+    let clone = ociman(
+        storage_dir.path(),
+        &[
+            "container",
+            "clone",
+            "bad-image-source",
+            "bad-image-dest",
+            "127.0.0.1:1/testrepo:latest",
+        ],
+    );
+    assert!(!clone.status.success());
 }
