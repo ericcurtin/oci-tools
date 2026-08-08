@@ -11,9 +11,15 @@
 //! `poststop` lifecycle hooks run for `run`; `createContainer`/
 //! `startContainer` run for both `run` and the `create`/`start`
 //! two-phase lifecycle (shared code between the two, see
-//! `docs/design/0087`); `prestart`/`createRuntime`/`poststart`/
-//! `poststop` for the `create`/`start`/`kill`/`delete` lifecycle
-//! specifically still remain — see `docs/design/0026`/`0035`/`0087`.
+//! `docs/design/0087`) — and (correcting this comment's own stale
+//! claim otherwise, 0572) so do `prestart`/`createRuntime`/
+//! `poststart`/`poststop` for the two-phase lifecycle: `create`
+//! shares the exact same `launch::create` real runc/crun both run
+//! `prestart`/`createRuntime` from (see `docs/design/0026`/`0035`/
+//! `0087`), `start` runs `poststart` (`cmd_start`), and `delete` runs
+//! `poststop` (`cmd_delete`) — `kill` has no hook point of its own in
+//! the runtime spec at all, so there was never a real gap there to
+//! begin with.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

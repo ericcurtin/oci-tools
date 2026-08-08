@@ -4805,10 +4805,11 @@ enum HealthcheckCommand {
     /// deliberately narrower scope: see `cmd_healthcheck_run`'s own
     /// doc comment for exactly what's deferred (no persisted health
     /// log/state, no startup-healthcheck distinction, no on-failure
-    /// actions, and — the one real, honestly-flagged gap — the
-    /// configured `Timeout` isn't enforced yet, so a genuinely hung
-    /// check currently blocks this command itself rather than being
-    /// killed and reported `unhealthy`).
+    /// actions). The configured `Timeout` *is* enforced (0308,
+    /// correcting this doc comment's own stale claim otherwise, 0572):
+    /// a genuinely hung check is killed (`SIGKILL`) once it elapses
+    /// and reported `unhealthy`, never left blocking this command
+    /// forever.
     Run {
         /// The container's ID or `--name`.
         id: String,
